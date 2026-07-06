@@ -139,7 +139,6 @@ def test_multi_layer_save_and_finalize() -> None:
 
 def test_decode_window_save_completion_is_drained_after_wait() -> None:
     request = _make_req("req-window")
-    request.is_decode_window_save = True
     request.decode_window_start = 256
     request.decode_window_end = 512
     request.decode_window_size = 256

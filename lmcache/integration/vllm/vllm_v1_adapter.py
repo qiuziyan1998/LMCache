@@ -273,6 +273,10 @@ class RequestTracker:
     # Decode window save only: highest token boundary confirmed readable from
     # LMCache by worker-side completion output.
     decode_window_save_committed_end: int = field(default=0, repr=False)
+    # Decode window save pending on the normal request metadata for this step.
+    decode_window_save_pending_start: Optional[int] = field(default=None, repr=False)
+    decode_window_save_pending_end: Optional[int] = field(default=None, repr=False)
+    decode_window_save_pending_size: Optional[int] = field(default=None, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -446,8 +450,7 @@ class ReqMeta:
     # Sparse decode only: shared with RequestTracker, reused across decode steps.
     decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
-    # Decode window save metadata, separate from the regular request save progress.
-    is_decode_window_save: bool = False
+    # Decode window save metadata, carried on the regular request metadata.
     decode_window_start: Optional[int] = None
     decode_window_end: Optional[int] = None
     decode_window_size: Optional[int] = None
@@ -488,53 +491,6 @@ class ReqMeta:
         return token_ids_tensor.tolist()
 
     @staticmethod
-    def from_decode_window_save(
-        tracker: RequestTracker,
-        block_size: int,
-        window_start: int,
-        window_end: int,
-        window_size: int,
-    ) -> Optional["ReqMeta"]:
-        """Create isolated metadata for a decode-window save."""
-        if window_start < 0 or window_end <= window_start:
-            return None
-        if window_end > len(tracker.token_ids):
-            return None
-
-        token_ids = tracker.token_ids[:window_end].copy()
-        token_ids = ReqMeta._token_ids_with_mm_hashes(token_ids, tracker)
-
-        num_blocks = len(tracker.allocated_block_ids)
-        if window_end > num_blocks * block_size:
-            logger.warning(
-                "Skipping decode window save for request %s: "
-                "window_end=%d exceeds slot capacity %d",
-                tracker.req_id,
-                window_end,
-                num_blocks * block_size,
-            )
-            return None
-
-        return ReqMeta(
-            req_id=tracker.req_id,
-            token_ids=token_ids,
-            slot_mapping=[
-                _build_slot_mapping(
-                    tracker.allocated_block_ids, block_size, len(token_ids)
-                )
-            ],
-            is_last_prefill=True,
-            save_spec=SaveSpec(window_start, True),
-            load_spec=None,
-            disagg_spec=None,
-            request_configs=tracker.request_configs,
-            is_decode_window_save=True,
-            decode_window_start=window_start,
-            decode_window_end=window_end,
-            decode_window_size=window_size,
-        )
-
-    @staticmethod
     def from_request_tracker(
         tracker: RequestTracker,
         block_size: int,
@@ -565,12 +521,24 @@ class ReqMeta:
         if input_token_len >= tracker.prompt_len:
             is_last_prefill = True
 
+        decode_window_start = tracker.decode_window_save_pending_start
+        decode_window_end = tracker.decode_window_save_pending_end
+        decode_window_size = tracker.decode_window_save_pending_size
+        has_decode_window_save = (
+            decode_window_start is not None
+            and decode_window_end is not None
+            and decode_window_end > decode_window_start
+        )
+
         # For save operation: do not save if the following condition is met
         # 1. has already been saved before (num_saved_tokens > 0)
         # 2. number of unsaved tokens is not reached the chunk boundary
         # 3. if save_decode_cache is False and it is in decode phase
 
-        skip_leading_tokens = tracker.num_saved_tokens
+        skip_leading_tokens = (
+            decode_window_start if has_decode_window_save
+            else tracker.num_saved_tokens
+        )
         chunk_boundary = (
             cdiv(tracker.num_saved_tokens + 1, lmcache_chunk_size) * lmcache_chunk_size
         )
@@ -585,6 +553,8 @@ class ReqMeta:
             or (tracker.is_decode_phase and not save_decode_cache)
             or request_skip
         )
+        if has_decode_window_save:
+            skip_save = False
 
         if skip_save and load_spec is None:
             return None
@@ -595,7 +565,9 @@ class ReqMeta:
         # NOTE(vladnosiv): for the input_token_len chunk prefill,
         # we are required to discard partial chunks,
         # as new tokens will be added in the next iteration.
-        if not is_last_prefill or discard_partial_chunks:
+        if has_decode_window_save:
+            num_tokens_to_save = int(decode_window_end)
+        elif not is_last_prefill or discard_partial_chunks:
             num_tokens_to_save = (
                 input_token_len // lmcache_chunk_size * lmcache_chunk_size
             )
@@ -641,6 +613,9 @@ class ReqMeta:
 
         if is_sparse_decode and load_spec is not None:
             num_slots = _sparse_slot_mapping_len(load_spec.lmcache_cached_tokens)
+            if has_decode_window_save:
+                num_slots = max(num_slots, len(token_ids))
+                num_slots = min(num_slots, num_blocks * block_size)
             current_slots = (
                 int(tracker.sparse_slot_mapping[0].numel())
                 if tracker.sparse_slot_mapping
@@ -717,7 +692,7 @@ class ReqMeta:
             )
 
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
-        return ReqMeta(
+        req_meta = ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
@@ -736,7 +711,15 @@ class ReqMeta:
             cached_chunk_ptrs_npu=tracker.cached_chunk_ptrs_npu,
             decode_token_mask=decode_token_mask,
             decode_ret_mask=decode_ret_mask,
+            decode_window_start=decode_window_start if has_decode_window_save else None,
+            decode_window_end=decode_window_end if has_decode_window_save else None,
+            decode_window_size=decode_window_size if has_decode_window_save else None,
         )
+        if has_decode_window_save:
+            tracker.decode_window_save_pending_start = None
+            tracker.decode_window_save_pending_end = None
+            tracker.decode_window_save_pending_size = None
+        return req_meta
 
 
 @dataclass
@@ -1156,30 +1139,24 @@ class LMCacheConnectorV1Impl:
         )
 
     @staticmethod
-    def _is_decode_window_save_request(request: ReqMeta) -> bool:
-        return bool(getattr(request, "is_decode_window_save", False))
+    def _has_decode_window_save(request: ReqMeta) -> bool:
+        window_start = getattr(request, "decode_window_start", None)
+        window_end = getattr(request, "decode_window_end", None)
+        return (
+            window_start is not None
+            and window_end is not None
+            and int(window_end) > int(window_start)
+        )
 
     @staticmethod
     def _layerwise_save_storer_key(request: ReqMeta) -> Any:
-        if not LMCacheConnectorV1Impl._is_decode_window_save_request(request):
-            return request.req_id
-        return (
-            request.req_id,
-            "decode_window_save",
-            getattr(request, "decode_window_start", None),
-            getattr(request, "decode_window_end", None),
-        )
+        return request.req_id
 
     def _drop_layerwise_save_storers(self, req_id: str) -> None:
         if not hasattr(self, "_layerwise_save_storers"):
             return
         for storer_key in list(self._layerwise_save_storers):
             if storer_key == req_id:
-                self._layerwise_save_storers.pop(storer_key, None)
-            elif isinstance(storer_key, tuple) and storer_key[:2] == (
-                req_id,
-                "decode_window_save",
-            ):
                 self._layerwise_save_storers.pop(storer_key, None)
 
     def _release_request_lookup_pins(self, req_id: str) -> None:
@@ -1191,14 +1168,12 @@ class LMCacheConnectorV1Impl:
             engine.lookup_unpin(req_id)
 
     def _maybe_lookup_unpin_for_request(self, request: ReqMeta) -> None:
-        if self._is_decode_window_save_request(request):
-            return
         if self._should_defer_lookup_unpin_for_sparse_decode(request):
             return
         self._release_request_lookup_pins(request.req_id)
 
     def _mark_decode_window_save_completed(self, request: ReqMeta) -> None:
-        if not self._is_decode_window_save_request(request):
+        if not self._has_decode_window_save(request):
             return
         window_end = request.decode_window_end
         if window_end is None:
@@ -1379,11 +1354,7 @@ class LMCacheConnectorV1Impl:
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
 
-        active_req_ids = {
-            req.req_id
-            for req in metadata.requests
-            if not self._is_decode_window_save_request(req)
-        }
+        active_req_ids = {req.req_id for req in metadata.requests}
         self._prune_worker_retrieve_state(active_req_ids)
 
         assert len(self.kv_caches) > 0
@@ -1920,7 +1891,7 @@ class LMCacheConnectorV1Impl:
 
                 if (
                     self.kv_role == "kv_producer"
-                    and not self._is_decode_window_save_request(request)
+                    and not self._has_decode_window_save(request)
                 ):
                     skip_leading_tokens = 0
                 else:
@@ -1962,7 +1933,7 @@ class LMCacheConnectorV1Impl:
                     cached_ends=request.cached_ends,
                     cached_memory_objs=request.cached_memory_objs,
                     cached_tensors=request.cached_tensors,
-                    decode_window_save=self._is_decode_window_save_request(request),
+                    decode_window_save=self._has_decode_window_save(request),
                     decode_window_start=getattr(request, "decode_window_start", None),
                     decode_window_end=getattr(request, "decode_window_end", None),
                     decode_window_size=getattr(request, "decode_window_size", None),
@@ -1974,7 +1945,7 @@ class LMCacheConnectorV1Impl:
             try:
                 next(layerwise_storer)
             except Exception:
-                if self._is_decode_window_save_request(request):
+                if self._has_decode_window_save(request):
                     logger.exception(
                         "[DECODE_WINDOW_SAVE] save_kv_layer failed: "
                         "req=%s window=[%s,%s) layer=%s",
@@ -2013,7 +1984,7 @@ class LMCacheConnectorV1Impl:
                     try:
                         next(layerwise_storer)
                     except Exception:
-                        if self._is_decode_window_save_request(request):
+                        if self._has_decode_window_save(request):
                             logger.exception(
                                 "[DECODE_WINDOW_SAVE] wait_for_save failed: "
                                 "req=%s window=[%s,%s)",
@@ -2383,33 +2354,43 @@ class LMCacheConnectorV1Impl:
         )
         return start
 
-    def _add_decode_window_save_metas(
-        self,
-        meta: LMCacheConnectorMetadata,
-        tracker: RequestTracker,
-    ) -> None:
+    def _prepare_decode_window_save(self, tracker: RequestTracker) -> None:
+        tracker.decode_window_save_pending_start = None
+        tracker.decode_window_save_pending_end = None
+        tracker.decode_window_save_pending_size = None
         if not self._should_decode_window_save(tracker):
             return
 
         window_size = self._decode_window_save_window_size
         next_start = self._init_decode_window_save_start(tracker)
+        pending_start: Optional[int] = None
+        pending_end: Optional[int] = None
 
         while len(tracker.token_ids) >= next_start + window_size:
             window_start = next_start
             window_end = window_start + window_size
-            req_meta = ReqMeta.from_decode_window_save(
-                tracker,
-                self._block_size,
-                window_start,
-                window_end,
-                window_size,
-            )
-            if req_meta is None:
+
+            num_blocks = len(tracker.allocated_block_ids)
+            if window_end > num_blocks * self._block_size:
+                logger.warning(
+                    "Skipping decode window save for request %s: "
+                    "window_end=%d exceeds slot capacity %d",
+                    tracker.req_id,
+                    window_end,
+                    num_blocks * self._block_size,
+                )
                 return
 
-            meta.add_request(req_meta)
+            if pending_start is None:
+                pending_start = window_start
+            pending_end = window_end
             tracker.decode_window_save_next_start = window_end
             next_start = window_end
+
+        if pending_start is not None and pending_end is not None:
+            tracker.decode_window_save_pending_start = pending_start
+            tracker.decode_window_save_pending_end = pending_end
+            tracker.decode_window_save_pending_size = window_size
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(
@@ -2466,6 +2447,7 @@ class LMCacheConnectorV1Impl:
             )
             self._request_trackers[request.req_id] = request_tracker
 
+            self._prepare_decode_window_save(request_tracker)
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -2476,7 +2458,6 @@ class LMCacheConnectorV1Impl:
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
-            self._add_decode_window_save_metas(meta, request_tracker)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
 
@@ -2513,7 +2494,7 @@ class LMCacheConnectorV1Impl:
                     all_token_ids=all_token_ids,
                 )
 
-                self._add_decode_window_save_metas(meta, request_tracker)
+                self._prepare_decode_window_save(request_tracker)
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
@@ -2638,7 +2619,7 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
 
-            self._add_decode_window_save_metas(meta, request_tracker)
+            self._prepare_decode_window_save(request_tracker)
             is_sparse_decode = self.enable_sparse_attention and (
                 request.num_computed_tokens > request.num_prompt_tokens
             )

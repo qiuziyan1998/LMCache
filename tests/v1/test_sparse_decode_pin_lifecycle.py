@@ -68,9 +68,8 @@ class TestSparseDecodePinLifecycle:
         connector.wait_for_save()
         assert engine.unpinned == ["req-done"]
 
-    def test_decode_window_save_metadata_does_not_unpin(self) -> None:
-        window_save = make_non_sparse_req_meta("req-window")
-        window_save.is_decode_window_save = True
+    def test_sparse_decode_with_decode_window_save_defers_unpin(self) -> None:
+        window_save = make_sparse_req_meta("req-window")
         window_save.decode_window_start = 256
         window_save.decode_window_end = 512
         window_save.decode_window_size = 256

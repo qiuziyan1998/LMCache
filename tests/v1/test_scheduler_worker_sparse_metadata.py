@@ -195,10 +195,17 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.load_spec is not None
         assert req_meta.load_spec.can_load is True
         assert req_meta.load_spec.lmcache_cached_tokens == 256
-        assert req_meta.token_ids == all_tokens[:256]
+        assert req_meta.save_spec is not None
+        assert req_meta.save_spec.can_save is True
+        assert req_meta.save_spec.skip_leading_tokens == 256
+        assert req_meta.decode_window_start == 256
+        assert req_meta.decode_window_end == 512
+        assert req_meta.token_ids == all_tokens[:512]
+        assert req_meta.cached_tensors is tracker.cached_tensors
+        assert req_meta.cached_chunk_ptrs_npu is tracker.cached_chunk_ptrs_npu
         assert tracker.sparse_token_ids == all_tokens[:256]
-        assert req_meta.slot_mapping[0].numel() == 256
-        assert tracker.sparse_slot_mapping[0].numel() == 256
+        assert req_meta.slot_mapping[0].numel() == 512
+        assert tracker.sparse_slot_mapping[0].numel() == 512
 
         impl.update_connector_output(
             SimpleNamespace(completed_decode_window_saves={req_id: 512})
@@ -324,7 +331,6 @@ class TestDecodeWindowSaveMetadata:
 
         assert len(meta.requests) == 1
         req_meta = meta.requests[0]
-        assert req_meta.is_decode_window_save is True
         assert req_meta.decode_window_start == 256
         assert req_meta.decode_window_end == 512
         assert req_meta.decode_window_size == 256
@@ -332,7 +338,9 @@ class TestDecodeWindowSaveMetadata:
         assert req_meta.save_spec.skip_leading_tokens == 256
         assert req_meta.token_ids == prompt + decode_tokens
         assert len(req_meta.slot_mapping[0]) == 512
-        assert tracker.num_saved_tokens == 256
+        assert req_meta.cached_tensors is tracker.cached_tensors
+        assert req_meta.cached_chunk_ptrs_npu is tracker.cached_chunk_ptrs_npu
+        assert tracker.num_saved_tokens == 512
         assert tracker.decode_window_save_next_start == 512
         assert tracker.decode_window_save_committed_end == 256
 
