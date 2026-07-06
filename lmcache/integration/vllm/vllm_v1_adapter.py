@@ -1178,6 +1178,28 @@ class LMCacheConnectorV1Impl:
         window_end = request.decode_window_end
         if window_end is None:
             return
+        if _env_flag("LMCACHE_DECODE_WINDOW_SAVE_DEBUG"):
+            tensor_counts = None
+            if request.cached_tensors:
+                tensor_counts = [
+                    len(layer_chunks) if layer_chunks is not None else 0
+                    for layer_chunks in request.cached_tensors
+                ]
+            ptr_counts = None
+            if request.cached_chunk_ptrs_npu:
+                ptr_counts = [
+                    0 if ptrs is None else int(ptrs.numel())
+                    for ptrs in request.cached_chunk_ptrs_npu
+                ]
+            logger.warning(
+                "[DECODE_WINDOW_SAVE] completed req=%s window=[%s,%s) "
+                "tensor_chunks=%s ptr_chunks=%s",
+                request.req_id,
+                getattr(request, "decode_window_start", None),
+                window_end,
+                tensor_counts,
+                ptr_counts,
+            )
         completed = getattr(self, "_completed_decode_window_saves", None)
         if completed is None:
             return
@@ -1204,6 +1226,13 @@ class LMCacheConnectorV1Impl:
                 tracker.decode_window_save_committed_end,
                 committed_end,
             )
+
+    def _drain_layerwise_storer(self, layerwise_storer: Any) -> None:
+        while True:
+            try:
+                next(layerwise_storer)
+            except StopIteration:
+                return
 
     def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
         if not hasattr(self, "_worker_retrieve_state"):
@@ -1933,6 +1962,8 @@ class LMCacheConnectorV1Impl:
                     cached_ends=request.cached_ends,
                     cached_memory_objs=request.cached_memory_objs,
                     cached_tensors=request.cached_tensors,
+                    cached_chunk_dev_ptrs=request.cached_chunk_dev_ptrs,
+                    cached_chunk_ptrs_npu=request.cached_chunk_ptrs_npu,
                     decode_window_save=self._has_decode_window_save(request),
                     decode_window_start=getattr(request, "decode_window_start", None),
                     decode_window_end=getattr(request, "decode_window_end", None),
@@ -1982,7 +2013,7 @@ class LMCacheConnectorV1Impl:
                 )
                 if layerwise_storer is not None:
                     try:
-                        next(layerwise_storer)
+                        self._drain_layerwise_storer(layerwise_storer)
                     except Exception:
                         if self._has_decode_window_save(request):
                             logger.exception(

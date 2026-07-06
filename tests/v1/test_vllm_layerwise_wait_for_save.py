@@ -26,10 +26,12 @@ class _FakeParent:
 
 
 class _FakeEngine:
-    def __init__(self):
+    def __init__(self, total_yields: int = 3):
         self.unpinned: list[str] = []
         self.store_steps: dict[str, int] = {}
         self.store_calls: list[str] = []
+        self.store_kwargs: dict[str, dict] = {}
+        self.total_yields = total_yields
 
     def lookup_unpin(self, req_id: str) -> None:
         self.unpinned.append(req_id)
@@ -37,10 +39,11 @@ class _FakeEngine:
     def store_layer(self, token_ids, **kwargs):
         req_id = kwargs["req_id"]
         self.store_calls.append(req_id)
+        self.store_kwargs[req_id] = kwargs
         self.store_steps.setdefault(req_id, 0)
 
         def _storer():
-            while True:
+            for _ in range(self.total_yields):
                 self.store_steps[req_id] += 1
                 yield None
 
@@ -65,12 +68,13 @@ def _make_req(req_id: str, can_save: bool = True):
         cached_ends=[],
         cached_memory_objs=[],
         cached_tensors=[],
+        cached_chunk_ptrs_npu=[],
     )
 
 
-def _make_connector(requests):
+def _make_connector(requests, total_yields: int = 3):
     metadata = LMCacheConnectorMetadata(requests=requests)
-    engine = _FakeEngine()
+    engine = _FakeEngine(total_yields=total_yields)
     connector = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     connector._parent = _FakeParent(metadata)
     connector._manager = _FakeManager(engine)
@@ -96,14 +100,14 @@ def test_layerwise_storer_is_request_scoped_across_interleaved_finalize() -> Non
 
     metadata.requests = [_make_req("req-1")]
     connector.wait_for_save()
-    assert engine.store_steps["req-1"] == 2
+    assert engine.store_steps["req-1"] == 3
     assert engine.store_steps["req-2"] == 1
     assert engine.unpinned == ["req-1"]
     assert set(connector._layerwise_save_storers.keys()) == {"req-2"}
 
     metadata.requests = [_make_req("req-2")]
     connector.wait_for_save()
-    assert engine.store_steps["req-2"] == 2
+    assert engine.store_steps["req-2"] == 3
     assert engine.unpinned == ["req-1", "req-2"]
     assert connector._layerwise_save_storers == {}
 
@@ -114,16 +118,19 @@ def test_wait_for_save_repeated_call_does_not_readvance_finalized_storer() -> No
     assert engine.store_steps["req-1"] == 1
 
     connector.wait_for_save()
-    assert engine.store_steps["req-1"] == 2
+    assert engine.store_steps["req-1"] == 3
     assert connector._layerwise_save_storers == {}
 
     connector.wait_for_save()
-    assert engine.store_steps["req-1"] == 2
+    assert engine.store_steps["req-1"] == 3
 
 
 def test_multi_layer_save_and_finalize() -> None:
-    connector, _, engine = _make_connector([_make_req("req-1"), _make_req("req-2")])
     num_layers = 4
+    connector, _, engine = _make_connector(
+        [_make_req("req-1"), _make_req("req-2")],
+        total_yields=num_layers + 1,
+    )
 
     for _ in range(num_layers):
         connector.save_kv_layer("layer_x", torch.zeros(1), None)
@@ -152,6 +159,23 @@ def test_decode_window_save_completion_is_drained_after_wait() -> None:
     assert connector.get_completed_decode_window_saves() == {}
 
 
+def test_layerwise_save_passes_sparse_cache_ptr_state() -> None:
+    request = _make_req("req-window")
+    request.decode_window_start = 256
+    request.decode_window_end = 512
+    request.decode_window_size = 256
+    request.cached_chunk_dev_ptrs = [[123]]
+    request.cached_chunk_ptrs_npu = [torch.arange(2)]
+    connector, _, engine = _make_connector([request])
+
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+
+    kwargs = engine.store_kwargs["req-window"]
+    assert kwargs["cached_tensors"] is request.cached_tensors
+    assert kwargs["cached_chunk_dev_ptrs"] is request.cached_chunk_dev_ptrs
+    assert kwargs["cached_chunk_ptrs_npu"] is request.cached_chunk_ptrs_npu
+
+
 def test_layerwise_save_skips_requests_that_cannot_save() -> None:
     connector, _, engine = _make_connector([_make_req("req-1", can_save=False)])
     connector.kv_role = "kv_both"
@@ -169,5 +193,5 @@ def test_layerwise_save_kv_producer_ignores_can_save_flag() -> None:
     assert set(connector._layerwise_save_storers.keys()) == {"req-1"}
 
     connector.wait_for_save()
-    assert engine.store_steps["req-1"] == 2
+    assert engine.store_steps["req-1"] == 3
     assert connector._layerwise_save_storers == {}
