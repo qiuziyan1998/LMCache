@@ -861,6 +861,48 @@ class TestDisaggSpecOwnership:
         assert tracker.disagg_spec is not None
         assert tracker.disagg_spec.receiver_id == "decode-host9000"
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
+    def test_bootstrap_new_request_uses_sparse_cold_load(self) -> None:
+        impl = _make_scheduler_impl()
+        impl.kv_role = "kv_consumer"
+        impl.config.dsa_two_groups = True
+        req_id = "bootstrap"
+        prompt_len = 4096
+        num_blocks = prompt_len // impl._block_size
+        request = SimpleNamespace(
+            req_id=req_id,
+            prompt_token_ids=list(range(prompt_len)),
+            num_computed_tokens=prompt_len,
+            block_ids=(
+                list(range(128)) + [-1] * (num_blocks - 128),
+                list(range(1000, 1000 + num_blocks)),
+            ),
+            sampling_params=SimpleNamespace(extra_args=None),
+        )
+        impl.load_specs[req_id] = LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=prompt_len,
+            can_load=True,
+            bootstrap_sample=True,
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[request],
+            scheduled_cached_reqs=StubCachedRequestData([], [], []),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.bootstrap_sample
+        assert req_meta.slot_mapping[0].numel() == 2048
+        assert req_meta.slot_mapping[0].min().item() >= 0
+        assert req_meta.indexer_slot_mapping[0].numel() == prompt_len
+        assert len(impl._request_trackers[req_id].sparse_token_ids) == prompt_len
+
     def test_cold_compact_resume_marker_is_one_shot(self) -> None:
         impl = _make_scheduler_impl()
         req_id = "cold-resume"

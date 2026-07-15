@@ -1,24 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections import defaultdict
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import Optional
 import argparse
 import asyncio
+import base64
+import binascii
+import hashlib
+import hmac
 import itertools
 import json
 import os
 import time
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Optional
 
 # Third Party
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
 import httpx
 import msgspec
 import numpy as np
 import zmq
 import zmq.asyncio
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 
 # First Party
 from lmcache.logging import init_logger
@@ -28,6 +32,92 @@ from lmcache.v1.storage_backend.pd_backend import (
 )
 
 logger = init_logger(__name__)
+
+
+_FINAL_HIDDEN_DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "float32": 4}
+_MAX_FINAL_HIDDEN_BYTES = 16 * 1024 * 1024
+_MAX_FINAL_HIDDEN_BASE64_CHARS = 4 * ((_MAX_FINAL_HIDDEN_BYTES + 2) // 3)
+
+
+def is_valid_final_hidden_payload(payload: object) -> bool:
+    """Validate the bounded, request-bound final-hidden transport envelope."""
+    if not isinstance(payload, dict):
+        return False
+    dtype_size = _FINAL_HIDDEN_DTYPE_BYTES.get(payload.get("dtype"))
+    shape = payload.get("shape")
+    data = payload.get("data")
+    if (
+        payload.get("version") != 1
+        or payload.get("encoding") != "base64"
+        or dtype_size is None
+        or not isinstance(shape, list)
+        or len(shape) != 1
+        or type(shape[0]) is not int
+        or shape[0] <= 0
+        or not isinstance(data, str)
+        or len(data) > _MAX_FINAL_HIDDEN_BASE64_CHARS
+        or not isinstance(payload.get("prompt_length"), int)
+        or payload["prompt_length"] <= 0
+        or not isinstance(payload.get("prompt_sha256"), str)
+        or len(payload["prompt_sha256"]) != 64
+        or not isinstance(payload.get("model_fingerprint"), str)
+        or len(payload["model_fingerprint"]) != 64
+        or not isinstance(payload.get("data_sha256"), str)
+        or len(payload["data_sha256"]) != 64
+    ):
+        return False
+    expected_bytes = shape[0] * dtype_size
+    if expected_bytes > _MAX_FINAL_HIDDEN_BYTES:
+        return False
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError, TypeError):
+        return False
+    return (
+        len(raw) == expected_bytes
+        and hmac.compare_digest(
+            hashlib.sha256(raw).hexdigest(), payload["data_sha256"]
+        )
+    )
+
+
+def prepare_decode_request(
+    req_data: dict,
+    prefill_output: dict,
+    org_max_tokens: int,
+    org_max_completion_tokens: Optional[int],
+    final_hidden_handoff: bool,
+) -> bool:
+    """Convert the completed P request into the D request.
+
+    Returns whether the P-generated first token must be emitted by the proxy.
+    Hidden handoff keeps the original prompt/token budget; an invalid or absent
+    artifact deliberately falls back to a normal D-side prefill.
+    """
+    params = prefill_output.get("kv_transfer_params") or {}
+    if final_hidden_handoff:
+        req_data["max_tokens"] = org_max_tokens
+        if org_max_completion_tokens is not None:
+            req_data["max_completion_tokens"] = org_max_completion_tokens
+        req_data.pop("kv_transfer_params", None)
+        artifact = params.get("bootstrap_final_hidden")
+        if is_valid_final_hidden_payload(artifact):
+            req_data["kv_transfer_params"] = {
+                "bootstrap_final_hidden": artifact,
+            }
+        else:
+            logger.warning(
+                "Final-hidden handoff artifact is absent or invalid; "
+                "decoder will run normal prefill."
+            )
+        return False
+
+    req_data["max_tokens"] = org_max_tokens - 1
+    if org_max_completion_tokens is not None:
+        req_data["max_completion_tokens"] = org_max_completion_tokens - 1
+    req_data["prompt"].append(params["first_tok"])
+    req_data.pop("kv_transfer_params", None)
+    return True
 
 
 @asynccontextmanager
@@ -198,6 +288,11 @@ def parse_args():
     parser.add_argument("--num-decoders", type=int, default=1)
     parser.add_argument("--proxy-host", type=str, default="localhost")
     parser.add_argument("--proxy-port", type=int, default=8500)
+    parser.add_argument(
+        "--final-hidden-handoff",
+        action="store_true",
+        help="Bootstrap decode from the producer final hidden state.",
+    )
 
     args = parser.parse_args()
     return args
@@ -380,8 +475,11 @@ async def handle_completions(request: Request):
         }
         num_tp_rank = len(decode_client.init_port or [])
 
+        final_hidden_handoff = global_args.final_hidden_handoff
         req_data["kv_transfer_params"] = {
-            "ret_first_tok": True,
+            (
+                "ret_final_hidden" if final_hidden_handoff else "ret_first_tok"
+            ): True,
             "disagg_spec": disagg_spec,
         }
 
@@ -398,9 +496,13 @@ async def handle_completions(request: Request):
         et = time.time()
         stats_calculator.add(et - st)
 
-        req_data["max_tokens"] = org_max_tokens - 1
-        req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
-        req_data.pop("kv_transfer_params")
+        emit_prefill_token = prepare_decode_request(
+            req_data,
+            prefill_output,
+            org_max_tokens,
+            None,
+            final_hidden_handoff,
+        )
         req_data["stream"] = True
         if stream_options is not None:
             req_data["stream_options"] = stream_options
@@ -423,9 +525,12 @@ async def handle_completions(request: Request):
                 ],
                 "usage": None,
             }
-            yield (
-                "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
-            ).encode()
+            if emit_prefill_token:
+                yield (
+                    "data: "
+                    + json.dumps(head_chunk, separators=(",", ":"))
+                    + "\n\n"
+                ).encode()
 
             # Wait until decode node signals that kv is ready
             await wait_decode_kv_ready(req_id, num_tp_rank)
@@ -486,8 +591,11 @@ async def handle_chat_completions(request: Request):
 
         num_tp_rank = len(decode_client.init_port or [])
 
+        final_hidden_handoff = global_args.final_hidden_handoff
         req_data["kv_transfer_params"] = {
-            "ret_first_tok": True,
+            (
+                "ret_final_hidden" if final_hidden_handoff else "ret_first_tok"
+            ): True,
             "disagg_spec": disagg_spec,
         }
 
@@ -504,14 +612,13 @@ async def handle_chat_completions(request: Request):
         et = time.time()
         stats_calculator.add(et - st)
 
-        req_data["max_tokens"] = org_max_tokens - 1
-        if org_max_completion_tokens is not None:
-            req_data["max_completion_tokens"] = org_max_completion_tokens - 1
-
-        # Add the first token from prefill to the tokenized messages for decode
-        req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
-
-        req_data.pop("kv_transfer_params")
+        emit_prefill_token = prepare_decode_request(
+            req_data,
+            prefill_output,
+            org_max_tokens,
+            org_max_completion_tokens,
+            final_hidden_handoff,
+        )
         req_data["stream"] = True
         if stream_options is not None:
             req_data["stream_options"] = stream_options
@@ -550,9 +657,12 @@ async def handle_chat_completions(request: Request):
                     }
                 ],
             }
-            yield (
-                "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
-            ).encode()
+            if emit_prefill_token:
+                yield (
+                    "data: "
+                    + json.dumps(head_chunk, separators=(",", ":"))
+                    + "\n\n"
+                ).encode()
 
             await wait_decode_kv_ready(req_id, num_tp_rank)
 

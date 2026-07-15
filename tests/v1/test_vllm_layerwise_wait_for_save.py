@@ -794,6 +794,34 @@ def test_finished_worker_request_closes_abandoned_layerwise_storer() -> None:
     assert engine.unpinned == ["req-1"]
 
 
+def test_request_finished_returns_captured_final_hidden() -> None:
+    connector, _, _ = _make_connector([_make_req("req-1")])
+    connector.async_loading = False
+    connector._request_trackers = {}
+    connector.config = SimpleNamespace(
+        dsa_two_groups=False,
+        get_extra_config_value=lambda _key, default=None: default,
+    )
+    payload = {
+        "version": 1,
+        "dtype": "bfloat16",
+        "shape": [4096],
+        "encoding": "base64",
+        "data": "AA==",
+    }
+    request = SimpleNamespace(
+        request_id="req-1",
+        status=None,
+        kv_transfer_params={"ret_final_hidden": True},
+        captured_final_hidden=payload,
+    )
+
+    should_free, return_params = connector.request_finished(request, [])
+
+    assert should_free is False
+    assert return_params == {"bootstrap_final_hidden": payload}
+
+
 def test_deferred_latent_flush_drains_full_store_layer() -> None:
     request = _make_req("req-1")
     request.save_spec.can_save_latent = True
