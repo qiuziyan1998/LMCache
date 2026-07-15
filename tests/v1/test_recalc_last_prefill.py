@@ -3,6 +3,7 @@
 
 # Standard
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 # Third Party
 import pytest
@@ -44,6 +45,36 @@ class TestFullHitRecalcLast:
         assert not LMCacheConnectorV1Impl._full_hit_recalc_last_token(
             spec, 18879, is_sparse_decode=True
         )
+
+    def test_bootstrap_hidden_full_hit_does_not_recalculate_last(self) -> None:
+        spec = LoadSpec(0, 18879, True, bootstrap_sample=True)
+        assert not LMCacheConnectorV1Impl._full_hit_recalc_last_token(
+            spec, 18879, is_sparse_decode=False
+        )
+
+    def test_scheduler_keeps_all_tokens_for_bootstrap_hidden(self) -> None:
+        prompt_len = 18879
+        connector = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+        connector.kv_role = "kv_consumer"
+        connector.enable_sparse_attention = True
+        connector.lookup_client = MagicMock()
+        connector.lookup_client.lookup_cache.return_value = prompt_len
+        connector.config = SimpleNamespace(min_retrieve_tokens=0)
+        connector.load_specs = {}
+        connector._requests_priority = {}
+
+        request = SimpleNamespace(
+            request_id="bootstrap",
+            num_tokens=prompt_len,
+            bootstrap_sample_pending=True,
+        )
+
+        assert connector.get_num_new_matched_tokens(request, 0) == prompt_len
+        assert connector.load_specs[request.request_id].bootstrap_sample
+
+        connector.enable_sparse_attention = False
+        assert connector.get_num_new_matched_tokens(request, 0) == prompt_len - 1
+        assert not connector.load_specs[request.request_id].bootstrap_sample
 
     def test_preserves_tokens_and_slots_for_partial_chunk(self) -> None:
         req = _make_prefill_req()
