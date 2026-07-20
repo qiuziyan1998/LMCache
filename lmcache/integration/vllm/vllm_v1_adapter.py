@@ -5855,7 +5855,18 @@ class LMCacheConnectorV1Impl:
         self._bootstrap_layerwise_req_ids = [
             request.req_id for request in bootstrap_requests
         ]
+        self._bootstrap_layer_wait_stats = None
         if bootstrap_requests:
+            self._bootstrap_layer_wait_stats = {
+                "started": time.perf_counter(),
+                "calls": 0,
+                "group_0_ms": 0.0,
+                "group_1_ms": 0.0,
+                "total_ms": 0.0,
+                "max_ms": 0.0,
+                "max_layer": None,
+                "max_group": None,
+            }
             logger.info(
                 "[BOOTSTRAP_LMCACHE_START] requests=%s metadata_requests=%d "
                 "dsa_two_groups=%s shared_cpu=%s use_layerwise=%s",
@@ -7272,6 +7283,7 @@ class LMCacheConnectorV1Impl:
                     )
 
         if bootstrap_req_ids:
+            wait_ms = (time.perf_counter() - wait_started) * 1000
             logger.info(
                 "[BOOTSTRAP_LMCACHE_LAYER_WAIT_DONE] layer_index=%d "
                 "wait_group=%d layer=%s next_layer=%d total_ms=%.3f",
@@ -7279,8 +7291,37 @@ class LMCacheConnectorV1Impl:
                 wait_group,
                 layer_name,
                 self.current_layer,
-                (time.perf_counter() - wait_started) * 1000,
+                wait_ms,
             )
+            wait_stats = getattr(self, "_bootstrap_layer_wait_stats", None)
+            if wait_stats is not None:
+                wait_stats["calls"] += 1
+                wait_stats["total_ms"] += wait_ms
+                group_key = f"group_{wait_group}_ms"
+                wait_stats[group_key] = wait_stats.get(group_key, 0.0) + wait_ms
+                if wait_ms > wait_stats["max_ms"]:
+                    wait_stats["max_ms"] = wait_ms
+                    wait_stats["max_layer"] = layer_name
+                    wait_stats["max_group"] = wait_group
+                if self.current_layer >= self.num_layers:
+                    logger.info(
+                        "[BOOTSTRAP_LMCACHE_WAIT_SUMMARY] requests=%s "
+                        "layers=%d calls=%d wall_ms=%.3f "
+                        "total_host_wait_ms=%.3f group_0_ms=%.3f "
+                        "group_1_ms=%.3f max_wait_ms=%.3f "
+                        "max_wait_group=%s max_wait_layer=%s",
+                        bootstrap_req_ids,
+                        self.num_layers,
+                        wait_stats["calls"],
+                        (time.perf_counter() - wait_stats["started"]) * 1000,
+                        wait_stats["total_ms"],
+                        wait_stats["group_0_ms"],
+                        wait_stats["group_1_ms"],
+                        wait_stats["max_ms"],
+                        wait_stats["max_group"],
+                        wait_stats["max_layer"],
+                    )
+                    self._bootstrap_layer_wait_stats = None
 
         return
 
