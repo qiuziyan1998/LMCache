@@ -235,6 +235,7 @@ class TestMooncakeConnectorCapabilities:
                 "protocol": "rdma",
                 "protocol_fallback": "tcp",
                 "device_name": "mlx5_0",
+                "mooncake_page_first_multi_buffer": True,
             }
         )
 
@@ -243,6 +244,7 @@ class TestMooncakeConnectorCapabilities:
         assert mooncake_config.protocol == "rdma"
         assert mooncake_config.protocol_fallback == "tcp"
         assert mooncake_config.device_name == "mlx5_0"
+        assert mooncake_config.page_first_multi_buffer is True
 
 
 class TestStorageManagerLayerwiseHelpers:
