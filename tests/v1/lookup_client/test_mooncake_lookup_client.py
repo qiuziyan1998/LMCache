@@ -9,6 +9,7 @@ import torch
 # First Party
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.lookup_client.mooncake_lookup_client import MooncakeLookupClient
+from lmcache.v1.mooncake_layout import mooncake_page_key
 
 
 class _FakeStore:
@@ -170,3 +171,32 @@ def test_mooncake_sampled_lookup_reverse_scans_first_and_last_layers():
         _sampled_string_keys(token_db, 3),
         winner_keys,
     ]
+
+
+def test_mooncake_page_lookup_uses_pages_and_keeps_partial_tail_legacy():
+    token_db = _FakeMultiChunkTokenDatabase(kv_group=0)
+    client = MooncakeLookupClient.__new__(MooncakeLookupClient)
+    client.config = SimpleNamespace(
+        dsa_two_groups=True,
+        use_layerwise=True,
+        experimental_sampled_layerwise_lookup=False,
+        chunk_size=4,
+        extra_config={"mooncake_page_first_multi_buffer": True},
+    )
+    client.metadata = SimpleNamespace(kv_shape=(4, 1, 4, 1, 1))
+    client.store = _FakeStore()
+    client.token_database = token_db
+
+    assert client.lookup(list(range(14))) == 14
+
+    expected = []
+    for chunk_index in range(3):
+        for kv_group in (0, 1):
+            key = token_db._make_key_by_hash(
+                0x100 + chunk_index, kv_group=kv_group
+            )
+            expected.append(mooncake_page_key(key, 4))
+    for kv_group in (0, 1):
+        key = token_db._make_key_by_hash(0x103, kv_group=kv_group)
+        expected.extend(layer.to_string() for layer in key.split_layers(4))
+    assert client.store.keys == expected

@@ -6,6 +6,8 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 import asyncio
 import sys
+import threading
+import time
 
 import pytest
 import torch
@@ -1709,6 +1711,91 @@ def test_rank0_windowed_remote_resolver_batches_layers_and_preserves_order():
         for layer_keys in keys_layer_major
     ]
     assert all(obj.is_pinned for layer in resolved for obj in layer)
+
+
+def test_rank0_windowed_remote_resolver_limits_concurrent_batches():
+    keys_layer_major = [
+        [replace(_make_key(), chunk_hash=0x500 + layer)] for layer in range(4)
+    ]
+    objects_by_key = {
+        key: _FakeResolvableMemoryObj()
+        for layer_keys in keys_layer_major
+        for key in layer_keys
+    }
+
+    class _ConcurrentStorageManager:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def batched_get(self, fetch_keys, location=None):
+            assert location == "RemoteBackend"
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.05)
+                return [objects_by_key[key] for key in fetch_keys]
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    storage_manager = _ConcurrentStorageManager()
+    engine = object.__new__(LMCacheEngine)
+    engine.storage_manager = storage_manager
+    engine._is_rank0_shared_mem_obj = lambda obj: obj in objects_by_key.values()
+    engine._validate_rank0_shared_mem_obj = lambda *args, **kwargs: None
+
+    resolved = engine._resolve_shared_rank0_remote_layers_windowed(
+        req_id="req-concurrent",
+        phase="sparse_decode_bootstrap",
+        kv_group=0,
+        keys_layer_major=keys_layer_major,
+        layers_per_batch=1,
+        max_inflight_batches=2,
+    )
+
+    assert storage_manager.max_active == 2
+    assert resolved == [
+        [objects_by_key[key] for key in layer_keys]
+        for layer_keys in keys_layer_major
+    ]
+
+
+def test_rank0_windowed_remote_resolver_releases_unconsumed_futures():
+    keys_layer_major = [
+        [replace(_make_key(), chunk_hash=0x600)],
+        [replace(_make_key(), chunk_hash=0x601)],
+    ]
+    unconsumed = _FakeResolvableMemoryObj()
+    started = threading.Barrier(2)
+
+    class _FailingConcurrentStorageManager:
+        def batched_get(self, fetch_keys, location=None):
+            assert location == "RemoteBackend"
+            started.wait()
+            if fetch_keys[0] == keys_layer_major[0][0]:
+                return [None]
+            time.sleep(0.02)
+            return [unconsumed]
+
+    engine = object.__new__(LMCacheEngine)
+    engine.storage_manager = _FailingConcurrentStorageManager()
+    engine._is_rank0_shared_mem_obj = lambda _obj: True
+    engine._validate_rank0_shared_mem_obj = lambda *args, **kwargs: None
+
+    with pytest.raises(ValueError, match="missed required chunks"):
+        engine._resolve_shared_rank0_remote_layers_windowed(
+            req_id="req-failure",
+            phase="sparse_decode_bootstrap",
+            kv_group=0,
+            keys_layer_major=keys_layer_major,
+            layers_per_batch=1,
+            max_inflight_batches=2,
+        )
+
+    assert unconsumed.ref_count_down_count == 1
 
 
 def test_rank0_resolver_releases_prefetched_hits_on_alignment_error():

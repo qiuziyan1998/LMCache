@@ -12,7 +12,7 @@ import pytest
 import torch
 
 # First Party
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1.storage_backend.connector.instrumented_connector import (
     InstrumentedRemoteConnector,
 )
@@ -23,10 +23,11 @@ from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 
 
 class _MemoryObj:
-    def __init__(self) -> None:
+    def __init__(self, size: int = 16, data_ptr: int = 123) -> None:
         self.ref_count = 1
         self.raw_tensor = object()
-        self.data_ptr = 123
+        self.data_ptr = data_ptr
+        self.size = size
 
     def ref_count_up(self) -> None:
         self.ref_count += 1
@@ -35,7 +36,10 @@ class _MemoryObj:
         self.ref_count -= 1
 
     def get_size(self) -> int:
-        return 16
+        return self.size
+
+    def is_valid(self) -> bool:
+        return self.ref_count > 0
 
 
 class _Serializer:
@@ -63,6 +67,17 @@ class _Connection:
 
 def _key(chunk_hash: int) -> CacheEngineKey:
     return CacheEngineKey("test", 1, 0, chunk_hash, torch.float16)
+
+
+def _layer_key(chunk_hash: int, layer_id: int) -> LayerCacheEngineKey:
+    return LayerCacheEngineKey(
+        "test",
+        1,
+        0,
+        chunk_hash,
+        torch.float16,
+        layer_id=layer_id,
+    )
 
 
 def _make_remote_backend(requires_completion: bool) -> RemoteBackend:
@@ -149,6 +164,80 @@ def test_mooncake_batch_status_failure_is_not_silenced() -> None:
                 [_key(1), _key(2)], [_MemoryObj(), _MemoryObj()]
             )
         )
+
+
+def test_mooncake_page_get_scatter_returns_layer_objects() -> None:
+    class _PageStore:
+        def batch_get_into_multi_buffers(self, page_keys, ptrs, sizes):
+            assert len(page_keys) == 1
+            assert ptrs == [[100, 300]]
+            assert sizes == [[16, 16]]
+            return [32]
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_num_layers = 2
+    connector.store = _PageStore()
+    memory_objs = [_MemoryObj(16, 100), _MemoryObj(16, 300)]
+    connector._allocate_zero_copy_buffers = lambda _keys: (
+        memory_objs,
+        [],
+        "batched",
+    )
+    keys = [_layer_key(1, 0), _layer_key(1, 1)]
+
+    loaded = asyncio.run(
+        connector._batch_get_pages(keys, [("page-key", [0, 1])])
+    )
+
+    assert loaded == {0: memory_objs[0], 1: memory_objs[1]}
+    assert all(memory_obj.ref_count == 1 for memory_obj in memory_objs)
+
+
+def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout() -> None:
+    class _PageStore:
+        def __init__(self) -> None:
+            self.page_args = None
+            self.legacy_args = None
+
+        def batch_put_from_multi_buffers(self, *args):
+            self.page_args = args
+            return [0]
+
+        def batch_put_from(self, *args):
+            self.legacy_args = args
+            return [0, 0]
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector.config = SimpleNamespace(transfer_timeout=1)
+    connector.replica_config = object()
+    connector._inflight_put_tasks = set()
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=4)
+    )
+    connector._metadata_for_raw_key = lambda _key: ([], [], None, 4)
+    connector.store = _PageStore()
+    keys = [
+        _layer_key(1, 0),
+        _layer_key(2, 0),
+        _layer_key(1, 1),
+        _layer_key(2, 1),
+    ]
+    memory_objs = [
+        _MemoryObj(16, 100),
+        _MemoryObj(8, 200),
+        _MemoryObj(16, 300),
+        _MemoryObj(8, 400),
+    ]
+
+    asyncio.run(connector._batched_put_zero_copy(keys, memory_objs))
+
+    assert connector.store.page_args[1] == [[100, 300]]
+    assert connector.store.page_args[2] == [[16, 16]]
+    assert connector.store.legacy_args[1] == [200, 400]
+    assert connector.store.legacy_args[2] == [8, 8]
+    assert all(memory_obj.ref_count == 1 for memory_obj in memory_objs)
 
 
 def test_mooncake_timeout_keeps_source_buffer_until_native_put_exits() -> None:

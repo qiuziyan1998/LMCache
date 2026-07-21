@@ -11,6 +11,10 @@ from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mooncake_layout import (
+    mooncake_page_key,
+    mooncake_page_layout_enabled,
+)
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
     first_last_layer_keys,
@@ -77,6 +81,7 @@ class MooncakeLookupClient(LookupClientInterface):
             use_layerwise
             and getattr(self.config, "experimental_sampled_layerwise_lookup", False)
         )
+        page_first = use_layerwise and mooncake_page_layout_enabled(self.config)
 
         for start, end, key in self.token_database.process_tokens(
             token_ids, request_configs=request_configs
@@ -92,7 +97,12 @@ class MooncakeLookupClient(LookupClientInterface):
                 )
                 group_keys.append(index_key)
 
-            if sampled_lookup:
+            if page_first and end - start == self.config.chunk_size:
+                chunk_keys = [
+                    mooncake_page_key(group_key, num_layers)
+                    for group_key in group_keys
+                ]
+            elif sampled_lookup:
                 chunk_keys = [
                     key.to_string()
                     for key in first_last_layer_keys(group_keys, num_layers)

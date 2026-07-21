@@ -2,6 +2,7 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -2155,6 +2156,7 @@ class LMCacheEngine:
         kv_group: int,
         keys_layer_major: list[list[CacheEngineKey]],
         layers_per_batch: int,
+        max_inflight_batches: int = 1,
     ) -> list[list[MemoryObj]]:
         """Resolve remote-only layers with fewer synchronous backend calls.
 
@@ -2168,6 +2170,8 @@ class LMCacheEngine:
         assert self.storage_manager is not None
         if layers_per_batch < 1:
             raise ValueError("layers_per_batch must be at least 1")
+        if max_inflight_batches < 1:
+            raise ValueError("max_inflight_batches must be at least 1")
         if not keys_layer_major:
             return []
 
@@ -2181,23 +2185,55 @@ class LMCacheEngine:
         fallback_materializations = 0
         started = time.perf_counter()
 
-        try:
-            for window_start in range(0, len(keys_layer_major), layers_per_batch):
-                window_end = min(
-                    window_start + layers_per_batch,
-                    len(keys_layer_major),
-                )
-                coordinates: list[tuple[int, int]] = []
-                fetch_keys: list[CacheEngineKey] = []
-                for layer_id in range(window_start, window_end):
-                    for chunk_index, key in enumerate(keys_layer_major[layer_id]):
-                        coordinates.append((layer_id, chunk_index))
-                        fetch_keys.append(key)
+        windows: list[
+            tuple[int, int, list[tuple[int, int]], list[CacheEngineKey]]
+        ] = []
+        for window_start in range(0, len(keys_layer_major), layers_per_batch):
+            window_end = min(
+                window_start + layers_per_batch,
+                len(keys_layer_major),
+            )
+            coordinates: list[tuple[int, int]] = []
+            fetch_keys: list[CacheEngineKey] = []
+            for layer_id in range(window_start, window_end):
+                for chunk_index, key in enumerate(keys_layer_major[layer_id]):
+                    coordinates.append((layer_id, chunk_index))
+                    fetch_keys.append(key)
+            windows.append((window_start, window_end, coordinates, fetch_keys))
 
-                fetched = self.storage_manager.batched_get(
-                    fetch_keys,
-                    location="RemoteBackend",
-                )
+        def fetch_window(
+            fetch_keys: list[CacheEngineKey],
+        ) -> list[Optional[MemoryObj]]:
+            return self.storage_manager.batched_get(
+                fetch_keys,
+                location="RemoteBackend",
+            )
+
+        executor: Optional[ThreadPoolExecutor] = None
+        futures: list[Future[list[Optional[MemoryObj]]]] = []
+        next_future_index = 0
+        if max_inflight_batches > 1 and len(windows) > 1:
+            executor = ThreadPoolExecutor(
+                max_workers=min(max_inflight_batches, len(windows)),
+                thread_name_prefix="lmcache-mooncake-get",
+            )
+            futures = [
+                executor.submit(fetch_window, fetch_keys)
+                for _, _, _, fetch_keys in windows
+            ]
+
+        try:
+            for window_index, (
+                window_start,
+                window_end,
+                coordinates,
+                fetch_keys,
+            ) in enumerate(windows):
+                if futures:
+                    fetched = futures[window_index].result()
+                    next_future_index = window_index + 1
+                else:
+                    fetched = fetch_window(fetch_keys)
                 backend_calls += 1
                 if len(fetched) != len(fetch_keys):
                     for fetched_obj in fetched:
@@ -2273,7 +2309,8 @@ class LMCacheEngine:
 
             logger.info(
                 "[P2D_SHARED_CPU_WINDOWED_GET] req=%s phase=%s kv_group=%d "
-                "layers=%d layers_per_batch=%d backend_calls=%d chunks=%d "
+                "layers=%d layers_per_batch=%d max_inflight_batches=%d "
+                "backend_calls=%d chunks=%d "
                 "direct_shared_objects=%d fallback_materializations=%d "
                 "total_ms=%.3f",
                 req_id,
@@ -2281,6 +2318,7 @@ class LMCacheEngine:
                 kv_group,
                 len(keys_layer_major),
                 layers_per_batch,
+                min(max_inflight_batches, len(windows)),
                 backend_calls,
                 sum(len(layer) for layer in keys_layer_major),
                 direct_shared_objects,
@@ -2289,6 +2327,16 @@ class LMCacheEngine:
             )
             return resolved_layers
         except Exception:
+            for future in futures[next_future_index:]:
+                if future.cancel():
+                    continue
+                try:
+                    unfetched = future.result()
+                except Exception:
+                    continue
+                for mem_obj in unfetched:
+                    if mem_obj is not None:
+                        mem_obj.ref_count_down()
             for mem_obj in reversed(pinned):
                 if mem_obj.is_pinned:
                     mem_obj.unpin()
@@ -2296,6 +2344,9 @@ class LMCacheEngine:
                 if mem_obj.is_valid():
                     mem_obj.ref_count_down()
             raise
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
 
     @staticmethod
     def _close_shared_retrieve_consumer(
