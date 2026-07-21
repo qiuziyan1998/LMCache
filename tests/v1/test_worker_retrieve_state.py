@@ -1793,6 +1793,130 @@ class TestWorkerRetrieveState:
         assert torch.equal(selected_payload, selected_tokens[1])
         assert torch.equal(target_payload, target_slot_mapping[1])
 
+    def test_bootstrap_wait_appends_partial_tail_to_explicit_sparse_load(self):
+        req = make_sparse_req_meta("req-1", token_count=542)
+        assert req.load_spec is not None
+        req.load_spec.bootstrap_sample = True
+        req.bootstrap_tail_token_indices = torch.tensor(
+            [512, 513], dtype=torch.int32
+        )
+        req.bootstrap_tail_slot_mapping = torch.tensor(
+            [2000, 2001], dtype=torch.long
+        )
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._bootstrap_layerwise_req_ids = ["req-1"]
+        impl._layerwise_retriever_is_sparse = [True]
+
+        captured = []
+
+        def _retriever():
+            payload = yield None
+            captured.append(payload)
+            yield torch.ones(542, dtype=torch.bool)
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+
+        selected_tokens = torch.tensor([[10, 11]], dtype=torch.int32)
+        target_slot_mapping = torch.tensor([[900, 901]], dtype=torch.long)
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=selected_tokens,
+            token_start_index=[0],
+            request_ids=["req-1"],
+            target_slot_mapping=target_slot_mapping,
+        )
+
+        selected_payload, token_start, target_payload = captured[0]
+        assert token_start is None
+        assert torch.equal(
+            selected_payload,
+            torch.tensor([10, 11, 512, 513], dtype=torch.int32),
+        )
+        assert torch.equal(
+            target_payload,
+            torch.tensor([900, 901, 2000, 2001], dtype=torch.long),
+        )
+
+    def test_bootstrap_tail_drops_counted_sparse_padding(self):
+        req = make_sparse_req_meta("req-1", token_count=542)
+        req.bootstrap_tail_token_indices = torch.tensor(
+            [512, 513], dtype=torch.int32
+        )
+        req.bootstrap_tail_slot_mapping = torch.tensor(
+            [2000, 2001], dtype=torch.long
+        )
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+
+        payload = impl._append_bootstrap_tail_to_sparse_payload(
+            req,
+            {
+                "selected_token_ids": torch.tensor(
+                    [[10, 11, 99, 99], [20, 21, 22, 99]],
+                    dtype=torch.int32,
+                ),
+                "target_slot_mapping": torch.tensor(
+                    [[900, 901, -1, -1], [910, 911, 912, -1]],
+                    dtype=torch.long,
+                ),
+                "selected_token_counts": torch.tensor([2, 3]),
+            },
+        )
+
+        selected_payload, token_start, target_payload = payload
+        assert token_start is None
+        assert torch.equal(
+            selected_payload,
+            torch.tensor([10, 11, 20, 21, 22, 512, 513], dtype=torch.int32),
+        )
+        assert torch.equal(
+            target_payload,
+            torch.tensor([900, 901, 910, 911, 912, 2000, 2001]),
+        )
+
+    def test_bootstrap_wait_hydrates_tail_with_no_selected_topk(self):
+        req = make_sparse_req_meta("req-1", token_count=4)
+        assert req.load_spec is not None
+        req.load_spec.bootstrap_sample = True
+        req.bootstrap_tail_token_indices = torch.tensor(
+            [512, 513], dtype=torch.int32
+        )
+        req.bootstrap_tail_slot_mapping = torch.tensor(
+            [2000, 2001], dtype=torch.long
+        )
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._bootstrap_layerwise_req_ids = ["req-1"]
+        impl._layerwise_retriever_is_sparse = [True]
+
+        captured = []
+
+        def _retriever():
+            payload = yield None
+            captured.append(payload)
+            yield torch.ones(4, dtype=torch.bool)
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+
+        impl.wait_for_layer_load("model.layers.0.self_attn.attn")
+
+        selected_payload, token_start, target_payload = captured[0]
+        assert token_start is None
+        assert torch.equal(
+            selected_payload,
+            torch.tensor([0, 1, 2, 3, 512, 513], dtype=torch.int32),
+        )
+        assert torch.equal(
+            target_payload,
+            torch.tensor([0, 1, 2, 3, 2000, 2001], dtype=torch.long),
+        )
+
     def test_wait_for_layer_load_reordered_rows_forward_payload_event(
         self, monkeypatch
     ):
@@ -2866,6 +2990,66 @@ class TestWorkerRetrieveState:
         assert tracker.sparse_decode_token_mask is None
         assert req_meta.decode_ret_mask is not None
         assert req_meta.decode_ret_mask.numel() == 512
+
+    def test_bootstrap_reqmeta_maps_partial_tail_to_live_vllm_blocks(self):
+        tracker = RequestTracker(
+            req_id="req-1",
+            prompt_len=542,
+            token_ids=list(range(542)),
+            allocated_block_ids=[11, 12, 13, 14, 15],
+            skip_save=True,
+        )
+        tracker.seed_sparse_decode_tokens(tracker.token_ids)
+
+        req_meta = ReqMeta.from_request_tracker(
+            tracker,
+            block_size=128,
+            lmcache_chunk_size=256,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=542,
+                can_load=True,
+                bootstrap_sample=True,
+            ),
+            is_sparse_decode=True,
+        )
+
+        assert req_meta is not None
+        assert torch.equal(
+            req_meta.bootstrap_tail_token_indices,
+            torch.arange(512, 542, dtype=torch.int32),
+        )
+        assert torch.equal(
+            req_meta.bootstrap_tail_slot_mapping,
+            torch.arange(15 * 128, 15 * 128 + 30, dtype=torch.long),
+        )
+
+    def test_bootstrap_reqmeta_has_no_tail_for_chunk_aligned_prompt(self):
+        tracker = RequestTracker(
+            req_id="req-1",
+            prompt_len=512,
+            token_ids=list(range(512)),
+            allocated_block_ids=[11, 12, 13, 14],
+            skip_save=True,
+        )
+        tracker.seed_sparse_decode_tokens(tracker.token_ids)
+
+        req_meta = ReqMeta.from_request_tracker(
+            tracker,
+            block_size=128,
+            lmcache_chunk_size=256,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=512,
+                can_load=True,
+                bootstrap_sample=True,
+            ),
+            is_sparse_decode=True,
+        )
+
+        assert req_meta is not None
+        assert req_meta.bootstrap_tail_token_indices is None
+        assert req_meta.bootstrap_tail_slot_mapping is None
 
     def test_sparse_decode_indexer_reuses_request_ret_mask(self):
         req = make_sparse_req_meta("req-1", token_count=512)
