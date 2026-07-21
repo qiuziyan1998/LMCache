@@ -225,11 +225,29 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if not self.use_hot:
             return
 
-        # TODO(Jiayi): optimize this with batching
-        for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(
-                key, memory_obj, on_complete_callback=on_complete_callback
-            )
+        stored_keys: list[CacheEngineKey] = []
+        with self.cpu_lock:
+            for key, memory_obj in zip(keys, memory_objs, strict=False):
+                if key in self.hot_cache:
+                    continue
+                memory_obj.ref_count_up()
+                self.hot_cache[key] = memory_obj
+                self.cache_policy.update_on_put(key)
+                stored_keys.append(key)
+                if self.batched_msg_sender is not None:
+                    self.batched_msg_sender.add_kv_op(
+                        op_type=OpType.ADMIT,
+                        key=key.chunk_hash,
+                    )
+
+        if on_complete_callback is not None:
+            for key in stored_keys:
+                try:
+                    on_complete_callback(key)
+                except Exception as e:
+                    logger.warning(
+                        f"on_complete_callback failed for key {key}: {e}"
+                    )
 
     def get_blocking(
         self,

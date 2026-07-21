@@ -34,6 +34,7 @@ class MooncakeStoreConfig:
     transfer_timeout: int
     storage_root_dir: str
     prefer_local_alloc: bool = False
+    protocol_fallback: Optional[str] = None
 
     @staticmethod
     def from_file(file_path: str) -> "MooncakeStoreConfig":
@@ -54,6 +55,7 @@ class MooncakeStoreConfig:
             transfer_timeout=config.get("transfer_timeout", 1),
             storage_root_dir=config.get("storage_root_dir", ""),
             prefer_local_alloc=prefer_local_alloc,
+            protocol_fallback=config.get("protocol_fallback"),
         )
 
     @staticmethod
@@ -88,6 +90,7 @@ class MooncakeStoreConfig:
             transfer_timeout=extra_config.get("transfer_timeout", 1),
             storage_root_dir=extra_config.get("storage_root_dir", ""),
             prefer_local_alloc=prefer_local_alloc,
+            protocol_fallback=extra_config.get("protocol_fallback"),
         )
 
 
@@ -211,14 +214,69 @@ class MooncakestoreConnector(RemoteConnector):
                     f"Failed to determine NUMA mapping before Mooncake setup: {e}"
                 )
 
-            self.store.setup(
-                self.config.local_hostname,
-                self.config.metadata_server,
-                self.config.global_segment_size,
-                self.config.local_buffer_size,
-                self.config.protocol,
+            requested_protocol = self.config.protocol
+
+            def setup_store(protocol: str) -> None:
+                result = self.store.setup(
+                    self.config.local_hostname,
+                    self.config.metadata_server,
+                    self.config.global_segment_size,
+                    self.config.local_buffer_size,
+                    protocol,
+                    self.config.device_name,
+                    self.config.master_server_address,
+                )
+                if isinstance(result, int) and result != 0:
+                    raise RuntimeError(
+                        "Mooncake store setup returned error "
+                        f"{result} for protocol={protocol}"
+                    )
+
+            try:
+                setup_store(requested_protocol)
+                self.effective_protocol = requested_protocol
+            except Exception as primary_exc:
+                fallback_protocol = self.config.protocol_fallback
+                if (
+                    not fallback_protocol
+                    or fallback_protocol == requested_protocol
+                ):
+                    raise
+                logger.warning(
+                    "Mooncake protocol setup failed; retrying configured "
+                    "fallback: requested=%s fallback=%s error=%s",
+                    requested_protocol,
+                    fallback_protocol,
+                    primary_exc,
+                )
+                close_store = getattr(self.store, "close", None)
+                if callable(close_store):
+                    try:
+                        close_store()
+                    except Exception:
+                        logger.debug(
+                            "Failed to close Mooncake store after setup error",
+                            exc_info=True,
+                        )
+                self.store = MooncakeDistributedStore()
+                try:
+                    setup_store(fallback_protocol)
+                except Exception as fallback_exc:
+                    raise RuntimeError(
+                        "Mooncake requested and fallback protocol setup both "
+                        "failed: "
+                        f"requested={requested_protocol}, "
+                        f"fallback={fallback_protocol}"
+                    ) from fallback_exc
+                self.effective_protocol = fallback_protocol
+
+            logger.info(
+                "[P2D_MOONCAKE_TRANSPORT] requested_protocol=%s "
+                "effective_protocol=%s fallback_protocol=%s device_name=%s",
+                requested_protocol,
+                self.effective_protocol,
+                self.config.protocol_fallback,
                 self.config.device_name,
-                self.config.master_server_address,
             )
             logger.info("Mooncake store setup completed successfully")
 
@@ -628,14 +686,47 @@ class MooncakestoreConnector(RemoteConnector):
         buffer_sizes: list[int] = []
 
         single_token_sizes: dict[int, int] = {}
-        for i, key in enumerate(keys):
-            meta_shapes, meta_dtypes, meta_fmt, single_token_size = (
-                self._metadata_for_raw_key(key)
+        key_metadata = [self._metadata_for_raw_key(key) for key in keys]
+        allocation_mode = "individual"
+        first_shapes, first_dtypes, first_fmt, _ = key_metadata[0]
+        uniform_metadata = all(
+            shapes == first_shapes and dtypes == first_dtypes and fmt == first_fmt
+            for shapes, dtypes, fmt, _ in key_metadata
+        )
+        if uniform_metadata:
+            batched = self.local_cpu_backend.batched_allocate(
+                first_shapes,
+                first_dtypes,
+                batch_size=len(keys),
+                fmt=first_fmt,
+                eviction=False,
+                busy_loop=False,
             )
-            obj = self.local_cpu_backend.allocate(
-                meta_shapes, meta_dtypes, meta_fmt
-            )
-            memory_objs.append(obj)
+            if batched is not None:
+                if len(batched) == len(keys) and all(
+                    obj.raw_tensor is not None for obj in batched
+                ):
+                    memory_objs = list(batched)
+                    allocation_mode = "batched"
+                else:
+                    for obj in batched:
+                        if obj.is_valid():
+                            obj.ref_count_down()
+
+        if not memory_objs:
+            for meta_shapes, meta_dtypes, meta_fmt, _ in key_metadata:
+                memory_objs.append(
+                    self.local_cpu_backend.allocate(
+                        meta_shapes,
+                        meta_dtypes,
+                        meta_fmt,
+                    )
+                )
+
+        for i, (key, metadata_entry, obj) in enumerate(
+            zip(keys, key_metadata, memory_objs, strict=True)
+        ):
+            single_token_size = metadata_entry[3]
             if obj is not None and obj.raw_tensor is not None:
                 valid_idx.append(i)
                 single_token_sizes[i] = single_token_size
@@ -677,6 +768,9 @@ class MooncakestoreConnector(RemoteConnector):
                 except Exception as exc:
                     logger.error(f"Reshape failed for key {keys[i]}: {exc}")
                     memory_objs[i].ref_count_down()  # type: ignore
+
+            for i in valid_idx[len(bytes_read_list) :]:
+                memory_objs[i].ref_count_down()  # type: ignore
 
             return results
 

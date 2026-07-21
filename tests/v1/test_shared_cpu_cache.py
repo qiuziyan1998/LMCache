@@ -1629,6 +1629,88 @@ def test_rank0_resolver_scatters_remote_suffix_in_token_order():
     assert all(obj.is_pinned for obj in resolved)
 
 
+def test_rank0_resolver_reuses_remote_object_already_in_shared_slab():
+    keys = [replace(_make_key(), chunk_hash=0x280 + i) for i in range(2)]
+    remote_objects = [_FakeResolvableMemoryObj(), _FakeResolvableMemoryObj()]
+
+    class _NoHotLookupBackend:
+        def get_blocking(self, _key):
+            raise AssertionError("shared remote objects must not be looked up again")
+
+    class _RemoteStorageManager:
+        def batched_get(self, fetch_keys, location=None):
+            assert fetch_keys == keys
+            assert location == "RemoteBackend"
+            return list(remote_objects)
+
+    engine = object.__new__(LMCacheEngine)
+    engine.storage_manager = _RemoteStorageManager()
+    engine._shared_local_cpu_backend = lambda: _NoHotLookupBackend()
+    engine._is_rank0_shared_mem_obj = lambda obj: obj in remote_objects
+    engine._validate_rank0_shared_mem_obj = lambda *args, **kwargs: None
+    engine._materialize_shared_rank0_copy = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("shared remote objects must not be copied")
+    )
+
+    resolved = engine._resolve_shared_rank0_layer_mem_objs(
+        req_id="req-1",
+        phase="sparse_decode_bootstrap",
+        layer_id=0,
+        kv_group=0,
+        keys_layer=keys,
+        local_prefix=LocalCPUPrefixGetResult([], [0, 1], keys),
+    )
+
+    assert resolved == remote_objects
+    assert all(obj.is_pinned for obj in resolved)
+    assert all(obj.ref_count_down_count == 0 for obj in resolved)
+
+
+def test_rank0_windowed_remote_resolver_batches_layers_and_preserves_order():
+    keys_layer_major = [
+        [
+            replace(_make_key(), chunk_hash=0x400 + layer * 2 + chunk)
+            for chunk in range(2)
+        ]
+        for layer in range(5)
+    ]
+    objects_by_key = {
+        key: _FakeResolvableMemoryObj()
+        for layer_keys in keys_layer_major
+        for key in layer_keys
+    }
+
+    class _WindowedStorageManager:
+        def __init__(self):
+            self.calls = []
+
+        def batched_get(self, fetch_keys, location=None):
+            self.calls.append((list(fetch_keys), location))
+            return [objects_by_key[key] for key in fetch_keys]
+
+    storage_manager = _WindowedStorageManager()
+    engine = object.__new__(LMCacheEngine)
+    engine.storage_manager = storage_manager
+    engine._is_rank0_shared_mem_obj = lambda obj: obj in objects_by_key.values()
+    engine._validate_rank0_shared_mem_obj = lambda *args, **kwargs: None
+
+    resolved = engine._resolve_shared_rank0_remote_layers_windowed(
+        req_id="req-1",
+        phase="sparse_decode_bootstrap",
+        kv_group=0,
+        keys_layer_major=keys_layer_major,
+        layers_per_batch=2,
+    )
+
+    assert [len(call[0]) for call in storage_manager.calls] == [4, 4, 2]
+    assert all(call[1] == "RemoteBackend" for call in storage_manager.calls)
+    assert resolved == [
+        [objects_by_key[key] for key in layer_keys]
+        for layer_keys in keys_layer_major
+    ]
+    assert all(obj.is_pinned for layer in resolved for obj in layer)
+
+
 def test_rank0_resolver_releases_prefetched_hits_on_alignment_error():
     keys = [replace(_make_key(), chunk_hash=0x300 + i) for i in range(2)]
     local_obj = _FakeResolvableMemoryObj()
