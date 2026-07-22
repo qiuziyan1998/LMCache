@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 import os
+import threading
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
@@ -69,10 +71,130 @@ SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
 SPARSE_DECODE_SHARED_CPU_PHASE = "sparse_decode_bootstrap"
+SHARED_CPU_PARALLEL_GROUP_PREFLIGHT = os.environ.get(
+    "LMCACHE_SHARED_CPU_PARALLEL_GROUP_PREFLIGHT", "1"
+).strip().lower() not in {"0", "false", "off"}
 
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
+
+
+def _new_shared_cpu_preflight_state() -> dict[str, Any]:
+    state_lock = threading.Lock()
+    return {
+        "_lock": state_lock,
+        "_errors": {},
+        "_materialize_condition": threading.Condition(state_lock),
+        "_materialize_next_group": 0,
+    }
+
+
+def _prime_sparse_retriever_pair(
+    latent_retriever: Generator[Any, Any, Any],
+    indexer_retriever: Generator[Any, Any, Any],
+    *,
+    request_id: str,
+    canonical_ret_mask: Optional[torch.Tensor],
+    indexer_ret_mask: Optional[torch.Tensor],
+    preflight_state: Optional[dict[str, Any]] = None,
+) -> None:
+    """Prime independent sparse group retrievers concurrently.
+
+    Group 1 receives a private return mask while both generators are active.
+    After both preflights finish, its mask is copied into the canonical mask,
+    preserving the existing serial order where group 1 writes that tensor
+    last. If either generator raises, both are closed before the original
+    group-ordered exception is propagated.
+    """
+    started = time.perf_counter()
+
+    def prime(
+        group_id: int,
+        retriever: Generator[Any, Any, Any],
+    ) -> tuple[Any, float]:
+        group_started = time.perf_counter()
+        try:
+            value = next(retriever)
+            return value, (time.perf_counter() - group_started) * 1000
+        except BaseException as exc:
+            if preflight_state is not None:
+                state_lock = preflight_state.get("_lock")
+                if state_lock is not None:
+                    with state_lock:
+                        errors = preflight_state.setdefault(
+                            "_unexpected_errors", {}
+                        )
+                        errors.setdefault(group_id, exc)
+                        condition = preflight_state.get(
+                            "_materialize_condition"
+                        )
+                        if condition is not None:
+                            condition.notify_all()
+                capacity_barrier = preflight_state.get("_capacity_barrier")
+                if capacity_barrier is not None:
+                    capacity_barrier.abort()
+            raise
+
+    results: list[Optional[tuple[Any, float]]] = [None, None]
+    errors: list[Optional[BaseException]] = [None, None]
+    with ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="lmcache-group-preflight",
+    ) as executor:
+        futures = [
+            executor.submit(prime, 0, latent_retriever),
+            executor.submit(prime, 1, indexer_retriever),
+        ]
+        for group_id, future in enumerate(futures):
+            try:
+                results[group_id] = future.result()
+            except BaseException as exc:
+                errors[group_id] = exc
+
+    first_error = next((error for error in errors if error is not None), None)
+    if first_error is not None:
+        for retriever in (latent_retriever, indexer_retriever):
+            try:
+                retriever.close()
+            except Exception:
+                logger.exception(
+                    "Failed to close sparse retriever after parallel "
+                    "preflight failure: req=%s",
+                    request_id,
+                )
+        raise first_error
+
+    if canonical_ret_mask is not None and indexer_ret_mask is not None:
+        if (
+            canonical_ret_mask.shape != indexer_ret_mask.shape
+            or canonical_ret_mask.dtype != indexer_ret_mask.dtype
+            or canonical_ret_mask.device != indexer_ret_mask.device
+        ):
+            latent_retriever.close()
+            indexer_retriever.close()
+            raise ValueError(
+                "Parallel sparse preflight return-mask metadata mismatch: "
+                f"request_id={request_id}, "
+                f"canonical_shape={tuple(canonical_ret_mask.shape)}, "
+                f"indexer_shape={tuple(indexer_ret_mask.shape)}, "
+                f"canonical_dtype={canonical_ret_mask.dtype}, "
+                f"indexer_dtype={indexer_ret_mask.dtype}, "
+                f"canonical_device={canonical_ret_mask.device}, "
+                f"indexer_device={indexer_ret_mask.device}"
+            )
+        canonical_ret_mask.copy_(indexer_ret_mask)
+
+    assert results[0] is not None and results[1] is not None
+    logger.info(
+        "[P2D_SHARED_CPU_PARALLEL_GROUP_PREFLIGHT] "
+        "req=%s groups=2 latent_ms=%.3f indexer_ms=%.3f wall_ms=%.3f "
+        "ret_mask_commit=group1_exact_copy",
+        request_id,
+        results[0][1],
+        results[1][1],
+        (time.perf_counter() - started) * 1000,
+    )
 
 
 def _ensure_list_attr(obj: Any, name: str) -> list:
@@ -5530,6 +5652,7 @@ class LMCacheConnectorV1Impl:
                     latent_prepared = self._prepared_sparse_source(
                         bound_state, 0, token_count
                     )
+                    latent_tail_prefix = tail_refresh_prefixes.get(0)
                     legacy_cache_bound = bool(tail_refresh_prefixes)
                     shared_cpu_preflight_state: Optional[dict[str, Any]] = None
                     if latent_prepared is not None:
@@ -5554,7 +5677,6 @@ class LMCacheConnectorV1Impl:
                                 invalidation_reason=invalidation_reason,
                             )
                         )
-                        latent_tail_prefix = tail_refresh_prefixes.get(0)
                         if shared_cpu_enabled and latent_tail_prefix is not None:
                             logger.info(
                                 "[P2D_SHARED_CPU_TAIL_PREFLIGHT_TRIGGER] "
@@ -5617,7 +5739,9 @@ class LMCacheConnectorV1Impl:
                             )
                             legacy_cache_bound = True
                         if shared_cpu_enabled and dsa_two_groups:
-                            shared_cpu_preflight_state = {}
+                            shared_cpu_preflight_state = (
+                                _new_shared_cpu_preflight_state()
+                            )
                         latent_cache = _retrieve_cache_kwargs(
                             request, kv_group=0, dsa_two_groups=dsa_two_groups
                         )
@@ -5673,11 +5797,14 @@ class LMCacheConnectorV1Impl:
                             **retrieve_kwargs,
                         )
                     )
-                    # NOTE: retrieve layers one by one with cpu prefetch
-                    next(layerwise_retriever)
 
                     indexer_retriever = None
                     indexer_skipped = False
+                    indexer_prepared = None
+                    indexer_ret_mask = None
+                    index_slot_for_log = None
+                    index_tail_prefix = None
+                    parallel_group_preflight = False
                     if dsa_two_groups:
                         indexer_kvcaches = self._kvcaches_for_group(1)
                         materialize_index = (
@@ -5760,6 +5887,7 @@ class LMCacheConnectorV1Impl:
                                 strict=shared_cpu_enabled,
                             )
                             assert idx_slot is not None
+                            index_slot_for_log = idx_slot
                             indexer_prepared = self._prepared_sparse_source(
                                 bound_state, 1, token_count
                             )
@@ -5860,7 +5988,9 @@ class LMCacheConnectorV1Impl:
                                     and dsa_two_groups
                                     and shared_cpu_preflight_state is None
                                 ):
-                                    shared_cpu_preflight_state = {}
+                                    shared_cpu_preflight_state = (
+                                        _new_shared_cpu_preflight_state()
+                                    )
                                 indexer_cache = _retrieve_cache_kwargs(
                                     request,
                                     kv_group=1,
@@ -5910,8 +6040,36 @@ class LMCacheConnectorV1Impl:
                                         token_count, bound_state
                                     )
                                 )
+                            can_parallel_group_preflight = getattr(
+                                self.lmcache_engine,
+                                "can_run_parallel_shared_cpu_group_preflight",
+                                None,
+                            )
+                            parallel_group_preflight = bool(
+                                SHARED_CPU_PARALLEL_GROUP_PREFLIGHT
+                                and shared_cpu_enabled
+                                and getattr(
+                                    self.lmcache_engine,
+                                    "supports_parallel_shared_cpu_group_preflight",
+                                    False,
+                                )
+                                and callable(can_parallel_group_preflight)
+                                and can_parallel_group_preflight()
+                                and latent_prepared is None
+                                and indexer_prepared is None
+                                and latent_tail_prefix is None
+                                and index_tail_prefix is None
+                            )
                             if request.decode_ret_mask is not None:
-                                indexer_kwargs["ret_mask"] = request.decode_ret_mask
+                                if parallel_group_preflight:
+                                    indexer_ret_mask = torch.empty_like(
+                                        request.decode_ret_mask
+                                    )
+                                    indexer_kwargs["ret_mask"] = indexer_ret_mask
+                                else:
+                                    indexer_kwargs["ret_mask"] = (
+                                        request.decode_ret_mask
+                                    )
                             indexer_retriever = (
                                 self.lmcache_engine.retrieve_layer_head_token_wise(
                                     retrieve_tokens,
@@ -5919,20 +6077,46 @@ class LMCacheConnectorV1Impl:
                                     **indexer_kwargs,
                                 )
                             )
+
+                    # NOTE: retrieve layers one by one with CPU prefetch. Full
+                    # two-group shared preflights have independent request
+                    # caches and masks, so their remote materialization can
+                    # overlap without changing the later layer order.
+                    if indexer_retriever is not None and parallel_group_preflight:
+                        assert shared_cpu_preflight_state is not None
+                        shared_cpu_preflight_state["_capacity_barrier"] = (
+                            threading.Barrier(2)
+                        )
+                        _prime_sparse_retriever_pair(
+                            layerwise_retriever,
+                            indexer_retriever,
+                            request_id=request.req_id,
+                            canonical_ret_mask=request.decode_ret_mask,
+                            indexer_ret_mask=indexer_ret_mask,
+                            preflight_state=shared_cpu_preflight_state,
+                        )
+                    else:
+                        next(layerwise_retriever)
+                        if indexer_retriever is not None:
                             next(indexer_retriever)
-                            if is_bootstrap_sample:
-                                logger.info(
-                                    "[BOOTSTRAP_INDEXER_MATERIALIZE] req=%s "
-                                    "token_count=%d index_slot_shape=%s "
-                                    "shared_cpu=%s sync=%s retriever_started=true",
-                                    request.req_id,
-                                    token_count,
-                                    tuple(idx_slot.shape)
-                                    if hasattr(idx_slot, "shape")
-                                    else None,
-                                    shared_cpu_enabled,
-                                    sync,
-                                )
+
+                    if indexer_retriever is not None and is_bootstrap_sample:
+                        logger.info(
+                            "[BOOTSTRAP_INDEXER_MATERIALIZE] req=%s "
+                            "token_count=%d index_slot_shape=%s "
+                            "shared_cpu=%s sync=%s retriever_started=true "
+                            "parallel_group_preflight=%s",
+                            request.req_id,
+                            token_count,
+                            (
+                                tuple(index_slot_for_log.shape)
+                                if hasattr(index_slot_for_log, "shape")
+                                else None
+                            ),
+                            shared_cpu_enabled,
+                            sync,
+                            parallel_group_preflight,
+                        )
 
                     if indexer_skipped:
                         request.shared_index_skipped = True

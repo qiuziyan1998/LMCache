@@ -2,6 +2,7 @@
 """Tests for worker-local sparse decode retrieve state cache."""
 
 # Standard
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -2179,7 +2180,15 @@ class TestWorkerRetrieveState:
         assert req_meta.bootstrap_tail_token_indices is None
         assert req_meta.bootstrap_tail_slot_mapping is None
 
-    def test_sparse_decode_indexer_reuses_request_ret_mask(self):
+    @pytest.mark.parametrize("can_parallel", [False, True])
+    def test_sparse_decode_group_preflight_preserves_ret_mask_order(
+        self, monkeypatch, can_parallel
+    ):
+        monkeypatch.setattr(
+            adapter_mod,
+            "SHARED_CPU_PARALLEL_GROUP_PREFLIGHT",
+            True,
+        )
         req = make_sparse_req_meta("req-1", token_count=512)
         req.decode_ret_mask = torch.zeros(512, dtype=torch.bool)
         req.indexer_slot_mapping = [torch.arange(512, dtype=torch.long)]
@@ -2199,19 +2208,31 @@ class TestWorkerRetrieveState:
         )
 
         captured_kwargs = []
+        prime_barrier = threading.Barrier(2)
+        prime_threads = set()
+        prime_threads_lock = threading.Lock()
 
         class _FakeSharedEngine:
             enable_shared_cpu_cache = True
+            supports_parallel_shared_cpu_group_preflight = True
             shared_cpu_cache_generation = 1
             config = SimpleNamespace(
                 extra_config={"shared_cpu_materialize_index_on_decode_cold": True}
             )
 
+            def can_run_parallel_shared_cpu_group_preflight(self):
+                return can_parallel
+
             def retrieve_layer_head_token_wise(self, tokens, mask, **kwargs):
                 captured_kwargs.append(kwargs)
 
                 def _retriever():
-                    yield None
+                    if can_parallel:
+                        prime_barrier.wait(timeout=2)
+                    with prime_threads_lock:
+                        prime_threads.add(threading.get_ident())
+                    kwargs["ret_mask"].fill_(kwargs["kv_group"] == 1)
+                    yield kwargs["ret_mask"]
                     yield torch.ones(len(tokens), dtype=torch.bool)
 
                 return _retriever()
@@ -2224,7 +2245,40 @@ class TestWorkerRetrieveState:
         assert captured_kwargs[0]["kv_group"] == 0
         assert captured_kwargs[1]["kv_group"] == 1
         assert captured_kwargs[0]["ret_mask"] is req.decode_ret_mask
-        assert captured_kwargs[1]["ret_mask"] is req.decode_ret_mask
+        if can_parallel:
+            assert captured_kwargs[1]["ret_mask"] is not req.decode_ret_mask
+        else:
+            assert captured_kwargs[1]["ret_mask"] is req.decode_ret_mask
+        assert torch.all(captured_kwargs[1]["ret_mask"])
+        assert torch.all(req.decode_ret_mask)
+        assert len(prime_threads) == (2 if can_parallel else 1)
+        assert (
+            captured_kwargs[0]["shared_cpu_request_preflight_state"]
+            is captured_kwargs[1]["shared_cpu_request_preflight_state"]
+        )
+
+    def test_parallel_group_preflight_preserves_group_order_on_failure(self):
+        prime_barrier = threading.Barrier(2)
+        closed = []
+
+        def make_retriever(group_id):
+            try:
+                yield from ()
+                prime_barrier.wait(timeout=2)
+                raise RuntimeError(f"group-{group_id}-failed")
+            finally:
+                closed.append(group_id)
+
+        with pytest.raises(RuntimeError, match="group-0-failed"):
+            adapter_mod._prime_sparse_retriever_pair(
+                make_retriever(0),
+                make_retriever(1),
+                request_id="req-1",
+                canonical_ret_mask=None,
+                indexer_ret_mask=None,
+            )
+
+        assert sorted(closed) == [0, 1]
 
     def test_sparse_decode_start_uses_minimal_prepared_kwargs(self):
         req = make_sparse_req_meta("req-1", token_count=256)
