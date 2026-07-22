@@ -952,12 +952,49 @@ class LMCacheEngine:
         gc_stats_before = gc.get_stats()
         serialize_started = time.perf_counter()
         serialize_thread_started = time.thread_time()
-        payload = envelope.to_dict()
+        compact_config = self._get_shared_config_value(
+            "shared_cpu_compact_handle_transport",
+            getattr(self, "shared_cpu_compact_handle_transport", False),
+        )
+        compact_enabled = (
+            compact_config.strip().lower() not in {"0", "false", "off"}
+            if isinstance(compact_config, str)
+            else bool(compact_config)
+        )
+        wire_format = "legacy_rows"
+        if compact_enabled:
+            try:
+                payload = envelope.to_compact_dict()
+                wire_format = "columnar_v1"
+            except Exception:
+                logger.exception(
+                    "Exact compact shared-handle encoding failed; "
+                    "falling back to the legacy row representation: "
+                    "req=%s phase=%s kv_group=%d layer_id=%d",
+                    envelope.request_id,
+                    envelope.phase,
+                    envelope.kv_group,
+                    envelope.layer_id,
+                )
+                payload = envelope.to_dict()
+        else:
+            payload = envelope.to_dict()
         serialize_thread_ms = (
             time.thread_time() - serialize_thread_started
         ) * 1000
         serialize_ms = (time.perf_counter() - serialize_started) * 1000
         gc_stats_after = gc.get_stats()
+        if envelope.layer_id == 0 and compact_enabled:
+            logger.info(
+                "[P2D_SHARED_ENVELOPE_WIRE] req=%s phase=%s kv_group=%d "
+                "handles=%d wire_format=%s encode_ms=%.3f",
+                envelope.request_id,
+                envelope.phase,
+                envelope.kv_group,
+                len(envelope.handles),
+                wire_format,
+                serialize_ms,
+            )
         if serialize_ms >= 100.0:
             gc_collections = [
                 after["collections"] - before["collections"]
@@ -974,6 +1011,7 @@ class LMCacheEngine:
             logger.info(
                 "[P2D_SHARED_ENVELOPE_TO_DICT_STALL] "
                 "req=%s phase=%s kv_group=%d layer_id=%d handles=%d "
+                "wire_format=%s "
                 "wall_ms=%.3f thread_cpu_ms=%.3f thread_not_running_ms=%.3f "
                 "gc_collections=%s gc_collected=%s",
                 envelope.request_id,
@@ -981,6 +1019,7 @@ class LMCacheEngine:
                 envelope.kv_group,
                 envelope.layer_id,
                 len(envelope.handles),
+                wire_format,
                 serialize_ms,
                 serialize_thread_ms,
                 max(0.0, serialize_ms - serialize_thread_ms),
@@ -1001,7 +1040,7 @@ class LMCacheEngine:
                 f"got {type(raw)!r}"
             )
         try:
-            return SharedHandleEnvelope.from_dict(raw)
+            return SharedHandleEnvelope.from_wire_dict(raw)
         except Exception as exc:
             raise ValueError(
                 "Shared CPU cache received corrupt envelope before view "

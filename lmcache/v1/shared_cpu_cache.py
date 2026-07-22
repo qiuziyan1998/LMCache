@@ -16,7 +16,7 @@ from typing import Any, Iterable, Optional, Union
 import torch
 
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
     MemoryFormat,
@@ -201,6 +201,406 @@ _FORBIDDEN_TRANSPORT_FIELDS = {
     "tensor",
 }
 
+_COMPACT_ENVELOPE_TYPE = "SharedHandleEnvelopeColumnarV1"
+
+
+def _require_exact_fields(
+    data: dict[str, Any],
+    fields: set[str],
+    owner: str,
+) -> None:
+    _require_fields(data, fields, owner)
+    unexpected = sorted(set(data) - fields)
+    if unexpected:
+        raise SharedCPUCacheValidationError(
+            f"{owner} contains unexpected fields: {unexpected}"
+        )
+
+
+def _values_exactly_equal(left: Any, right: Any) -> bool:
+    """Compare serialized values without Python's cross-type equality."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        if len(left) != len(right):
+            return False
+        return all(
+            _values_exactly_equal(left_key, right_key)
+            and _values_exactly_equal(left_value, right_value)
+            for (left_key, left_value), (right_key, right_value) in zip(
+                left.items(), right.items(), strict=True
+            )
+        )
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _values_exactly_equal(left_value, right_value)
+            for left_value, right_value in zip(left, right, strict=True)
+        )
+    if left is None or isinstance(left, (bool, int, float, str, bytes)):
+        return bool(left == right)
+    # Unknown objects are only common when they are literally the same value.
+    # This deliberately sacrifices compression rather than trusting a custom
+    # equality implementation that may ignore serialized state.
+    return left is right
+
+
+def _encode_exact_column(values: list[Any]) -> dict[str, Any]:
+    """Encode a column using only representations proven exactly reversible."""
+    if not values:
+        return {"kind": "values", "values": []}
+
+    if all(isinstance(value, int) and not isinstance(value, bool) for value in values):
+        step = 0 if len(values) == 1 else int(values[1]) - int(values[0])
+        if all(
+            int(value) == int(values[0]) + index * step
+            for index, value in enumerate(values)
+        ):
+            return {
+                "kind": "arithmetic",
+                "start": int(values[0]),
+                "step": step,
+            }
+
+    default = values[0]
+    overrides = [
+        [index, value]
+        for index, value in enumerate(values[1:], start=1)
+        if not _values_exactly_equal(value, default)
+    ]
+    if len(overrides) * 2 < len(values):
+        return {
+            "kind": "default_overrides",
+            "default": default,
+            "overrides": overrides,
+        }
+    return {"kind": "values", "values": values}
+
+
+def _decode_exact_column(
+    encoded: dict[str, Any],
+    count: int,
+    owner: str,
+) -> list[Any]:
+    if not isinstance(encoded, dict):
+        raise SharedCPUCacheValidationError(
+            f"{owner} expected dict column, got {type(encoded)!r}"
+        )
+    kind = encoded.get("kind")
+    if kind == "arithmetic":
+        _require_exact_fields(encoded, {"kind", "start", "step"}, owner)
+        start = int(encoded["start"])
+        step = int(encoded["step"])
+        return [start + index * step for index in range(count)]
+    if kind == "default_overrides":
+        _require_exact_fields(
+            encoded,
+            {"kind", "default", "overrides"},
+            owner,
+        )
+        overrides = encoded["overrides"]
+        if not isinstance(overrides, list):
+            raise SharedCPUCacheValidationError(
+                f"{owner} overrides must be a list"
+            )
+        values = [encoded["default"] for _ in range(count)]
+        seen: set[int] = set()
+        for item in overrides:
+            if not isinstance(item, list) or len(item) != 2:
+                raise SharedCPUCacheValidationError(
+                    f"{owner} override must be [index, value]"
+                )
+            index = int(item[0])
+            if index < 0 or index >= count or index in seen:
+                raise SharedCPUCacheValidationError(
+                    f"{owner} has invalid override index {index}"
+                )
+            seen.add(index)
+            values[index] = item[1]
+        return values
+    if kind == "values":
+        _require_exact_fields(encoded, {"kind", "values"}, owner)
+        values = encoded["values"]
+        if not isinstance(values, list) or len(values) != count:
+            raise SharedCPUCacheValidationError(
+                f"{owner} value count mismatch: "
+                f"{len(values) if isinstance(values, list) else type(values)!r} "
+                f"!= {count}"
+            )
+        return values
+    raise SharedCPUCacheValidationError(
+        f"{owner} has unsupported column encoding {kind!r}"
+    )
+
+
+def _positions_descriptor(positions: Optional[list[int]]) -> Any:
+    if positions is None:
+        return None
+    if not all(type(value) is int for value in positions):
+        return ["values", positions]
+    if len(positions) <= 1:
+        return [
+            "range",
+            int(positions[0]) if positions else 0,
+            1,
+            len(positions),
+        ]
+    start = int(positions[0])
+    step = int(positions[1]) - start
+    if all(
+        int(value) == start + index * step
+        for index, value in enumerate(positions)
+    ):
+        return ["range", start, step, len(positions)]
+    # Preserve the original explicit list. The compact path must not mutate it,
+    # and avoiding a second copy is important for irregular long contexts.
+    return ["values", positions]
+
+
+def _encode_positions_column(
+    values: list[Optional[list[int]]],
+) -> dict[str, Any]:
+    descriptors = [_positions_descriptor(value) for value in values]
+    if descriptors and all(
+        isinstance(descriptor, list)
+        and len(descriptor) == 4
+        and descriptor[0] == "range"
+        for descriptor in descriptors
+    ):
+        return {
+            "kind": "ranges",
+            "starts": _encode_exact_column(
+                [int(descriptor[1]) for descriptor in descriptors]
+            ),
+            "steps": _encode_exact_column(
+                [int(descriptor[2]) for descriptor in descriptors]
+            ),
+            "counts": _encode_exact_column(
+                [int(descriptor[3]) for descriptor in descriptors]
+            ),
+        }
+    return {
+        "kind": "descriptors",
+        "descriptors": _encode_exact_column(descriptors),
+    }
+
+
+def _decode_positions_column(
+    encoded: dict[str, Any],
+    count: int,
+) -> list[Optional[list[int]]]:
+    if not isinstance(encoded, dict):
+        raise SharedCPUCacheValidationError(
+            "Compact shared handle cached_positions must be a dict"
+        )
+    kind = encoded.get("kind")
+    if kind == "ranges":
+        _require_exact_fields(
+            encoded,
+            {"kind", "starts", "steps", "counts"},
+            "Compact shared handle cached_positions",
+        )
+        starts = _decode_exact_column(encoded["starts"], count, "position starts")
+        steps = _decode_exact_column(encoded["steps"], count, "position steps")
+        lengths = _decode_exact_column(encoded["counts"], count, "position counts")
+        decoded: list[Optional[list[int]]] = []
+        for start, step, length in zip(starts, steps, lengths, strict=True):
+            start = int(start)
+            step = int(step)
+            length = int(length)
+            if length < 0:
+                raise SharedCPUCacheValidationError(
+                    "Compact shared handle position count must be non-negative"
+                )
+            decoded.append([start + index * step for index in range(length)])
+        return decoded
+    if kind != "descriptors":
+        raise SharedCPUCacheValidationError(
+            f"Unsupported cached_positions encoding {kind!r}"
+        )
+    _require_exact_fields(
+        encoded,
+        {"kind", "descriptors"},
+        "Compact shared handle cached_positions",
+    )
+    descriptors = _decode_exact_column(
+        encoded["descriptors"],
+        count,
+        "position descriptors",
+    )
+    decoded = []
+    for descriptor in descriptors:
+        if descriptor is None:
+            decoded.append(None)
+        elif (
+            isinstance(descriptor, list)
+            and len(descriptor) == 4
+            and descriptor[0] == "range"
+        ):
+            start = int(descriptor[1])
+            step = int(descriptor[2])
+            length = int(descriptor[3])
+            if length < 0:
+                raise SharedCPUCacheValidationError(
+                    "Compact shared handle position count must be non-negative"
+                )
+            decoded.append([start + index * step for index in range(length)])
+        elif (
+            isinstance(descriptor, list)
+            and len(descriptor) == 2
+            and descriptor[0] == "values"
+            and isinstance(descriptor[1], list)
+        ):
+            decoded.append(list(descriptor[1]))
+        else:
+            raise SharedCPUCacheValidationError(
+                f"Invalid compact cached_positions descriptor {descriptor!r}"
+            )
+    return decoded
+
+
+def _encode_key_column(keys: list[CacheEngineKey]) -> dict[str, Any]:
+    if not keys:
+        return {"kind": "objects", "values": []}
+    key_type = type(keys[0])
+    supported = key_type in (CacheEngineKey, LayerCacheEngineKey)
+    common_fields = (
+        "model_name",
+        "world_size",
+        "worker_id",
+        "dtype",
+        "request_configs",
+        "kv_group",
+    )
+    if supported and all(
+        type(key) is key_type
+        and all(
+            _values_exactly_equal(
+                getattr(key, field), getattr(keys[0], field)
+            )
+            for field in common_fields
+        )
+        and (
+            key_type is CacheEngineKey
+            or int(getattr(key, "layer_id")) == int(getattr(keys[0], "layer_id"))
+        )
+        for key in keys
+    ):
+        template = {
+            "key_type": (
+                "layer" if key_type is LayerCacheEngineKey else "chunk"
+            ),
+            "model_name": keys[0].model_name,
+            "world_size": int(keys[0].world_size),
+            "worker_id": int(keys[0].worker_id),
+            "dtype": _dtype_to_str(keys[0].dtype),
+            "request_configs": keys[0].request_configs,
+            "kv_group": int(keys[0].kv_group),
+            "layer_id": (
+                int(keys[0].layer_id)
+                if key_type is LayerCacheEngineKey
+                else None
+            ),
+        }
+        return {
+            "kind": "template_hashes",
+            "template": template,
+            "chunk_hashes": [key.chunk_hash for key in keys],
+        }
+    return {"kind": "objects", "values": keys}
+
+
+def _decode_key_column(
+    encoded: dict[str, Any],
+    count: int,
+) -> list[CacheEngineKey]:
+    if not isinstance(encoded, dict):
+        raise SharedCPUCacheValidationError(
+            "Compact shared handle keys must be a dict"
+        )
+    kind = encoded.get("kind")
+    if kind == "objects":
+        _require_exact_fields(
+            encoded, {"kind", "values"}, "Compact shared handle keys"
+        )
+        values = encoded["values"]
+        if (
+            not isinstance(values, list)
+            or len(values) != count
+            or not all(isinstance(value, CacheEngineKey) for value in values)
+        ):
+            raise SharedCPUCacheValidationError(
+                "Compact shared handle key object count/type mismatch"
+            )
+        return values
+    if kind != "template_hashes":
+        raise SharedCPUCacheValidationError(
+            f"Unsupported compact shared handle key encoding {kind!r}"
+        )
+    _require_exact_fields(
+        encoded,
+        {"kind", "template", "chunk_hashes"},
+        "Compact shared handle keys",
+    )
+    template = encoded["template"]
+    if not isinstance(template, dict):
+        raise SharedCPUCacheValidationError(
+            "Compact shared handle key template must be a dict"
+        )
+    _require_exact_fields(
+        template,
+        {
+            "key_type",
+            "model_name",
+            "world_size",
+            "worker_id",
+            "dtype",
+            "request_configs",
+            "kv_group",
+            "layer_id",
+        },
+        "Compact shared handle key template",
+    )
+    hashes = encoded["chunk_hashes"]
+    if not isinstance(hashes, list) or len(hashes) != count:
+        raise SharedCPUCacheValidationError(
+            "Compact shared handle key hash count mismatch"
+        )
+    dtype = _dtype_from_str(template["dtype"])
+    if dtype is None:
+        raise SharedCPUCacheValidationError(
+            "Compact shared handle key dtype cannot be None"
+        )
+    key_type = template["key_type"]
+    if key_type not in ("chunk", "layer"):
+        raise SharedCPUCacheValidationError(
+            f"Unsupported compact shared handle key type {key_type!r}"
+        )
+    keys: list[CacheEngineKey] = []
+    for chunk_hash in hashes:
+        kwargs = {
+            "model_name": template["model_name"],
+            "world_size": int(template["world_size"]),
+            "worker_id": int(template["worker_id"]),
+            "chunk_hash": chunk_hash,
+            "dtype": dtype,
+            "request_configs": template["request_configs"],
+            "kv_group": int(template["kv_group"]),
+        }
+        if key_type == "layer":
+            keys.append(
+                LayerCacheEngineKey(
+                    **kwargs,
+                    layer_id=int(template["layer_id"]),
+                )
+            )
+        else:
+            if template["layer_id"] is not None:
+                raise SharedCPUCacheValidationError(
+                    "Compact chunk key cannot carry layer_id"
+                )
+            keys.append(CacheEngineKey(**kwargs))
+    return keys
+
 
 @dataclass(frozen=True)
 class SharedChunkHandle:
@@ -383,6 +783,109 @@ class SharedHandleEnvelope:
     message: Optional[str] = None
     error_details: Optional[dict[str, Any]] = None
 
+    def to_compact_dict(self) -> dict[str, Any]:
+        """Return an exact columnar wire representation of this envelope.
+
+        Fields common to the envelope are validated and omitted from each
+        handle. Repeated and arithmetic columns are compressed only after an
+        exact equality check; arbitrary values remain explicit. Decoding
+        recreates the same ``SharedChunkHandle`` values and order.
+        """
+        handles = self.handles
+        for handle in handles:
+            common_failures = []
+            if handle.request_id != self.request_id:
+                common_failures.append("request_id")
+            if handle.phase != self.phase:
+                common_failures.append("phase")
+            if int(handle.layer_id) != int(self.layer_id):
+                common_failures.append("layer_id")
+            if int(handle.kv_group) != int(self.kv_group):
+                common_failures.append("kv_group")
+            if int(handle.generation) != int(self.generation):
+                common_failures.append("generation")
+            if common_failures:
+                raise SharedCPUCacheValidationError(
+                    "Compact shared handle envelope has non-common fields: "
+                    f"{common_failures}; request_id={self.request_id}, "
+                    f"layer_id={self.layer_id}, kv_group={self.kv_group}, "
+                    f"chunk_index={handle.chunk_index}"
+                )
+
+        columns = {
+            "keys": _encode_key_column([handle.key for handle in handles]),
+            "chunk_indices": _encode_exact_column(
+                [int(handle.chunk_index) for handle in handles]
+            ),
+            "shm_names": _encode_exact_column(
+                [handle.shm_name for handle in handles]
+            ),
+            "offsets": _encode_exact_column(
+                [int(handle.offset) for handle in handles]
+            ),
+            "physical_sizes": _encode_exact_column(
+                [int(handle.physical_size) for handle in handles]
+            ),
+            "logical_sizes": _encode_exact_column(
+                [int(handle.logical_size) for handle in handles]
+            ),
+            "shapes": _encode_exact_column(
+                [tuple(int(dim) for dim in handle.shape) for handle in handles]
+            ),
+            "dtypes": _encode_exact_column(
+                [_dtype_to_str(handle.dtype) for handle in handles]
+            ),
+            "formats": _encode_exact_column(
+                [handle.fmt.value for handle in handles]
+            ),
+            "nested_shapes": _encode_exact_column(
+                [
+                    (
+                        tuple(
+                            tuple(int(dim) for dim in shape)
+                            for shape in handle.shapes
+                        )
+                        if handle.shapes is not None
+                        else None
+                    )
+                    for handle in handles
+                ]
+            ),
+            "nested_dtypes": _encode_exact_column(
+                [
+                    (
+                        tuple(_dtype_to_str(dtype) for dtype in handle.dtypes)
+                        if handle.dtypes is not None
+                        else None
+                    )
+                    for handle in handles
+                ]
+            ),
+            "cached_positions": _encode_positions_column(
+                [handle.cached_positions for handle in handles]
+            ),
+            "producer_ranks": _encode_exact_column(
+                [int(handle.producer_rank) for handle in handles]
+            ),
+            "statuses": _encode_exact_column(
+                [handle.status for handle in handles]
+            ),
+        }
+        return {
+            "__type__": _COMPACT_ENVELOPE_TYPE,
+            "request_id": self.request_id,
+            "phase": self.phase,
+            "request_ordinal": int(self.request_ordinal),
+            "layer_id": int(self.layer_id),
+            "kv_group": int(self.kv_group),
+            "status": self.status,
+            "generation": int(self.generation),
+            "handle_count": len(handles),
+            "handle_columns": columns,
+            "message": self.message,
+            "error_details": self.error_details,
+        }
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "request_id": self.request_id,
@@ -447,6 +950,181 @@ class SharedHandleEnvelope:
                 SharedChunkHandle.from_dict(handle)
                 for handle in data["handles"]
             ],
+            message=data["message"],
+            error_details=data["error_details"],
+        )
+
+    @classmethod
+    def from_wire_dict(cls, data: dict[str, Any]) -> "SharedHandleEnvelope":
+        """Decode either the legacy row format or exact compact format."""
+        if not isinstance(data, dict):
+            raise SharedCPUCacheValidationError(
+                "SharedHandleEnvelope expected dict payload, "
+                f"got {type(data)!r}"
+            )
+        wire_type = data.get("__type__")
+        if wire_type is None:
+            return cls.from_dict(data)
+        if wire_type != _COMPACT_ENVELOPE_TYPE:
+            raise SharedCPUCacheValidationError(
+                f"Unsupported shared handle envelope wire type {wire_type!r}"
+            )
+        _require_exact_fields(
+            data,
+            {
+                "__type__",
+                "request_id",
+                "phase",
+                "request_ordinal",
+                "layer_id",
+                "kv_group",
+                "status",
+                "generation",
+                "handle_count",
+                "handle_columns",
+                "message",
+                "error_details",
+            },
+            "Compact SharedHandleEnvelope",
+        )
+        _reject_private_fields(
+            data,
+            _FORBIDDEN_TRANSPORT_FIELDS,
+            "Compact SharedHandleEnvelope",
+        )
+        status = data["status"]
+        if status not in ("ok", "miss", "skipped", "error"):
+            raise SharedCPUCacheValidationError(
+                "Compact SharedHandleEnvelope has unsupported status "
+                f"{status!r}"
+            )
+        count = int(data["handle_count"])
+        if count < 0:
+            raise SharedCPUCacheValidationError(
+                "Compact SharedHandleEnvelope handle_count must be non-negative"
+            )
+        columns = data["handle_columns"]
+        if not isinstance(columns, dict):
+            raise SharedCPUCacheValidationError(
+                "Compact SharedHandleEnvelope handle_columns must be a dict"
+            )
+        _require_exact_fields(
+            columns,
+            {
+                "keys",
+                "chunk_indices",
+                "shm_names",
+                "offsets",
+                "physical_sizes",
+                "logical_sizes",
+                "shapes",
+                "dtypes",
+                "formats",
+                "nested_shapes",
+                "nested_dtypes",
+                "cached_positions",
+                "producer_ranks",
+                "statuses",
+            },
+            "Compact SharedHandleEnvelope columns",
+        )
+        keys = _decode_key_column(columns["keys"], count)
+        chunk_indices = _decode_exact_column(
+            columns["chunk_indices"], count, "handle chunk_indices"
+        )
+        shm_names = _decode_exact_column(
+            columns["shm_names"], count, "handle shm_names"
+        )
+        offsets = _decode_exact_column(
+            columns["offsets"], count, "handle offsets"
+        )
+        physical_sizes = _decode_exact_column(
+            columns["physical_sizes"], count, "handle physical_sizes"
+        )
+        logical_sizes = _decode_exact_column(
+            columns["logical_sizes"], count, "handle logical_sizes"
+        )
+        shapes = _decode_exact_column(
+            columns["shapes"], count, "handle shapes"
+        )
+        dtypes = _decode_exact_column(
+            columns["dtypes"], count, "handle dtypes"
+        )
+        formats = _decode_exact_column(
+            columns["formats"], count, "handle formats"
+        )
+        nested_shapes = _decode_exact_column(
+            columns["nested_shapes"], count, "handle nested_shapes"
+        )
+        nested_dtypes = _decode_exact_column(
+            columns["nested_dtypes"], count, "handle nested_dtypes"
+        )
+        cached_positions = _decode_positions_column(
+            columns["cached_positions"], count
+        )
+        producer_ranks = _decode_exact_column(
+            columns["producer_ranks"], count, "handle producer_ranks"
+        )
+        handle_statuses = _decode_exact_column(
+            columns["statuses"], count, "handle statuses"
+        )
+
+        handles: list[SharedChunkHandle] = []
+        for index in range(count):
+            dtype = _dtype_from_str(dtypes[index])
+            if dtype is None:
+                raise SharedCPUCacheValidationError(
+                    "Compact shared handle dtype cannot be None"
+                )
+            encoded_nested_shapes = nested_shapes[index]
+            encoded_nested_dtypes = nested_dtypes[index]
+            decoded_nested_shapes = (
+                [torch.Size(shape) for shape in encoded_nested_shapes]
+                if encoded_nested_shapes is not None
+                else None
+            )
+            decoded_nested_dtypes = None
+            if encoded_nested_dtypes is not None:
+                decoded_nested_dtypes = []
+                for encoded_dtype in encoded_nested_dtypes:
+                    nested_dtype = _dtype_from_str(encoded_dtype)
+                    if nested_dtype is None:
+                        raise SharedCPUCacheValidationError(
+                            "Compact nested handle dtype cannot be None"
+                        )
+                    decoded_nested_dtypes.append(nested_dtype)
+            handles.append(
+                SharedChunkHandle(
+                    request_id=data["request_id"],
+                    phase=data["phase"],
+                    key=keys[index],
+                    layer_id=int(data["layer_id"]),
+                    kv_group=int(data["kv_group"]),
+                    chunk_index=int(chunk_indices[index]),
+                    shm_name=shm_names[index],
+                    offset=int(offsets[index]),
+                    physical_size=int(physical_sizes[index]),
+                    logical_size=int(logical_sizes[index]),
+                    shape=torch.Size(shapes[index]),
+                    dtype=dtype,
+                    fmt=MemoryFormat(formats[index]),
+                    generation=int(data["generation"]),
+                    producer_rank=int(producer_ranks[index]),
+                    status=handle_statuses[index],
+                    shapes=decoded_nested_shapes,
+                    dtypes=decoded_nested_dtypes,
+                    cached_positions=cached_positions[index],
+                )
+            )
+        return cls(
+            request_id=data["request_id"],
+            phase=data["phase"],
+            request_ordinal=int(data["request_ordinal"]),
+            layer_id=int(data["layer_id"]),
+            kv_group=int(data["kv_group"]),
+            status=status,
+            generation=int(data["generation"]),
+            handles=handles,
             message=data["message"],
             error_details=data["error_details"],
         )

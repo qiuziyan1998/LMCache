@@ -21,6 +21,10 @@ from lmcache.v1.memory_management import (
     TensorMemoryObj,
 )
 from lmcache.v1.shared_cpu_cache import (
+    _decode_exact_column,
+    _decode_positions_column,
+    _encode_exact_column,
+    _encode_positions_column,
     PassiveSharedViewAllocator,
     SharedChunkHandle,
     SharedCPUCacheError,
@@ -2572,6 +2576,164 @@ def test_skipped_index_envelope_round_trips_without_handles():
     assert decoded.kv_group == 1
     assert decoded.handles == []
     assert decoded.message is not None
+
+
+def test_compact_shared_envelope_round_trip_is_field_exact():
+    base_key = CacheEngineKey(
+        model_name="model",
+        world_size=8,
+        worker_id=0,
+        chunk_hash=0,
+        dtype=torch.bfloat16,
+        request_configs={"lmcache.tag.tenant": "a", "untagged": 7},
+        kv_group=1,
+    )
+    handles = []
+    for chunk_index, (logical_size, shape, position_count) in enumerate(
+        ((64, (4, 8), 4), (64, (4, 8), 4), (32, (2, 8), 2))
+    ):
+        key = replace(
+            base_key.get_layer(5),
+            chunk_hash=1000 + chunk_index,
+        )
+        handles.append(
+            SharedChunkHandle(
+                request_id="req-compact",
+                phase="sparse_decode_bootstrap",
+                key=key,
+                layer_id=5,
+                kv_group=1,
+                chunk_index=10 + chunk_index,
+                shm_name="/lmcache-test",
+                offset=128 + chunk_index * 64,
+                physical_size=64,
+                logical_size=logical_size,
+                shape=torch.Size(shape),
+                dtype=torch.bfloat16,
+                fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+                generation=11,
+                producer_rank=0,
+                cached_positions=list(
+                    range(chunk_index * 4, chunk_index * 4 + position_count)
+                ),
+            )
+        )
+    envelope = SharedHandleEnvelope(
+        request_id="req-compact",
+        phase="sparse_decode_bootstrap",
+        request_ordinal=3,
+        layer_id=5,
+        kv_group=1,
+        status="ok",
+        generation=11,
+        handles=handles,
+    )
+
+    encoded = envelope.to_compact_dict()
+    decoded = SharedHandleEnvelope.from_wire_dict(encoded)
+
+    assert encoded["__type__"] == "SharedHandleEnvelopeColumnarV1"
+    assert encoded["handle_count"] == len(handles)
+    assert encoded["handle_columns"]["cached_positions"]["kind"] == "ranges"
+    assert decoded == envelope
+    for original, restored in zip(handles, decoded.handles, strict=True):
+        assert type(restored.key) is type(original.key)
+        assert restored.key.request_configs == original.key.request_configs
+        assert restored.cached_positions == original.cached_positions
+
+
+def test_compact_shared_envelope_rejects_corrupt_column_schema():
+    envelope = SharedHandleEnvelope(
+        request_id="req-compact",
+        phase="sparse_decode_bootstrap",
+        request_ordinal=0,
+        layer_id=0,
+        kv_group=0,
+        status="skipped",
+        generation=1,
+        handles=[],
+    )
+    encoded = envelope.to_compact_dict()
+    encoded["handle_columns"].pop("offsets")
+
+    with pytest.raises(SharedCPUCacheValidationError, match="offsets"):
+        SharedHandleEnvelope.from_wire_dict(encoded)
+
+
+def test_compact_columns_preserve_cross_type_and_irregular_values_exactly():
+    encoded = _encode_exact_column([1, True, 1])
+    assert _decode_exact_column(encoded, 3, "test") == [1, True, 1]
+    assert [type(value) for value in _decode_exact_column(encoded, 3, "test")] == [
+        int,
+        bool,
+        int,
+    ]
+
+    positions = [[0, 2, 1], [True, 2]]
+    restored = _decode_positions_column(
+        _encode_positions_column(positions),
+        len(positions),
+    )
+    assert restored == positions
+    assert type(restored[1][0]) is bool
+
+
+def test_shared_envelope_transport_uses_compact_format_when_enabled():
+    engine = object.__new__(LMCacheEngine)
+    engine.shared_cpu_compact_handle_transport = True
+    engine.config = SimpleNamespace(extra_config={})
+    engine.metadata = SimpleNamespace(first_rank=0)
+    payloads = []
+    engine.broadcast_object_fn = lambda payload, rank: payloads.append(
+        (payload, rank)
+    )
+    envelope = SharedHandleEnvelope(
+        request_id="req-compact",
+        phase="sparse_decode_bootstrap",
+        request_ordinal=0,
+        layer_id=0,
+        kv_group=0,
+        status="skipped",
+        generation=1,
+        handles=[],
+    )
+
+    engine._broadcast_shared_envelope(envelope)
+
+    assert payloads[0][0]["__type__"] == "SharedHandleEnvelopeColumnarV1"
+    receiver = object.__new__(LMCacheEngine)
+    receiver.metadata = SimpleNamespace(first_rank=0)
+    receiver.broadcast_object_fn = lambda _payload, _rank: payloads[0][0]
+    assert receiver._receive_shared_envelope() == envelope
+
+
+def test_shared_envelope_transport_can_force_legacy_format():
+    engine = object.__new__(LMCacheEngine)
+    engine.shared_cpu_compact_handle_transport = True
+    engine.config = SimpleNamespace(
+        shared_cpu_compact_handle_transport=False,
+        extra_config={},
+    )
+    engine.metadata = SimpleNamespace(first_rank=0)
+    payloads = []
+    engine.broadcast_object_fn = lambda payload, rank: payloads.append(
+        (payload, rank)
+    )
+    envelope = SharedHandleEnvelope(
+        request_id="req-legacy",
+        phase="sparse_decode_bootstrap",
+        request_ordinal=0,
+        layer_id=0,
+        kv_group=0,
+        status="skipped",
+        generation=1,
+        handles=[],
+    )
+
+    engine._broadcast_shared_envelope(envelope)
+
+    assert "__type__" not in payloads[0][0]
+    assert payloads[0][0] == envelope.to_dict()
 
 
 def test_shared_envelope_rejects_missing_required_field():
