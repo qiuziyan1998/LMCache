@@ -949,9 +949,44 @@ class LMCacheEngine:
         call while allowing platform integrations to attribute their outer
         publication latency precisely.
         """
+        gc_stats_before = gc.get_stats()
         serialize_started = time.perf_counter()
+        serialize_thread_started = time.thread_time()
         payload = envelope.to_dict()
+        serialize_thread_ms = (
+            time.thread_time() - serialize_thread_started
+        ) * 1000
         serialize_ms = (time.perf_counter() - serialize_started) * 1000
+        gc_stats_after = gc.get_stats()
+        if serialize_ms >= 100.0:
+            gc_collections = [
+                after["collections"] - before["collections"]
+                for before, after in zip(
+                    gc_stats_before, gc_stats_after, strict=True
+                )
+            ]
+            gc_collected = [
+                after["collected"] - before["collected"]
+                for before, after in zip(
+                    gc_stats_before, gc_stats_after, strict=True
+                )
+            ]
+            logger.info(
+                "[P2D_SHARED_ENVELOPE_TO_DICT_STALL] "
+                "req=%s phase=%s kv_group=%d layer_id=%d handles=%d "
+                "wall_ms=%.3f thread_cpu_ms=%.3f thread_not_running_ms=%.3f "
+                "gc_collections=%s gc_collected=%s",
+                envelope.request_id,
+                envelope.phase,
+                envelope.kv_group,
+                envelope.layer_id,
+                len(envelope.handles),
+                serialize_ms,
+                serialize_thread_ms,
+                max(0.0, serialize_ms - serialize_thread_ms),
+                gc_collections,
+                gc_collected,
+            )
 
         collective_started = time.perf_counter()
         self.broadcast_object_fn(payload, self.metadata.first_rank)
