@@ -1471,6 +1471,7 @@ class LMCacheEngine:
         chunk_locations_layer_major: list[list[str]],
         token_count: int = 0,
         chunk_token_lengths: Optional[list[int]] = None,
+        skip_global_scan_if_no_allocation: bool = False,
     ) -> dict[str, Any]:
         local_cpu_backend = self._shared_local_cpu_backend()
         required_local_keys = {
@@ -1549,6 +1550,42 @@ class LMCacheEngine:
             if callable(get_free_size):
                 free_bytes = int(get_free_size())
 
+        active_sparse_requests = set(self._shared_cpu_active_sparse_requests)
+        if req_id:
+            active_sparse_requests.add(req_id)
+
+        if skip_global_scan_if_no_allocation and missing_chunk_count == 0:
+            # Every requested chunk is already retained in the rank0 shared
+            # slab, so this retrieve cannot allocate or evict anything.  The
+            # full hot-cache scan below is only needed to determine how much
+            # additional materialization could fit.  On decode tail refreshes
+            # that scan otherwise walks the entire stable sparse prefix even
+            # though the required additional capacity is exactly zero.
+            return {
+                "request_id": req_id,
+                "phase": phase,
+                "kv_group": kv_group,
+                "token_count": int(token_count or 0),
+                "chunk_count": sum(len(layer) for layer in keys_layer_major),
+                "missing_chunk_count": 0,
+                "hot_chunk_count": len(rank0_shared_hot_keys),
+                "non_shm_hot_chunk_count": len(non_shm_hot_keys),
+                "required_bytes": 0,
+                "per_chunk_physical_bytes_estimate": default_chunk_bytes,
+                # These are conservative lower-bound diagnostics.  Exact
+                # eviction and pin totals require the global scan that this
+                # no-allocation path intentionally avoids.
+                "available_after_eviction": free_bytes,
+                "free_bytes": free_bytes,
+                "evictable_bytes": 0,
+                "pinned_bytes": 0,
+                "protected_hot_bytes": 0,
+                "active_sparse_requests": len(active_sparse_requests),
+                "slab_size": slab_size,
+                "capacity_scan_skipped": True,
+                "fits": True,
+            }
+
         evictable_bytes = 0
         pinned_bytes = 0
         protected_hot_bytes = 0
@@ -1569,9 +1606,6 @@ class LMCacheEngine:
                 evictable_bytes += physical_size
 
         available_after_eviction = free_bytes + evictable_bytes
-        active_sparse_requests = set(self._shared_cpu_active_sparse_requests)
-        if req_id:
-            active_sparse_requests.add(req_id)
         details = {
             "request_id": req_id,
             "phase": phase,

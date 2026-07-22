@@ -1232,6 +1232,44 @@ def test_runtime_capacity_details_exclude_required_hot_chunks_from_evictable():
     assert details["fits"] is True
 
 
+def test_runtime_capacity_skips_global_scan_when_all_chunks_are_shared_hot():
+    engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    hot_key = _make_key()
+    hot_obj = _make_memory_obj(
+        torch.empty(1024, dtype=torch.uint8),
+        physical_size=64,
+    )
+
+    class _NoGlobalScanCache(dict):
+        def items(self):
+            raise AssertionError("zero-capacity retrieve must not scan hot cache")
+
+    backend = _FakeLocalCPUBackend(
+        free_bytes=128,
+        hot_cache=_NoGlobalScanCache({hot_key: hot_obj}),
+    )
+    engine._shared_local_cpu_backend = lambda: backend
+    engine._is_rank0_shared_mem_obj = lambda mem_obj: mem_obj is hot_obj
+    engine.config.chunk_size = 4
+
+    details = engine._shared_cpu_runtime_capacity_details(
+        req_id="req-1",
+        phase="sparse_decode_bootstrap",
+        kv_group=0,
+        keys_layer_major=[[hot_key]],
+        chunk_locations_layer_major=[["LocalCPUBackend"]],
+        token_count=1,
+        chunk_token_lengths=[1],
+        skip_global_scan_if_no_allocation=True,
+    )
+
+    assert details["missing_chunk_count"] == 0
+    assert details["required_bytes"] == 0
+    assert details["available_after_eviction"] == 128
+    assert details["capacity_scan_skipped"] is True
+    assert details["fits"] is True
+
+
 def test_capacity_snapshot_reads_nested_pin_allocator_free_space():
     engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
     backend = _FakeLocalCPUBackend(free_bytes=768, hot_cache={})
