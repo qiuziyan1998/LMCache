@@ -939,8 +939,24 @@ class LMCacheEngine:
             error_details=details,
         )
 
-    def _broadcast_shared_envelope(self, envelope: SharedHandleEnvelope) -> None:
-        self.broadcast_object_fn(envelope.to_dict(), self.metadata.first_rank)
+    def _broadcast_shared_envelope(
+        self, envelope: SharedHandleEnvelope
+    ) -> tuple[float, float]:
+        """Serialize and broadcast one shared-handle envelope.
+
+        The returned timings are diagnostic only.  Keeping the timing result in
+        the return value preserves the single serialization and collective
+        call while allowing platform integrations to attribute their outer
+        publication latency precisely.
+        """
+        serialize_started = time.perf_counter()
+        payload = envelope.to_dict()
+        serialize_ms = (time.perf_counter() - serialize_started) * 1000
+
+        collective_started = time.perf_counter()
+        self.broadcast_object_fn(payload, self.metadata.first_rank)
+        collective_ms = (time.perf_counter() - collective_started) * 1000
+        return serialize_ms, collective_ms
 
     def _receive_shared_envelope(self) -> SharedHandleEnvelope:
         raw = self.broadcast_object_fn(None, self.metadata.first_rank)
@@ -1039,6 +1055,7 @@ class LMCacheEngine:
         layer_id: int,
         kv_group: int,
         chunk_index_offset: int = 0,
+        timings_ms: Optional[dict[str, float]] = None,
     ) -> list[SharedChunkHandle]:
         if self.shared_cpu_cache_name is None:
             raise ValueError("Shared CPU cache name is not initialized")
@@ -1054,6 +1071,7 @@ class LMCacheEngine:
             zip(keys_layer, mem_objs_layer, strict=True)
         ):
             chunk_index = int(chunk_index_offset) + local_chunk_index
+            validate_started = time.perf_counter()
             self._validate_rank0_shared_mem_obj(
                 mem_obj,
                 req_id=req_id,
@@ -1062,6 +1080,12 @@ class LMCacheEngine:
                 kv_group=kv_group,
                 chunk_index=chunk_index,
             )
+            if timings_ms is not None:
+                timings_ms["validate"] = timings_ms.get("validate", 0.0) + (
+                    time.perf_counter() - validate_started
+                ) * 1000
+
+            object_build_started = time.perf_counter()
             handles.append(
                 SharedChunkHandle.from_memory_obj(
                     request_id=req_id,
@@ -1076,6 +1100,10 @@ class LMCacheEngine:
                     producer_rank=self.metadata.worker_id,
                 )
             )
+            if timings_ms is not None:
+                timings_ms["object_build"] = timings_ms.get(
+                    "object_build", 0.0
+                ) + (time.perf_counter() - object_build_started) * 1000
         return handles
 
     def _layerwise_chunk_location_if_fully_stored(

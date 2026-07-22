@@ -1681,6 +1681,56 @@ def test_rank0_handle_builder_validates_objects_before_publication():
         )
 
 
+def test_rank0_handle_builder_records_diagnostic_subphases():
+    engine = object.__new__(LMCacheEngine)
+    engine.shared_cpu_cache_name = "/lmcache-test"
+    engine.shared_cpu_cache_generation = 3
+    engine.metadata = SimpleNamespace(worker_id=0)
+    engine._validate_rank0_shared_mem_obj = lambda *_args, **_kwargs: None
+    backing = torch.arange(1024, dtype=torch.uint8)
+    timings_ms = {}
+
+    handles = engine._make_shared_handles_for_layer(
+        req_id="req-1",
+        phase="dense_prefix",
+        keys_layer=[_make_key()],
+        mem_objs_layer=[_make_memory_obj(backing)],
+        layer_id=0,
+        kv_group=0,
+        timings_ms=timings_ms,
+    )
+
+    assert len(handles) == 1
+    assert set(timings_ms) == {"validate", "object_build"}
+    assert timings_ms["validate"] >= 0
+    assert timings_ms["object_build"] >= 0
+
+
+def test_shared_envelope_broadcast_reports_serialize_and_collective_time():
+    engine = object.__new__(LMCacheEngine)
+    engine.metadata = SimpleNamespace(first_rank=0)
+    broadcasts = []
+    engine.broadcast_object_fn = lambda payload, rank: broadcasts.append(
+        (payload, rank)
+    )
+    envelope = SharedHandleEnvelope(
+        request_id="req-1",
+        phase="dense_prefix",
+        request_ordinal=0,
+        layer_id=0,
+        kv_group=0,
+        status="skipped",
+        generation=3,
+        handles=[],
+    )
+
+    serialize_ms, collective_ms = engine._broadcast_shared_envelope(envelope)
+
+    assert broadcasts == [(envelope.to_dict(), 0)]
+    assert serialize_ms >= 0
+    assert collective_ms >= 0
+
+
 def test_shared_chunk_handle_preserves_key_and_cached_positions():
     backing = torch.arange(1024, dtype=torch.uint8)
     key = _make_key()
