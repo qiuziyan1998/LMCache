@@ -2180,10 +2180,6 @@ class LMCacheEngine:
         ]
         acquired: list[MemoryObj] = []
         pinned: list[MemoryObj] = []
-        backend_calls = 0
-        direct_shared_objects = 0
-        fallback_materializations = 0
-        started = time.perf_counter()
 
         windows: list[
             tuple[int, int, list[tuple[int, int]], list[CacheEngineKey]]
@@ -2234,7 +2230,6 @@ class LMCacheEngine:
                     next_future_index = window_index + 1
                 else:
                     fetched = fetch_window(fetch_keys)
-                backend_calls += 1
                 if len(fetched) != len(fetch_keys):
                     for fetched_obj in fetched:
                         if fetched_obj is not None:
@@ -2273,7 +2268,6 @@ class LMCacheEngine:
                         if self._is_rank0_shared_mem_obj(fetched_obj):
                             mem_obj = fetched_obj
                             pending_fetched[index] = None
-                            direct_shared_objects += 1
                         else:
                             try:
                                 mem_obj = self._materialize_shared_rank0_copy(
@@ -2288,7 +2282,6 @@ class LMCacheEngine:
                             finally:
                                 fetched_obj.ref_count_down()
                                 pending_fetched[index] = None
-                            fallback_materializations += 1
 
                         acquired.append(mem_obj)
                         mem_obj.pin()
@@ -2307,24 +2300,6 @@ class LMCacheEngine:
                         if fetched_obj is not None:
                             fetched_obj.ref_count_down()
 
-            logger.info(
-                "[P2D_SHARED_CPU_WINDOWED_GET] req=%s phase=%s kv_group=%d "
-                "layers=%d layers_per_batch=%d max_inflight_batches=%d "
-                "backend_calls=%d chunks=%d "
-                "direct_shared_objects=%d fallback_materializations=%d "
-                "total_ms=%.3f",
-                req_id,
-                phase,
-                kv_group,
-                len(keys_layer_major),
-                layers_per_batch,
-                min(max_inflight_batches, len(windows)),
-                backend_calls,
-                sum(len(layer) for layer in keys_layer_major),
-                direct_shared_objects,
-                fallback_materializations,
-                (time.perf_counter() - started) * 1000,
-            )
             return resolved_layers
         except Exception:
             for future in futures[next_future_index:]:

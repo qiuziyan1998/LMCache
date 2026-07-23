@@ -278,14 +278,6 @@ class MooncakestoreConnector(RemoteConnector):
                     ) from fallback_exc
                 self.effective_protocol = fallback_protocol
 
-            logger.info(
-                "[P2D_MOONCAKE_TRANSPORT] requested_protocol=%s "
-                "effective_protocol=%s fallback_protocol=%s device_name=%s",
-                requested_protocol,
-                self.effective_protocol,
-                self.config.protocol_fallback,
-                self.config.device_name,
-            )
             logger.info("Mooncake store setup completed successfully")
 
         except ValueError as e:
@@ -320,11 +312,6 @@ class MooncakestoreConnector(RemoteConnector):
                     "Installed Mooncake lacks page-first APIs: "
                     f"{missing_methods}"
                 )
-            logger.info(
-                "[P2D_MOONCAKE_PAGE_LAYOUT] enabled=True num_layers=%d",
-                self._page_num_layers,
-            )
-
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
         self.registered_buffer_ptr = None
@@ -828,12 +815,9 @@ class MooncakestoreConnector(RemoteConnector):
         keys: List[CacheEngineKey],
         page_groups: list[tuple[str, list[int]]],
     ) -> dict[int, MemoryObj]:
-        total_started = time.perf_counter()
         flat_indices = [index for _, indices in page_groups for index in indices]
         page_keys = [keys[index] for index in flat_indices]
-        allocation_started = time.perf_counter()
-        memory_objs, _, allocation_mode = self._allocate_zero_copy_buffers(page_keys)
-        allocation_ms = (time.perf_counter() - allocation_started) * 1000
+        memory_objs, _, _ = self._allocate_zero_copy_buffers(page_keys)
         object_by_index = {
             original_index: memory_objs[position]
             for position, original_index in enumerate(flat_indices)
@@ -857,19 +841,15 @@ class MooncakestoreConnector(RemoteConnector):
             )
 
         loaded: dict[int, MemoryObj] = {}
-        transfer_ms = 0.0
-        bytes_read = 0
         try:
             if not submitted_groups:
                 return loaded
-            transfer_started = time.perf_counter()
             statuses = await asyncio.to_thread(
                 self.store.batch_get_into_multi_buffers,
                 [page_key for page_key, _ in submitted_groups],
                 all_buffer_ptrs,
                 all_buffer_sizes,
             )
-            transfer_ms = (time.perf_counter() - transfer_started) * 1000
             for group_index, (page_key, indices) in enumerate(submitted_groups):
                 if group_index >= len(statuses):
                     logger.warning(
@@ -887,39 +867,12 @@ class MooncakestoreConnector(RemoteConnector):
                         expected_bytes,
                     )
                     continue
-                bytes_read += status
                 for index in indices:
                     memory_obj = object_by_index[index]
                     assert memory_obj is not None
                     loaded[index] = memory_obj
                     object_by_index[index] = None
 
-            first_key = keys[flat_indices[0]]
-            gib_s = (
-                bytes_read / (1024**3) / (transfer_ms / 1000)
-                if transfer_ms > 0
-                else 0.0
-            )
-            logger.info(
-                "[P2D_MOONCAKE_GET] mode=batch_get_into_multi_buffers "
-                "worker_id=%s kv_group=%s page_objects=%d logical_keys=%d "
-                "keys_hit=%d requested_bytes=%d transferred_bytes=%d "
-                "allocation_ms=%.3f transfer_ms=%.3f total_ms=%.3f "
-                "effective_gib_s=%.3f allocation_mode=%s buffers_per_page=%d",
-                first_key.worker_id,
-                first_key.kv_group,
-                len(submitted_groups),
-                len(flat_indices),
-                len(loaded),
-                sum(sum(sizes) for sizes in all_buffer_sizes),
-                bytes_read,
-                allocation_ms,
-                transfer_ms,
-                (time.perf_counter() - total_started) * 1000,
-                gib_s,
-                allocation_mode,
-                self._page_num_layers,
-            )
             return loaded
         except Exception as exc:
             logger.error("Mooncake page-first get failed: %s", exc)
@@ -1286,15 +1239,6 @@ class MooncakestoreConnector(RemoteConnector):
                             "Mooncake page put failed for "
                             f"{page_key}: status {status}"
                         )
-            logger.info(
-                "[P2D_MOONCAKE_PUT] mode=batch_put_from_multi_buffers "
-                "page_objects=%d logical_keys=%d bytes=%d buffers_per_page=%d",
-                len(page_groups),
-                len(page_memory_objs),
-                sum(sum(sizes) for sizes in all_buffer_sizes),
-                self._page_num_layers,
-            )
-
         if legacy_indices:
             legacy_indices = sorted(set(legacy_indices))
             await self._batched_put_zero_copy_legacy(
