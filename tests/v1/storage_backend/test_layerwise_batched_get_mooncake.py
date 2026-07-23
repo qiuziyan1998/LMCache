@@ -222,7 +222,7 @@ class TestMooncakeConnectorCapabilities:
         assert conn.support_batched_get() is True
         assert conn.support_batched_get_non_blocking() is False
 
-    def test_lmcache_config_exposes_protocol_fallback(self):
+    def test_lmcache_config_exposes_page_first_multi_buffer(self):
         from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
             MooncakeStoreConfig,
         )
@@ -233,7 +233,6 @@ class TestMooncakeConnectorCapabilities:
                 "metadata_server": "127.0.0.1:8080",
                 "master_server_address": "127.0.0.1:50051",
                 "protocol": "rdma",
-                "protocol_fallback": "tcp",
                 "device_name": "mlx5_0",
                 "mooncake_page_first_multi_buffer": True,
             }
@@ -242,7 +241,6 @@ class TestMooncakeConnectorCapabilities:
         mooncake_config = MooncakeStoreConfig.load_from_lmcache_config(config)
 
         assert mooncake_config.protocol == "rdma"
-        assert mooncake_config.protocol_fallback == "tcp"
         assert mooncake_config.device_name == "mlx5_0"
         assert mooncake_config.page_first_multi_buffer is True
 
