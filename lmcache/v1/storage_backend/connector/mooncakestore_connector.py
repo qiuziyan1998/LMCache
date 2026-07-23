@@ -35,7 +35,6 @@ class MooncakeStoreConfig:
     transfer_timeout: int
     storage_root_dir: str
     prefer_local_alloc: bool = False
-    protocol_fallback: Optional[str] = None
     page_first_multi_buffer: bool = False
 
     @staticmethod
@@ -57,7 +56,6 @@ class MooncakeStoreConfig:
             transfer_timeout=config.get("transfer_timeout", 1),
             storage_root_dir=config.get("storage_root_dir", ""),
             prefer_local_alloc=prefer_local_alloc,
-            protocol_fallback=config.get("protocol_fallback"),
             page_first_multi_buffer=config.get(
                 "mooncake_page_first_multi_buffer", False
             ),
@@ -95,7 +93,6 @@ class MooncakeStoreConfig:
             transfer_timeout=extra_config.get("transfer_timeout", 1),
             storage_root_dir=extra_config.get("storage_root_dir", ""),
             prefer_local_alloc=prefer_local_alloc,
-            protocol_fallback=extra_config.get("protocol_fallback"),
             page_first_multi_buffer=extra_config.get(
                 "mooncake_page_first_multi_buffer", False
             ),
@@ -222,61 +219,15 @@ class MooncakestoreConnector(RemoteConnector):
                     f"Failed to determine NUMA mapping before Mooncake setup: {e}"
                 )
 
-            requested_protocol = self.config.protocol
-
-            def setup_store(protocol: str) -> None:
-                result = self.store.setup(
-                    self.config.local_hostname,
-                    self.config.metadata_server,
-                    self.config.global_segment_size,
-                    self.config.local_buffer_size,
-                    protocol,
-                    self.config.device_name,
-                    self.config.master_server_address,
-                )
-                if isinstance(result, int) and result != 0:
-                    raise RuntimeError(
-                        "Mooncake store setup returned error "
-                        f"{result} for protocol={protocol}"
-                    )
-
-            try:
-                setup_store(requested_protocol)
-                self.effective_protocol = requested_protocol
-            except Exception as primary_exc:
-                fallback_protocol = self.config.protocol_fallback
-                if (
-                    not fallback_protocol
-                    or fallback_protocol == requested_protocol
-                ):
-                    raise
-                logger.warning(
-                    "Mooncake protocol setup failed; retrying configured "
-                    "fallback: requested=%s fallback=%s error=%s",
-                    requested_protocol,
-                    fallback_protocol,
-                    primary_exc,
-                )
-                close_store = getattr(self.store, "close", None)
-                if callable(close_store):
-                    try:
-                        close_store()
-                    except Exception:
-                        logger.debug(
-                            "Failed to close Mooncake store after setup error",
-                            exc_info=True,
-                        )
-                self.store = MooncakeDistributedStore()
-                try:
-                    setup_store(fallback_protocol)
-                except Exception as fallback_exc:
-                    raise RuntimeError(
-                        "Mooncake requested and fallback protocol setup both "
-                        "failed: "
-                        f"requested={requested_protocol}, "
-                        f"fallback={fallback_protocol}"
-                    ) from fallback_exc
-                self.effective_protocol = fallback_protocol
+            self.store.setup(
+                self.config.local_hostname,
+                self.config.metadata_server,
+                self.config.global_segment_size,
+                self.config.local_buffer_size,
+                self.config.protocol,
+                self.config.device_name,
+                self.config.master_server_address,
+            )
 
             logger.info("Mooncake store setup completed successfully")
 
