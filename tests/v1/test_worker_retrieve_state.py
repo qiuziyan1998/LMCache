@@ -1891,7 +1891,14 @@ class TestWorkerRetrieveState:
         def _retriever():
             payload = yield None
             captured.append(payload)
-            yield torch.ones(3, dtype=torch.bool)
+            payload[adapter_mod._EXPLICIT_SPARSE_LOAD_RESULT_KEY] = {
+                "request_id": "req-1",
+                "layer_id": 0,
+                "requested_tokens": 3,
+                "loaded_tokens": 3,
+                "status": "loaded",
+            }
+            yield torch.ones(4, dtype=torch.bool)
 
         retriever = _retriever()
         next(retriever)
@@ -1911,6 +1918,275 @@ class TestWorkerRetrieveState:
         assert len(captured) == 1
         assert captured[0]["selected_token_counts"].item() == 3
         assert captured[0]["selected_token_ids"].shape == (4,)
+
+    @pytest.mark.parametrize(
+        ("selected", "targets", "counts", "reason"),
+        [
+            (
+                torch.tensor([[1]], dtype=torch.int32),
+                None,
+                torch.tensor([1], dtype=torch.int32),
+                "selected_token_counts requires target_slot_mapping",
+            ),
+            (
+                None,
+                torch.tensor([[100]], dtype=torch.long),
+                torch.tensor([1], dtype=torch.int32),
+                "explicit target slots require selected_tokens",
+            ),
+        ],
+    )
+    def test_explicit_sparse_payload_fields_are_atomic(
+        self,
+        selected,
+        targets,
+        counts,
+        reason,
+    ):
+        impl, _, _ = make_worker_connector([], use_layerwise=True)
+        with pytest.raises(RuntimeError, match=reason):
+            impl.wait_for_layer_load(
+                "model.layers.0.self_attn.attn",
+                selected_tokens=selected,
+                target_slot_mapping=targets,
+                selected_token_counts=counts,
+            )
+
+    @pytest.mark.parametrize(
+        ("ret_mask", "result", "reason"),
+        [
+            (
+                torch.tensor([True, True, False, False]),
+                {
+                    "request_id": "req-strict",
+                    "layer_id": 0,
+                    "requested_tokens": 2,
+                    "loaded_tokens": 2,
+                    "status": "loaded",
+                },
+                "LMCache source prefix is incomplete",
+            ),
+            (
+                torch.ones(4, dtype=torch.bool),
+                None,
+                "device connector did not report a load result",
+            ),
+            (
+                torch.ones(4, dtype=torch.bool),
+                {
+                    "request_id": "req-strict",
+                    "layer_id": 0,
+                    "requested_tokens": 2,
+                    "loaded_tokens": 1,
+                    "status": "loaded",
+                },
+                "not all selected tokens were loaded",
+            ),
+            (
+                torch.ones(4, dtype=torch.bool),
+                {
+                    "request_id": "req-other",
+                    "layer_id": 0,
+                    "requested_tokens": 2,
+                    "loaded_tokens": 2,
+                    "status": "loaded",
+                },
+                "device connector reported the wrong request",
+            ),
+            (
+                torch.ones(4, dtype=torch.bool),
+                {
+                    "request_id": "req-strict",
+                    "layer_id": 1,
+                    "requested_tokens": 2,
+                    "loaded_tokens": 2,
+                    "status": "loaded",
+                },
+                "device connector reported the wrong layer",
+            ),
+            (
+                torch.ones(4, dtype=torch.bool),
+                {
+                    "request_id": "req-strict",
+                    "layer_id": 0,
+                    "requested_tokens": "not-an-integer",
+                    "loaded_tokens": 2,
+                    "status": "loaded",
+                },
+                "device connector returned an invalid integer field "
+                "requested_tokens='not-an-integer'",
+            ),
+        ],
+    )
+    def test_explicit_sparse_load_is_strict(
+        self, ret_mask, result, reason
+    ):
+        req = make_sparse_req_meta("req-strict", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+        impl._layerwise_sparse_req_ids = [req.req_id]
+
+        def _retriever():
+            payload = yield None
+            if result is not None:
+                payload[adapter_mod._EXPLICIT_SPARSE_LOAD_RESULT_KEY] = result
+            yield ret_mask
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"request=req-strict layer=model\.layers\.0\.self_attn\.attn "
+                f"reason={reason}"
+            ),
+        ):
+            impl.wait_for_layer_load(
+                "model.layers.0.self_attn.attn",
+                selected_tokens=torch.tensor([[0, 1, 0]], dtype=torch.int32),
+                request_ids=[req.req_id],
+                target_slot_mapping=torch.tensor(
+                    [[903, 900, 0]], dtype=torch.long
+                ),
+                selected_token_counts=torch.tensor([2], dtype=torch.int32),
+            )
+
+    def test_explicit_sparse_zero_count_is_successful_no_op(self):
+        req = make_sparse_req_meta("req-zero", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+        impl._layerwise_sparse_req_ids = [req.req_id]
+
+        def _retriever():
+            payload = yield None
+            payload[adapter_mod._EXPLICIT_SPARSE_LOAD_RESULT_KEY] = {
+                "request_id": req.req_id,
+                "layer_id": 0,
+                "requested_tokens": 0,
+                "loaded_tokens": 0,
+                "status": "no_op",
+            }
+            yield torch.zeros(4, dtype=torch.bool)
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=torch.tensor([[99, 98]], dtype=torch.int32),
+            request_ids=[req.req_id],
+            target_slot_mapping=torch.tensor([[903, 907]], dtype=torch.long),
+            selected_token_counts=torch.tensor([0], dtype=torch.int32),
+        )
+
+        assert impl.current_layer == 1
+
+    def test_explicit_sparse_unhealthy_retriever_fails_with_context(self):
+        req = make_sparse_req_meta("req-unhealthy", token_count=4)
+        impl, _, engine = make_worker_connector([req], use_layerwise=True)
+        engine.is_healthy = lambda: False
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+        impl._layerwise_sparse_req_ids = [req.req_id]
+
+        def _retriever():
+            yield torch.zeros(4, dtype=torch.bool)
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"request=req-unhealthy layer=model\.layers\.0\.self_attn\.attn "
+                r"reason=LMCache is unhealthy"
+            ),
+        ):
+            impl.wait_for_layer_load(
+                "model.layers.0.self_attn.attn",
+                selected_tokens=torch.tensor([[0]], dtype=torch.int32),
+                request_ids=[req.req_id],
+                target_slot_mapping=torch.tensor([[903]], dtype=torch.long),
+                selected_token_counts=torch.tensor([1], dtype=torch.int32),
+            )
+
+    def test_explicit_sparse_source_setup_error_has_request_layer_context(self):
+        req = make_sparse_req_meta("req-source-error", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+        impl._layerwise_sparse_req_ids = [req.req_id]
+
+        def _retriever():
+            yield None
+            raise ValueError("source chunk 3 is missing")
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"request=req-source-error "
+                r"layer=model\.layers\.0\.self_attn\.attn "
+                r"reason=layerwise retriever raised ValueError: "
+                r"source chunk 3 is missing"
+            ),
+        ):
+            impl.wait_for_layer_load(
+                "model.layers.0.self_attn.attn",
+                selected_tokens=torch.tensor([[0]], dtype=torch.int32),
+                request_ids=[req.req_id],
+                target_slot_mapping=torch.tensor([[903]], dtype=torch.long),
+                selected_token_counts=torch.tensor([1], dtype=torch.int32),
+            )
+
+    def test_explicit_sparse_connector_error_adds_callsite_layer_context(self):
+        req = make_sparse_req_meta("req-connector-error", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+        impl._layerwise_sparse_req_ids = [req.req_id]
+
+        def _retriever():
+            yield None
+            raise RuntimeError(
+                "Explicit sparse retrieve failed: "
+                "request=req-connector-error layer=0 reason=middle chunk is short"
+            )
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"request=req-connector-error "
+                r"layer=model\.layers\.0\.self_attn\.attn "
+                r"reason=device connector reported: Explicit sparse retrieve "
+                r"failed: request=req-connector-error layer=0 "
+                r"reason=middle chunk is short"
+            ),
+        ):
+            impl.wait_for_layer_load(
+                "model.layers.0.self_attn.attn",
+                selected_tokens=torch.tensor([[0]], dtype=torch.int32),
+                request_ids=[req.req_id],
+                target_slot_mapping=torch.tensor([[903]], dtype=torch.long),
+                selected_token_counts=torch.tensor([1], dtype=torch.int32),
+            )
 
     def test_wait_for_layer_load_routes_exact_batch_rows_per_request(self):
         requests = [
@@ -2702,6 +2978,8 @@ class TestWorkerRetrieveState:
             "lmcache_cached_tokens",
         }
         prepared_source = kwargs["prepared_sparse_source"]
+        assert kwargs["req_id"] == req.req_id
+        assert kwargs["lmcache_cached_tokens"] == 256
         assert prepared_source.total_tokens == 256
         assert prepared_source.chunk_token_counts == (256,)
         assert prepared_source.pointer_device == torch.device("cpu")

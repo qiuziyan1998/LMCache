@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+from typing import TYPE_CHECKING, Any, Generator, NoReturn, Optional, Union
 
 # Third Party
 from vllm.config import (
@@ -69,6 +69,7 @@ SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
 SPARSE_DECODE_SHARED_CPU_PHASE = "sparse_decode_bootstrap"
+_EXPLICIT_SPARSE_LOAD_RESULT_KEY = "_lmcache_explicit_sparse_load_result"
 LayerwiseSaveKey = tuple[str, str, int, int, int]
 
 
@@ -753,6 +754,9 @@ class ReqMeta:
     # Sparse decode only: shared with RequestTracker, reused across decode steps.
     decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
+    explicit_sparse_source_validation_key: Optional[tuple[int, int]] = field(
+        default=None, repr=False
+    )
     # Decode window save metadata, separate from the regular request save progress.
     is_decode_window_save: bool = False
     decode_window_start: Optional[int] = None
@@ -4811,6 +4815,14 @@ class LMCacheConnectorV1Impl:
                 "slot_mapping": slot_mapping,
                 "sync": sync,
                 "kv_group": kv_group,
+                # Keep request context on the prepared fast path as well.
+                # The device connector uses it to turn any strict sparse-load
+                # failure into an actionable request/layer error instead of
+                # reporting request=None.
+                "req_id": request.req_id,
+                "lmcache_cached_tokens": (
+                    request.load_spec.lmcache_cached_tokens
+                ),
                 "prepared_sparse_source": prepared_source,
             }
         else:
@@ -5569,6 +5581,120 @@ class LMCacheConnectorV1Impl:
             self._abort_layerwise_retrieve_step(requests)
             raise
 
+    @staticmethod
+    def _validate_explicit_sparse_load_result(
+        request: ReqMeta,
+        layer_name: str,
+        expected_layer_id: int,
+        payload: dict[str, Any],
+        ret_token_mask: Optional[torch.Tensor],
+    ) -> None:
+        """Validate source availability and the connector's scatter result.
+
+        ret_token_mask is a CPU source-availability mask; it does not by itself
+        prove that the current layer's scatter completed. The connector writes
+        a separate shape-derived result into the mutable payload. No selected
+        token/count device tensor is read here.
+        """
+
+        def fail(reason: str) -> NoReturn:
+            raise RuntimeError(
+                "Explicit sparse retrieve failed: "
+                f"request={request.req_id} layer={layer_name} reason={reason}"
+            )
+
+        result = payload.pop(_EXPLICIT_SPARSE_LOAD_RESULT_KEY, None)
+        if not isinstance(result, dict):
+            fail("device connector did not report a load result")
+
+        reported_request_id = result.get("request_id")
+        if reported_request_id != request.req_id:
+            fail(
+                "device connector reported the wrong request "
+                f"reported={reported_request_id!r} expected={request.req_id!r}"
+            )
+
+        def result_int(field: str) -> int:
+            raw_value = result.get(field)
+            try:
+                return int(raw_value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                fail(
+                    "device connector returned an invalid integer field "
+                    f"{field}={raw_value!r}: {type(exc).__name__}: {exc}"
+                )
+
+        reported_layer_id = result_int("layer_id")
+        if reported_layer_id != expected_layer_id:
+            fail(
+                "device connector reported the wrong layer "
+                f"reported={reported_layer_id} expected={expected_layer_id}"
+            )
+        requested = result_int("requested_tokens")
+        loaded = result_int("loaded_tokens")
+        status = result.get("status")
+        if requested == 0:
+            if loaded != 0 or status != "no_op":
+                fail(
+                    "zero-count load was not reported as a no-op "
+                    f"status={status!r} loaded={loaded}"
+                )
+            return
+        if requested < 0 or loaded != requested or status != "loaded":
+            fail(
+                "not all selected tokens were loaded "
+                f"status={status!r} loaded={loaded} requested={requested}"
+            )
+        if not isinstance(ret_token_mask, torch.Tensor):
+            fail(
+                "LMCache returned no valid source availability mask "
+                f"type={type(ret_token_mask).__name__}"
+            )
+        if ret_token_mask.device.type != "cpu":
+            fail(
+                "source availability mask must stay on CPU to avoid a "
+                f"per-layer device sync, got device={ret_token_mask.device}"
+            )
+
+        load_spec = request.load_spec
+        frontier = min(
+            int(load_spec.lmcache_cached_tokens) if load_spec is not None else 0,
+            len(request.token_ids),
+        )
+        validation_key = (frontier, ret_token_mask.data_ptr())
+        if request.explicit_sparse_source_validation_key == validation_key:
+            return
+        ret_mask = ret_token_mask.to(dtype=torch.bool).reshape(-1)
+        if ret_mask.numel() < frontier:
+            fail(
+                "source availability mask is shorter than the LMCache frontier "
+                f"mask_tokens={ret_mask.numel()} frontier={frontier}"
+            )
+        expected_mask = request.decode_token_mask
+        if expected_mask is None:
+            missing = ~ret_mask[:frontier]
+        else:
+            if expected_mask.device.type != "cpu":
+                fail(
+                    "expected source mask must stay on CPU to avoid a "
+                    f"per-layer device sync, got device={expected_mask.device}"
+                )
+            expected = expected_mask.to(dtype=torch.bool).reshape(-1)
+            if expected.numel() < frontier:
+                fail(
+                    "expected source mask is shorter than the LMCache frontier "
+                    f"mask_tokens={expected.numel()} frontier={frontier}"
+                )
+            missing = expected[:frontier] & ~ret_mask[:frontier]
+        missing_indices = torch.nonzero(missing, as_tuple=False).reshape(-1)
+        if missing_indices.numel():
+            fail(
+                "LMCache source prefix is incomplete "
+                f"first_missing_token={int(missing_indices[0])} "
+                f"missing_tokens={missing_indices.numel()} frontier={frontier}"
+            )
+        request.explicit_sparse_source_validation_key = validation_key
+
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(
         self,
@@ -5599,6 +5725,25 @@ class LMCacheConnectorV1Impl:
                 selected_tokens/target_slot_mapping/selected_token_counts were
                 built. LMCache waits on this before row-selecting those tensors.
         """
+        # ``target_slot_mapping`` without counts is the legacy exact-width
+        # payload and remains supported. A counted payload is the strict
+        # scratch-reuse contract and is never allowed to lose its paired
+        # target tensor.
+        if (
+            selected_token_counts is not None
+            and target_slot_mapping is None
+        ):
+            raise RuntimeError(
+                "Explicit sparse retrieve failed: "
+                f"layer={layer_name} reason=selected_token_counts requires "
+                "target_slot_mapping"
+            )
+        if target_slot_mapping is not None and selected_tokens is None:
+            raise RuntimeError(
+                "Explicit sparse retrieve failed: "
+                f"layer={layer_name} reason=explicit target slots require "
+                "selected_tokens"
+            )
         if self.layerwise_retrievers and logger.isEnabledFor(10):
             logger.debug("Waiting for layer %d to be loaded", self.current_layer)
 
@@ -5871,7 +6016,58 @@ class LMCacheConnectorV1Impl:
                             indexer_retriever.send((None, 0))
                             sparse_indexer_sent_layers.add(indexer_sent_key)
                     else:
-                        ret_token_mask = layerwise_retriever.send(sparse_payload)
+                        strict_explicit_payload = (
+                            isinstance(sparse_payload, dict)
+                            and sparse_payload.get("target_slot_mapping") is not None
+                            and sparse_payload.get("selected_token_counts") is not None
+                        )
+                        try:
+                            ret_token_mask = layerwise_retriever.send(sparse_payload)
+                        except StopIteration as exc:
+                            if strict_explicit_payload:
+                                health_fn = getattr(
+                                    self.lmcache_engine, "is_healthy", None
+                                )
+                                reason = (
+                                    "LMCache is unhealthy"
+                                    if callable(health_fn) and not health_fn()
+                                    else "layerwise retriever ended before load"
+                                )
+                                raise RuntimeError(
+                                    "Explicit sparse retrieve failed: "
+                                    f"request={request.req_id} layer={layer_name} "
+                                    f"reason={reason}"
+                                ) from exc
+                            raise
+                        except Exception as exc:
+                            if strict_explicit_payload:
+                                if (
+                                    isinstance(exc, RuntimeError)
+                                    and str(exc).startswith(
+                                        "Explicit sparse retrieve failed:"
+                                    )
+                                ):
+                                    raise RuntimeError(
+                                        "Explicit sparse retrieve failed: "
+                                        f"request={request.req_id} "
+                                        f"layer={layer_name} reason=device "
+                                        f"connector reported: {exc}"
+                                    ) from exc
+                                raise RuntimeError(
+                                    "Explicit sparse retrieve failed: "
+                                    f"request={request.req_id} layer={layer_name} "
+                                    "reason=layerwise retriever raised "
+                                    f"{type(exc).__name__}: {exc}"
+                                ) from exc
+                            raise
+                        if strict_explicit_payload:
+                            self._validate_explicit_sparse_load_result(
+                                request,
+                                layer_name,
+                                self.current_layer,
+                                sparse_payload,
+                                ret_token_mask,
+                            )
                         if (
                             indexer_retriever is not None
                             and sparse_indexer_sent_layers is not None
