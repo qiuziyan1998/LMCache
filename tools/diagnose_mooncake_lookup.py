@@ -297,6 +297,18 @@ def _all_layer_keys(
     ]
 
 
+def _payload_layout(
+    key: CacheEngineKey,
+    payload_bytes: int,
+) -> tuple[torch.Size, torch.dtype, MemoryFormat]:
+    fmt = (
+        MemoryFormat.KV_DSA_INDEX_FMT
+        if key.kv_group == 1
+        else MemoryFormat.KV_MLA_LATENT_FMT
+    )
+    return torch.Size([1, 1, payload_bytes]), torch.uint8, fmt
+
+
 def _storage_manager(
     spec: RunSpec,
 ) -> tuple[StorageManager, RemoteBackend, list[tuple[int, list[CacheEngineKey]]]]:
@@ -482,11 +494,15 @@ def _producer(
         for offset in range(0, len(keys), spec.put_batch_size):
             key_batch = keys[offset : offset + spec.put_batch_size]
             objects = []
-            for index, _ in enumerate(key_batch):
+            for index, key in enumerate(key_batch):
+                shape, dtype, fmt = _payload_layout(
+                    key,
+                    spec.put_payload_bytes,
+                )
                 memory_obj = manager.allocate(
-                    torch.Size([spec.put_payload_bytes]),
-                    torch.uint8,
-                    fmt=MemoryFormat.BINARY,
+                    shape,
+                    dtype,
+                    fmt=fmt,
                     eviction=False,
                     busy_loop=False,
                 )

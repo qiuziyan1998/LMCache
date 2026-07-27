@@ -106,3 +106,25 @@ def test_diagnostic_marks_short_status_response() -> None:
         "key": "omitted",
         "status": None,
     }
+
+
+@pytest.mark.parametrize(
+    ("kv_group", "expected_format"),
+    (
+        (0, "KV_MLA_LATENT_FMT"),
+        (1, "KV_DSA_INDEX_FMT"),
+    ),
+)
+def test_roundtrip_payload_uses_supported_layerwise_format(
+    kv_group: int,
+    expected_format: str,
+) -> None:
+    diagnostic = _load_diagnostic_module()
+    key = type("_Key", (), {"kv_group": kv_group})()
+
+    shape, dtype, fmt = diagnostic._payload_layout(key, 7)
+
+    assert shape == diagnostic.torch.Size([1, 1, 7])
+    assert dtype == diagnostic.torch.uint8
+    assert fmt is getattr(diagnostic.MemoryFormat, expected_format)
+    assert fmt is not diagnostic.MemoryFormat.BINARY
