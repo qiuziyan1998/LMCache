@@ -11,6 +11,10 @@ from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mooncake_key_trace import (
+    maybe_trace_mooncake_store,
+    run_mooncake_zero_lookup_retries,
+)
 from lmcache.v1.mooncake_layout import (
     mooncake_page_key,
     mooncake_page_layout_enabled,
@@ -44,6 +48,11 @@ class MooncakeLookupClient(LookupClientInterface):
             "tcp",
             "",
             master_addr,
+        )
+        self.store = maybe_trace_mooncake_store(
+            self.store,
+            "scheduler-lookup",
+            metadata,
         )
 
         # Initialize token database for processing tokens
@@ -118,42 +127,55 @@ class MooncakeLookupClient(LookupClientInterface):
             chunk_keys_by_chunk.append(chunk_keys)
             ends.append(end)
 
+        if not chunk_keys_by_chunk:
+            return 0
+
         if sampled_lookup:
-            def batch_exists(keys: list[str]) -> bool:
-                if not keys:
-                    return False
-                results = self.store.batch_is_exist(keys)
-                return len(results) == len(keys) and all(
-                    result == 1 for result in results
+
+            def sampled_lookup_once() -> int:
+                def batch_exists(keys: list[str]) -> bool:
+                    if not keys:
+                        return False
+                    results = self.store.batch_is_exist(keys)
+                    return len(results) == len(keys) and all(
+                        result == 1 for result in results
+                    )
+
+                winner = find_last_sampled_hit(
+                    len(chunk_keys_by_chunk),
+                    lambda index: batch_exists(chunk_keys_by_chunk[index]),
                 )
+                return 0 if winner is None else ends[winner]
 
-            winner = find_last_sampled_hit(
-                len(chunk_keys_by_chunk),
-                lambda index: batch_exists(chunk_keys_by_chunk[index]),
+            return run_mooncake_zero_lookup_retries(
+                getattr(self, "config", None),
+                lookup_id,
+                sampled_lookup_once,
             )
-            return 0 if winner is None else ends[winner]
 
-        # Use batch_is_exist to check all keys at once
-        # rets is list of int: 1 = found, 0 = not found, -1 = error
         keys = [key for chunk_keys in chunk_keys_by_chunk for key in chunk_keys]
-        rets = self.store.batch_is_exist(keys)
 
-        # Find the first key that doesn't exist (ret != 1)
-        # This follows the same logic as cache engine's lookup method
-        offset = 0
-        for chunk_idx, chunk_keys in enumerate(chunk_keys_by_chunk):
-            key_count = len(chunk_keys)
-            chunk_rets = rets[offset : offset + key_count]
-            offset += key_count
-            if len(chunk_rets) < key_count or any(
-                ret != 1 for ret in chunk_rets
-            ):
-                # Return the end position of the previous chunk
-                # If chunk_idx == 0, no chunks were found, return 0
-                return ends[chunk_idx - 1] if chunk_idx > 0 else 0
+        def lookup_once() -> int:
+            # Use batch_is_exist to check all keys at once.
+            # Results: 1 = found, 0 = not found, -1 = error.
+            rets = self.store.batch_is_exist(keys)
 
-        # All keys were found, return the last end position
-        return ends[-1] if ends else 0
+            offset = 0
+            for chunk_idx, chunk_keys in enumerate(chunk_keys_by_chunk):
+                key_count = len(chunk_keys)
+                chunk_rets = rets[offset : offset + key_count]
+                offset += key_count
+                if len(chunk_rets) < key_count or any(
+                    ret != 1 for ret in chunk_rets
+                ):
+                    return ends[chunk_idx - 1] if chunk_idx > 0 else 0
+            return ends[-1] if ends else 0
+
+        return run_mooncake_zero_lookup_retries(
+            getattr(self, "config", None),
+            lookup_id,
+            lookup_once,
+        )
 
     def supports_producer_reuse(self) -> bool:
         """Return True as MooncakeLookupClient supports producer kvcache reuse"""

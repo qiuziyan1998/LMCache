@@ -419,6 +419,15 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": 3000,
         "env_converter": int,
     },
+    "mooncake_lookup_retry_delays_ms": {
+        "type": Optional[list[int]],
+        "default": [10, 50, 200],
+        "env_converter": _to_int_list,
+        "description": (
+            "Delays before retrying a zero-token Mooncake lookup. "
+            "An empty list disables retry."
+        ),
+    },
     "min_retrieve_tokens": {
         "type": int,
         "default": 0,
@@ -589,6 +598,12 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
 # Specialized methods that are unique to LMCacheEngineConfig
 def _validate_config(self):
     """Validate configuration"""
+
+    retry_delays = self.mooncake_lookup_retry_delays_ms or []
+    if any(delay < 0 for delay in retry_delays):
+        raise ValueError(
+            "mooncake_lookup_retry_delays_ms must contain non-negative values"
+        )
 
     # needed for the old async serializer implementation
     # # auto-adjust save_unfull_chunk for async loading to prevent CPU fragmentation

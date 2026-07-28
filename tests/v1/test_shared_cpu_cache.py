@@ -594,6 +594,32 @@ def test_sampled_lookup_returns_zero_after_first_chunk_miss() -> None:
     assert engine.storage_manager.calls[0][1] == ["RemoteBackend"]
 
 
+def test_sampled_mooncake_lookup_retries_only_complete_zero_result() -> None:
+    engine = _make_sampled_lookup_engine([])
+    engine.config.remote_url = "mooncakestore://metadata/"
+    engine.config.mooncake_lookup_retry_delays_ms = [0, 0]
+
+    class _DelayedRemoteSampleStorageManager(
+        _RecordingRemoteSampleStorageManager
+    ):
+        def batched_contains(self, keys, search_range=None, pin=False):
+            keys = list(keys)
+            self.calls.append((keys, search_range, pin))
+            if len(self.calls) < 3:
+                return 0, {}
+            return len(keys), {"RemoteBackend": keys}
+
+    engine.storage_manager = _DelayedRemoteSampleStorageManager([])
+
+    assert engine.lookup(list(range(14)), lookup_id="req", pin=False) == 14
+    first_keys = _sampled_keys_for_chunk(engine.token_database, 0)
+    assert [call[0] for call in engine.storage_manager.calls[:3]] == [
+        first_keys,
+        first_keys,
+        first_keys,
+    ]
+
+
 def test_sampled_lookup_can_select_partial_tail_chunk() -> None:
     token_db = _FakeMultiChunkLookupTokenDatabase()
     first_keys = _sampled_keys_for_chunk(token_db, 0)
