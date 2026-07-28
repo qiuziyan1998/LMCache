@@ -173,28 +173,6 @@ def test_mooncake_sampled_lookup_reverse_scans_first_and_last_layers():
     ]
 
 
-def test_mooncake_sampled_lookup_retries_complete_zero_result():
-    class _DelayedStore(_FakeStore):
-        def batch_is_exist(self, keys):
-            self.keys = keys
-            self.calls.append(list(keys))
-            return [1 for _ in keys] if len(self.calls) == 3 else [0 for _ in keys]
-
-    client = MooncakeLookupClient.__new__(MooncakeLookupClient)
-    client.config = SimpleNamespace(
-        dsa_two_groups=True,
-        use_layerwise=True,
-        experimental_sampled_layerwise_lookup=True,
-        mooncake_lookup_retry_delays_ms=[0, 0],
-    )
-    client.metadata = SimpleNamespace(kv_shape=(2, 1, 256, 1, 1))
-    client.store = _DelayedStore()
-    client.token_database = _FakeTokenDatabase(kv_group=0)
-
-    assert client.lookup([1, 2, 3], lookup_id="req") == 3
-    assert len(client.store.calls) == 3
-
-
 def test_mooncake_page_lookup_uses_pages_and_keeps_partial_tail_legacy():
     token_db = _FakeMultiChunkTokenDatabase(kv_group=0)
     client = MooncakeLookupClient.__new__(MooncakeLookupClient)

@@ -129,33 +129,6 @@ def test_experimental_sampled_lookup_env_knob(monkeypatch):
     assert config.experimental_sampled_layerwise_lookup is True
 
 
-def test_mooncake_zero_lookup_retry_defaults_and_env_override(monkeypatch):
-    assert LMCacheEngineConfig.from_defaults().mooncake_lookup_retry_delays_ms == [
-        10,
-        50,
-        200,
-    ]
-    first = LMCacheEngineConfig()
-    second = LMCacheEngineConfig()
-    first.mooncake_lookup_retry_delays_ms.append(500)
-    assert second.mooncake_lookup_retry_delays_ms == [10, 50, 200]
-
-    monkeypatch.setenv("LMCACHE_MOONCAKE_LOOKUP_RETRY_DELAYS_MS", "0,25")
-
-    config = LMCacheEngineConfig.from_env()
-
-    assert config.mooncake_lookup_retry_delays_ms == [0, 25]
-
-
-def test_mooncake_zero_lookup_retry_rejects_negative_delay():
-    config = LMCacheEngineConfig.from_defaults(
-        mooncake_lookup_retry_delays_ms=[10, -1],
-    )
-
-    with pytest.raises(ValueError, match="must contain non-negative values"):
-        config.validate()
-
-
 @pytest.mark.parametrize(
     ("overrides", "missing_flag"),
     [

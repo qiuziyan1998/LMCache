@@ -14,7 +14,6 @@ from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
-from lmcache.v1.mooncake_key_trace import maybe_trace_mooncake_store
 from lmcache.v1.mooncake_layout import mooncake_page_key
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
@@ -228,11 +227,6 @@ class MooncakestoreConnector(RemoteConnector):
                 self.config.protocol,
                 self.config.device_name,
                 self.config.master_server_address,
-            )
-            self.store = maybe_trace_mooncake_store(
-                self.store,
-                "worker-connector",
-                local_cpu_backend.metadata,
             )
 
             logger.info("Mooncake store setup completed successfully")

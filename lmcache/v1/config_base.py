@@ -7,8 +7,7 @@ for all LMCache configuration systems to avoid code duplication.
 """
 
 # Standard
-from copy import deepcopy
-from dataclasses import field, make_dataclass
+from dataclasses import make_dataclass
 from typing import Any, Callable, Dict, Optional, Protocol, Union
 import ast
 import json
@@ -220,12 +219,7 @@ def create_config_class(
     # Extract fields from configuration definitions
     fields_dict = {}
     for name, config in config_definitions.items():
-        default = config["default"]
-        if isinstance(default, (dict, list, set)):
-            default = field(
-                default_factory=lambda value=default: deepcopy(value),
-            )
-        fields_dict[name] = (config["type"], default)
+        fields_dict[name] = (config["type"], config["default"])
 
     def _post_init(self):
         """Post-initialization setup"""

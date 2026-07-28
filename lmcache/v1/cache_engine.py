@@ -57,10 +57,6 @@ from lmcache.v1.memory_management import (  # noqa: E501
     TensorMemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.mooncake_key_trace import (
-    mooncake_trace_context,
-    run_mooncake_zero_lookup_retries,
-)
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
@@ -2964,17 +2960,12 @@ class LMCacheEngine:
             transfer_spec = kwargs.get("transfer_spec", None)
             # TODO: we implicitly rely on batched_put to call ref_count_down
             # this management should be done in a cleaner way
-            with mooncake_trace_context(
-                req_id,
-                "store",
-                kv_group=kv_group,
-            ):
-                self.storage_manager.batched_put(
-                    keys,
-                    memory_objs,
-                    transfer_spec=transfer_spec,
-                    location=self.store_location,
-                )
+            self.storage_manager.batched_put(
+                keys,
+                memory_objs,
+                transfer_spec=transfer_spec,
+                location=self.store_location,
+            )
 
         self.stats_monitor.on_store_finished(
             store_stats,
@@ -3211,17 +3202,11 @@ class LMCacheEngine:
                 for layer_id in range(self.num_layers):
                     yield
                     next(mem_obj_generator)
-                    with mooncake_trace_context(
-                        req_id,
-                        "store",
-                        kv_group=kv_group,
-                        layer_id=layer_id,
-                    ):
-                        self.storage_manager.batched_put(
-                            keys[layer_id],
-                            memory_objs[layer_id],
-                            location=self.store_location,
-                        )
+                    self.storage_manager.batched_put(
+                        keys[layer_id],
+                        memory_objs[layer_id],
+                        location=self.store_location,
+                    )
                     for mem_obj in memory_objs[layer_id]:
                         pending_store_release.pop(id(mem_obj), None)
 
@@ -3797,26 +3782,12 @@ class LMCacheEngine:
                     for _, end, key in chunk_info_iterator:
                         assert isinstance(key, CacheEngineKey)
                         sampled_chunks.append((end, key))
-                    if not sampled_chunks:
-                        return 0
-
-                    def sampled_lookup_once() -> int:
-                        return self._sampled_scheduler_lookup(
-                            sampled_chunks,
-                            lookup_id=lookup_id,
-                            pin=pin,
-                            request_configs=request_configs,
-                        )
-
-                    remote_url = str(getattr(self.config, "remote_url", ""))
-                    if remote_url.startswith("mooncakestore://"):
-                        res = run_mooncake_zero_lookup_retries(
-                            self.config,
-                            lookup_id,
-                            sampled_lookup_once,
-                        )
-                    else:
-                        res = sampled_lookup_once()
+                    res = self._sampled_scheduler_lookup(
+                        sampled_chunks,
+                        lookup_id=lookup_id,
+                        pin=pin,
+                        request_configs=request_configs,
+                    )
                     return res
 
                 lookup_kv_groups = self._layerwise_lookup_kv_groups()
