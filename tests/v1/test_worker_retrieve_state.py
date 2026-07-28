@@ -4409,7 +4409,7 @@ class TestWorkerRetrieveState:
         assert impl._worker_retrieve_state is not pruned_states
         assert set(impl._worker_retrieve_state) == active_req_ids
 
-    def test_prune_releases_shared_scope_but_keeps_warm_metadata(self):
+    def test_prune_keeps_shared_warm_state(self):
         class FakeMemObj:
             def __init__(self):
                 self.released = 0
@@ -4430,6 +4430,7 @@ class TestWorkerRetrieveState:
         impl = _make_impl()
         impl.lmcache_engine = engine
         backing = FakeMemObj()
+        prepared_source = SimpleNamespace(total_tokens=256)
         engine.register_shared_cpu_sparse_request(
             "req-2",
             owned_groups={0: [[backing]]},
@@ -4443,7 +4444,9 @@ class TestWorkerRetrieveState:
                 cached_ends=[256],
                 cached_memory_objs=[[backing]],
                 cached_chunk_ptrs_npu=[torch.tensor([123], dtype=torch.long)],
+                prepared_sparse_sources={0: prepared_source},
                 metadata_warm=True,
+                token_count=256,
                 shared_latent_status="present",
                 shared_generation=9,
                 pointer_cache_generation=9,
@@ -4455,15 +4458,16 @@ class TestWorkerRetrieveState:
         impl._prune_worker_retrieve_state({"req-1"})
 
         state = impl._worker_retrieve_state["req-2"]
-        assert backing.unpinned == 1
-        assert backing.released == 1
-        assert "req-2" not in engine._shared_cpu_request_leases
+        assert backing.unpinned == 0
+        assert backing.released == 0
+        assert "req-2" in engine._shared_cpu_request_leases
         assert state.cached_keys == [["k2"]]
         assert state.cached_starts == [0]
         assert state.cached_ends == [256]
-        assert state.cached_memory_objs == []
-        assert state.cached_chunk_ptrs_npu == []
-        assert state.shared_request_active is False
+        assert state.cached_memory_objs == [[backing]]
+        assert len(state.cached_chunk_ptrs_npu) == 1
+        assert state.prepared_sparse_sources == {0: prepared_source}
+        assert state.shared_request_active is True
         assert state.metadata_warm is True
 
     def test_prune_drops_non_warm_finished_requests(self):

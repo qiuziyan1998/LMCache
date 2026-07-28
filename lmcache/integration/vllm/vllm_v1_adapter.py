@@ -3476,17 +3476,9 @@ class LMCacheConnectorV1Impl:
         dropped_req_ids = set(self._worker_retrieve_state) - active_req_ids
         for req_id in dropped_req_ids:
             state = self._worker_retrieve_state.get(req_id)
-            shared_request_active = bool(
-                state is not None and state.shared_request_active
-            )
-            if shared_request_active:
-                self._release_shared_worker_retrieve_state(
-                    state,
-                    getattr(self, "lmcache_engine", None),
-                )
             if state is not None and (state.metadata_warm or state.has_cache()):
                 continue
-            if state is not None and not shared_request_active:
+            if state is not None:
                 self._release_shared_worker_retrieve_state(
                     state,
                     getattr(self, "lmcache_engine", None),
