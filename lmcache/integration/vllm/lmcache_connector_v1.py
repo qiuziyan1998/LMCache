@@ -44,6 +44,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             super().__init__(vllm_config=vllm_config, role=role)
         self._lmcache_engine = LMCacheConnectorV1Impl(vllm_config, role, self)
 
+    @property
+    def supports_dsa_compact_external_load(self) -> bool:
+        return self._lmcache_engine.supports_dsa_cold_compact_load()
+
     # ==============================
     # Worker-side methods
     # ==============================
@@ -197,9 +201,12 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
-        return self._lmcache_engine.get_num_new_matched_tokens(
+        matched_tokens = self._lmcache_engine.get_num_new_matched_tokens(
             request, num_computed_tokens
-        ), False
+        )
+        return matched_tokens, self._lmcache_engine.should_load_kv_async(
+            request.request_id
+        )
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -207,7 +214,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         """
         Update KVConnector state after block allocation.
         """
-        self._lmcache_engine.update_state_after_alloc(request, num_external_tokens)
+        self._lmcache_engine.update_state_after_alloc(
+            request, num_external_tokens, blocks
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

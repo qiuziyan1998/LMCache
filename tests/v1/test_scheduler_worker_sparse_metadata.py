@@ -2,6 +2,7 @@
 """P2: scheduler-side sparse decode metadata and zombie request behavior."""
 
 # Standard
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -16,6 +17,7 @@ pytest.importorskip("vllm")
 from lmcache.integration.vllm import vllm_v1_adapter as adapter_module
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
+    LoadSpec,
     RequestTracker,
     WorkerRetrieveState,
 )
@@ -45,6 +47,9 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl.config.save_decode_cache = False
     impl.config.save_full_chunk_in_decode = False
     impl.config.dsa_two_groups = False
+    impl.config.enable_dsa_cold_compact_load = False
+    impl.config.enable_sparse_attention = True
+    impl.config.enable_shared_cpu_cache = False
     impl.config.use_layerwise = True
     impl.config.priority_limit = None
     impl.kv_role = "kv_both"
@@ -106,6 +111,181 @@ def test_dsa_prefix_hit_uses_full_allocation_and_chunk_aligned_committed_end(
     assert load_spec.dsa_committed_end == expected_committed
     assert load_spec.dsa_scratch_capacity == 4096
     assert not hasattr(request, "dsa_external_tail_chunk_start")
+
+
+def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = 8192
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+    request = SimpleNamespace(request_id="cold-full-hit", num_tokens=8192)
+
+    assert impl.get_num_new_matched_tokens(request, 0) == 8191
+    assert impl.should_load_kv_async(request.request_id)
+    assert getattr(
+        impl.load_specs[request.request_id], "dsa_cold_compact_load"
+    )
+    assert impl.load_specs[request.request_id].dsa_committed_end == 8191
+    assert (
+        getattr(impl.load_specs[request.request_id], "dsa_release_frontier")
+        == 7936
+    )
+
+    lookup_client.lookup_cache.return_value = 8193
+    unaligned = SimpleNamespace(request_id="cold-unaligned", num_tokens=8193)
+    assert impl.get_num_new_matched_tokens(unaligned, 0) == 8192
+    assert impl.load_specs[unaligned.request_id].dsa_committed_end == 8192
+    assert (
+        getattr(impl.load_specs[unaligned.request_id], "dsa_release_frontier")
+        == 8192
+    )
+
+    lookup_client.lookup_cache.return_value = 4096
+    partial = SimpleNamespace(request_id="cold-partial-hit", num_tokens=8192)
+    assert impl.get_num_new_matched_tokens(partial, 0) == 4096
+    assert not impl.should_load_kv_async(partial.request_id)
+    partial_spec = impl.load_specs[partial.request_id]
+    assert not hasattr(partial_spec, "dsa_cold_compact_load")
+    assert not hasattr(partial_spec, "dsa_release_frontier")
+
+
+def test_dsa_cold_compact_is_disabled_with_vllm_prefix_caching() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=True)
+    )
+
+    assert not impl.supports_dsa_cold_compact_load()
+
+
+def test_dsa_cold_compact_alloc_metadata_has_only_indexer_slots() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl._pending_dsa_cold_load_metas = {}
+    impl._dsa_cold_indexer_block_ids = {}
+    impl._dsa_cold_load_generation = 0
+    lookup_client = MagicMock()
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+    req_id = "cold-meta"
+    impl.load_specs[req_id] = LoadSpec(
+        vllm_cached_tokens=0,
+        lmcache_cached_tokens=8192,
+        can_load=False,
+    )
+    setattr(impl.load_specs[req_id], "dsa_cold_compact_load", True)
+    request = SimpleNamespace(
+        request_id=req_id,
+        num_tokens=8192,
+        all_token_ids=list(range(8192)),
+        prompt_token_ids=list(range(8192)),
+        sampling_params=SimpleNamespace(extra_args=None),
+        kv_transfer_params=None,
+    )
+    blocks = SimpleNamespace(
+        get_unhashed_block_ids_all_groups=lambda: [
+            list(range(16)),
+            list(range(100, 612)),
+        ]
+    )
+
+    impl.update_state_after_alloc(request, 8191, blocks)
+    req_meta = impl._pending_dsa_cold_load_metas[req_id]
+    assert req_meta.slot_mapping == []
+    assert len(req_meta.indexer_slot_mapping[0]) == 8192
+    assert getattr(req_meta.load_spec, "dsa_cold_load_generation") == 1
+
+
+def test_dsa_cold_compact_finished_signal_waits_for_future() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    future = Future()
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(
+            lmcache_cached_tokens=8192,
+            dsa_cold_load_generation=1,
+        )
+    )
+    state = WorkerRetrieveState(req_id="cold-future")
+    state.location = "LocalCPUBackend"
+    impl._dsa_cold_load_futures = {
+        "cold-future": (1, future, request, {100, 101}, 0.0)
+    }
+    impl._publish_worker_retrieve_state = MagicMock()
+    impl._invalid_block_ids = set()
+
+    assert impl._drain_dsa_cold_load_futures() is None
+    assert "cold-future" in impl._dsa_cold_load_futures
+
+    future.set_result(state)
+    assert impl._drain_dsa_cold_load_futures() == {"cold-future"}
+    impl._publish_worker_retrieve_state.assert_called_once()
+
+
+def test_dsa_cold_compact_abort_releases_unpublished_cpu_state() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    future = Future()
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(
+            lmcache_cached_tokens=8192,
+            dsa_cold_load_generation=1,
+        )
+    )
+    state = WorkerRetrieveState(req_id="cold-aborted")
+    future.set_result(state)
+    impl._dsa_cold_load_futures = {
+        "cold-aborted": (1, future, request, {100, 101}, 0.0)
+    }
+    impl._dsa_cold_aborted_req_ids = {"cold-aborted"}
+    impl.lmcache_engine = object()
+    impl._publish_worker_retrieve_state = MagicMock()
+    impl._release_unadopted_shared_request_objects = MagicMock()
+    impl._release_shared_worker_retrieve_state = MagicMock()
+    impl._release_request_lookup_pins = MagicMock()
+    impl._invalid_block_ids = set()
+
+    assert impl._drain_dsa_cold_load_futures() == {"cold-aborted"}
+    impl._publish_worker_retrieve_state.assert_not_called()
+    impl._release_unadopted_shared_request_objects.assert_called_once_with(
+        state, request
+    )
+    impl._release_shared_worker_retrieve_state.assert_called_once()
+    impl._release_request_lookup_pins.assert_called_once_with("cold-aborted")
+    assert not hasattr(impl, "_dsa_cold_aborted_req_ids")
+
+
+def test_dsa_cold_compact_failure_does_not_mark_request_ready() -> None:
+    impl = _make_scheduler_impl()
+    impl._dsa_cold_loaded_req_ids = set()
+    impl._dsa_cold_indexer_block_ids = {
+        "cold-failed": {100, 101},
+        "cold-ready": {200, 201},
+    }
+    for req_id in ("cold-failed", "cold-ready"):
+        impl.load_specs[req_id] = LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=8192,
+            can_load=True,
+        )
+        setattr(impl.load_specs[req_id], "dsa_cold_compact_load", True)
+
+    impl.update_connector_output(
+        SimpleNamespace(
+            finished_recving={"cold-failed", "cold-ready"},
+            invalid_block_ids={100, 101},
+            completed_decode_window_saves={},
+        )
+    )
+
+    assert impl._dsa_cold_loaded_req_ids == {"cold-ready"}
+    assert not hasattr(impl, "_dsa_cold_indexer_block_ids")
 
 
 def test_first_sparse_step_publishes_initial_release_frontier_once() -> None:

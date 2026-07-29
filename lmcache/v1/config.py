@@ -307,6 +307,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "enable_dsa_cold_compact_load": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
     "enable_shared_cpu_cache": {
         "type": bool,
         "default": False,
@@ -675,6 +680,22 @@ def _validate_config(self):
                 "shared_cpu_cache_name and shm_name refer to the same shared "
                 "slab and must not conflict."
                 + shared_cpu_config_context
+            )
+
+    if self.enable_dsa_cold_compact_load:
+        required_flags = {
+            "use_layerwise": self.use_layerwise,
+            "enable_sparse_attention": self.enable_sparse_attention,
+            "dsa_two_groups": self.dsa_two_groups,
+            "enable_shared_cpu_cache": enable_shared_cpu_cache,
+        }
+        missing_flags = [
+            name for name, enabled in required_flags.items() if not enabled
+        ]
+        if missing_flags:
+            raise ValueError(
+                "enable_dsa_cold_compact_load requires "
+                + ", ".join(f"{name}=true" for name in missing_flags)
             )
 
     if self.experimental_sampled_layerwise_lookup:
