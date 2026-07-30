@@ -774,6 +774,53 @@ class WorkerRetrieveState:
         return bool(self.cached_keys)
 
 
+def _dsa_cold_tensor_summary(value: Any) -> str:
+    if value is None:
+        return "none"
+    if not isinstance(value, torch.Tensor):
+        return type(value).__name__
+    return (
+        f"shape={tuple(value.shape)},dtype={value.dtype},device={value.device},"
+        f"contiguous={value.is_contiguous()}"
+    )
+
+
+def _dsa_cold_state_summary(state: Optional[WorkerRetrieveState]) -> dict[str, Any]:
+    if state is None:
+        return {"present": False}
+
+    def cache_summary(values: list[list[Any]]) -> tuple[int, int]:
+        return sum(bool(layer) for layer in values), sum(len(layer) for layer in values)
+
+    latent_layers, latent_chunks = cache_summary(state.cached_tensors)
+    indexer_layers, indexer_chunks = cache_summary(state.cached_tensors_indexer)
+    return {
+        "present": True,
+        "token_count": int(state.token_count),
+        "metadata_warm": bool(state.metadata_warm),
+        "shared_active": bool(state.shared_request_active),
+        "latent_status": state.shared_latent_status,
+        "index_status": state.shared_index_status,
+        "shared_generation": int(state.shared_generation),
+        "pointer_generation": int(state.pointer_cache_generation),
+        "latent_layers": latent_layers,
+        "latent_chunks": latent_chunks,
+        "indexer_layers": indexer_layers,
+        "indexer_chunks": indexer_chunks,
+        "latent_ptr_layers": sum(
+            ptrs is not None for ptrs in state.cached_chunk_ptrs_npu
+        ),
+        "indexer_ptr_layers": sum(
+            ptrs is not None for ptrs in state.cached_chunk_ptrs_npu_indexer
+        ),
+        "prepared_groups": sorted(state.prepared_sparse_sources),
+        "scope_token": state.request_scope_token,
+        "prune_protected": bool(
+            getattr(state, "_dsa_cold_prune_protected", False)
+        ),
+    }
+
+
 @dataclass
 class ReqMeta:
     # Request id
@@ -3294,6 +3341,19 @@ class LMCacheConnectorV1Impl:
             completed.get(request.req_id, 0), int(committed_end)
         )
         published.add(request.req_id)
+        state = getattr(self, "_worker_retrieve_state", {}).get(request.req_id)
+        if state is not None and getattr(
+            state, "_dsa_cold_prune_protected", False
+        ):
+            logger.info(
+                "[DSA_COLD_DIAG] initial_release_published req=%s "
+                "source=wait_for_save committed_end=%d request_tokens=%d "
+                "state=%s",
+                request.req_id,
+                int(committed_end),
+                len(request.token_ids),
+                _dsa_cold_state_summary(state),
+            )
 
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         completed = getattr(self, "_completed_decode_window_saves", None)
@@ -3315,14 +3375,33 @@ class LMCacheConnectorV1Impl:
             invalid_blocks = set(
                 getattr(connector_output, "invalid_block_ids", None) or ()
             )
-            for req_id in (
+            finished_recving = tuple(
                 getattr(connector_output, "finished_recving", None) or ()
-            ):
+            )
+            for req_id in finished_recving:
                 load_spec = self.load_specs.get(req_id)
                 request_blocks = validation_blocks.pop(req_id, None)
-                failed = request_blocks is None or bool(
-                    request_blocks.intersection(invalid_blocks)
+                invalid_for_request = (
+                    set()
+                    if request_blocks is None
+                    else request_blocks.intersection(invalid_blocks)
                 )
+                failed = request_blocks is None or bool(
+                    invalid_for_request
+                )
+                if load_spec is not None and getattr(
+                    load_spec, "dsa_cold_compact_load", False
+                ):
+                    logger.info(
+                        "[DSA_COLD_DIAG] scheduler_completion req=%s "
+                        "finished_recving=%s validation_blocks=%s "
+                        "invalid_for_request=%s failed=%s",
+                        req_id,
+                        sorted(set(finished_recving)),
+                        None if request_blocks is None else len(request_blocks),
+                        sorted(invalid_for_request),
+                        failed,
+                    )
                 if (
                     not failed
                     and load_spec is not None
@@ -3513,6 +3592,16 @@ class LMCacheConnectorV1Impl:
                 # latent lease until the scheduler's authoritative request
                 # finish/abort cleanup; otherwise that worker would reload the
                 # indexer when the final TP lets the request resume.
+                if not getattr(state, "_dsa_cold_prune_logged", False):
+                    logger.info(
+                        "[DSA_COLD_DIAG] prune_protected req=%s "
+                        "active_req_ids=%s registry_version=%d state=%s",
+                        req_id,
+                        sorted(active_req_ids),
+                        getattr(self, "_worker_retrieve_registry_version", 0),
+                        _dsa_cold_state_summary(state),
+                    )
+                    setattr(state, "_dsa_cold_prune_logged", True)
                 continue
             if shared_request_active:
                 self._release_shared_worker_retrieve_state(
@@ -5266,6 +5355,19 @@ class LMCacheConnectorV1Impl:
         npu_device_id = (
             int(torch.npu.current_device()) if hasattr(torch, "npu") else None
         )
+        logger.info(
+            "[DSA_COLD_DIAG] cold_submit req=%s generation=%d tokens=%d "
+            "indexer_slots=%s indexer_blocks=%d block_size=%d "
+            "submitted_npu_device=%s configured_device=%s",
+            request.req_id,
+            generation,
+            request.load_spec.lmcache_cached_tokens,
+            _dsa_cold_tensor_summary(indexer_slots),
+            len(indexer_block_ids),
+            self._block_size,
+            npu_device_id,
+            self.device,
+        )
         future = self._get_dsa_cold_load_executor().submit(
             self._run_dsa_cold_compact_load,
             request,
@@ -5298,6 +5400,18 @@ class LMCacheConnectorV1Impl:
         tokens = request.token_ids[:token_count]
         token_mask = torch.ones(token_count, dtype=torch.bool)
         state = WorkerRetrieveState(req_id=request.req_id)
+        logger.info(
+            "[DSA_COLD_DIAG] cold_worker_begin req=%s tokens=%d "
+            "submitted_npu_device=%s current_npu_device=%s "
+            "configured_device=%s latent_layers=%d indexer_layers=%d",
+            request.req_id,
+            token_count,
+            npu_device_id,
+            int(torch.npu.current_device()) if hasattr(torch, "npu") else None,
+            self.device,
+            latent_layers,
+            indexer_layers,
+        )
         try:
             empty_slots = torch.empty(0, dtype=torch.long)
             retrieve_kwargs, _, _ = self._sparse_retrieve_kwargs(
@@ -5371,6 +5485,13 @@ class LMCacheConnectorV1Impl:
             self._refresh_prepared_sparse_sources(state, token_count)
             if state.prepared_sparse_sources.get(0) is None:
                 raise RuntimeError("Cold compact latent source was not sealed")
+            logger.info(
+                "[DSA_COLD_DIAG] cold_worker_loaded req=%s "
+                "indexer_slots=%s state=%s",
+                request.req_id,
+                _dsa_cold_tensor_summary(indexer_slots),
+                _dsa_cold_state_summary(state),
+            )
             return state
         except BaseException:
             try:
@@ -5599,6 +5720,14 @@ class LMCacheConnectorV1Impl:
                             prior_retrieve_state = self._worker_retrieve_state.get(
                                 request.req_id
                             )
+                        cold_diag_request = bool(
+                            prior_retrieve_state is not None
+                            and getattr(
+                                prior_retrieve_state,
+                                "_dsa_cold_prune_protected",
+                                False,
+                            )
+                        )
                         if (
                             _mtp_dw_deep_diag_enabled()
                             and prior_retrieve_state is not None
@@ -5650,7 +5779,7 @@ class LMCacheConnectorV1Impl:
                             )
                         )
                         if retrieve_state_invalidated:
-                            if _mtp_dw_deep_diag_enabled():
+                            if _mtp_dw_deep_diag_enabled() or cold_diag_request:
                                 invalidation_reason = "resumed_from_preemption"
                                 if prior_retrieve_state is not None:
                                     invalidation_reason = (
@@ -5660,6 +5789,15 @@ class LMCacheConnectorV1Impl:
                                             prior_retrieve_state,
                                         )
                                     )
+                            if cold_diag_request:
+                                logger.error(
+                                    "[DSA_COLD_DIAG] cold_state_invalidated "
+                                    "req=%s token_count=%d reason=%s state=%s",
+                                    request.req_id,
+                                    token_count,
+                                    invalidation_reason,
+                                    _dsa_cold_state_summary(prior_retrieve_state),
+                                )
                             self._drop_worker_retrieve_state(request.req_id)
                         bound_state = (
                             sparse_bound_state
@@ -5668,6 +5806,7 @@ class LMCacheConnectorV1Impl:
                         )
                     else:
                         bound_state = None
+                        cold_diag_request = False
 
                     retrieve_state = bound_state
                     if retrieve_state is None:
@@ -5731,6 +5870,38 @@ class LMCacheConnectorV1Impl:
                                 shared_cpu_enabled,
                             )
                         )
+                        indexer_resident = bool(
+                            shared_cpu_enabled
+                            and materialize_index
+                            and self._shared_sparse_decode_indexer_is_resident(
+                                request,
+                                bound_state,
+                                token_count,
+                            )
+                        )
+                        if cold_diag_request:
+                            logger.info(
+                                "[DSA_COLD_DIAG] sparse_resume_decision "
+                                "req=%s sparse_warm_ref=%s token_count=%d "
+                                "lmcache_cached_tokens=%d shared_cpu=%s "
+                                "materialize_index=%s indexer_resident=%s "
+                                "latent_slots=%s request_indexer_slots=%s "
+                                "state=%s",
+                                request.req_id,
+                                request.sparse_warm_ref,
+                                token_count,
+                                request.load_spec.lmcache_cached_tokens,
+                                shared_cpu_enabled,
+                                materialize_index,
+                                indexer_resident,
+                                _dsa_cold_tensor_summary(slot_mapping),
+                                _dsa_cold_tensor_summary(
+                                    request.indexer_slot_mapping[0]
+                                    if request.indexer_slot_mapping
+                                    else None
+                                ),
+                                _dsa_cold_state_summary(bound_state),
+                            )
                         if (
                             shared_cpu_enabled
                             and not materialize_index
@@ -5739,11 +5910,7 @@ class LMCacheConnectorV1Impl:
                         elif (
                             shared_cpu_enabled
                             and materialize_index
-                            and self._shared_sparse_decode_indexer_is_resident(
-                                request,
-                                bound_state,
-                                token_count,
-                            )
+                            and indexer_resident
                         ):
                             logger.debug(
                                 "Skipping shared CPU DSA index retrieve for "
@@ -5762,6 +5929,19 @@ class LMCacheConnectorV1Impl:
                                     "kvcaches for kv_group=1."
                                 )
                         else:
+                            if cold_diag_request:
+                                logger.error(
+                                    "[DSA_COLD_DIAG] unexpected_indexer_retrieve "
+                                    "req=%s materialize_index=%s "
+                                    "indexer_resident=%s invalidated=%s "
+                                    "invalidation_reason=%s state=%s",
+                                    request.req_id,
+                                    materialize_index,
+                                    indexer_resident,
+                                    retrieve_state_invalidated,
+                                    invalidation_reason,
+                                    _dsa_cold_state_summary(bound_state),
+                                )
                             latent_sparse_slots = (
                                 slot_mapping[0]
                                 if isinstance(slot_mapping, list)
@@ -6453,6 +6633,23 @@ class LMCacheConnectorV1Impl:
                             )
                             and indexer_sent_key not in sparse_indexer_sent_layers
                         ):
+                            cold_state = getattr(
+                                self, "_worker_retrieve_state", {}
+                            ).get(request.req_id)
+                            if cold_state is not None and getattr(
+                                cold_state, "_dsa_cold_prune_protected", False
+                            ):
+                                logger.info(
+                                    "[DSA_COLD_DIAG] indexer_retriever_send "
+                                    "req=%s layer_name=%s parsed_layer=%s "
+                                    "current_layer=%d wait_group=%d state=%s",
+                                    request.req_id,
+                                    layer_name,
+                                    parsed_layer_id,
+                                    self.current_layer,
+                                    wait_group,
+                                    _dsa_cold_state_summary(cold_state),
+                                )
                             indexer_retriever.send((None, 0))
                             sparse_indexer_sent_layers.add(indexer_sent_key)
                     else:
@@ -7280,6 +7477,17 @@ class LMCacheConnectorV1Impl:
                     # the other workers; explicit finish/abort remains the
                     # authoritative cleanup path.
                     setattr(state, "_dsa_cold_prune_protected", True)
+                    logger.info(
+                        "[DSA_COLD_DIAG] cold_state_published req=%s "
+                        "generation=%d registry_identity=%s state=%s",
+                        req_id,
+                        generation,
+                        bool(
+                            getattr(self, "_worker_retrieve_state", {}).get(req_id)
+                            is state
+                        ),
+                        _dsa_cold_state_summary(state),
+                    )
                 logger.info(
                     "[DSA_COLD_COMPACT] request=%s generation=%d "
                     "status=%s tokens=%d indexer_blocks=%d elapsed_ms=%.3f",
@@ -7518,6 +7726,19 @@ class LMCacheConnectorV1Impl:
             and num_external_hit_tokens == request.num_tokens
             and need_to_allocate > 0
         )
+        if dsa_cold_compact_load:
+            logger.info(
+                "[DSA_COLD_DIAG] lookup_selected req=%s request_tokens=%d "
+                "local_tokens=%d external_hit_tokens=%d need_to_allocate=%d "
+                "scratch_capacity=%d sparse_attention=%s",
+                req_id,
+                request.num_tokens,
+                num_computed_tokens,
+                num_external_hit_tokens,
+                need_to_allocate,
+                self._dsa_scratch_capacity,
+                self.enable_sparse_attention,
+            )
         below_min_retrieve = (
             not dsa_prefix_hit
             and min_retrieve > 0
@@ -8134,6 +8355,16 @@ class LMCacheConnectorV1Impl:
                 if load_spec is None:
                     raise RuntimeError("Cold compact resume lost its LoadSpec")
                 delattr(load_spec, "dsa_cold_compact_load")
+                logger.info(
+                    "[DSA_COLD_DIAG] scheduler_resume_metadata req=%s "
+                    "computed_tokens=%d lmcache_cached_tokens=%d "
+                    "committed_end=%s release_frontier=%s",
+                    request.req_id,
+                    request.num_computed_tokens,
+                    load_spec.lmcache_cached_tokens,
+                    load_spec.dsa_committed_end,
+                    getattr(load_spec, "dsa_release_frontier", None),
+                )
             num_tokens_to_compute = (
                 request.num_computed_tokens
                 + scheduler_output.num_scheduled_tokens[request.req_id]
