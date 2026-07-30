@@ -3505,6 +3505,15 @@ class LMCacheConnectorV1Impl:
             shared_request_active = bool(
                 state is not None and state.shared_request_active
             )
+            if shared_request_active and getattr(
+                state, "_dsa_cold_prune_protected", False
+            ):
+                # TP workers can report cold-load completion on different
+                # forwards. Keep an early worker's resident indexer and shared
+                # latent lease until the scheduler's authoritative request
+                # finish/abort cleanup; otherwise that worker would reload the
+                # indexer when the final TP lets the request resume.
+                continue
             if shared_request_active:
                 self._release_shared_worker_retrieve_state(
                     state,
@@ -3613,6 +3622,8 @@ class LMCacheConnectorV1Impl:
         state.indexer_slot_mapping = None
         state.decode_ret_mask = None
         state.req_id = None
+        if hasattr(state, "_dsa_cold_prune_protected"):
+            delattr(state, "_dsa_cold_prune_protected")
 
     @staticmethod
     def _shared_required_chunk_count(
@@ -7263,6 +7274,12 @@ class LMCacheConnectorV1Impl:
                         metadata_warm=True,
                         token_count=request.load_spec.lmcache_cached_tokens,
                     )
+                    # Completion reports from different TP workers may be
+                    # accumulated across multiple forwards. Preserve this
+                    # worker's state while the scheduler is still waiting for
+                    # the other workers; explicit finish/abort remains the
+                    # authoritative cleanup path.
+                    setattr(state, "_dsa_cold_prune_protected", True)
                 logger.info(
                     "[DSA_COLD_COMPACT] request=%s generation=%d "
                     "status=%s tokens=%d indexer_blocks=%d elapsed_ms=%.3f",

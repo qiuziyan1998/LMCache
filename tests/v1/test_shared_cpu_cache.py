@@ -2750,7 +2750,11 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
 
     def resolve_layer(**kwargs):
         resolver_calls["layer"] += 1
-        return [mem_objs[kwargs["layer_id"]]]
+        mem_obj = mem_objs[kwargs["layer_id"]]
+        # Match _resolve_shared_rank0_layer_mem_objs(), which returns an
+        # ownership pin that the retriever releases after publication.
+        mem_obj.pin()
+        return [mem_obj]
 
     engine._resolve_shared_rank0_layer_mem_objs = resolve_layer
 
