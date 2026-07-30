@@ -74,6 +74,9 @@ SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
 SPARSE_DECODE_SHARED_CPU_PHASE = "sparse_decode_bootstrap"
+INDEXER_RETRIEVE_FULL = "full_materialize"
+INDEXER_RETRIEVE_METADATA_ONLY = "metadata_only"
+INDEXER_RETRIEVE_RESIDENT_SKIP = "resident_skip"
 DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS_ENV = (
     "VLLM_ASCEND_LMCACHE_DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS"
 )
@@ -732,6 +735,10 @@ class WorkerRetrieveState:
     cached_shared_handles_indexer: list[list[Any]] = field(default_factory=list)
     shared_latent_status: str = "missing"
     shared_index_status: str = "missing"
+    # This tracks the live vLLM group-1 allocation, independently from the
+    # shared CPU source frontier stored in token_count.
+    indexer_npu_resident: bool = False
+    indexer_npu_materialization_pending: bool = field(default=False, repr=False)
     shared_generation: int = 0
     pointer_cache_generation: int = 0
     shared_request_active: bool = False
@@ -2159,29 +2166,34 @@ class LMCacheConnectorV1Impl:
         return kv_role == "kv_consumer"
 
     @staticmethod
-    def _shared_sparse_decode_indexer_is_resident(
+    def _shared_sparse_decode_indexer_retrieve_mode(
         request: "ReqMeta",
         bound_state: Optional[WorkerRetrieveState],
         token_count: int,
-    ) -> bool:
-        """Return true when the live request already has DSA index in vLLM.
+    ) -> str:
+        """Select how group-1 state reaches the next sparse decode frontier.
 
         Shared CPU decode must cold-materialize the DSA index once because a
-        prefix hit may skip prefill. After that, the same live request keeps
-        the indexer KV resident in vLLM; reloading it from LMCache on every
-        decode token is redundant. Decode-save growth resets/extends the
-        request state, so the next larger prefix still materializes once.
+        prefix hit may skip prefill. A live request then keeps group 1 resident
+        in vLLM while decode-save growth only makes its shared CPU metadata
+        stale. Refresh that metadata without overwriting resident NPU KV.
         """
-        if bound_state is None or not bound_state.shared_request_active:
-            return False
-        if bound_state.shared_index_status != "present":
-            return False
-        if request.load_spec is None:
-            return False
-        return (
+        if (
+            bound_state is None
+            or not bound_state.shared_request_active
+            or bound_state.shared_index_status != "present"
+            or not bound_state.indexer_npu_resident
+            or request.load_spec is None
+            or request.resumed_from_preemption
+        ):
+            return INDEXER_RETRIEVE_FULL
+        cpu_metadata_current = (
             int(request.load_spec.lmcache_cached_tokens) <= int(bound_state.token_count)
             and int(token_count) <= int(bound_state.token_count)
         )
+        if cpu_metadata_current:
+            return INDEXER_RETRIEVE_RESIDENT_SKIP
+        return INDEXER_RETRIEVE_METADATA_ONLY
 
     @staticmethod
     def _shared_request_scope_token(
@@ -2227,6 +2239,7 @@ class LMCacheConnectorV1Impl:
             pointer_generation,
             state.shared_latent_status,
             state.shared_index_status,
+            state.indexer_npu_resident,
             bool(self._is_dsa_two_groups()),
             bool(materialize_index),
             int(getattr(self, "num_layers", 0) or 0),
@@ -3571,6 +3584,8 @@ class LMCacheConnectorV1Impl:
 
         state.shared_latent_status = "missing"
         state.shared_index_status = "missing"
+        state.indexer_npu_resident = False
+        state.indexer_npu_materialization_pending = False
         state.shared_generation = 0
         state.pointer_cache_generation = 0
         state.shared_request_active = False
@@ -3818,6 +3833,10 @@ class LMCacheConnectorV1Impl:
             "decode_ret_mask": state.decode_ret_mask,
             "shared_generation": state.shared_generation,
             "pointer_cache_generation": state.pointer_cache_generation,
+            "indexer_npu_resident": state.indexer_npu_resident,
+            "indexer_npu_materialization_pending": (
+                state.indexer_npu_materialization_pending
+            ),
             "request_scope_token": state.request_scope_token,
             "shared_validation_signature": state.shared_validation_signature,
             "prepared_sparse_sources": dict(state.prepared_sparse_sources),
@@ -5021,6 +5040,10 @@ class LMCacheConnectorV1Impl:
             if state is None or not state.has_cache():
                 continue
 
+            if state.indexer_npu_materialization_pending:
+                state.indexer_npu_resident = True
+                state.indexer_npu_materialization_pending = False
+
             token_count = int(request.load_spec.lmcache_cached_tokens)
             if request.sparse_warm_ref:
                 # Do not shrink state while consuming an async reference that
@@ -5082,6 +5105,7 @@ class LMCacheConnectorV1Impl:
         token_count: int,
         shared_cpu_enabled: bool,
         shared_cpu_preflight_state: Optional[dict[str, Any]],
+        metadata_only: bool = False,
     ) -> tuple[
         dict[str, Any],
         Optional[dict[str, Any]],
@@ -5093,11 +5117,13 @@ class LMCacheConnectorV1Impl:
             if request.sparse_warm_ref
             else token_count
         )
-        prepared_source = self._prepared_sparse_source(
-            retrieve_state,
-            kv_group,
-            prepared_token_count,
-        )
+        prepared_source = None
+        if not metadata_only:
+            prepared_source = self._prepared_sparse_source(
+                retrieve_state,
+                kv_group,
+                prepared_token_count,
+            )
         if request.sparse_warm_ref and prepared_source is None:
             raise RuntimeError(
                 "Sparse warm metadata cannot enter bootstrap without token "
@@ -5137,6 +5163,8 @@ class LMCacheConnectorV1Impl:
                 retrieve_kwargs["shared_cpu_request_preflight_state"] = (
                     shared_cpu_preflight_state
                 )
+            if metadata_only:
+                retrieve_kwargs["sparse_metadata_only"] = True
             retrieve_kwargs.update(
                 self._sparse_decode_bootstrap_reuse_kwargs(token_count, bound_state)
             )
@@ -5495,14 +5523,10 @@ class LMCacheConnectorV1Impl:
                                 shared_cpu_enabled,
                             )
                         )
-                        _indexer_resident = None
-                        if (
-                            shared_cpu_enabled
-                            and materialize_index
-                            and bound_state is not None
-                        ):
-                            _indexer_resident = (
-                                self._shared_sparse_decode_indexer_is_resident(
+                        indexer_mode = INDEXER_RETRIEVE_FULL
+                        if shared_cpu_enabled and materialize_index:
+                            indexer_mode = (
+                                self._shared_sparse_decode_indexer_retrieve_mode(
                                     request,
                                     bound_state,
                                     token_count,
@@ -5513,8 +5537,8 @@ class LMCacheConnectorV1Impl:
                                 "[MTP_DW_INDEXER] req=%s shared_cpu=%s "
                                 "materialize=%s bound_present=%s "
                                 "bound_active=%s bound_index=%s "
-                                "bound_tc=%d lmcache_cached=%d "
-                                "token_count=%d resident=%s",
+                                "npu_resident=%s bound_tc=%d "
+                                "lmcache_cached=%d token_count=%d mode=%s",
                                 request.req_id,
                                 shared_cpu_enabled,
                                 materialize_index,
@@ -5530,6 +5554,11 @@ class LMCacheConnectorV1Impl:
                                     else None
                                 ),
                                 (
+                                    bound_state.indexer_npu_resident
+                                    if bound_state
+                                    else False
+                                ),
+                                (
                                     int(bound_state.token_count)
                                     if bound_state
                                     else 0
@@ -5540,7 +5569,7 @@ class LMCacheConnectorV1Impl:
                                     else 0
                                 ),
                                 token_count,
-                                _indexer_resident,
+                                indexer_mode,
                             )
                         if (
                             shared_cpu_enabled
@@ -5550,7 +5579,7 @@ class LMCacheConnectorV1Impl:
                         elif (
                             shared_cpu_enabled
                             and materialize_index
-                            and _indexer_resident
+                            and indexer_mode == INDEXER_RETRIEVE_RESIDENT_SKIP
                         ):
                             logger.debug(
                                 "Skipping shared CPU DSA index retrieve for "
@@ -5629,6 +5658,10 @@ class LMCacheConnectorV1Impl:
                                 dsa_two_groups=dsa_two_groups,
                                 shared_cpu_enabled=shared_cpu_enabled,
                                 shared_cpu_preflight_state=shared_cpu_preflight_state,
+                                metadata_only=(
+                                    indexer_mode
+                                    == INDEXER_RETRIEVE_METADATA_ONLY
+                                ),
                             )
                             indexer_retriever = (
                                 self.lmcache_engine.retrieve_layer_head_token_wise(
@@ -5637,6 +5670,10 @@ class LMCacheConnectorV1Impl:
                                     **indexer_kwargs,
                                 )
                             )
+                            if indexer_mode == INDEXER_RETRIEVE_FULL:
+                                retrieve_state.indexer_npu_materialization_pending = (
+                                    True
+                                )
                             self.layerwise_retrievers[-1] = (
                                 layerwise_retriever,
                                 indexer_retriever,
@@ -5646,6 +5683,8 @@ class LMCacheConnectorV1Impl:
                     if indexer_skipped:
                         request.shared_index_skipped = True
                         retrieve_state.clear_group(1)
+                        retrieve_state.indexer_npu_resident = False
+                        retrieve_state.indexer_npu_materialization_pending = False
                     retrieve_location = retrieve_kwargs.get(
                         "cached_retrieve_location"
                     )

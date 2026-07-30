@@ -911,6 +911,8 @@ class TestWorkerRetrieveState:
             cached_shared_handles=[["handle"]],
             shared_latent_status="present",
             shared_index_status="skipped",
+            indexer_npu_resident=True,
+            indexer_npu_materialization_pending=True,
             shared_request_active=True,
             request_scope_token="req-1:4",
         )
@@ -926,6 +928,8 @@ class TestWorkerRetrieveState:
         engine.release_shared_cpu_sparse_request.assert_called_once_with("req-1")
         assert state.cached_shared_handles == []
         assert state.shared_index_status == "missing"
+        assert state.indexer_npu_resident is False
+        assert state.indexer_npu_materialization_pending is False
         assert state.shared_generation == 0
         assert state.pointer_cache_generation == 0
         assert state.shared_request_active is False
@@ -2751,6 +2755,88 @@ class TestWorkerRetrieveState:
         assert captured_kwargs[0]["ret_mask"] is req.decode_ret_mask
         assert captured_kwargs[1]["ret_mask"] is req.decode_ret_mask
 
+    def test_sparse_decode_frontier_growth_refreshes_indexer_metadata_only(self):
+        req = make_sparse_req_meta("req-1", token_count=512)
+        req.indexer_slot_mapping = [torch.arange(512, dtype=torch.long)]
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = True
+        impl.num_layers = 1
+        impl.kv_caches = {
+            "model.layers.0.self_attn.attn.k_cache": torch.zeros(1),
+            "model.layers.0.self_attn.indexer.k_cache": torch.zeros(1),
+        }
+        impl._refresh_kvcaches_list()
+        impl.layerwise_retrievers = []
+        impl._layerwise_requests = []
+        impl._layerwise_retriever_is_sparse = []
+        impl._layerwise_sparse_req_ids = []
+        impl._stats_monitor = SimpleNamespace(
+            update_interval_vllm_hit_tokens=lambda *_args: None,
+            update_interval_prompt_tokens=lambda *_args: None,
+        )
+        state = WorkerRetrieveState(
+            req_id=req.req_id,
+            cached_keys=[["k0"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["m0"]],
+            cached_tensors=[[torch.zeros(256)]],
+            cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
+            cached_keys_indexer=[["ik0"]],
+            cached_starts_indexer=[0],
+            cached_ends_indexer=[256],
+            cached_memory_objs_indexer=[["im0"]],
+            cached_tensors_indexer=[[torch.zeros(256)]],
+            cached_chunk_ptrs_npu_indexer=[
+                torch.tensor([222], dtype=torch.long)
+            ],
+            metadata_warm=True,
+            token_count=256,
+            shared_latent_status="present",
+            shared_index_status="present",
+            indexer_npu_resident=True,
+            shared_generation=1,
+            pointer_cache_generation=1,
+            shared_request_active=True,
+            request_scope_token="req-1:1:256",
+            prepared_sparse_sources={
+                0: PreparedSparseSource(layers=(), total_tokens=256),
+                1: PreparedSparseSource(layers=(), total_tokens=256),
+            },
+        )
+        impl._worker_retrieve_state[req.req_id] = state
+        captured_kwargs = []
+
+        class _FakeSharedEngine:
+            enable_shared_cpu_cache = True
+            shared_cpu_cache_generation = 1
+            config = SimpleNamespace(
+                extra_config={"shared_cpu_materialize_index_on_decode_cold": True}
+            )
+
+            def retrieve_layer_head_token_wise(self, tokens, mask, **kwargs):
+                captured_kwargs.append(kwargs)
+
+                def _retriever():
+                    yield kwargs.get("ret_mask")
+                    while True:
+                        yield kwargs.get("ret_mask")
+
+                return _retriever()
+
+        impl.lmcache_engine = _FakeSharedEngine()
+
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+
+        assert len(captured_kwargs) == 2
+        assert captured_kwargs[0]["kv_group"] == 0
+        assert "sparse_metadata_only" not in captured_kwargs[0]
+        assert captured_kwargs[1]["kv_group"] == 1
+        assert captured_kwargs[1]["sparse_metadata_only"] is True
+        assert "prepared_sparse_source" not in captured_kwargs[1]
+        assert state.indexer_npu_resident is True
+        impl._drain_layerwise_retrievers()
+
     def test_sparse_decode_start_uses_minimal_prepared_kwargs(self):
         req = make_sparse_req_meta("req-1", token_count=256)
         state = WorkerRetrieveState(
@@ -4002,35 +4088,87 @@ class TestWorkerRetrieveState:
         assert state.cached_ends_indexer == [256]
         assert state.token_count == 256
 
-    def test_shared_indexer_resident_only_when_present_and_covered(self):
+    def test_shared_indexer_selects_retrieve_mode_by_npu_and_cpu_state(self):
         request = _make_request()
         request.load_spec.lmcache_cached_tokens = 512
         state = WorkerRetrieveState(
             token_count=512,
             shared_request_active=True,
             shared_index_status="present",
+            indexer_npu_resident=True,
         )
 
-        assert LMCacheConnectorV1Impl._shared_sparse_decode_indexer_is_resident(
-            request,
-            state,
-            512,
+        assert (
+            LMCacheConnectorV1Impl._shared_sparse_decode_indexer_retrieve_mode(
+                request,
+                state,
+                512,
+            )
+            == adapter_mod.INDEXER_RETRIEVE_RESIDENT_SKIP
         )
 
         request.load_spec.lmcache_cached_tokens = 768
-        assert not LMCacheConnectorV1Impl._shared_sparse_decode_indexer_is_resident(
-            request,
-            state,
-            768,
+        assert (
+            LMCacheConnectorV1Impl._shared_sparse_decode_indexer_retrieve_mode(
+                request,
+                state,
+                768,
+            )
+            == adapter_mod.INDEXER_RETRIEVE_METADATA_ONLY
         )
 
         request.load_spec.lmcache_cached_tokens = 512
         state.shared_index_status = "missing"
-        assert not LMCacheConnectorV1Impl._shared_sparse_decode_indexer_is_resident(
-            request,
-            state,
-            512,
+        assert (
+            LMCacheConnectorV1Impl._shared_sparse_decode_indexer_retrieve_mode(
+                request,
+                state,
+                512,
+            )
+            == adapter_mod.INDEXER_RETRIEVE_FULL
         )
+
+        state.shared_index_status = "present"
+        state.indexer_npu_resident = False
+        assert (
+            LMCacheConnectorV1Impl._shared_sparse_decode_indexer_retrieve_mode(
+                request,
+                state,
+                512,
+            )
+            == adapter_mod.INDEXER_RETRIEVE_FULL
+        )
+
+        state.indexer_npu_resident = True
+        request.resumed_from_preemption = True
+        assert (
+            LMCacheConnectorV1Impl._shared_sparse_decode_indexer_retrieve_mode(
+                request,
+                state,
+                512,
+            )
+            == adapter_mod.INDEXER_RETRIEVE_FULL
+        )
+
+    def test_full_indexer_materialization_commits_residency_at_finalization(self):
+        impl = _make_impl()
+        request = _make_request()
+        request.is_sparse_decode = True
+        state = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            indexer_npu_materialization_pending=True,
+        )
+        impl._worker_retrieve_state[request.req_id] = state
+        impl._prepared_sparse_sources_current = MagicMock(return_value=False)
+        impl._shared_worker_retrieve_state_is_current = MagicMock(return_value=False)
+        impl._publish_worker_retrieve_state = MagicMock()
+        metadata = SimpleNamespace(requests=[request])
+
+        impl._finalize_worker_retrieve_state_from_metadata(metadata)
+
+        assert state.indexer_npu_resident is True
+        assert state.indexer_npu_materialization_pending is False
+        impl._publish_worker_retrieve_state.assert_called_once()
 
     def test_current_shared_state_skip_requires_validation_signature(self):
         impl = _make_impl()
