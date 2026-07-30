@@ -5252,9 +5252,13 @@ class LMCacheConnectorV1Impl:
         indexer_block_ids = set(
             (indexer_slots // self._block_size).tolist()
         )
+        npu_device_id = (
+            int(torch.npu.current_device()) if hasattr(torch, "npu") else None
+        )
         future = self._get_dsa_cold_load_executor().submit(
             self._run_dsa_cold_compact_load,
             request,
+            npu_device_id,
         )
         futures[request.req_id] = (
             generation,
@@ -5265,10 +5269,10 @@ class LMCacheConnectorV1Impl:
         )
 
     def _run_dsa_cold_compact_load(
-        self, request: ReqMeta
+        self, request: ReqMeta, npu_device_id: Optional[int]
     ) -> WorkerRetrieveState:
-        if hasattr(torch, "npu"):
-            torch.npu.set_device(self.device)
+        if npu_device_id is not None:
+            torch.npu.set_device(npu_device_id)
         assert request.load_spec is not None
         assert self.lmcache_engine is not None
         latent_layers = self._num_layers_for_group(0)

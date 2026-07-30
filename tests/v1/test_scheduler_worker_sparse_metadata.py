@@ -204,6 +204,49 @@ def test_dsa_cold_compact_alloc_metadata_has_only_indexer_slots() -> None:
     assert getattr(req_meta.load_spec, "dsa_cold_load_generation") == 1
 
 
+def test_dsa_cold_compact_submit_captures_current_npu_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    impl._block_size = 16
+    impl._dsa_cold_load_futures = {}
+    impl._run_dsa_cold_compact_load = MagicMock()
+    executor = SimpleNamespace(submit=MagicMock(return_value=Future()))
+    impl._get_dsa_cold_load_executor = lambda: executor
+    fake_npu = SimpleNamespace(current_device=MagicMock(return_value=5))
+    monkeypatch.setattr(adapter_module.torch, "npu", fake_npu, raising=False)
+    request = SimpleNamespace(
+        req_id="cold-device-submit",
+        load_spec=SimpleNamespace(dsa_cold_load_generation=1),
+        indexer_slot_mapping=[torch.tensor([160, 161])],
+    )
+
+    impl._submit_dsa_cold_compact_load(request)
+
+    executor.submit.assert_called_once_with(
+        impl._run_dsa_cold_compact_load,
+        request,
+        5,
+    )
+
+
+def test_dsa_cold_compact_worker_restores_submitted_npu_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    impl.lmcache_engine = object()
+    impl.num_layers = 1
+    impl._num_layers_for_group = lambda _kv_group: 0
+    fake_npu = SimpleNamespace(set_device=MagicMock())
+    monkeypatch.setattr(adapter_module.torch, "npu", fake_npu, raising=False)
+    request = SimpleNamespace(load_spec=object())
+
+    with pytest.raises(RuntimeError, match="matching latent/indexer"):
+        impl._run_dsa_cold_compact_load(request, 6)
+
+    fake_npu.set_device.assert_called_once_with(6)
+
+
 def test_dsa_cold_compact_finished_signal_waits_for_future() -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     future = Future()
