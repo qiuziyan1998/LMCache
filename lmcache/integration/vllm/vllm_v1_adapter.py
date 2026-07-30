@@ -5495,6 +5495,53 @@ class LMCacheConnectorV1Impl:
                                 shared_cpu_enabled,
                             )
                         )
+                        _indexer_resident = None
+                        if (
+                            shared_cpu_enabled
+                            and materialize_index
+                            and bound_state is not None
+                        ):
+                            _indexer_resident = (
+                                self._shared_sparse_decode_indexer_is_resident(
+                                    request,
+                                    bound_state,
+                                    token_count,
+                                )
+                            )
+                        if _mtp_dw_diag_enabled():
+                            logger.info(
+                                "[MTP_DW_INDEXER] req=%s shared_cpu=%s "
+                                "materialize=%s bound_present=%s "
+                                "bound_active=%s bound_index=%s "
+                                "bound_tc=%d lmcache_cached=%d "
+                                "token_count=%d resident=%s",
+                                request.req_id,
+                                shared_cpu_enabled,
+                                materialize_index,
+                                bound_state is not None,
+                                (
+                                    bound_state.shared_request_active
+                                    if bound_state
+                                    else False
+                                ),
+                                (
+                                    bound_state.shared_index_status
+                                    if bound_state
+                                    else None
+                                ),
+                                (
+                                    int(bound_state.token_count)
+                                    if bound_state
+                                    else 0
+                                ),
+                                (
+                                    int(request.load_spec.lmcache_cached_tokens)
+                                    if request.load_spec
+                                    else 0
+                                ),
+                                token_count,
+                                _indexer_resident,
+                            )
                         if (
                             shared_cpu_enabled
                             and not materialize_index
@@ -5503,11 +5550,7 @@ class LMCacheConnectorV1Impl:
                         elif (
                             shared_cpu_enabled
                             and materialize_index
-                            and self._shared_sparse_decode_indexer_is_resident(
-                                request,
-                                bound_state,
-                                token_count,
-                            )
+                            and _indexer_resident
                         ):
                             logger.debug(
                                 "Skipping shared CPU DSA index retrieve for "
