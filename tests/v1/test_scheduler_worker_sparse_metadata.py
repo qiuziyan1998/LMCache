@@ -796,6 +796,68 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.save_spec is not None
         assert req_meta.save_spec.can_save is False
 
+    def test_cold_compact_kv_both_keeps_partial_prompt_prepared_frontier(
+        self,
+    ) -> None:
+        impl = _make_scheduler_impl()
+        impl.config.dsa_two_groups = True
+        impl._decode_window_save_window_size = 256
+        impl._dsa_scratch_capacity = 4096
+
+        req_id = "cold-kv-both-partial"
+        prompt_len = 4355
+        release_frontier = 4352
+        decode_token = 10_001
+        vllm_req = _make_vllm_request(
+            req_id,
+            prompt_len,
+            prompt_len,
+            decode_token,
+        )
+        impl._unfinished_requests[req_id] = vllm_req
+
+        num_blocks = (prompt_len + 1 + impl._block_size - 1) // impl._block_size
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(prompt_len)),
+            allocated_block_ids=list(range(num_blocks)),
+            allocated_block_ids_indexer=list(range(10_000, 10_000 + num_blocks)),
+            num_saved_tokens=prompt_len,
+            decode_window_save_committed_end=release_frontier,
+        )
+        tracker.is_decode_phase = True
+        tracker.sparse_token_ids = list(range(prompt_len))
+        tracker.sparse_meta_frontier = prompt_len
+        setattr(tracker, "sparse_remap_frontier", prompt_len - 1)
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+        req_meta = next(req for req in meta.requests if req.is_sparse_decode)
+
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.lmcache_cached_tokens == prompt_len
+        assert req_meta.load_spec.dsa_committed_end == prompt_len - 1
+        assert (
+            getattr(req_meta.load_spec, "dsa_release_frontier")
+            == release_frontier
+        )
+        assert req_meta.sparse_warm_ref
+        assert req_meta.token_ids == []
+        assert req_meta.slot_mapping == []
+        assert req_meta.indexer_slot_mapping == []
+
     def test_multi_step_sparse_decode_reuses_tracker_sparse_token_ids(self) -> None:
         impl = _make_scheduler_impl()
         req_id = "sparse-req"

@@ -8642,9 +8642,15 @@ class LMCacheConnectorV1Impl:
                     )
                 else:
                     dsa_remap_frontier = dsa_release_frontier
-                if self.kv_role == "kv_consumer":
+                cold_compact_live = hasattr(
+                    request_tracker, "sparse_remap_frontier"
+                )
+                if self.kv_role == "kv_consumer" or cold_compact_live:
                     # Include the final partial prompt chunk in worker metadata;
-                    # only the release frontier must remain chunk-aligned.
+                    # only the release frontier must remain chunk-aligned. A
+                    # cold compact kv_both request has already materialized its
+                    # complete prompt source, so shrinking this frontier would
+                    # discard the prepared worker state and reload both groups.
                     lmcache_cached_for_sparse = max(
                         lmcache_cached_for_sparse, request_tracker.prompt_len
                     )
