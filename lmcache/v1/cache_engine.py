@@ -57,6 +57,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
     TensorMemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mooncake_layout import mooncake_page_layout_enabled
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
@@ -2344,15 +2345,62 @@ class LMCacheEngine:
 
         to_release: list[MemoryObj] = []
         try:
+            pre_resolved_layers: Optional[list[list[MemoryObj]]] = None
+            page_first_remote_only = mooncake_page_layout_enabled(
+                getattr(self, "config", None)
+            ) and all(
+                chunk_location == "RemoteBackend"
+                for layer_locations in chunk_locations_layer_major
+                for chunk_location in layer_locations
+            )
+            if page_first_remote_only:
+                try:
+                    pre_resolved_layers = (
+                        self._resolve_shared_rank0_remote_layers_windowed(
+                            req_id=req_id,
+                            phase=phase,
+                            kv_group=kv_group,
+                            keys_layer_major=keys_layer_major,
+                            layers_per_batch=self.num_layers,
+                        )
+                    )
+                except Exception as exc:
+                    message = (
+                        "Shared CPU cache rank0 page-first materialization "
+                        "failed before handle publication."
+                    )
+                    self._broadcast_shared_envelope(
+                        self._shared_layerwise_error_envelope(
+                            req_id=req_id,
+                            phase=phase,
+                            request_ordinal=request_ordinal,
+                            layer_id=0,
+                            kv_group=kv_group,
+                            message=message,
+                            details={"error": str(exc), "location": location},
+                        )
+                    )
+                    raise
+                to_release.extend(
+                    mem_obj
+                    for mem_objs_layer in pre_resolved_layers
+                    for mem_obj in mem_objs_layer
+                )
             for layer_id in range(self.num_layers):
                 try:
-                    mem_objs_layer = self._resolve_shared_rank0_layer_mem_objs(
-                        req_id=req_id,
-                        phase=phase,
-                        layer_id=layer_id,
-                        kv_group=kv_group,
-                        keys_layer=keys_layer_major[layer_id],
-                        chunk_locations=chunk_locations_layer_major[layer_id],
+                    mem_objs_layer = (
+                        pre_resolved_layers[layer_id]
+                        if pre_resolved_layers is not None
+                        else self._resolve_shared_rank0_layer_mem_objs(
+                            req_id=req_id,
+                            phase=phase,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                            keys_layer=keys_layer_major[layer_id],
+                            chunk_locations=(
+                                chunk_locations_layer_major[layer_id]
+                            ),
+                        )
                     )
                 except Exception as exc:
                     message = (
@@ -2374,7 +2422,8 @@ class LMCacheEngine:
                         )
                     )
                     raise
-                to_release.extend(mem_objs_layer)
+                if pre_resolved_layers is None:
+                    to_release.extend(mem_objs_layer)
 
                 handles = self._make_shared_handles_for_layer(
                     req_id=req_id,
