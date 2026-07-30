@@ -2177,6 +2177,11 @@ class LMCacheEngine:
         ]
         acquired: list[MemoryObj] = []
         pinned: list[MemoryObj] = []
+        cold_perf = str(phase).startswith("dsa_cold_compact")
+        backend_get_ms = 0.0
+        publish_prepare_ms = 0.0
+        fetched_bytes = 0
+        fetched_chunks = 0
 
         try:
             for window_start in range(
@@ -2195,10 +2200,21 @@ class LMCacheEngine:
                         coordinates.append((layer_id, chunk_index))
                         fetch_keys.append(key)
 
+                fetch_started_at = time.monotonic() if cold_perf else 0.0
                 fetched = self.storage_manager.batched_get(
                     fetch_keys,
                     location="RemoteBackend",
                 )
+                if cold_perf:
+                    backend_get_ms += (
+                        time.monotonic() - fetch_started_at
+                    ) * 1000
+                    fetched_chunks += len(fetch_keys)
+                    fetched_bytes += sum(
+                        int(fetched_obj.get_size())
+                        for fetched_obj in fetched
+                        if fetched_obj is not None
+                    )
                 if len(fetched) != len(fetch_keys):
                     for fetched_obj in fetched:
                         if fetched_obj is not None:
@@ -2228,6 +2244,7 @@ class LMCacheEngine:
                         f"kv_group={kv_group}, missing={missing}"
                     )
 
+                prepare_started_at = time.monotonic() if cold_perf else 0.0
                 pending_fetched = list(fetched)
                 try:
                     for index, (layer_id, chunk_index) in enumerate(coordinates):
@@ -2268,7 +2285,31 @@ class LMCacheEngine:
                     for fetched_obj in pending_fetched:
                         if fetched_obj is not None:
                             fetched_obj.ref_count_down()
+                    if cold_perf:
+                        publish_prepare_ms += (
+                            time.monotonic() - prepare_started_at
+                        ) * 1000
 
+            if cold_perf:
+                logger.info(
+                    "[DSA_COLD_PERF] shared_rank0_page_first req=%s "
+                    "phase=%s kv_group=%s layers=%d chunks=%d bytes=%d "
+                    "backend_get_ms=%.3f backend_gib_s=%.3f "
+                    "publish_prepare_ms=%.3f",
+                    req_id,
+                    phase,
+                    kv_group,
+                    len(keys_layer_major),
+                    fetched_chunks,
+                    fetched_bytes,
+                    backend_get_ms,
+                    (
+                        fetched_bytes / 1024**3 / (backend_get_ms / 1000)
+                        if backend_get_ms > 0
+                        else 0.0
+                    ),
+                    publish_prepare_ms,
+                )
             return resolved_layers
         except Exception:
             for mem_obj in reversed(pinned):
@@ -2344,6 +2385,11 @@ class LMCacheEngine:
         next(mem_obj_consumer)
 
         to_release: list[MemoryObj] = []
+        cold_perf = bool(kwargs.get("dsa_cold_connector_only", False))
+        layer_resolve_ms = 0.0
+        handle_publish_ms = 0.0
+        gpu_enqueue_ms = 0.0
+        consumer_finish_ms = 0.0
         try:
             pre_resolved_layers: Optional[list[list[MemoryObj]]] = None
             page_first_remote_only = mooncake_page_layout_enabled(
@@ -2387,6 +2433,7 @@ class LMCacheEngine:
                     for mem_obj in mem_objs_layer
                 )
             for layer_id in range(self.num_layers):
+                resolve_started_at = time.monotonic() if cold_perf else 0.0
                 try:
                     mem_objs_layer = (
                         pre_resolved_layers[layer_id]
@@ -2422,9 +2469,14 @@ class LMCacheEngine:
                         )
                     )
                     raise
+                if cold_perf:
+                    layer_resolve_ms += (
+                        time.monotonic() - resolve_started_at
+                    ) * 1000
                 if pre_resolved_layers is None:
                     to_release.extend(mem_objs_layer)
 
+                publish_started_at = time.monotonic() if cold_perf else 0.0
                 handles = self._make_shared_handles_for_layer(
                     req_id=req_id,
                     phase=phase,
@@ -2445,17 +2497,31 @@ class LMCacheEngine:
                         handles=handles,
                     )
                 )
+                if cold_perf:
+                    handle_publish_ms += (
+                        time.monotonic() - publish_started_at
+                    ) * 1000
 
                 if layer_id == 0:
                     yield torch.sum(ret_mask)
                 else:
                     yield None
 
+                enqueue_started_at = time.monotonic() if cold_perf else 0.0
                 mem_obj_consumer.send(mem_objs_layer)
+                if cold_perf:
+                    gpu_enqueue_ms += (
+                        time.monotonic() - enqueue_started_at
+                    ) * 1000
 
+            finish_started_at = time.monotonic() if cold_perf else 0.0
             next(mem_obj_consumer)
             self._close_shared_retrieve_consumer(mem_obj_consumer)
             mem_obj_consumer = None
+            if cold_perf:
+                consumer_finish_ms = (
+                    time.monotonic() - finish_started_at
+                ) * 1000
             retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(
                 monitor_req_id,
@@ -2467,6 +2533,21 @@ class LMCacheEngine:
                 kv_group,
                 retrieved_tokens,
             )
+            if cold_perf:
+                logger.info(
+                    "[DSA_COLD_PERF] shared_rank0_consume req=%s phase=%s "
+                    "kv_group=%s layers=%d layer_resolve_ms=%.3f "
+                    "handle_publish_ms=%.3f gpu_enqueue_ms=%.3f "
+                    "consumer_finish_ms=%.3f",
+                    req_id,
+                    phase,
+                    kv_group,
+                    self.num_layers,
+                    layer_resolve_ms,
+                    handle_publish_ms,
+                    gpu_enqueue_ms,
+                    consumer_finish_ms,
+                )
             yield None
             # Keep request-owned shared objects through the final layer wait,
             # but release them before the result yield can remain suspended.
@@ -2503,10 +2584,21 @@ class LMCacheEngine:
         mem_obj_consumer = None
         to_release: list[MemoryObj] = []
         expected_handle_count: Optional[int] = None
+        cold_perf = bool(kwargs.get("dsa_cold_connector_only", False))
+        envelope_wait_ms = 0.0
+        consumer_init_ms = 0.0
+        create_view_ms = 0.0
+        gpu_enqueue_ms = 0.0
+        consumer_finish_ms = 0.0
 
         try:
             for layer_id in range(self.num_layers):
+                envelope_started_at = time.monotonic() if cold_perf else 0.0
                 envelope = self._receive_shared_envelope()
+                if cold_perf:
+                    envelope_wait_ms += (
+                        time.monotonic() - envelope_started_at
+                    ) * 1000
                 self._validate_shared_layerwise_envelope(
                     envelope,
                     req_id=req_id,
@@ -2529,12 +2621,17 @@ class LMCacheEngine:
                     ends = ends_all[:expected_handle_count]
                     for start, end in zip(starts, ends, strict=False):
                         ret_mask[start:end] = True
+                    init_started_at = time.monotonic() if cold_perf else 0.0
                     mem_obj_consumer = self.gpu_connector.batched_to_gpu(
                         starts,
                         ends,
                         **kwargs,
                     )
                     next(mem_obj_consumer)
+                    if cold_perf:
+                        consumer_init_ms = (
+                            time.monotonic() - init_started_at
+                        ) * 1000
                 elif len(envelope.handles) != expected_handle_count:
                     raise ValueError(
                         "Shared CPU cache passive received inconsistent handle "
@@ -2542,6 +2639,7 @@ class LMCacheEngine:
                         f"{expected_handle_count}"
                     )
 
+                view_started_at = time.monotonic() if cold_perf else 0.0
                 mem_objs_layer: list[MemoryObj] = []
                 for chunk_index, handle in enumerate(envelope.handles):
                     expected_shape, expected_dtype, expected_fmt = (
@@ -2571,6 +2669,10 @@ class LMCacheEngine:
                     )
                     mem_objs_layer.append(mem_obj)
                     to_release.append(mem_obj)
+                if cold_perf:
+                    create_view_ms += (
+                        time.monotonic() - view_started_at
+                    ) * 1000
 
                 if layer_id == 0:
                     yield torch.sum(ret_mask)
@@ -2578,12 +2680,22 @@ class LMCacheEngine:
                     yield None
 
                 assert mem_obj_consumer is not None
+                enqueue_started_at = time.monotonic() if cold_perf else 0.0
                 mem_obj_consumer.send(mem_objs_layer)
+                if cold_perf:
+                    gpu_enqueue_ms += (
+                        time.monotonic() - enqueue_started_at
+                    ) * 1000
 
             if mem_obj_consumer is not None:
+                finish_started_at = time.monotonic() if cold_perf else 0.0
                 next(mem_obj_consumer)
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
                 mem_obj_consumer = None
+                if cold_perf:
+                    consumer_finish_ms = (
+                        time.monotonic() - finish_started_at
+                    ) * 1000
 
             retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -2593,6 +2705,22 @@ class LMCacheEngine:
                 kv_group,
                 retrieved_tokens,
             )
+            if cold_perf:
+                logger.info(
+                    "[DSA_COLD_PERF] shared_passive_consume req=%s phase=%s "
+                    "kv_group=%s layers=%d envelope_wait_ms=%.3f "
+                    "consumer_init_ms=%.3f create_view_ms=%.3f "
+                    "gpu_enqueue_ms=%.3f consumer_finish_ms=%.3f",
+                    req_id,
+                    phase,
+                    kv_group,
+                    self.num_layers,
+                    envelope_wait_ms,
+                    consumer_init_ms,
+                    create_view_ms,
+                    gpu_enqueue_ms,
+                    consumer_finish_ms,
+                )
             yield None
             # Keep request-owned shared objects through the final layer wait,
             # but release them before the result yield can remain suspended.

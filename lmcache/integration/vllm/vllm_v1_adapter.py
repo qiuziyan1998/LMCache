@@ -785,6 +785,31 @@ def _dsa_cold_tensor_summary(value: Any) -> str:
     )
 
 
+def _dsa_cold_stream_identity(stream: Any) -> tuple[Any, Any]:
+    if stream is None:
+        return (None, None)
+    stream_id = None
+    for attr in ("stream_id", "npu_stream", "cuda_stream"):
+        value = getattr(stream, attr, None)
+        if value is not None:
+            stream_id = value
+            break
+    return (str(getattr(stream, "device", None)), stream_id)
+
+
+def _dsa_cold_stream_summary(stream: Any) -> str:
+    device, stream_id = _dsa_cold_stream_identity(stream)
+    return f"type={type(stream).__name__},device={device},id={stream_id}"
+
+
+def _dsa_cold_percentile_ms(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(len(ordered) * percentile)))
+    return ordered[index]
+
+
 def _dsa_cold_state_summary(state: Optional[WorkerRetrieveState]) -> dict[str, Any]:
     if state is None:
         return {"present": False}
@@ -5321,6 +5346,28 @@ class LMCacheConnectorV1Impl:
             self._dsa_cold_load_executor = executor
         return executor
 
+    def _get_dsa_cold_control_stream(self) -> Any:
+        stream = getattr(self, "_dsa_cold_control_stream", None)
+        if stream is not None:
+            return stream
+        npu = getattr(torch, "npu", None)
+        stream_ctor = getattr(npu, "Stream", None)
+        if stream_ctor is None:
+            return None
+        stream = stream_ctor()
+        self._dsa_cold_control_stream = stream
+        return stream
+
+    @staticmethod
+    def _dsa_cold_control_stream_context(stream: Any):
+        if stream is None:
+            return nullcontext()
+        npu = getattr(torch, "npu", None)
+        stream_context = getattr(npu, "stream", None)
+        if stream_context is None:
+            return nullcontext()
+        return stream_context(stream)
+
     def _synchronize_dsa_cold_dense_load(self) -> None:
         assert self.lmcache_engine is not None
         synchronize = getattr(
@@ -5386,8 +5433,44 @@ class LMCacheConnectorV1Impl:
     ) -> WorkerRetrieveState:
         if npu_device_id is not None:
             torch.npu.set_device(npu_device_id)
+        npu = getattr(torch, "npu", None)
+        current_stream = getattr(npu, "current_stream", None)
+        ambient_stream = current_stream() if current_stream is not None else None
+        control_stream = self._get_dsa_cold_control_stream()
+        with self._dsa_cold_control_stream_context(control_stream):
+            active_stream = (
+                current_stream() if current_stream is not None else None
+            )
+            gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+            load_stream = getattr(gpu_connector, "load_stream", None)
+            logger.info(
+                "[DSA_COLD_PERF] stream_binding req=%s device=%s "
+                "ambient_stream=%s control_stream=%s active_stream=%s "
+                "load_stream=%s isolated_from_ambient=%s",
+                getattr(request, "req_id", None),
+                npu_device_id,
+                _dsa_cold_stream_summary(ambient_stream),
+                _dsa_cold_stream_summary(control_stream),
+                _dsa_cold_stream_summary(active_stream),
+                _dsa_cold_stream_summary(load_stream),
+                _dsa_cold_stream_identity(active_stream)
+                != _dsa_cold_stream_identity(ambient_stream),
+            )
+            return self._run_dsa_cold_compact_load_on_control_stream(
+                request,
+                npu_device_id,
+                control_stream,
+            )
+
+    def _run_dsa_cold_compact_load_on_control_stream(
+        self,
+        request: ReqMeta,
+        npu_device_id: Optional[int],
+        control_stream: Any,
+    ) -> WorkerRetrieveState:
         assert request.load_spec is not None
         assert self.lmcache_engine is not None
+        worker_started_at = time.monotonic()
         latent_layers = self._num_layers_for_group(0)
         indexer_layers = self._num_layers_for_group(1)
         if latent_layers != self.num_layers or indexer_layers != self.num_layers:
@@ -5413,6 +5496,7 @@ class LMCacheConnectorV1Impl:
             indexer_layers,
         )
         try:
+            setup_started_at = time.monotonic()
             empty_slots = torch.empty(0, dtype=torch.long)
             retrieve_kwargs, _, _ = self._sparse_retrieve_kwargs(
                 request,
@@ -5430,6 +5514,7 @@ class LMCacheConnectorV1Impl:
             )
             retrieve_kwargs["materialize_only"] = True
             retrieve_kwargs["shared_cpu_phase"] = "dsa_cold_compact_latent"
+            retrieve_kwargs["dsa_cold_connector_only"] = True
             latent_retriever = (
                 self.lmcache_engine.retrieve_layer_head_token_wise(
                     tokens,
@@ -5451,21 +5536,59 @@ class LMCacheConnectorV1Impl:
                 kv_group=1,
                 req_id=request.req_id,
                 request_configs=request.request_configs,
+                shared_cpu_phase="dsa_cold_compact_indexer",
                 shared_cpu_request_ordinal=0,
+                dsa_cold_connector_only=True,
             )
+            setup_ms = (time.monotonic() - setup_started_at) * 1000
 
+            latent_step_ms = 0.0
+            indexer_step_ms = 0.0
+            layer_wall_ms: list[float] = []
+            close_ms = 0.0
             try:
+                phase_started_at = time.monotonic()
                 latent_result = next(latent_retriever)
+                latent_prime_ms = (time.monotonic() - phase_started_at) * 1000
+
+                phase_started_at = time.monotonic()
                 next(indexer_retriever)
+                indexer_prime_first_ms = (
+                    time.monotonic() - phase_started_at
+                ) * 1000
+
+                phase_started_at = time.monotonic()
                 next(indexer_retriever)
+                indexer_prime_second_ms = (
+                    time.monotonic() - phase_started_at
+                ) * 1000
+
                 indexer_result = None
-                for _ in range(self.num_layers):
+                loop_started_at = time.monotonic()
+                for _layer_id in range(self.num_layers):
+                    layer_started_at = time.monotonic()
+                    phase_started_at = time.monotonic()
                     latent_result = latent_retriever.send(None)
+                    latent_step_ms += (
+                        time.monotonic() - phase_started_at
+                    ) * 1000
+
+                    phase_started_at = time.monotonic()
                     indexer_result = next(indexer_retriever)
+                    indexer_step_ms += (
+                        time.monotonic() - phase_started_at
+                    ) * 1000
+                    layer_wall_ms.append(
+                        (time.monotonic() - layer_started_at) * 1000
+                    )
+                loop_ms = (time.monotonic() - loop_started_at) * 1000
             finally:
+                close_started_at = time.monotonic()
                 latent_retriever.close()
                 indexer_retriever.close()
+                close_ms = (time.monotonic() - close_started_at) * 1000
 
+            validate_started_at = time.monotonic()
             if (
                 latent_result is None
                 or int(latent_result.sum().item()) != token_count
@@ -5476,15 +5599,76 @@ class LMCacheConnectorV1Impl:
                 or int(indexer_result.sum().item()) != token_count
             ):
                 raise RuntimeError("Cold compact indexer retrieve was incomplete")
+            validate_ms = (time.monotonic() - validate_started_at) * 1000
 
+            sync_started_at = time.monotonic()
             self._synchronize_dsa_cold_dense_load()
+            dense_sync_ms = (time.monotonic() - sync_started_at) * 1000
 
+            control_sync_started_at = time.monotonic()
+            if control_stream is not None:
+                control_stream.synchronize()
+            control_sync_ms = (
+                time.monotonic() - control_sync_started_at
+            ) * 1000
+
+            seal_started_at = time.monotonic()
             state.location = retrieve_kwargs.get("cached_retrieve_location")
             state.metadata_warm = state.has_cache()
             state.token_count = token_count
             self._refresh_prepared_sparse_sources(state, token_count)
             if state.prepared_sparse_sources.get(0) is None:
                 raise RuntimeError("Cold compact latent source was not sealed")
+            seal_ms = (time.monotonic() - seal_started_at) * 1000
+            slowest_layer = (
+                max(range(len(layer_wall_ms)), key=layer_wall_ms.__getitem__)
+                if layer_wall_ms
+                else -1
+            )
+            worker_total_ms = (time.monotonic() - worker_started_at) * 1000
+            accounted_ms = (
+                setup_ms
+                + latent_prime_ms
+                + indexer_prime_first_ms
+                + indexer_prime_second_ms
+                + loop_ms
+                + close_ms
+                + validate_ms
+                + dense_sync_ms
+                + control_sync_ms
+                + seal_ms
+            )
+            logger.info(
+                "[DSA_COLD_PERF] phase_summary req=%s tokens=%d layers=%d "
+                "setup_ms=%.3f latent_prime_ms=%.3f "
+                "indexer_prime_first_ms=%.3f indexer_prime_second_ms=%.3f "
+                "loop_ms=%.3f latent_steps_ms=%.3f indexer_steps_ms=%.3f "
+                "layer_p50_ms=%.3f layer_p95_ms=%.3f "
+                "slowest_layer=%d slowest_layer_ms=%.3f close_ms=%.3f "
+                "validate_ms=%.3f dense_sync_ms=%.3f control_sync_ms=%.3f "
+                "seal_ms=%.3f other_ms=%.3f worker_total_ms=%.3f",
+                request.req_id,
+                token_count,
+                self.num_layers,
+                setup_ms,
+                latent_prime_ms,
+                indexer_prime_first_ms,
+                indexer_prime_second_ms,
+                loop_ms,
+                latent_step_ms,
+                indexer_step_ms,
+                _dsa_cold_percentile_ms(layer_wall_ms, 0.50),
+                _dsa_cold_percentile_ms(layer_wall_ms, 0.95),
+                slowest_layer,
+                layer_wall_ms[slowest_layer] if slowest_layer >= 0 else 0.0,
+                close_ms,
+                validate_ms,
+                dense_sync_ms,
+                control_sync_ms,
+                seal_ms,
+                max(0.0, worker_total_ms - accounted_ms),
+                worker_total_ms,
+            )
             logger.info(
                 "[DSA_COLD_DIAG] cold_worker_loaded req=%s "
                 "indexer_slots=%s state=%s",
@@ -5496,6 +5680,8 @@ class LMCacheConnectorV1Impl:
         except BaseException:
             try:
                 self._synchronize_dsa_cold_dense_load()
+                if control_stream is not None:
+                    control_stream.synchronize()
             except BaseException:
                 logger.exception(
                     "Cold compact cleanup could not synchronize the dense "

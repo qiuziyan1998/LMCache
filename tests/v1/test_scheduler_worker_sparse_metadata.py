@@ -247,6 +247,56 @@ def test_dsa_cold_compact_worker_restores_submitted_npu_device(
     fake_npu.set_device.assert_called_once_with(6)
 
 
+def test_dsa_cold_compact_worker_uses_isolated_control_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    load_stream = SimpleNamespace(device="npu:3", stream_id=30)
+    impl.lmcache_engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(load_stream=load_stream)
+    )
+    ambient_stream = SimpleNamespace(device="npu:3", stream_id=10)
+    control_stream = SimpleNamespace(
+        device="npu:3",
+        stream_id=20,
+        synchronize=MagicMock(),
+    )
+    active_stream = [ambient_stream]
+
+    class _StreamContext:
+        def __enter__(self):
+            active_stream[0] = control_stream
+            return control_stream
+
+        def __exit__(self, exc_type, exc, tb):
+            active_stream[0] = ambient_stream
+            return False
+
+    fake_npu = SimpleNamespace(
+        set_device=MagicMock(),
+        current_stream=lambda: active_stream[0],
+        Stream=MagicMock(return_value=control_stream),
+        stream=lambda stream: _StreamContext(),
+    )
+    monkeypatch.setattr(adapter_module.torch, "npu", fake_npu, raising=False)
+    observed_streams = []
+    state = WorkerRetrieveState(req_id="cold-stream")
+
+    def _run_on_control(request, npu_device_id, submitted_control_stream):
+        observed_streams.append(fake_npu.current_stream())
+        assert submitted_control_stream is control_stream
+        return state
+
+    impl._run_dsa_cold_compact_load_on_control_stream = _run_on_control
+    request = SimpleNamespace(req_id="cold-stream")
+
+    assert impl._run_dsa_cold_compact_load(request, 3) is state
+    assert observed_streams == [control_stream]
+    assert active_stream[0] is ambient_stream
+    fake_npu.set_device.assert_called_once_with(3)
+    fake_npu.Stream.assert_called_once_with()
+
+
 def test_dsa_cold_compact_finished_signal_waits_for_future() -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     future = Future()
