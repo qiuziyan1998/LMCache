@@ -3,8 +3,9 @@
 
 # Standard
 from concurrent.futures import Future
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import asyncio
+import sys
 import threading
 
 # Third Party
@@ -17,7 +18,11 @@ from lmcache.v1.storage_backend.connector.instrumented_connector import (
     InstrumentedRemoteConnector,
 )
 from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
+    MooncakeStoreConfig,
     MooncakestoreConnector,
+)
+from lmcache.v1.storage_backend.connector.mooncakestore_process import (
+    _run_mooncake_process_worker,
 )
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 
@@ -265,3 +270,234 @@ def test_mooncake_timeout_keeps_source_buffer_until_native_put_exits() -> None:
 
     asyncio.run(run())
     assert memory_obj.ref_count == 1
+
+
+def test_mooncake_page_get_process_isolation_uses_shared_offsets() -> None:
+    class _ProcessClient:
+        def __init__(self) -> None:
+            self.calls = []
+            self.pid = 1234
+
+        def get_pages(
+            self,
+            page_keys,
+            page_offsets,
+            page_sizes,
+            *,
+            timeout,
+        ):
+            self.calls.append(
+                (page_keys, page_offsets, page_sizes, timeout)
+            )
+            return [32]
+
+    class _ParentStore:
+        @staticmethod
+        def batch_get_into_multi_buffers(*_args):
+            raise AssertionError('parent Mooncake store must not transfer')
+
+    buffer = SimpleNamespace(
+        data_ptr=lambda: 1000,
+        numel=lambda: 4096,
+    )
+    process_client = _ProcessClient()
+    connector = object.__new__(MooncakestoreConnector)
+    connector.config = SimpleNamespace(transfer_timeout=7)
+    connector.store = _ParentStore()
+    connector._cold_process_transfer_client = process_client
+    connector.local_cpu_backend = SimpleNamespace(
+        memory_allocator=SimpleNamespace(buffer=buffer)
+    )
+    memory_objs = [_MemoryObj(16, 1016), _MemoryObj(16, 1048)]
+    connector._allocate_zero_copy_buffers = lambda _keys: (
+        memory_objs,
+        [],
+        'batched',
+    )
+    keys = [_layer_key(1, 0), _layer_key(1, 1)]
+
+    loaded = asyncio.run(
+        connector._batch_get_pages_process_isolated(
+            keys,
+            [('page-key', [0, 1])],
+        )
+    )
+
+    assert loaded == {0: memory_objs[0], 1: memory_objs[1]}
+    assert process_client.calls == [
+        (['page-key'], [[16, 48]], [[16, 16]], 7.0)
+    ]
+    assert all(memory_obj.ref_count == 1 for memory_obj in memory_objs)
+
+
+def test_mooncake_process_worker_reconstructs_shared_slab_pointers(
+    monkeypatch,
+) -> None:
+    class _Connection:
+        def __init__(self) -> None:
+            self.messages = iter(
+                [
+                    ('get_pages', ['page'], [[16, 48]], [[16, 16]]),
+                    ('close',),
+                ]
+            )
+            self.sent = []
+            self.closed = False
+
+        def recv(self):
+            return next(self.messages)
+
+        def send(self, value) -> None:
+            self.sent.append(value)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _Mapping:
+        ptr = 1000
+        size = 4096
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _Store:
+        def __init__(self) -> None:
+            self.get_calls = []
+            self.unregistered = []
+            self.closed = False
+
+        def setup(self, *_args) -> None:
+            return None
+
+        def register_buffer(self, ptr, size) -> int:
+            assert (ptr, size) == (1000, 4096)
+            return 0
+
+        def batch_get_into_multi_buffers(self, keys, ptrs, sizes):
+            self.get_calls.append((keys, ptrs, sizes))
+            return [32]
+
+        def unregister_buffer(self, ptr) -> None:
+            self.unregistered.append(ptr)
+
+        def close(self) -> None:
+            self.closed = True
+
+    mapping = _Mapping()
+    store = _Store()
+    mooncake_module = ModuleType('mooncake')
+    mooncake_store_module = ModuleType('mooncake.store')
+    mooncake_store_module.MooncakeDistributedStore = lambda: store
+    monkeypatch.setitem(sys.modules, 'mooncake', mooncake_module)
+    monkeypatch.setitem(sys.modules, 'mooncake.store', mooncake_store_module)
+    monkeypatch.setattr(
+        'lmcache.v1.storage_backend.connector.mooncakestore_process.'
+        'SharedSlabMapping.attach',
+        lambda **_kwargs: mapping,
+    )
+    connection = _Connection()
+    config = MooncakeStoreConfig(
+        local_hostname='host',
+        metadata_server='meta',
+        global_segment_size=1,
+        local_buffer_size=0,
+        protocol='tcp',
+        device_name='npu',
+        master_server_address='master',
+        transfer_timeout=30,
+        storage_root_dir='',
+    )
+
+    _run_mooncake_process_worker(
+        connection,
+        config.__dict__,
+        'slab',
+        4096,
+        0,
+    )
+
+    assert store.get_calls == [
+        (['page'], [[1016, 1048]], [[16, 16]])
+    ]
+    assert connection.sent[0][0] == 'ready'
+    assert connection.sent[1] == ('result', [32])
+    assert connection.sent[2] == ('closed', None)
+    assert store.unregistered == [1000]
+    assert store.closed
+    assert mapping.closed
+    assert connection.closed
+
+
+def test_remote_backend_dispatches_process_isolated_get(monkeypatch) -> None:
+    calls = []
+    memory_obj = _MemoryObj()
+
+    class _GetConnection:
+        @staticmethod
+        def support_batched_get() -> bool:
+            return True
+
+        def batched_get(self, _keys):
+            calls.append('normal')
+
+            async def result():
+                return [memory_obj]
+
+            return result()
+
+        def batched_get_process_isolated(self, _keys):
+            calls.append('isolated')
+
+            async def result():
+                return [memory_obj]
+
+            return result()
+
+    def submit(coroutine, _loop) -> Future:
+        future: Future = Future()
+        future.set_result(asyncio.run(coroutine))
+        return future
+
+    monkeypatch.setattr(asyncio, 'run_coroutine_threadsafe', submit)
+    backend = object.__new__(RemoteBackend)
+    backend.local_cpu_backend = object()
+    backend.connection = _GetConnection()
+    backend._mla_worker_id_as0_mode = False
+    backend.loop = object()
+    backend.config = SimpleNamespace(blocking_timeout_secs=1)
+    backend.stats_monitor = SimpleNamespace(
+        update_interval_remote_time_to_get_sync=lambda _value: None,
+        get_current_retrieve_stats=lambda: None,
+    )
+    backend.deserializer = SimpleNamespace(deserialize=lambda value: value)
+    backend._get_blocking_failed_count = 0
+
+    result = backend.batched_get_blocking_process_isolated([_key(1)])
+
+    assert result == [memory_obj]
+    assert calls == ['isolated']
+
+
+def test_instrumented_connector_forwards_process_isolated_get() -> None:
+    memory_obj = _MemoryObj()
+
+    class _Underlying:
+        async def batched_get_process_isolated(self, keys):
+            assert keys == [_key(1)]
+            return [memory_obj]
+
+    connector = object.__new__(InstrumentedRemoteConnector)
+    connector._connector = _Underlying()
+    connector._stats_monitor = SimpleNamespace(
+        update_interval_remote_time_to_get=lambda _value: None,
+        update_interval_remote_read_metrics=lambda _value: None,
+    )
+
+    result = asyncio.run(
+        connector.batched_get_process_isolated([_key(1)])
+    )
+
+    assert result == [memory_obj]

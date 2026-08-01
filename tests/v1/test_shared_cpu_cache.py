@@ -1154,10 +1154,12 @@ class _FakePassiveSharedView:
 class _FakePassiveSharedAllocator:
     def __init__(self):
         self.views = []
+        self.create_kwargs = []
 
     def create_view(self, *args, **kwargs):
         view = _FakePassiveSharedView()
         self.views.append(view)
+        self.create_kwargs.append(kwargs)
         return view
 
 
@@ -1711,6 +1713,53 @@ def test_rank0_windowed_remote_resolver_batches_layers_and_preserves_order():
     assert all(obj.is_pinned for layer in resolved for obj in layer)
 
 
+def test_rank0_windowed_remote_resolver_enables_cold_process_isolation():
+    keys_layer_major = [[replace(_make_key(), chunk_hash=0x500)]]
+    memory_obj = _FakeResolvableMemoryObj()
+
+    class _ProcessStorageManager:
+        def __init__(self):
+            self.calls = []
+
+        def batched_get(self, _fetch_keys, location=None):
+            raise AssertionError(
+                f'normal batched_get selected for location={location}'
+            )
+
+        def batched_get_process_isolated(
+            self, fetch_keys, location=None
+        ):
+            self.calls.append((list(fetch_keys), location))
+            return [memory_obj]
+
+    storage_manager = _ProcessStorageManager()
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        get_extra_config_value=lambda key, default: (
+            True if key == 'dsa_cold_process_isolation' else default
+        )
+    )
+    engine.storage_manager = storage_manager
+    engine._is_rank0_shared_mem_obj = lambda obj: obj is memory_obj
+    engine._validate_rank0_shared_mem_obj = lambda *args, **kwargs: None
+
+    resolved = engine._resolve_shared_rank0_remote_layers_windowed(
+        req_id='req-process',
+        phase='dsa_cold_compact_latent',
+        kv_group=0,
+        keys_layer_major=keys_layer_major,
+        layers_per_batch=1,
+    )
+
+    assert resolved == [[memory_obj]]
+    assert storage_manager.calls == [
+        (
+            [keys_layer_major[0][0]],
+            'RemoteBackend',
+        )
+    ]
+
+
 def test_rank0_resolver_releases_prefetched_hits_on_alignment_error():
     keys = [replace(_make_key(), chunk_hash=0x300 + i) for i in range(2)]
     local_obj = _FakeResolvableMemoryObj()
@@ -2116,7 +2165,8 @@ def test_passive_allocator_rejects_inconsistent_shape_size():
         )
 
 
-def test_passive_allocator_rejects_key_mismatch():
+@pytest.mark.parametrize('compact_expected_key', [False, True])
+def test_passive_allocator_rejects_key_mismatch(compact_expected_key):
     slab = torch.arange(1024, dtype=torch.uint8)
     source_obj = _make_memory_obj(slab)
     key = _make_key()
@@ -2138,6 +2188,10 @@ def test_passive_allocator_rejects_key_mismatch():
         generation=2,
     )
 
+    expected_key = _make_key(kv_group=1)
+    if not compact_expected_key:
+        expected_key = expected_key.get_first_layer()
+
     with pytest.raises(SharedCPUCacheValidationError, match="expected="):
         allocator.create_view(
             handle,
@@ -2146,11 +2200,14 @@ def test_passive_allocator_rejects_key_mismatch():
             expected_layer_id=0,
             expected_kv_group=0,
             expected_chunk_index=0,
-            expected_key=_make_key(kv_group=1),
+            expected_key=expected_key,
         )
 
 
-def test_passive_allocator_accepts_rank0_key_for_passive_rank():
+@pytest.mark.parametrize('compact_expected_key', [False, True])
+def test_passive_allocator_accepts_rank0_key_for_passive_rank(
+    compact_expected_key,
+):
     slab = torch.arange(1024, dtype=torch.uint8)
     source_obj = _make_memory_obj(slab)
     handle = SharedChunkHandle.from_memory_obj(
@@ -2170,14 +2227,19 @@ def test_passive_allocator_accepts_rank0_key_for_passive_rank():
         shm_name="/lmcache-test",
         generation=2,
     )
-    expected_key = CacheEngineKey(
+    expected_base_key = CacheEngineKey(
         model_name="model",
         world_size=8,
         worker_id=1,
         chunk_hash=1234,
         dtype=torch.float16,
         kv_group=0,
-    ).get_first_layer()
+    )
+    expected_key = (
+        expected_base_key
+        if compact_expected_key
+        else expected_base_key.get_first_layer()
+    )
 
     view = allocator.create_view(
         handle,
@@ -2846,6 +2908,65 @@ def test_shared_dense_passive_retriever_releases_before_result_tail(
         view.ref_count_down_count
         for view in engine.shared_cpu_cache_passive_allocator.views
     ] == [1, 1]
+    with pytest.raises(StopIteration):
+        next(retriever)
+
+
+def test_cold_process_passive_retrieve_uses_compact_expected_keys(
+    monkeypatch,
+):
+    import lmcache.v1.cache_engine as cache_engine_module
+
+    monkeypatch.setattr(
+        cache_engine_module,
+        'assert_layerwise_gpu_connector',
+        lambda _connector: None,
+    )
+    engine = _make_passive_shared_retrieve_engine(kv_group=0)
+    engine.config = SimpleNamespace(
+        get_extra_config_value=lambda key, default: (
+            True if key == 'dsa_cold_process_isolation' else default
+        )
+    )
+    envelopes = iter(
+        [
+            SharedHandleEnvelope(
+                request_id='req-1',
+                phase='dsa_cold_compact_latent',
+                request_ordinal=0,
+                layer_id=layer_id,
+                kv_group=0,
+                status='ok',
+                generation=9,
+                handles=[object()],
+            )
+            for layer_id in range(engine.num_layers)
+        ]
+    )
+    engine._receive_shared_envelope = lambda: next(envelopes)
+    ret_mask = torch.zeros(4, dtype=torch.bool)
+    retriever = engine._retrieve_layer_shared_passive(
+        starts_all=[0],
+        ends_all=[4],
+        keys_layer_major=[[_make_key()]],
+        ret_mask=ret_mask,
+        monitor_req_id=123,
+        req_id='req-1',
+        kv_group=0,
+        kwargs={
+            'shared_cpu_phase': 'dsa_cold_compact_latent',
+            'shared_cpu_request_ordinal': 0,
+        },
+    )
+
+    yielded = [next(retriever) for _ in range(engine.num_layers + 1)]
+
+    assert yielded[0].item() == 4
+    assert all(
+        kwargs['expected_key'] == _make_key()
+        for kwargs in engine.shared_cpu_cache_passive_allocator.create_kwargs
+    )
+    assert torch.equal(next(retriever), ret_mask)
     with pytest.raises(StopIteration):
         next(retriever)
 

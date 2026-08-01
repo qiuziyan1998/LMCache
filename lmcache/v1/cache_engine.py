@@ -2172,6 +2172,14 @@ class LMCacheEngine:
         if not keys_layer_major:
             return []
 
+        process_isolation = bool(
+            phase.startswith('dsa_cold_compact')
+            and getattr(self, 'config', None) is not None
+            and self.config.get_extra_config_value(
+                'dsa_cold_process_isolation', False
+            )
+        )
+
         resolved_layers: list[list[MemoryObj]] = [
             [] for _ in keys_layer_major
         ]
@@ -2195,7 +2203,12 @@ class LMCacheEngine:
                         coordinates.append((layer_id, chunk_index))
                         fetch_keys.append(key)
 
-                fetched = self.storage_manager.batched_get(
+                batched_get = self.storage_manager.batched_get
+                if process_isolation:
+                    batched_get = (
+                        self.storage_manager.batched_get_process_isolated
+                    )
+                fetched = batched_get(
                     fetch_keys,
                     location="RemoteBackend",
                 )
@@ -2500,6 +2513,12 @@ class LMCacheEngine:
         phase = kwargs.get("shared_cpu_phase", "dense_prefix")
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
         assert_layerwise_gpu_connector(self.gpu_connector)
+        compact_expected_keys = bool(
+            phase.startswith('dsa_cold_compact')
+            and self.config.get_extra_config_value(
+                'dsa_cold_process_isolation', False
+            )
+        )
         mem_obj_consumer = None
         to_release: list[MemoryObj] = []
         expected_handle_count: Optional[int] = None
@@ -2559,7 +2578,11 @@ class LMCacheEngine:
                         expected_layer_id=layer_id,
                         expected_kv_group=kv_group,
                         expected_chunk_index=chunk_index,
-                        expected_key=keys_layer_major[layer_id][chunk_index],
+                        expected_key=(
+                            keys_layer_major[0][chunk_index]
+                            if compact_expected_keys
+                            else keys_layer_major[layer_id][chunk_index]
+                        ),
                         expected_shape=expected_shape,
                         expected_dtype=expected_dtype,
                         expected_fmt=expected_fmt,
@@ -3496,6 +3519,7 @@ class LMCacheEngine:
         starts = []
         ends = []
         keys = []
+        compact_keys: list[CacheEngineKey] = []
         segments: List[LayerwiseRetrieveSegment] = []
         segment_location: Optional[str] = None
         segment_starts: List[int] = []
@@ -3507,6 +3531,13 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         if shared_layerwise_retrieve and self._is_passive():
+            phase = kwargs.get('shared_cpu_phase', 'dense_prefix')
+            compact_expected_keys = bool(
+                phase.startswith('dsa_cold_compact')
+                and self.config.get_extra_config_value(
+                    'dsa_cold_process_isolation', False
+                )
+            )
             for start, end, key in self.token_database.process_tokens(
                 tokens=tokens,
                 mask=mask,
@@ -3516,14 +3547,19 @@ class LMCacheEngine:
                 assert isinstance(key, CacheEngineKey)
                 starts.append(start)
                 ends.append(end)
-                keys.append(key.split_layers(self.num_layers))
+                if compact_expected_keys:
+                    compact_keys.append(key)
+                else:
+                    keys.append(key.split_layers(self.num_layers))
 
             yield from self._retrieve_layer_shared_passive(
                 starts_all=starts,
                 ends_all=ends,
-                keys_layer_major=[list(row) for row in zip(*keys, strict=False)]
-                if keys
-                else [],
+                keys_layer_major=(
+                    [compact_keys]
+                    if compact_expected_keys
+                    else [list(row) for row in zip(*keys, strict=False)]
+                ),
                 ret_mask=ret_mask,
                 monitor_req_id=monitor_req_id,
                 req_id=req_id,
@@ -3536,6 +3572,14 @@ class LMCacheEngine:
             location = None
             chunk_locations: list[list[str]] = []
             missing_shared_chunks: list[dict[str, Any]] = []
+            remote_only_hint = bool(
+                kwargs.get('shared_cpu_phase', 'dense_prefix').startswith(
+                    'dsa_cold_compact'
+                )
+                and self.config.get_extra_config_value(
+                    'dsa_cold_process_isolation', False
+                )
+            )
             phase = kwargs.get("shared_cpu_phase", "dense_prefix")
             request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
             for start, end, key in self.token_database.process_tokens(
@@ -3548,8 +3592,14 @@ class LMCacheEngine:
 
                 keys_multi_layer = key.split_layers(self.num_layers)
                 locations_multi_layer: list[str] = []
+                if remote_only_hint:
+                    locations_multi_layer = [
+                        'RemoteBackend'
+                    ] * self.num_layers
                 missing_layer = False
                 for layer_idx, layer_key in enumerate(keys_multi_layer):
+                    if remote_only_hint:
+                        break
                     current_location = self._find_shared_rank0_chunk_location(
                         layer_key
                     )

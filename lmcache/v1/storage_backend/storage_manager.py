@@ -508,6 +508,36 @@ class StorageManager:
                 return memory_objs
         return [None] * len(keys)
 
+    def batched_get_process_isolated(
+        self,
+        keys: List[CacheEngineKey],
+        location: Optional[str] = None,
+    ) -> List[Optional[MemoryObj]]:
+        '''Retrieve one cold Mooncake batch without touching the normal path.'''
+        for backend_name, storage_backend in self.get_active_storage_backends(
+            location
+        ):
+            isolated_get = getattr(
+                storage_backend,
+                'batched_get_blocking_process_isolated',
+                None,
+            )
+            if backend_name != 'RemoteBackend' or not callable(isolated_get):
+                raise RuntimeError(
+                    'Process-isolated batched get requires RemoteBackend; '
+                    f'selected={backend_name}'
+                )
+            memory_objs = isolated_get(keys)
+            if memory_objs:
+                if None not in memory_objs:
+                    self._write_back_to_local_cpu(
+                        backend_name,
+                        keys,
+                        cast(List[MemoryObj], memory_objs),
+                    )
+                return memory_objs
+        return [None] * len(keys)
+
     def _write_back_to_local_cpu(
         self,
         backend_name: str,

@@ -5,6 +5,8 @@ from typing import Any, Callable, List, Optional, no_type_check
 import asyncio
 import json
 import os
+import threading
+import time
 
 # Third Party
 import torch
@@ -239,6 +241,15 @@ class MooncakestoreConnector(RemoteConnector):
             raise
 
         self._page_first_multi_buffer = self.config.page_first_multi_buffer
+        self._cold_process_transfer_client = None
+        self._cold_process_transfer_spec = None
+        self._cold_process_transfer_lock = None
+        self._cold_process_isolation = bool(
+            lmcache_config is not None
+            and lmcache_config.get_extra_config_value(
+                'dsa_cold_process_isolation', False
+            )
+        )
         self._page_num_layers = int(
             getattr(local_cpu_backend.metadata, "kv_shape", (1,))[0]
         )
@@ -263,6 +274,37 @@ class MooncakestoreConnector(RemoteConnector):
                     "Installed Mooncake lacks page-first APIs: "
                     f"{missing_methods}"
                 )
+        if self._cold_process_isolation:
+            assert lmcache_config is not None
+            if not self._page_first_multi_buffer:
+                raise ValueError(
+                    'dsa_cold_process_isolation requires '
+                    'mooncake_page_first_multi_buffer=true'
+                )
+            allocator = local_cpu_backend.memory_allocator
+            allocator_buffer = getattr(allocator, 'buffer', None)
+            allocator_shm_name = getattr(allocator, 'shm_name', None)
+            if allocator_buffer is None or allocator_shm_name is None:
+                raise ValueError(
+                    'dsa_cold_process_isolation requires a shm-backed '
+                    'LocalCPU allocator exposing buffer and shm_name'
+                )
+            self._cold_process_transfer_spec = (
+                str(allocator_shm_name),
+                int(allocator_buffer.numel()),
+                float(
+                    lmcache_config.get_extra_config_value(
+                        'dsa_cold_process_startup_timeout_secs', 60
+                    )
+                ),
+            )
+            self._cold_process_transfer_lock = threading.Lock()
+            logger.info(
+                '[DSA_COLD_PROCESS] configured lazy sidecar shm_name=%s '
+                'slab_bytes=%d',
+                allocator_shm_name,
+                int(allocator_buffer.numel()),
+            )
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
         self.registered_buffer_ptr = None
@@ -743,6 +785,49 @@ class MooncakestoreConnector(RemoteConnector):
             # Use optimized mode with local metadata
             return await self._batch_get_into(keys)
 
+    def _get_or_create_cold_process_transfer_client(self) -> Any:
+        client = self._cold_process_transfer_client
+        if client is not None and not getattr(client, 'closed', False):
+            return client
+        spec = self._cold_process_transfer_spec
+        lock = self._cold_process_transfer_lock
+        if spec is None or lock is None:
+            raise RuntimeError(
+                'Mooncake cold process transfer was not configured'
+            )
+        with lock:
+            client = self._cold_process_transfer_client
+            if client is not None and not getattr(client, 'closed', False):
+                return client
+            # First Party
+            from lmcache.v1.storage_backend.connector.mooncakestore_process import (
+                MooncakeProcessTransferClient,
+            )
+
+            shm_name, slab_size, startup_timeout = spec
+            client = MooncakeProcessTransferClient(
+                config=self.config,
+                shm_name=shm_name,
+                slab_size=slab_size,
+                generation=0,
+                startup_timeout=startup_timeout,
+            )
+            self._cold_process_transfer_client = client
+            return client
+
+    async def batched_get_process_isolated(
+        self, keys: List[CacheEngineKey]
+    ) -> List[Optional[MemoryObj]]:
+        '''Run a cold page-first get in the dedicated Mooncake process.'''
+        if not keys:
+            return []
+        if self.save_chunk_meta or not self._page_first_multi_buffer:
+            raise RuntimeError(
+                'Mooncake process-isolated get requires metadata-free '
+                'page-first mode'
+            )
+        return await self._batch_get_into_process_isolated(keys)
+
     def support_batched_async_contains(self) -> bool:
         return True
 
@@ -833,6 +918,128 @@ class MooncakestoreConnector(RemoteConnector):
                 if memory_obj is not None and memory_obj.is_valid():
                     memory_obj.ref_count_down()
 
+    async def _batch_get_pages_process_isolated(
+        self,
+        keys: List[CacheEngineKey],
+        page_groups: list[tuple[str, list[int]]],
+    ) -> dict[int, MemoryObj]:
+        flat_indices = [index for _, indices in page_groups for index in indices]
+        page_keys = [keys[index] for index in flat_indices]
+        memory_objs, _, _ = self._allocate_zero_copy_buffers(page_keys)
+        object_by_index = {
+            original_index: memory_objs[position]
+            for position, original_index in enumerate(flat_indices)
+        }
+
+        submitted_groups: list[tuple[str, list[int]]] = []
+        all_buffer_ptrs: list[list[int]] = []
+        all_buffer_sizes: list[list[int]] = []
+        for page_key, indices in page_groups:
+            group_objects = [object_by_index[index] for index in indices]
+            if any(
+                obj is None or obj.raw_tensor is None for obj in group_objects
+            ):
+                continue
+            submitted_groups.append((page_key, indices))
+            all_buffer_ptrs.append(
+                [obj.data_ptr for obj in group_objects if obj is not None]
+            )
+            all_buffer_sizes.append(
+                [obj.get_size() for obj in group_objects if obj is not None]
+            )
+
+        loaded: dict[int, MemoryObj] = {}
+        try:
+            if not submitted_groups:
+                return loaded
+            client = self._cold_process_transfer_client
+            if client is None or getattr(client, 'closed', False):
+                client = await asyncio.to_thread(
+                    self._get_or_create_cold_process_transfer_client
+                )
+            allocator_buffer = getattr(
+                self.local_cpu_backend.memory_allocator,
+                'buffer',
+                None,
+            )
+            if allocator_buffer is None:
+                raise RuntimeError(
+                    'Mooncake cold process get lost the shared slab buffer'
+                )
+            slab_ptr = int(allocator_buffer.data_ptr())
+            all_buffer_offsets = [
+                [int(ptr) - slab_ptr for ptr in ptrs]
+                for ptrs in all_buffer_ptrs
+            ]
+            slab_size = int(allocator_buffer.numel())
+            for offsets, sizes in zip(
+                all_buffer_offsets, all_buffer_sizes, strict=True
+            ):
+                if any(
+                    offset < 0 or offset + size > slab_size
+                    for offset, size in zip(offsets, sizes, strict=True)
+                ):
+                    raise RuntimeError(
+                        'Mooncake cold process destination lies outside '
+                        'the shared CPU slab'
+                    )
+            process_started = time.perf_counter()
+            logger.info(
+                '[DSA_COLD_PROCESS] submit parent_pid=%d child_pid=%d '
+                'pages=%d buffers=%d bytes=%d',
+                os.getpid(),
+                client.pid,
+                len(submitted_groups),
+                sum(len(sizes) for sizes in all_buffer_sizes),
+                sum(sum(sizes) for sizes in all_buffer_sizes),
+            )
+            statuses = await asyncio.to_thread(
+                client.get_pages,
+                [page_key for page_key, _ in submitted_groups],
+                all_buffer_offsets,
+                all_buffer_sizes,
+                timeout=float(self.config.transfer_timeout),
+            )
+            logger.info(
+                '[DSA_COLD_PROCESS] done parent_pid=%d child_pid=%d '
+                'pages=%d elapsed_ms=%.3f',
+                os.getpid(),
+                client.pid,
+                len(submitted_groups),
+                (time.perf_counter() - process_started) * 1000,
+            )
+            for group_index, (page_key, indices) in enumerate(submitted_groups):
+                if group_index >= len(statuses):
+                    logger.warning(
+                        "Mooncake page get omitted status for page=%s", page_key
+                    )
+                    continue
+                expected_bytes = sum(all_buffer_sizes[group_index])
+                status = statuses[group_index]
+                if status != expected_bytes:
+                    logger.warning(
+                        "Mooncake page get failed or was short: page=%s "
+                        "status=%s expected_bytes=%d",
+                        page_key,
+                        status,
+                        expected_bytes,
+                    )
+                    continue
+                for index in indices:
+                    memory_obj = object_by_index[index]
+                    assert memory_obj is not None
+                    loaded[index] = memory_obj
+                    object_by_index[index] = None
+
+            return loaded
+        except Exception as exc:
+            logger.error("Mooncake page-first get failed: %s", exc)
+            return loaded
+        finally:
+            for memory_obj in object_by_index.values():
+                if memory_obj is not None and memory_obj.is_valid():
+                    memory_obj.ref_count_down()
+
     async def _batch_get_into(
         self, keys: List[CacheEngineKey]
     ) -> List[Optional[MemoryObj]]:
@@ -872,6 +1079,40 @@ class MooncakestoreConnector(RemoteConnector):
                 legacy_indices, legacy_results, strict=False
             ):
                 results[index] = memory_obj
+        return results
+
+    async def _batch_get_into_process_isolated(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        if not getattr(self, "_page_first_multi_buffer", False):
+            return await self._batch_get_into_legacy(keys)
+
+        complete_groups, legacy_indices = self._complete_page_groups(keys)
+        if not complete_groups:
+            raise RuntimeError(
+                'Mooncake cold process isolation found no complete pages'
+            )
+        if legacy_indices:
+            raise RuntimeError(
+                'Mooncake cold process isolation requires complete '
+                'page-first groups; legacy keys were selected'
+            )
+
+        # The strict shared-CPU preflight already proved that every key is
+        # remotely present. Keep Mooncake status allocation and page execution
+        # entirely in the child process.
+        page_groups = complete_groups
+
+        results: list[Optional[MemoryObj]] = [None] * len(keys)
+        if page_groups:
+            page_results = await self._batch_get_pages_process_isolated(
+                keys,
+                page_groups,
+            )
+            for index, memory_obj in page_results.items():
+                results[index] = memory_obj
+
         return results
 
     async def _batch_get_into_legacy(
@@ -1290,6 +1531,10 @@ class MooncakestoreConnector(RemoteConnector):
             await asyncio.gather(
                 *tuple(self._inflight_put_tasks), return_exceptions=True
             )
+
+        if self._cold_process_transfer_client is not None:
+            self._cold_process_transfer_client.close()
+            self._cold_process_transfer_client = None
 
         # Unregister buffer before closing the store
         self._unregister_cpu_buffer()

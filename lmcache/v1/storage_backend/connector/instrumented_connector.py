@@ -174,6 +174,35 @@ class InstrumentedRemoteConnector(RemoteConnector):
             )
         return memory_objs
 
+    async def batched_get_process_isolated(
+        self, keys: List[CacheEngineKey]
+    ) -> List[Optional[MemoryObj]]:
+        isolated_retrieve = getattr(
+            self._connector,
+            'batched_get_process_isolated',
+            None,
+        )
+        if not callable(isolated_retrieve):
+            raise RuntimeError(
+                'Wrapped connector does not support process-isolated get'
+            )
+        begin = time.perf_counter()
+        memory_objs = await isolated_retrieve(keys)
+        duration = time.perf_counter() - begin
+        self._stats_monitor.update_interval_remote_time_to_get(
+            duration * 1000
+        )
+        total_size = sum(
+            memory_obj.get_size()
+            for memory_obj in memory_objs
+            if memory_obj is not None
+        )
+        if total_size > 0:
+            self._stats_monitor.update_interval_remote_read_metrics(
+                total_size
+            )
+        return memory_objs
+
     async def batched_put(
         self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
     ):

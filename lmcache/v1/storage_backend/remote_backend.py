@@ -513,6 +513,77 @@ class RemoteBackend(StorageBackendInterface):
         )
         return decompressed_memory_objs
 
+    def batched_get_blocking_process_isolated(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        '''Retrieve a Mooncake batch through the dedicated cold process.'''
+        if self.local_cpu_backend is None:
+            return [None] * len(keys)
+        if self.connection is None:
+            return [None] * len(keys)
+        if self._mla_worker_id_as0_mode:
+            keys = [key.with_new_worker_id(0) for key in keys]
+
+        isolated_retrieve = getattr(
+            self.connection,
+            'batched_get_process_isolated',
+            None,
+        )
+        if not callable(isolated_retrieve):
+            raise RuntimeError(
+                'Remote connector does not support process-isolated '
+                'batched get'
+            )
+
+        started = time.perf_counter()
+        future = asyncio.run_coroutine_threadsafe(
+            isolated_retrieve(keys),
+            self.loop,
+        )
+        try:
+            memory_objs = future.result(self.config.blocking_timeout_secs)
+        except Exception as exc:
+            if isinstance(exc, TimeoutError):
+                future.cancel()
+            logger.warning(
+                'Process-isolated batched get failed: %s',
+                exc,
+            )
+            memory_objs = [None] * len(keys)
+
+        duration = time.perf_counter() - started
+        self.stats_monitor.update_interval_remote_time_to_get_sync(
+            duration * 1000
+        )
+        retrieve_stats = self.stats_monitor.get_current_retrieve_stats()
+        if retrieve_stats is not None:
+            retrieve_stats.detailed_metrics[
+                'remote_backend_batched_get_blocking_time'
+            ] = (
+                retrieve_stats.detailed_metrics.get(
+                    'remote_backend_batched_get_blocking_time', 0.0
+                )
+                + duration
+            )
+
+        results: list[Optional[MemoryObj]] = []
+        failed = False
+        for memory_obj in memory_objs:
+            if memory_obj is None:
+                failed = True
+                results.append(None)
+            else:
+                results.append(self.deserializer.deserialize(memory_obj))
+        if failed:
+            self._get_blocking_failed_count += 1
+        if len(results) != len(keys):
+            raise RuntimeError(
+                'Process-isolated batched get returned unexpected count: '
+                f'keys={len(keys)}, results={len(results)}'
+            )
+        return results
+
     async def support_batched_async_contains(self) -> bool:
         return (
             self.connection is not None

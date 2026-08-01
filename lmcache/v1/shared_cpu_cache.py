@@ -291,12 +291,19 @@ def _shared_key_matches_expected(
     expected_key: CacheEngineKey,
     expected_producer_rank: Optional[int],
 ) -> bool:
-    if handle_key == expected_key:
+    if type(handle_key) is type(expected_key) and handle_key == expected_key:
         return True
     if expected_producer_rank is None:
         return False
     if type(handle_key) is not type(expected_key):
-        return False
+        # A compact passive lookup may retain one base key per chunk instead
+        # of materializing one LayerCacheEngineKey per layer. Layer identity
+        # is validated independently by expected_layer_id.
+        if not (
+            hasattr(handle_key, 'layer_id')
+            and not hasattr(expected_key, 'layer_id')
+        ):
+            return False
     if int(handle_key.worker_id) != int(expected_producer_rank):
         return False
 
