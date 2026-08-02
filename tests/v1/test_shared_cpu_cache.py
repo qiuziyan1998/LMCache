@@ -24,6 +24,7 @@ from lmcache.v1.shared_cpu_cache import (
     SharedCPUCacheError,
     SharedCPUCacheValidationError,
     SharedHandleEnvelope,
+    SharedHandleGroupEnvelope,
     SharedCPURequestLease,
     SharedSlabMapping,
 )
@@ -2573,6 +2574,58 @@ def test_skipped_index_envelope_round_trips_without_handles():
     assert decoded.kv_group == 1
     assert decoded.handles == []
     assert decoded.message is not None
+
+
+def test_shared_handle_group_envelope_round_trips_all_layers():
+    envelopes = [
+        SharedHandleEnvelope(
+            request_id="req-1",
+            phase="sparse_decode_bootstrap",
+            request_ordinal=0,
+            layer_id=layer_id,
+            kv_group=1,
+            status="skipped",
+            generation=9,
+            handles=[],
+            message="no new handles",
+        )
+        for layer_id in range(3)
+    ]
+    group = SharedHandleGroupEnvelope(envelopes)
+
+    encoded = group.to_dict()
+    decoded = SharedHandleGroupEnvelope.from_dict(encoded)
+
+    assert encoded["envelope_type"] == "group"
+    assert [envelope.layer_id for envelope in decoded.envelopes] == [0, 1, 2]
+    assert decoded.kv_group == 1
+    assert decoded.status == "skipped"
+    assert decoded.handles == []
+
+
+def test_receive_shared_envelope_decodes_group_payload():
+    group = SharedHandleGroupEnvelope(
+        [
+            SharedHandleEnvelope(
+                request_id="req-1",
+                phase="sparse_decode_bootstrap",
+                request_ordinal=0,
+                layer_id=0,
+                kv_group=0,
+                status="skipped",
+                generation=9,
+                handles=[],
+            )
+        ]
+    )
+    engine = object.__new__(LMCacheEngine)
+    engine.metadata = SimpleNamespace(first_rank=0)
+    engine.broadcast_object_fn = lambda _obj, _rank: group.to_dict()
+
+    decoded = engine._receive_shared_envelope()
+
+    assert isinstance(decoded, SharedHandleGroupEnvelope)
+    assert decoded.envelopes == group.envelopes
 
 
 def test_shared_envelope_rejects_missing_required_field():

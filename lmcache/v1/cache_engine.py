@@ -66,6 +66,7 @@ from lmcache.v1.shared_cpu_cache import (
     SharedCPURequestLease,
     SharedChunkHandle,
     SharedHandleEnvelope,
+    SharedHandleGroupEnvelope,
     SharedSlabMapping,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
@@ -964,10 +965,15 @@ class LMCacheEngine:
             error_details=details,
         )
 
-    def _broadcast_shared_envelope(self, envelope: SharedHandleEnvelope) -> None:
+    def _broadcast_shared_envelope(
+        self,
+        envelope: Union[SharedHandleEnvelope, SharedHandleGroupEnvelope],
+    ) -> None:
         self.broadcast_object_fn(envelope.to_dict(), self.metadata.first_rank)
 
-    def _receive_shared_envelope(self) -> SharedHandleEnvelope:
+    def _receive_shared_envelope(
+        self,
+    ) -> Union[SharedHandleEnvelope, SharedHandleGroupEnvelope]:
         raw = self.broadcast_object_fn(None, self.metadata.first_rank)
         if not isinstance(raw, dict):
             raise ValueError(
@@ -975,6 +981,8 @@ class LMCacheEngine:
                 f"got {type(raw)!r}"
             )
         try:
+            if raw.get("envelope_type") == "group":
+                return SharedHandleGroupEnvelope.from_dict(raw)
             return SharedHandleEnvelope.from_dict(raw)
         except Exception as exc:
             raise ValueError(

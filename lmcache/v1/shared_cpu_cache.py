@@ -626,6 +626,81 @@ class SharedHandleEnvelope:
         )
 
 
+@dataclass(frozen=True)
+class SharedHandleGroupEnvelope:
+    """One collective payload containing every layer envelope for a KV group."""
+
+    envelopes: list[SharedHandleEnvelope]
+
+    def __post_init__(self) -> None:
+        if not self.envelopes:
+            raise SharedCPUCacheValidationError(
+                "SharedHandleGroupEnvelope requires at least one layer envelope"
+            )
+
+    @property
+    def status(self) -> str:
+        return self.envelopes[0].status
+
+    @property
+    def layer_id(self) -> int:
+        return self.envelopes[0].layer_id
+
+    @property
+    def kv_group(self) -> int:
+        return self.envelopes[0].kv_group
+
+    @property
+    def handles(self) -> list[SharedChunkHandle]:
+        return [
+            handle
+            for envelope in self.envelopes
+            for handle in envelope.handles
+        ]
+
+    @property
+    def message(self) -> Optional[str]:
+        return self.envelopes[0].message
+
+    @property
+    def error_details(self) -> Optional[dict[str, Any]]:
+        return self.envelopes[0].error_details
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "envelope_type": "group",
+            "envelopes": [envelope.to_dict() for envelope in self.envelopes],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SharedHandleGroupEnvelope":
+        if not isinstance(data, dict):
+            raise SharedCPUCacheValidationError(
+                "SharedHandleGroupEnvelope expected dict payload, "
+                f"got {type(data)!r}"
+            )
+        _require_fields(
+            data,
+            {"envelope_type", "envelopes"},
+            "SharedHandleGroupEnvelope",
+        )
+        if data["envelope_type"] != "group":
+            raise SharedCPUCacheValidationError(
+                "SharedHandleGroupEnvelope has unsupported envelope_type "
+                f"{data['envelope_type']!r}"
+            )
+        if not isinstance(data["envelopes"], list) or not data["envelopes"]:
+            raise SharedCPUCacheValidationError(
+                "SharedHandleGroupEnvelope envelopes must be a non-empty list"
+            )
+        return cls(
+            envelopes=[
+                SharedHandleEnvelope.from_dict(envelope)
+                for envelope in data["envelopes"]
+            ]
+        )
+
+
 def validate_shared_handle(
     handle: SharedChunkHandle,
     *,
