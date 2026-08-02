@@ -444,6 +444,65 @@ class ChunkedTokenDatabase(TokenDatabase):
         else:
             raise ValueError("Either tokens or hashes must be provided.")
 
+    def process_tokens_from_prefix(
+        self,
+        tokens: Union[torch.Tensor, List[int]],
+        *,
+        prefix_token_count: int,
+        prefix_hash: int,
+        make_key: bool = True,
+        request_configs: Optional[dict] = None,
+        kv_group: int = 0,
+    ) -> Iterable[ProcessTokensResult]:
+        """Process only full-request tokens after a cached chunk prefix.
+
+        Args:
+            tokens: Complete request token sequence.
+            prefix_token_count: Chunk-aligned number of tokens already covered
+                by ``prefix_hash``.
+            prefix_hash: Chained hash after ``prefix_token_count`` tokens.
+            make_key: Return cache keys when true, otherwise return hashes.
+            request_configs: Optional request-specific cache-key configuration.
+            kv_group: KV group used to construct cache keys.
+
+        Yields:
+            Absolute ``(start, end, key_or_hash)`` tuples for suffix chunks.
+
+        Raises:
+            ValueError: If the cached prefix is negative, unaligned, or longer
+                than the supplied token sequence.
+        """
+        if prefix_token_count < 0 or prefix_token_count > len(tokens):
+            raise ValueError(
+                "Incremental token prefix is outside the request: "
+                f"prefix_token_count={prefix_token_count}, tokens={len(tokens)}"
+            )
+        if prefix_token_count % self.chunk_size != 0:
+            raise ValueError(
+                "Incremental token prefix must be chunk aligned: "
+                f"prefix_token_count={prefix_token_count}, "
+                f"chunk_size={self.chunk_size}"
+            )
+
+        suffix_tokens = tokens[prefix_token_count:]
+        current_hash = prefix_hash
+        for chunk_id, token_chunk in enumerate(self._chunk_tokens(suffix_tokens)):
+            current_hash = self._hash_tokens(token_chunk, current_hash)
+            start_idx = prefix_token_count + chunk_id * self.chunk_size
+            end_idx = min(start_idx + self.chunk_size, len(tokens))
+            if make_key:
+                yield (
+                    start_idx,
+                    end_idx,
+                    self._make_key_by_hash(
+                        current_hash,
+                        request_configs,
+                        kv_group=kv_group,
+                    ),
+                )
+            else:
+                yield start_idx, end_idx, current_hash
+
 
 class SegmentTokenDatabase(TokenDatabase):
     """

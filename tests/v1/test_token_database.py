@@ -64,6 +64,62 @@ def test_chunked_token_database(chunk_length, save_unfull_chunk):
             assert ed == original_results[j + i][1]
 
 
+@pytest.mark.parametrize("kv_group", [0, 1])
+def test_chunked_token_database_processes_only_incremental_suffix(kv_group):
+    chunk_length = 256
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=chunk_length,
+        backend="cpu",
+        save_unfull_chunk=True,
+    )
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+    tokens = generate_tokens(6144, "cpu")
+    full_results = list(db.process_tokens(tokens=tokens, kv_group=kv_group))
+    prefix_chunks = 23
+    prefix_token_count = prefix_chunks * chunk_length
+    prefix_hash = full_results[prefix_chunks - 1][2].chunk_hash
+    original_hash_func = db.hash_func
+    hash_calls = 0
+
+    def counting_hash(value):
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_hash_func(value)
+
+    db.hash_func = counting_hash
+    incremental_results = list(
+        db.process_tokens_from_prefix(
+            tokens,
+            prefix_token_count=prefix_token_count,
+            prefix_hash=prefix_hash,
+            kv_group=kv_group,
+        )
+    )
+
+    assert incremental_results == full_results[prefix_chunks:]
+    assert hash_calls == 1
+    assert incremental_results[0][0:2] == (5888, 6144)
+    assert incremental_results[0][2].kv_group == kv_group
+
+
+@pytest.mark.parametrize("prefix_token_count", [-1, 15, 65])
+def test_chunked_token_database_rejects_invalid_incremental_prefix(
+    prefix_token_count,
+):
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+    tokens = generate_tokens(64, "cpu")
+
+    with pytest.raises(ValueError, match="Incremental token prefix"):
+        list(
+            db.process_tokens_from_prefix(
+                tokens,
+                prefix_token_count=prefix_token_count,
+                prefix_hash=0,
+            )
+        )
+
+
 @pytest.mark.parametrize("prefix_length", [0, 16, 64, 256])
 @pytest.mark.parametrize("chunk_lengths", [[256, 512, 256], [1024, 512, 256]])
 @pytest.mark.skipif(

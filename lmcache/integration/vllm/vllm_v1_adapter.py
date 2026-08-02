@@ -765,6 +765,7 @@ class WorkerRetrieveState:
     location: Optional[str] = None
     metadata_warm: bool = False
     token_count: int = 0
+    metadata_token_ids: list[int] = field(default_factory=list, repr=False)
     slot_mapping: Optional[torch.Tensor] = field(default=None, repr=False)
     indexer_slot_mapping: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
@@ -3609,6 +3610,7 @@ class LMCacheConnectorV1Impl:
         state.shared_request_active = False
         state.request_scope_token = None
         state.shared_validation_signature = None
+        state.metadata_token_ids.clear()
         state.slot_mapping = None
         state.indexer_slot_mapping = None
         state.decode_ret_mask = None
@@ -3846,6 +3848,7 @@ class LMCacheConnectorV1Impl:
             "location": state.location,
             "metadata_warm": state.metadata_warm,
             "token_count": state.token_count,
+            "metadata_token_ids": list(state.metadata_token_ids),
             "slot_mapping": state.slot_mapping,
             "indexer_slot_mapping": state.indexer_slot_mapping,
             "decode_ret_mask": state.decode_ret_mask,
@@ -5028,6 +5031,12 @@ class LMCacheConnectorV1Impl:
                 request,
                 previous_token_count,
             )
+            if not request.sparse_warm_ref and len(request.token_ids) >= token_count:
+                state.metadata_token_ids = (
+                    list(request.token_ids)
+                    if len(request.token_ids) == token_count
+                    else request.token_ids[:token_count]
+                )
         except Exception:
             self._release_unadopted_shared_request_objects(state, request)
             preserve_previous_lease = (
@@ -5175,6 +5184,7 @@ class LMCacheConnectorV1Impl:
                 "request_configs": request.request_configs,
                 "shared_cpu_phase": SPARSE_DECODE_SHARED_CPU_PHASE,
                 "shared_cpu_request_ordinal": request_ordinal,
+                "cached_metadata_token_ids": retrieve_state.metadata_token_ids,
                 **retrieve_state.cache_kwargs(kv_group, dsa_two_groups),
             }
             if shared_cpu_preflight_state is not None:

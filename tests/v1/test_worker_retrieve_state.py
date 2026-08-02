@@ -1198,6 +1198,7 @@ class TestWorkerRetrieveState:
         impl.lmcache_engine = engine
         backing_obj = FakeMemObj()
         request = _make_request()
+        request.token_ids = list(range(256))
         state = WorkerRetrieveState(
             cached_keys=[["k"]],
             cached_starts=[0],
@@ -1225,6 +1226,7 @@ class TestWorkerRetrieveState:
         assert state.shared_generation == 9
         assert state.pointer_cache_generation == 9
         assert state.shared_request_active is True
+        assert state.metadata_token_ids == request.token_ids[:256]
 
         LMCacheConnectorV1Impl._release_shared_worker_retrieve_state(
             state,
@@ -1233,6 +1235,7 @@ class TestWorkerRetrieveState:
         assert backing_obj.unpinned == 1
         assert backing_obj.released == 1
         assert state.cached_memory_objs == []
+        assert state.metadata_token_ids == []
 
     def test_tp1_shared_state_cleanup_keeps_local_cpu_hot_cache_reference(self):
         class BorrowedLocalCPUObj:
