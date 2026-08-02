@@ -1447,6 +1447,43 @@ def test_runtime_capacity_details_exclude_required_hot_chunks_from_evictable():
     assert details["hot_chunk_count"] == 1
     assert details["non_shm_hot_chunk_count"] == 0
     assert details["active_sparse_requests"] == 2
+    assert details["capacity_scan_skipped"] is False
+    assert details["fits"] is True
+
+
+def test_runtime_capacity_skips_hot_cache_scan_when_no_allocation_is_needed():
+    class _FailOnItems(dict):
+        def items(self):
+            raise AssertionError("zero-allocation capacity check scanned hot cache")
+
+    engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    hot_key = _make_key()
+    hot_obj = _make_memory_obj(
+        torch.empty(1024, dtype=torch.uint8),
+        physical_size=64,
+    )
+    backend = _FakeLocalCPUBackend(
+        free_bytes=0,
+        hot_cache=_FailOnItems({hot_key: hot_obj}),
+    )
+    engine._shared_local_cpu_backend = lambda: backend
+    engine._is_rank0_shared_mem_obj = lambda mem_obj: mem_obj is hot_obj
+    engine.config.chunk_size = 4
+
+    details = engine._shared_cpu_runtime_capacity_details(
+        req_id="req-1",
+        phase="sparse_decode_bootstrap",
+        kv_group=0,
+        keys_layer_major=[[hot_key]],
+        chunk_locations_layer_major=[["LocalCPUBackend"]],
+        token_count=1,
+        chunk_token_lengths=[1],
+    )
+
+    assert details["missing_chunk_count"] == 0
+    assert details["required_bytes"] == 0
+    assert details["capacity_scan_skipped"] is True
+    assert details["available_after_eviction"] is None
     assert details["fits"] is True
 
 
@@ -1496,6 +1533,7 @@ def test_runtime_capacity_counts_non_shm_hot_hits_as_required_bytes():
     assert details["protected_hot_bytes"] == 0
     assert details["hot_chunk_count"] == 0
     assert details["non_shm_hot_chunk_count"] == 1
+    assert details["capacity_scan_skipped"] is False
     assert details["fits"] is False
 
 

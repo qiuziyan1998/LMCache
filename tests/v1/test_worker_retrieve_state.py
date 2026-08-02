@@ -1009,7 +1009,7 @@ class TestWorkerRetrieveState:
         assert result == (None, None)
         impl._release_finished_worker_requests.assert_called_once_with({"req-1"})
 
-    def test_get_finished_defers_cleanup_until_wait_for_save(self):
+    def test_get_finished_defers_cleanup_until_wait_for_save(self, monkeypatch):
         request = SimpleNamespace(
             req_id="req-1",
             token_ids=[1, 2, 3],
@@ -1025,6 +1025,13 @@ class TestWorkerRetrieveState:
         impl._finished_req_ids_waiting_for_save = set()
         impl._release_finished_worker_requests = MagicMock()
         impl._wait_for_save_impl = MagicMock()
+        timing_events = []
+        monkeypatch.setattr(adapter_mod, "_mtp_dw_diag_enabled", lambda: True)
+        monkeypatch.setattr(
+            adapter_mod,
+            "_mtp_dw_event",
+            lambda stage, **fields: timing_events.append((stage, fields)),
+        )
 
         assert impl.get_finished({"req-1"}) == (None, None)
         impl._release_finished_worker_requests.assert_not_called()
@@ -1037,8 +1044,14 @@ class TestWorkerRetrieveState:
         assert save_context == {}
         impl._release_finished_worker_requests.assert_called_once_with({"req-1"})
         assert impl._finished_req_ids_waiting_for_save == set()
+        assert len(timing_events) == 1
+        stage, fields = timing_events[0]
+        assert stage == "timing"
+        assert fields["event"] == "wait_for_save"
+        assert fields["succeeded"] is True
+        assert fields["elapsed_ms"] >= 0
 
-    def test_wait_for_save_failure_marks_step_complete(self):
+    def test_wait_for_save_failure_marks_step_complete(self, monkeypatch):
         impl = _make_impl()
         impl._parent = SimpleNamespace(
             _get_connector_metadata=lambda: LMCacheConnectorMetadata()
@@ -1047,6 +1060,12 @@ class TestWorkerRetrieveState:
         impl._finished_req_ids_waiting_for_save = set()
         impl._wait_for_save_impl = MagicMock(
             side_effect=RuntimeError("save failed")
+        )
+        monkeypatch.setattr(adapter_mod, "_mtp_dw_diag_enabled", lambda: True)
+        monkeypatch.setattr(
+            adapter_mod,
+            "_mtp_dw_event",
+            MagicMock(side_effect=RuntimeError("diagnostic failed")),
         )
         with pytest.raises(RuntimeError, match="save failed"):
             impl.wait_for_save()
@@ -3225,15 +3244,28 @@ class TestWorkerRetrieveState:
         assert impl._layerwise_sparse_req_ids == ["req-1", "req-2"]
         impl._drain_layerwise_retrievers()
 
-    def test_start_load_kv_without_attention_skips_step_setup(self):
+    def test_start_load_kv_without_attention_skips_step_setup(self, monkeypatch):
         impl = _make_impl()
         impl._parent = SimpleNamespace(_get_connector_metadata=MagicMock())
+        timing_events = []
+        monkeypatch.setattr(adapter_mod, "_mtp_dw_diag_enabled", lambda: True)
+        monkeypatch.setattr(
+            adapter_mod,
+            "_mtp_dw_event",
+            lambda stage, **fields: timing_events.append((stage, fields)),
+        )
 
         impl.start_load_kv(SimpleNamespace(attn_metadata=None))
 
         impl._parent._get_connector_metadata.assert_not_called()
         assert impl.current_layer == 0
         assert impl._wait_for_save_done is False
+        assert len(timing_events) == 1
+        stage, fields = timing_events[0]
+        assert stage == "timing"
+        assert fields["event"] == "start_load_kv"
+        assert fields["succeeded"] is True
+        assert fields["elapsed_ms"] >= 0
 
     def test_drain_layerwise_retrievers_closes_all_on_failure(self):
         impl = _make_impl()

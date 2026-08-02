@@ -104,6 +104,24 @@ def _mtp_dw_event(stage: str, **fields: Any) -> None:
     logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
 
 
+def _emit_mtp_dw_timing(
+    event: str,
+    started_at: float,
+    succeeded: bool,
+) -> None:
+    """Emit optional timing without changing connector behavior."""
+    try:
+        _mtp_dw_event(
+            "timing",
+            event=event,
+            elapsed_ms=round((time.perf_counter() - started_at) * 1000, 4),
+            succeeded=succeeded,
+        )
+    except Exception:
+        # Diagnostics must never replace a load/save result or exception.
+        return
+
+
 def _retrieve_stats_interval_seconds() -> int:
     raw_value = os.environ.get(RETRIEVE_STATS_INTERVAL_SECONDS_ENV, "0")
     try:
@@ -5204,6 +5222,10 @@ class LMCacheConnectorV1Impl:
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start this step's KV loads and atomically discard partial setup."""
+        timing_started_at = (
+            time.perf_counter() if _mtp_dw_diag_enabled() else None
+        )
+        succeeded = False
         try:
             self._start_load_kv(forward_context, **kwargs)
         except BaseException:
@@ -5215,6 +5237,15 @@ class LMCacheConnectorV1Impl:
                 if request.load_spec is not None and request.load_spec.can_load
             )
             raise
+        else:
+            succeeded = True
+        finally:
+            if timing_started_at is not None:
+                _emit_mtp_dw_timing(
+                    "start_load_kv",
+                    timing_started_at,
+                    succeeded,
+                )
 
     def _start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -6917,6 +6948,10 @@ class LMCacheConnectorV1Impl:
     def wait_for_save(self):
         """Block until this step's KV saves reach the connector boundary."""
 
+        timing_started_at = (
+            time.perf_counter() if _mtp_dw_diag_enabled() else None
+        )
+        succeeded = False
         save_context: dict[str, Any] = {}
         save_fence_complete = False
         try:
@@ -6936,6 +6971,14 @@ class LMCacheConnectorV1Impl:
             for request in save_context.get("decode_window_saves", ()):
                 self._mark_decode_window_save_completed(request)
             self._complete_worker_save_step()
+            succeeded = True
+        finally:
+            if timing_started_at is not None:
+                _emit_mtp_dw_timing(
+                    "wait_for_save",
+                    timing_started_at,
+                    succeeded,
+                )
 
     def _wait_for_save_impl(self, save_context: dict[str, Any]) -> None:
         connector_metadata = self._parent._get_connector_metadata()
