@@ -1892,6 +1892,40 @@ class LMCacheEngine:
             if callable(get_free_size):
                 free_bytes = int(get_free_size())
 
+        # Most cold requests still fit in currently free shared memory.  In that
+        # case no eviction decision is needed, so avoid walking the entire hot
+        # cache.  The walk becomes increasingly expensive as prior cold
+        # requests populate the slab.
+        if required_bytes <= free_bytes:
+            active_sparse_requests = {
+                lease_req_id
+                for lease_req_id, lease in self._shared_cpu_request_leases.items()
+                if lease.active
+            }
+            if req_id:
+                active_sparse_requests.add(req_id)
+            return {
+                "request_id": req_id,
+                "phase": phase,
+                "kv_group": kv_group,
+                "token_count": int(token_count or 0),
+                "chunk_count": sum(len(layer) for layer in keys_layer_major),
+                "missing_chunk_count": missing_chunk_count,
+                "hot_chunk_count": len(rank0_shared_hot_keys),
+                "non_shm_hot_chunk_count": len(non_shm_hot_keys),
+                "required_bytes": required_bytes,
+                "per_chunk_physical_bytes_estimate": default_chunk_bytes,
+                "available_after_eviction": free_bytes,
+                "free_bytes": free_bytes,
+                "evictable_bytes": 0,
+                "pinned_bytes": 0,
+                "protected_hot_bytes": 0,
+                "active_sparse_requests": len(active_sparse_requests),
+                "slab_size": slab_size,
+                "fits": True,
+                "capacity_scan_skipped": True,
+                "capacity_scan_skip_reason": "free_capacity_sufficient",
+            }
         evictable_bytes = 0
         pinned_bytes = 0
         protected_hot_bytes = 0
@@ -1938,6 +1972,8 @@ class LMCacheEngine:
             "active_sparse_requests": len(active_sparse_requests),
             "slab_size": slab_size,
             "fits": required_bytes <= available_after_eviction,
+            "capacity_scan_skipped": False,
+            "capacity_scan_skip_reason": None,
         }
         return details
 

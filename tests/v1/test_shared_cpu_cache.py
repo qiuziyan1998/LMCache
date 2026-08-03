@@ -1846,6 +1846,37 @@ def test_sparse_capacity_shape_helper_keeps_two_dim_token_shape():
     )
 
 
+def test_runtime_capacity_skips_hot_cache_scan_when_free_space_is_sufficient():
+    engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    miss_key = _make_key()
+
+    class _NoScanHotCache(dict):
+        def items(self):
+            raise AssertionError("hot cache must not be scanned")
+
+    backend = _FakeLocalCPUBackend(
+        free_bytes=1 << 30,
+        hot_cache=_NoScanHotCache(),
+    )
+    engine._shared_local_cpu_backend = lambda: backend
+    engine.config.chunk_size = 4
+
+    details = engine._shared_cpu_runtime_capacity_details(
+        req_id="req-fast",
+        phase="sparse_decode_bootstrap",
+        kv_group=0,
+        keys_layer_major=[[miss_key]],
+        chunk_locations_layer_major=[["MooncakeStore"]],
+        token_count=4,
+        chunk_token_lengths=[1],
+    )
+
+    assert details["fits"] is True
+    assert details["capacity_scan_skipped"] is True
+    assert details["capacity_scan_skip_reason"] == "free_capacity_sufficient"
+    assert details["available_after_eviction"] == 1 << 30
+
+
 def test_runtime_capacity_details_exclude_required_hot_chunks_from_evictable():
     engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
     hot_key = _make_key()
