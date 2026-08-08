@@ -813,6 +813,57 @@ def test_async_decode_save_allows_two_jobs_and_commits_in_order(
     }
 
 
+def test_async_decode_save_accepts_late_initial_prefill_frontier() -> None:
+    impl = _make_scheduler_impl()
+    _enable_async_decode_save(impl)
+    impl._decode_window_save_window_size = 256
+    tracker = RequestTracker(
+        req_id="async-late-prefill",
+        prompt_len=6143,
+        token_ids=list(range(6144)),
+        allocated_block_ids=list(range(512)),
+        num_saved_tokens=5888,
+        decode_window_save_generation=10,
+    )
+    tracker.is_decode_phase = True
+    impl._request_trackers[tracker.req_id] = tracker
+    impl._unfinished_requests[tracker.req_id] = SimpleNamespace()
+    meta = LMCacheConnectorMetadata()
+
+    impl._add_decode_window_save_metas(meta, tracker)
+
+    state = tracker.decode_window_save_async_state
+    assert state is not None
+    [job] = state.pending_jobs
+    assert (job.start, job.end) == (5888, 6144)
+    assert tracker.decode_window_save_next_start == 6144
+
+    prefill_output = SimpleNamespace(
+        decode_save_completions=[],
+        completed_decode_window_saves={tracker.req_id: 5888},
+    )
+    impl.update_connector_output(prefill_output)
+
+    assert prefill_output.completed_decode_window_saves == {
+        tracker.req_id: 5888
+    }
+    assert tracker.decode_window_save_committed_end == 5888
+    assert tracker.decode_window_save_next_start == 6144
+    assert state.pending_count == 1
+
+    decode_output = SimpleNamespace(
+        decode_save_completions=[_completion_for_job(tracker.req_id, job)],
+        completed_decode_window_saves={},
+    )
+    impl.update_connector_output(decode_output)
+
+    assert decode_output.completed_decode_window_saves == {
+        tracker.req_id: 6144
+    }
+    assert tracker.decode_window_save_committed_end == 6144
+    assert state.pending_count == 0
+
+
 def test_async_decode_save_does_not_cross_unverified_mtp_tokens() -> None:
     impl = _make_scheduler_impl()
     _enable_async_decode_save(impl)

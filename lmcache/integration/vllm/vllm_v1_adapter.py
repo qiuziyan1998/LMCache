@@ -3707,6 +3707,21 @@ class LMCacheConnectorV1Impl:
                     f"LMCache committed_end={committed_end} exceeds request "
                     f"frontier={len(tracker.token_ids)} for request {req_id}."
                 )
+            if (
+                is_initial_frontier
+                and tracker.decode_window_save_next_start is not None
+                and committed_end
+                < int(tracker.decode_window_save_next_start)
+            ):
+                # Prefill storage and the first decode-window store execute on
+                # independent paths. The decode job may be issued before the
+                # worker reports the initial prefill frontier. Accept that
+                # late initial completion without rewinding the issued async
+                # frontier or treating it as an out-of-order decode window.
+                if committed_end > tracker.decode_window_save_committed_end:
+                    tracker.decode_window_save_committed_end = committed_end
+                    published[req_id] = committed_end
+                continue
             initial_cached_end = (
                 tracker.num_lmcache_cached_tokens
                 // self._lmcache_chunk_size
