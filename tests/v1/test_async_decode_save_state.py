@@ -1,9 +1,58 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from unittest.mock import MagicMock
+import json
+
+# Third Party
 import pytest
 
 # First Party
-from lmcache.integration.vllm.async_decode_save import AsyncDecodeSaveState
+from lmcache.integration.vllm import async_decode_save as async_decode_save_module
+from lmcache.integration.vllm.async_decode_save import (
+    ASYNC_DECODE_SAVE_LOG_COMPLETIONS_ENV,
+    AsyncDecodeSaveState,
+    log_async_decode_save_completion,
+)
+
+
+def test_completion_logging_is_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(ASYNC_DECODE_SAVE_LOG_COMPLETIONS_ENV, raising=False)
+    log_info = MagicMock()
+    monkeypatch.setattr(async_decode_save_module.logger, "info", log_info)
+
+    log_async_decode_save_completion("persist_complete", request_id="req")
+
+    log_info.assert_not_called()
+
+
+def test_completion_logging_emits_structured_json_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(ASYNC_DECODE_SAVE_LOG_COMPLETIONS_ENV, "yes")
+    log_info = MagicMock()
+    monkeypatch.setattr(async_decode_save_module.logger, "info", log_info)
+
+    log_async_decode_save_completion(
+        "persist_complete",
+        request_id="req",
+        start=256,
+        end=512,
+        tokens=256,
+    )
+
+    log_info.assert_called_once()
+    log_format, encoded_payload = log_info.call_args.args
+    assert log_format == "[ASYNC_DECODE_SAVE] %s"
+    assert json.loads(encoded_payload) == {
+        "schema": 1,
+        "event": "persist_complete",
+        "request_id": "req",
+        "start": 256,
+        "end": 512,
+        "tokens": 256,
+    }
 
 
 def test_out_of_order_completion_advances_only_contiguous_prefix() -> None:

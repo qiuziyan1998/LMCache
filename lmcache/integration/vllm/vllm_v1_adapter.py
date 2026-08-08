@@ -47,7 +47,11 @@ from lmcache.integration.vllm.utils import (
 from lmcache.integration.vllm.decode_window_commit import (
     publish_delayed_decode_window_commit,
 )
-from lmcache.integration.vllm.async_decode_save import AsyncDecodeSaveState
+from lmcache.integration.vllm.async_decode_save import (
+    AsyncDecodeSaveState,
+    async_decode_save_completion_logging_enabled,
+    log_async_decode_save_completion,
+)
 from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
@@ -3604,6 +3608,26 @@ class LMCacheConnectorV1Impl:
                 published[completion.request_id] = max(
                     published.get(completion.request_id, 0),
                     publish_end,
+                )
+            if (
+                advance.committed_jobs
+                and async_decode_save_completion_logging_enabled()
+            ):
+                first_committed = advance.committed_jobs[0]
+                last_committed = advance.committed_jobs[-1]
+                log_async_decode_save_completion(
+                    "commit_advanced",
+                    request_id=completion.request_id,
+                    generation=completion.generation,
+                    trigger_job_id=completion.job_id,
+                    committed_job_ids=[job.job_id for job in advance.committed_jobs],
+                    start=first_committed.start,
+                    end=last_committed.end,
+                    tokens=last_committed.end - first_committed.start,
+                    is_final=last_committed.is_final,
+                    ordered_committed_end=advance.committed_end,
+                    published_committed_end=(tracker.decode_window_save_committed_end),
+                    pending_jobs=state.pending_count,
                 )
             if (
                 state.pending_count == 0

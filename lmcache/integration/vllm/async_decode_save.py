@@ -3,6 +3,41 @@
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
+import json
+import os
+
+# First Party
+from lmcache.logging import init_logger
+
+logger = init_logger(__name__)
+
+ASYNC_DECODE_SAVE_LOG_COMPLETIONS_ENV = "LMCACHE_ASYNC_DECODE_SAVE_LOG_COMPLETIONS"
+_TRUE_ENV_VALUES = frozenset(("1", "true", "yes", "on"))
+
+
+def async_decode_save_completion_logging_enabled() -> bool:
+    """Return whether async decode-save completion events should be logged."""
+    value = os.environ.get(ASYNC_DECODE_SAVE_LOG_COMPLETIONS_ENV, "0")
+    return value.strip().lower() in _TRUE_ENV_VALUES
+
+
+def log_async_decode_save_completion(event: str, **fields: Any) -> None:
+    """Log one structured async decode-save completion event when enabled.
+
+    Args:
+        event: Lifecycle event name, such as ``persist_complete`` or
+            ``commit_advanced``.
+        **fields: JSON-serializable event fields.
+    """
+    if not async_decode_save_completion_logging_enabled():
+        return
+    payload = {"schema": 1, "event": event}
+    payload.update(fields)
+    logger.info(
+        "[ASYNC_DECODE_SAVE] %s",
+        json.dumps(payload, separators=(",", ":")),
+    )
 
 
 class DecodeSaveJobState(str, Enum):
@@ -138,4 +173,3 @@ class AsyncDecodeSaveState:
             committed.append(head)
 
         return DecodeSaveAdvance(False, self.committed_end, tuple(committed))
-

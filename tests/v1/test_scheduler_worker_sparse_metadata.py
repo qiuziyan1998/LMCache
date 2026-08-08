@@ -6,6 +6,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+import json
 
 # Third Party
 import pytest
@@ -14,7 +15,11 @@ import torch
 pytest.importorskip("vllm")
 
 # First Party
+from lmcache.integration.vllm import async_decode_save as async_decode_save_module
 from lmcache.integration.vllm import vllm_v1_adapter as adapter_module
+from lmcache.integration.vllm.async_decode_save import (
+    ASYNC_DECODE_SAVE_LOG_COMPLETIONS_ENV,
+)
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
     LMCacheConnectorMetadata,
@@ -733,7 +738,12 @@ def _completion_for_job(req_id: str, job) -> KVConnectorSaveCompletion:
     )
 
 
-def test_async_decode_save_allows_two_jobs_and_commits_in_order() -> None:
+def test_async_decode_save_allows_two_jobs_and_commits_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(ASYNC_DECODE_SAVE_LOG_COMPLETIONS_ENV, "1")
+    log_info = MagicMock()
+    monkeypatch.setattr(async_decode_save_module.logger, "info", log_info)
     impl = _make_scheduler_impl()
     _enable_async_decode_save(impl)
     impl._decode_window_save_window_size = 256
@@ -773,17 +783,34 @@ def test_async_decode_save_allows_two_jobs_and_commits_in_order() -> None:
     assert second_output.completed_decode_window_saves == {}
     assert state.committed_end == 256
     assert state.pending_count == 2
+    log_info.assert_not_called()
 
     first_output = SimpleNamespace(
         decode_save_completions=[_completion_for_job(tracker.req_id, first)],
         completed_decode_window_saves={},
     )
     impl.update_connector_output(first_output)
-    assert first_output.completed_decode_window_saves == {
-        tracker.req_id: 768
-    }
+    assert first_output.completed_decode_window_saves == {tracker.req_id: 768}
     assert state.committed_end == 768
     assert state.pending_count == 0
+    log_info.assert_called_once()
+    log_format, encoded_payload = log_info.call_args.args
+    assert log_format == "[ASYNC_DECODE_SAVE] %s"
+    assert json.loads(encoded_payload) == {
+        "schema": 1,
+        "event": "commit_advanced",
+        "request_id": tracker.req_id,
+        "generation": 9,
+        "trigger_job_id": first.job_id,
+        "committed_job_ids": [first.job_id, second.job_id],
+        "start": 256,
+        "end": 768,
+        "tokens": 512,
+        "is_final": False,
+        "ordered_committed_end": 768,
+        "published_committed_end": 768,
+        "pending_jobs": 0,
+    }
 
 
 def test_async_decode_save_does_not_cross_unverified_mtp_tokens() -> None:
