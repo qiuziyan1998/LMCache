@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.outputs import KVConnectorSaveCompletion
 import torch
 
 # First Party
@@ -171,6 +172,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
 
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         return self._lmcache_engine.get_completed_decode_window_saves()
+
+    def get_decode_save_completions(self) -> list[KVConnectorSaveCompletion]:
+        return self._lmcache_engine.get_decode_save_completions()
 
     def shutdown(self):
         """

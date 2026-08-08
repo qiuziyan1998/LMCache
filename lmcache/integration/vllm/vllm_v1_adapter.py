@@ -7,6 +7,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import json
 import os
+import threading
 import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
@@ -17,6 +18,7 @@ from vllm.config import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorBlockLease,
     KVConnectorMetadata,
     KVConnectorRole,
 )
@@ -26,6 +28,7 @@ from vllm.distributed.parallel_state import (
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
+from vllm.v1.outputs import KVConnectorSaveCompletion
 from vllm.version import __version__ as VLLM_VERSION
 import torch
 
@@ -44,6 +47,7 @@ from lmcache.integration.vllm.utils import (
 from lmcache.integration.vllm.decode_window_commit import (
     publish_delayed_decode_window_commit,
 )
+from lmcache.integration.vllm.async_decode_save import AsyncDecodeSaveState
 from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
@@ -89,7 +93,27 @@ DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS_ENV = (
 RETRIEVE_STATS_INTERVAL_SECONDS_ENV = (
     "VLLM_ASCEND_LMCACHE_RETRIEVE_STATS_INTERVAL_SECONDS"
 )
+ASYNC_DECODE_SAVE_ENV = "LMCACHE_ASYNC_DECODE_SAVE"
+ASYNC_DECODE_SAVE_MAX_PER_REQUEST_ENV = (
+    "LMCACHE_ASYNC_DECODE_SAVE_MAX_PENDING_PER_REQUEST"
+)
+ASYNC_DECODE_SAVE_MAX_PER_WORKER_ENV = (
+    "LMCACHE_ASYNC_DECODE_SAVE_MAX_PENDING_PER_WORKER"
+)
+ASYNC_DECODE_SAVE_MAX_PER_REQUEST_DEFAULT = 2
+ASYNC_DECODE_SAVE_MAX_PER_WORKER_DEFAULT = 32
 LayerwiseSaveKey = tuple[str, str, int, int, int]
+
+
+def _async_decode_save_enabled(
+    env_value: Optional[str],
+    window_size: int,
+    use_layerwise: bool,
+) -> bool:
+    """Enable by default only when the decode-window path supports it."""
+    if env_value is None:
+        return window_size > 0 and use_layerwise
+    return not is_false(env_value)
 
 
 def _mtp_dw_diag_enabled() -> bool:
@@ -572,6 +596,18 @@ class RequestTracker:
     decode_window_save_pending_commits: deque[int] = field(
         default_factory=deque, repr=False
     )
+    # Async decode-save ordering state. The legacy frontier fields above stay
+    # populated because sparse scheduling consumes them, but this queue is the
+    # authoritative source for issued and physically completed jobs.
+    decode_window_save_generation: int = field(default=0, repr=False)
+    decode_window_save_async_state: Optional[AsyncDecodeSaveState] = field(
+        default=None, repr=False
+    )
+    decode_window_save_finish_pending: bool = field(default=False, repr=False)
+    decode_window_save_final_end: Optional[int] = field(default=None, repr=False)
+    # Highest token position whose target KV existed before the current
+    # speculative forward. Async saves never cross this verified boundary.
+    decode_window_save_safe_end: Optional[int] = field(default=None, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -671,11 +707,12 @@ class RequestTracker:
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
             self.num_lmcache_cached_tokens = lmcache_cached_tokens
-            self.decode_window_save_committed_end = lmcache_cached_tokens
-            self.decode_window_save_next_start = None
-            self.decode_window_save_anchor = None
-            self.decode_window_save_inflight_end = None
-            self.decode_window_save_pending_commits.clear()
+            if self.decode_window_save_async_state is None:
+                self.decode_window_save_committed_end = lmcache_cached_tokens
+                self.decode_window_save_next_start = None
+                self.decode_window_save_anchor = None
+                self.decode_window_save_inflight_end = None
+                self.decode_window_save_pending_commits.clear()
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
 
             # FIX: For preempted requests, restore token_ids from the full
@@ -836,6 +873,9 @@ class ReqMeta:
     decode_window_start: Optional[int] = None
     decode_window_end: Optional[int] = None
     decode_window_size: Optional[int] = None
+    decode_save_generation: int = 0
+    decode_save_job_id: int = 0
+    decode_save_is_final: bool = False
 
     # Set by scheduler when a cached request resumes after preemption.
     resumed_from_preemption: bool = False
@@ -1396,6 +1436,7 @@ class ReqMeta:
 @dataclass
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
+    block_leases: list[KVConnectorBlockLease] = field(default_factory=list)
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -1604,6 +1645,51 @@ class LMCacheConnectorV1Impl:
         self._decode_window_save_window_size = (
             self._get_decode_window_save_window_size(config)
         )
+        async_decode_save_value = os.environ.get(ASYNC_DECODE_SAVE_ENV)
+        self._async_decode_save = _async_decode_save_enabled(
+            async_decode_save_value,
+            self._decode_window_save_window_size,
+            config.use_layerwise,
+        )
+        try:
+            self._async_decode_save_max_pending_per_request = max(
+                1,
+                int(
+                    os.environ.get(
+                        ASYNC_DECODE_SAVE_MAX_PER_REQUEST_ENV,
+                        str(ASYNC_DECODE_SAVE_MAX_PER_REQUEST_DEFAULT),
+                    )
+                ),
+            )
+            self._async_decode_save_max_pending_per_worker = max(
+                1,
+                int(
+                    os.environ.get(
+                        ASYNC_DECODE_SAVE_MAX_PER_WORKER_ENV,
+                        str(ASYNC_DECODE_SAVE_MAX_PER_WORKER_DEFAULT),
+                    )
+                ),
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "async decode-save pending limits must be positive integers"
+            ) from exc
+        if getattr(self, "_async_decode_save", False):
+            if self._decode_window_save_window_size <= 0:
+                raise ValueError(
+                    f"{ASYNC_DECODE_SAVE_ENV}=true requires "
+                    "decode_window_save_window_size > 0"
+                )
+            if not config.use_layerwise:
+                raise ValueError(
+                    f"{ASYNC_DECODE_SAVE_ENV}=true requires use_layerwise=true"
+                )
+            logger.info(
+                "Async decode save enabled: max_pending_per_request=%d, "
+                "max_pending_per_worker=%d",
+                self._async_decode_save_max_pending_per_request,
+                self._async_decode_save_max_pending_per_worker,
+            )
         self._decode_window_save_commit_delay_windows = max(
             int(
                 os.environ.get(
@@ -1662,10 +1748,16 @@ class LMCacheConnectorV1Impl:
             self._finished_req_ids_waiting_for_save: set[str] = set()
             self._late_finished_sending: set[str] = set()
             self._completed_decode_window_saves: dict[str, int] = {}
+            self._decode_save_completions: deque[
+                KVConnectorSaveCompletion
+            ] = deque()
+            self._decode_save_completion_lock = threading.Lock()
             self._decode_window_save_completed_groups: set[LayerwiseSaveKey] = set()
             self._prefill_save_completed_groups: dict[LayerwiseSaveKey, int] = {}
             self._decode_window_save_expected_start: dict[str, int] = {}
             self._warn_mla_per_rank_lookup_config(config)
+        else:
+            self._decode_window_save_next_generation = 1
 
     def _warn_mla_per_rank_lookup_config(self, config: LMCacheEngineConfig) -> None:
         metadata = self.lmcache_engine_metadata
@@ -3422,6 +3514,105 @@ class LMCacheConnectorV1Impl:
         completed.clear()
         return drained
 
+    def get_decode_save_completions(self) -> list[KVConnectorSaveCompletion]:
+        """Drain physical async decode-save completions from this worker."""
+        completions = getattr(self, "_decode_save_completions", None)
+        if not completions:
+            return []
+        lock = getattr(self, "_decode_save_completion_lock", None)
+        assert lock is not None
+        with lock:
+            drained = list(completions)
+            completions.clear()
+        return drained
+
+    def _record_async_decode_save_completion(self, request: ReqMeta) -> None:
+        engine = self.lmcache_engine
+        assert engine is not None
+        metadata = getattr(engine, "metadata", None)
+        worker_id = int(getattr(metadata, "worker_id", 0) or 0)
+        world_size = int(getattr(metadata, "world_size", 1) or 1)
+        save_only_first_rank = bool(
+            self.config.get_extra_config_value(
+                "save_only_first_rank",
+                bool(getattr(metadata, "use_mla", False)),
+            )
+            and bool(getattr(metadata, "use_mla", False))
+        )
+        completion = KVConnectorSaveCompletion(
+            source="lmcache",
+            request_id=request.req_id,
+            generation=request.decode_save_generation,
+            job_id=request.decode_save_job_id,
+            start=int(request.decode_window_start or 0),
+            end=int(request.decode_window_end or 0),
+            is_final=request.decode_save_is_final,
+            worker_id=worker_id,
+            expected_count=1 if save_only_first_rank else world_size,
+        )
+        with self._decode_save_completion_lock:
+            self._decode_save_completions.append(completion)
+
+    def _apply_async_decode_save_completions(
+        self, connector_output: Any
+    ) -> dict[str, int]:
+        published: dict[str, int] = {}
+        for completion in getattr(
+            connector_output, "decode_save_completions", ()
+        ):
+            if completion.source != "lmcache":
+                continue
+            tracker = self._request_trackers.get(completion.request_id)
+            if tracker is None:
+                continue
+            state = tracker.decode_window_save_async_state
+            if state is None:
+                raise RuntimeError(
+                    "received async decode-save completion for a synchronous "
+                    f"tracker: req_id={completion.request_id}"
+                )
+            advance = state.complete(
+                generation=completion.generation,
+                job_id=completion.job_id,
+                start=completion.start,
+                end=completion.end,
+                is_final=completion.is_final,
+            )
+            self._sync_async_decode_save_legacy_fields(tracker)
+            for committed_job in advance.committed_jobs:
+                if committed_job.is_final:
+                    tracker.decode_window_save_committed_end = committed_job.end
+                    continue
+                if committed_job.end % self._lmcache_chunk_size:
+                    raise RuntimeError(
+                        "non-final async decode save completed at an unaligned "
+                        f"frontier: req_id={completion.request_id}, "
+                        f"end={committed_job.end}"
+                    )
+                publish_end = publish_delayed_decode_window_commit(
+                    tracker.decode_window_save_pending_commits,
+                    committed_job.end,
+                    self._decode_window_save_commit_delay_windows,
+                    is_initial_frontier=False,
+                )
+                if publish_end is None:
+                    continue
+                tracker.decode_window_save_committed_end = max(
+                    tracker.decode_window_save_committed_end,
+                    publish_end,
+                )
+                published[completion.request_id] = max(
+                    published.get(completion.request_id, 0),
+                    publish_end,
+                )
+            if (
+                state.pending_count == 0
+                and not tracker.decode_window_save_finish_pending
+                and completion.request_id not in self._unfinished_requests
+            ):
+                self._request_trackers.pop(completion.request_id, None)
+        return published
+
     def update_connector_output(self, connector_output: Any) -> None:
         validation_blocks = getattr(
             self, "_dsa_cold_indexer_block_ids", None
@@ -3450,8 +3641,15 @@ class LMCacheConnectorV1Impl:
                     cold_loaded.add(req_id)
             if not validation_blocks:
                 del self._dsa_cold_indexer_block_ids
+        async_published = self._apply_async_decode_save_completions(
+            connector_output
+        )
         completed = getattr(connector_output, "completed_decode_window_saves", None)
         if not completed:
+            if async_published:
+                connector_output.completed_decode_window_saves.update(
+                    async_published
+                )
             return
         published: dict[str, int] = {}
         for req_id, window_end in completed.items():
@@ -3609,6 +3807,8 @@ class LMCacheConnectorV1Impl:
         # frontiers keeps release and split_boundary on the same commit point.
         completed.clear()
         completed.update(published)
+        for req_id, committed_end in async_published.items():
+            completed[req_id] = max(completed.get(req_id, 0), committed_end)
 
     def _mark_worker_retrieve_registry_changed(self) -> None:
         self._worker_retrieve_registry_version = (
@@ -7362,6 +7562,11 @@ class LMCacheConnectorV1Impl:
                 save_spec is None or not save_spec.can_save
             ) and self.kv_role != "kv_producer":
                 continue
+            if self._uses_async_decode_save(request):
+                # The background dispatcher consumes the request-owned exact
+                # mappings after forward. Per-layer hooks must not create a
+                # second synchronous storer for the same range.
+                continue
             self._note_decode_window_save_seen(request)
 
             # Per-group gating: in two-group mode, skip indexer save if
@@ -7621,6 +7826,14 @@ class LMCacheConnectorV1Impl:
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
         pass
 
+    def _uses_async_decode_save(self, request: ReqMeta) -> bool:
+        return False
+
+    def _submit_async_decode_save(self, request: ReqMeta) -> None:
+        raise NotImplementedError(
+            f"async decode save is not implemented for {type(self).__name__}"
+        )
+
     def _handle_save_request_error(
         self,
         _request: ReqMeta,
@@ -7676,6 +7889,10 @@ class LMCacheConnectorV1Impl:
                             request.save_spec,
                         )
             for request in connector_metadata.requests:
+                if self._uses_async_decode_save(request):
+                    self._submit_async_decode_save(request)
+                    self._maybe_lookup_unpin_for_request(request)
+                    continue
                 for kv_group in (0, 1):
                     storer_key = self._layerwise_save_storer_key(
                         request,
@@ -8477,7 +8694,56 @@ class LMCacheConnectorV1Impl:
             // self._lmcache_chunk_size
             * self._lmcache_chunk_size
         )
+        if getattr(self, "_async_decode_save", False):
+            tracker.decode_window_save_async_state = AsyncDecodeSaveState(
+                generation=tracker.decode_window_save_generation,
+                initial_end=start,
+            )
         return start
+
+    def _async_decode_save_pending_count(self) -> int:
+        return sum(
+            state.pending_count
+            for tracker in self._request_trackers.values()
+            if (state := tracker.decode_window_save_async_state) is not None
+        )
+
+    def _sync_async_decode_save_legacy_fields(
+        self, tracker: RequestTracker
+    ) -> None:
+        state = tracker.decode_window_save_async_state
+        if state is None:
+            return
+        tracker.decode_window_save_next_start = state.issued_end
+        tracker.decode_window_save_inflight_end = (
+            state.pending_jobs[-1].end if state.pending_jobs else None
+        )
+
+    def _build_decode_save_block_lease(
+        self,
+        tracker: RequestTracker,
+        job_id: int,
+        start: int,
+        end: int,
+    ) -> KVConnectorBlockLease:
+        start_block = start // self._block_size
+        end_block = cdiv(end, self._block_size)
+        block_groups: list[tuple[int, ...]] = [
+            tuple(tracker.allocated_block_ids[start_block:end_block])
+        ]
+        if tracker.allocated_block_ids_indexer is not None:
+            block_groups.append(
+                tuple(
+                    tracker.allocated_block_ids_indexer[start_block:end_block]
+                )
+            )
+        return KVConnectorBlockLease(
+            source="lmcache",
+            request_id=tracker.req_id,
+            generation=tracker.decode_window_save_generation,
+            job_id=job_id,
+            block_ids=tuple(block_groups),
+        )
 
     def _build_request_meta(
         self,
@@ -8519,11 +8785,48 @@ class LMCacheConnectorV1Impl:
         next_start = self._init_decode_window_save_start(tracker)
         self._trace_decode_window_decision(tracker)
 
-        if tracker.decode_window_save_inflight_end is not None:
+        async_state = tracker.decode_window_save_async_state
+        if getattr(self, "_async_decode_save", False):
+            if async_state is None:
+                async_state = AsyncDecodeSaveState(
+                    generation=tracker.decode_window_save_generation,
+                    initial_end=next_start,
+                )
+                tracker.decode_window_save_async_state = async_state
+            if (
+                async_state.pending_count
+                >= self._async_decode_save_max_pending_per_request
+            ):
+                self._trace_decode_window_decision(
+                    tracker,
+                    decision="blocked",
+                    reason="request_queue_full",
+                )
+                return
+            if (
+                self._async_decode_save_pending_count()
+                >= self._async_decode_save_max_pending_per_worker
+            ):
+                self._trace_decode_window_decision(
+                    tracker,
+                    decision="blocked",
+                    reason="worker_queue_full",
+                )
+                return
+        elif tracker.decode_window_save_inflight_end is not None:
             return
 
+        available_frontier = len(tracker.token_ids)
+        if (
+            getattr(self, "_async_decode_save", False)
+            and tracker.decode_window_save_safe_end is not None
+        ):
+            available_frontier = min(
+                available_frontier,
+                tracker.decode_window_save_safe_end,
+            )
         available_end = next_start + (
-            (len(tracker.token_ids) - next_start) // window_size * window_size
+            (available_frontier - next_start) // window_size * window_size
         )
         while available_end > next_start:
             window_start = next_start
@@ -8667,10 +8970,98 @@ class LMCacheConnectorV1Impl:
             self._trace_decode_window_decision(
                 tracker, decision="emitted", reason="window_ready"
             )
+            if async_state is not None:
+                job = async_state.issue(window_start, window_end)
+                req_meta.decode_save_generation = job.generation
+                req_meta.decode_save_job_id = job.job_id
+                meta.block_leases.append(
+                    self._build_decode_save_block_lease(
+                        tracker,
+                        job.job_id,
+                        window_start,
+                        window_end,
+                    )
+                )
             meta.add_request(req_meta)
-            tracker.decode_window_save_next_start = window_end
-            tracker.decode_window_save_inflight_end = window_end
+            if async_state is not None:
+                self._sync_async_decode_save_legacy_fields(tracker)
+            else:
+                tracker.decode_window_save_next_start = window_end
+                tracker.decode_window_save_inflight_end = window_end
             break
+
+    def _add_decode_final_save_meta(
+        self,
+        meta: LMCacheConnectorMetadata,
+        tracker: RequestTracker,
+    ) -> None:
+        if (
+            not getattr(self, "_async_decode_save", False)
+            or not tracker.decode_window_save_finish_pending
+        ):
+            return
+        final_end = tracker.decode_window_save_final_end
+        if final_end is None:
+            return
+        next_start = self._init_decode_window_save_start(tracker)
+        state = tracker.decode_window_save_async_state
+        assert state is not None
+        if final_end < state.issued_end:
+            raise RuntimeError(
+                "normal request finish rolled back across an issued decode-save "
+                f"range: req_id={tracker.req_id}, final_end={final_end}, "
+                f"issued_end={state.issued_end}"
+            )
+        if final_end == state.issued_end:
+            tracker.decode_window_save_finish_pending = False
+            return
+        if (
+            state.pending_count
+            >= self._async_decode_save_max_pending_per_request
+            or self._async_decode_save_pending_count()
+            >= self._async_decode_save_max_pending_per_worker
+        ):
+            return
+
+        req_meta = ReqMeta.from_decode_window_save(
+            tracker,
+            self._block_size,
+            next_start,
+            final_end,
+            self._decode_window_save_window_size,
+            windowed_sparse_layerwise_save=(
+                self._windowed_sparse_layerwise_save_enabled()
+            ),
+        )
+        if req_meta is None:
+            raise RuntimeError(
+                "failed to build final decode-save metadata: "
+                f"req_id={tracker.req_id}, range=[{next_start}, {final_end})"
+            )
+        if (
+            self._is_dsa_two_groups()
+            and getattr(req_meta.save_spec, "can_save_indexer", False) is False
+        ):
+            raise RuntimeError(
+                "final decode save requires matching DSA indexer blocks: "
+                f"req_id={tracker.req_id}"
+            )
+
+        job = state.issue(next_start, final_end, is_final=True)
+        req_meta.decode_save_generation = job.generation
+        req_meta.decode_save_job_id = job.job_id
+        req_meta.decode_save_is_final = True
+        meta.block_leases.append(
+            self._build_decode_save_block_lease(
+                tracker,
+                job.job_id,
+                next_start,
+                final_end,
+            )
+        )
+        meta.add_request(req_meta)
+        tracker.decode_window_save_finish_pending = False
+        self._sync_async_decode_save_legacy_fields(tracker)
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(
@@ -8692,11 +9083,22 @@ class LMCacheConnectorV1Impl:
         pending_cold = getattr(self, "_pending_dsa_cold_load_metas", None)
 
         for finished_req_id in scheduler_output.finished_req_ids:
-            tracker = self._request_trackers.pop(finished_req_id, None)
+            tracker = self._request_trackers.get(finished_req_id)
             if tracker is not None:
                 self._trace_decode_window_decision(
                     tracker, decision="request_finish", reason="request_finished"
                 )
+                self._add_decode_final_save_meta(meta, tracker)
+                state = tracker.decode_window_save_async_state
+                keep_tracker = bool(
+                    getattr(self, "_async_decode_save", False)
+                    and (
+                        tracker.decode_window_save_finish_pending
+                        or (state is not None and state.pending_count > 0)
+                    )
+                )
+                if not keep_tracker:
+                    self._request_trackers.pop(finished_req_id, None)
             if _mtp_dw_diag_enabled():
                 states = getattr(self, "_mtp_dw_window_decision_states", None)
                 if states is not None:
@@ -8728,6 +9130,14 @@ class LMCacheConnectorV1Impl:
                 validation_blocks.pop(finished_req_id, None)
                 if not validation_blocks:
                     del self._dsa_cold_indexer_block_ids
+
+        # A normal finish may reach the queue while the per-request/global
+        # admission limit is full. Finished IDs are edge-triggered by vLLM, so
+        # retry those mandatory final tails from connector-owned tracker state.
+        if getattr(self, "_async_decode_save", False):
+            for tracker in tuple(self._request_trackers.values()):
+                if tracker.decode_window_save_finish_pending:
+                    self._add_decode_final_save_meta(meta, tracker)
 
         if pending_cold:
             setattr(meta, "dsa_cold_compact_load_pending", True)
@@ -8785,6 +9195,14 @@ class LMCacheConnectorV1Impl:
                     self._unfinished_requests.get(request.req_id)
                 ),
             )
+            next_generation = getattr(
+                self, "_decode_window_save_next_generation", 1
+            )
+            request_tracker.decode_window_save_generation = next_generation
+            self._decode_window_save_next_generation = next_generation + 1
+            request_tracker.decode_window_save_safe_end = int(
+                request.num_computed_tokens
+            )
             if load_spec is not None and load_spec.dsa_committed_end is not None:
                 release_frontier = getattr(
                     load_spec, "dsa_release_frontier", None
@@ -8833,6 +9251,13 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens = load_spec.lmcache_cached_tokens
                     vllm_cached_tokens = load_spec.vllm_cached_tokens
                 request_tracker = self._request_trackers[req.req_id]
+                request_tracker.decode_window_save_safe_end = int(
+                    getattr(
+                        req,
+                        "num_computed_tokens",
+                        len(request_tracker.token_ids),
+                    )
+                )
 
                 # Pass all_token_ids for preempted requests to restore
                 # token_ids correctly for chunk key computation
@@ -8867,6 +9292,9 @@ class LMCacheConnectorV1Impl:
             # TODO: this is a dangerous reference to the request object inside vllm
             if request := self._unfinished_requests.get(req_id):
                 num_current_tokens = request.num_computed_tokens
+                request_tracker.decode_window_save_safe_end = int(
+                    num_current_tokens
+                )
                 # tracker_len < num_computed_tokens during decode
                 #   (important for save_decode_cache).
                 # num_computed_tokens < tracker_len after preemption.
@@ -8954,18 +9382,31 @@ class LMCacheConnectorV1Impl:
                     )
                     tokens_to_keep = num_token_slots
 
+                async_state = request_tracker.decode_window_save_async_state
+                if (
+                    async_state is not None
+                    and not preempted
+                    and tokens_to_keep < async_state.issued_end
+                ):
+                    raise RuntimeError(
+                        "request rolled back across an issued async decode-save "
+                        f"range: req_id={req_id}, keep={tokens_to_keep}, "
+                        f"issued_end={async_state.issued_end}"
+                    )
+
                 request_tracker.token_ids = list(request.all_token_ids[:tokens_to_keep])
                 request_tracker.num_saved_tokens = min(
                     request_tracker.num_saved_tokens, tokens_to_keep
                 )
-                request_tracker.decode_window_save_committed_end = min(
-                    request_tracker.decode_window_save_committed_end,
-                    tokens_to_keep,
-                )
-                request_tracker.decode_window_save_next_start = None
-                request_tracker.decode_window_save_anchor = None
-                request_tracker.decode_window_save_inflight_end = None
-                request_tracker.decode_window_save_pending_commits.clear()
+                if async_state is None:
+                    request_tracker.decode_window_save_committed_end = min(
+                        request_tracker.decode_window_save_committed_end,
+                        tokens_to_keep,
+                    )
+                    request_tracker.decode_window_save_next_start = None
+                    request_tracker.decode_window_save_anchor = None
+                    request_tracker.decode_window_save_inflight_end = None
+                    request_tracker.decode_window_save_pending_commits.clear()
                 request_tracker.sparse_meta_frontier = None
                 if hasattr(request_tracker, "sparse_remap_frontier"):
                     delattr(request_tracker, "sparse_remap_frontier")
@@ -9135,7 +9576,41 @@ class LMCacheConnectorV1Impl:
                     request_tracker.num_lmcache_cached_tokens
                 )
 
-        return False, return_params
+        delay_free = False
+        if getattr(self, "_async_decode_save", False):
+            request_tracker = self._request_trackers.get(request.request_id)
+            normal_finish = request.status in (
+                RequestStatus.FINISHED_STOPPED,
+                RequestStatus.FINISHED_LENGTH_CAPPED,
+                RequestStatus.FINISHED_REPETITION,
+            )
+            if request_tracker is not None and normal_finish:
+                final_end = min(
+                    int(request.num_computed_tokens),
+                    len(request_tracker.token_ids),
+                )
+                if final_end > request_tracker.prompt_len:
+                    self._init_decode_window_save_start(request_tracker)
+                    state = request_tracker.decode_window_save_async_state
+                    assert state is not None
+                    if final_end < state.issued_end:
+                        raise RuntimeError(
+                            "request finished behind an issued decode-save "
+                            f"frontier: req_id={request.request_id}, "
+                            f"final_end={final_end}, issued_end={state.issued_end}"
+                        )
+                    request_tracker.decode_window_save_final_end = final_end
+                    request_tracker.decode_window_save_finish_pending = (
+                        final_end > state.issued_end
+                    )
+            if request_tracker is not None:
+                state = request_tracker.decode_window_save_async_state
+                delay_free = bool(
+                    state is not None
+                    or request_tracker.decode_window_save_finish_pending
+                )
+
+        return delay_free, return_params
 
     @_lmcache_nvtx_annotate
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:

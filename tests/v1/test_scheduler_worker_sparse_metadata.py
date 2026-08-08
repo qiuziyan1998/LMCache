@@ -17,10 +17,14 @@ pytest.importorskip("vllm")
 from lmcache.integration.vllm import vllm_v1_adapter as adapter_module
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
+    LMCacheConnectorMetadata,
     LoadSpec,
     RequestTracker,
     WorkerRetrieveState,
+    _async_decode_save_enabled,
 )
+from vllm.v1.outputs import KVConnectorSaveCompletion
+from vllm.v1.request import RequestStatus
 from tests.v1.connector_test_utils import make_worker_impl
 
 
@@ -66,6 +70,28 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl._requests_priority = {}
     impl._cold_perf_lookup_started = {}
     return impl
+
+
+@pytest.mark.parametrize(
+    ("env_value", "window_size", "use_layerwise", "expected"),
+    [
+        (None, 256, True, True),
+        (None, 0, True, False),
+        (None, 256, False, False),
+        ("false", 256, True, False),
+        ("true", 0, False, True),
+    ],
+)
+def test_async_decode_save_default_configuration(
+    env_value: str | None,
+    window_size: int,
+    use_layerwise: bool,
+    expected: bool,
+) -> None:
+    assert (
+        _async_decode_save_enabled(env_value, window_size, use_layerwise)
+        is expected
+    )
 
 
 def _make_vllm_request(
@@ -686,6 +712,245 @@ def test_decode_window_merges_all_complete_windows_that_are_ready() -> None:
     assert next_emitted.decode_window_end == 1792
 
 
+def _enable_async_decode_save(impl: LMCacheConnectorV1Impl) -> None:
+    impl._async_decode_save = True
+    impl._async_decode_save_max_pending_per_request = 2
+    impl._async_decode_save_max_pending_per_worker = 32
+    impl._decode_window_save_next_generation = 1
+
+
+def _completion_for_job(req_id: str, job) -> KVConnectorSaveCompletion:
+    return KVConnectorSaveCompletion(
+        source="lmcache",
+        request_id=req_id,
+        generation=job.generation,
+        job_id=job.job_id,
+        start=job.start,
+        end=job.end,
+        is_final=job.is_final,
+        worker_id=-1,
+        expected_count=1,
+    )
+
+
+def test_async_decode_save_allows_two_jobs_and_commits_in_order() -> None:
+    impl = _make_scheduler_impl()
+    _enable_async_decode_save(impl)
+    impl._decode_window_save_window_size = 256
+    tracker = RequestTracker(
+        req_id="async-window",
+        prompt_len=256,
+        token_ids=list(range(512)),
+        allocated_block_ids=list(range(64)),
+        num_saved_tokens=256,
+        decode_window_save_generation=9,
+    )
+    tracker.is_decode_phase = True
+    impl._request_trackers[tracker.req_id] = tracker
+    impl._unfinished_requests[tracker.req_id] = SimpleNamespace()
+    meta = LMCacheConnectorMetadata()
+
+    impl._add_decode_window_save_metas(meta, tracker)
+    tracker.token_ids.extend(range(512, 768))
+    impl._add_decode_window_save_metas(meta, tracker)
+
+    state = tracker.decode_window_save_async_state
+    assert state is not None
+    first, second = state.pending_jobs
+    assert len(meta.requests) == 2
+    assert len(meta.block_leases) == 2
+    assert tracker.decode_window_save_next_start == 768
+
+    tracker.token_ids.extend(range(768, 1024))
+    impl._add_decode_window_save_metas(meta, tracker)
+    assert len(meta.requests) == 2
+
+    second_output = SimpleNamespace(
+        decode_save_completions=[_completion_for_job(tracker.req_id, second)],
+        completed_decode_window_saves={},
+    )
+    impl.update_connector_output(second_output)
+    assert second_output.completed_decode_window_saves == {}
+    assert state.committed_end == 256
+    assert state.pending_count == 2
+
+    first_output = SimpleNamespace(
+        decode_save_completions=[_completion_for_job(tracker.req_id, first)],
+        completed_decode_window_saves={},
+    )
+    impl.update_connector_output(first_output)
+    assert first_output.completed_decode_window_saves == {
+        tracker.req_id: 768
+    }
+    assert state.committed_end == 768
+    assert state.pending_count == 0
+
+
+def test_async_decode_save_does_not_cross_unverified_mtp_tokens() -> None:
+    impl = _make_scheduler_impl()
+    _enable_async_decode_save(impl)
+    impl._decode_window_save_window_size = 256
+    tracker = RequestTracker(
+        req_id="async-mtp",
+        prompt_len=256,
+        token_ids=list(range(520)),
+        allocated_block_ids=list(range(64)),
+        num_saved_tokens=256,
+        decode_window_save_generation=2,
+        decode_window_save_safe_end=511,
+    )
+    tracker.is_decode_phase = True
+    impl._request_trackers[tracker.req_id] = tracker
+    meta = LMCacheConnectorMetadata()
+
+    impl._add_decode_window_save_metas(meta, tracker)
+    assert meta.requests == []
+
+    tracker.decode_window_save_safe_end = 512
+    impl._add_decode_window_save_metas(meta, tracker)
+    assert len(meta.requests) == 1
+    assert meta.requests[0].decode_window_end == 512
+
+
+def test_async_decode_save_emits_partial_final_tail() -> None:
+    impl = _make_scheduler_impl()
+    _enable_async_decode_save(impl)
+    impl._decode_window_save_window_size = 256
+    impl.config.get_extra_config_value.return_value = False
+    tracker = RequestTracker(
+        req_id="async-final",
+        prompt_len=256,
+        token_ids=list(range(600)),
+        allocated_block_ids=list(range(64)),
+        num_saved_tokens=256,
+        decode_window_save_generation=4,
+    )
+    tracker.is_decode_phase = True
+    impl._request_trackers[tracker.req_id] = tracker
+    first_meta = LMCacheConnectorMetadata()
+    impl._add_decode_window_save_metas(first_meta, tracker)
+    assert first_meta.requests[0].decode_window_end == 512
+
+    request = SimpleNamespace(
+        request_id=tracker.req_id,
+        status=RequestStatus.FINISHED_STOPPED,
+        num_computed_tokens=600,
+        kv_transfer_params=None,
+    )
+    delay_free, _ = impl.request_finished(request, [])
+    assert delay_free
+    assert tracker.decode_window_save_finish_pending
+
+    scheduler_output = StubSchedulerOutput(
+        finished_req_ids={tracker.req_id},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=StubCachedRequestData([], [], []),
+        num_scheduled_tokens={},
+    )
+    final_meta = impl.build_connector_meta(scheduler_output)
+
+    [final_request] = final_meta.requests
+    assert final_request.decode_window_start == 512
+    assert final_request.decode_window_end == 600
+    assert final_request.decode_save_is_final
+    assert len(final_meta.block_leases) == 1
+
+
+def test_async_decode_save_backpressure_with_41_requests() -> None:
+    impl = _make_scheduler_impl()
+    _enable_async_decode_save(impl)
+    impl._decode_window_save_window_size = 256
+    trackers = []
+    for index in range(41):
+        tracker = RequestTracker(
+            req_id=f"async-{index}",
+            prompt_len=256,
+            token_ids=list(range(512)),
+            allocated_block_ids=list(range(64)),
+            num_saved_tokens=256,
+            decode_window_save_generation=index + 1,
+        )
+        tracker.is_decode_phase = True
+        trackers.append(tracker)
+        impl._request_trackers[tracker.req_id] = tracker
+
+    meta = LMCacheConnectorMetadata()
+    for tracker in trackers:
+        impl._add_decode_window_save_metas(meta, tracker)
+
+    assert len(meta.requests) == 32
+    assert len(meta.block_leases) == 32
+    assert impl._async_decode_save_pending_count() == 32
+    assert all(
+        tracker.decode_window_save_async_state is not None
+        and tracker.decode_window_save_async_state.pending_count == 0
+        for tracker in trackers[32:]
+    )
+
+    first_state = trackers[0].decode_window_save_async_state
+    assert first_state is not None
+    [first_job] = first_state.pending_jobs
+    completion_output = SimpleNamespace(
+        decode_save_completions=[
+            _completion_for_job(trackers[0].req_id, first_job)
+        ],
+        completed_decode_window_saves={},
+    )
+    impl.update_connector_output(completion_output)
+    assert completion_output.completed_decode_window_saves == {
+        trackers[0].req_id: 512
+    }
+    assert impl._async_decode_save_pending_count() == 31
+
+    retry_meta = LMCacheConnectorMetadata()
+    impl._add_decode_window_save_metas(retry_meta, trackers[32])
+    assert len(retry_meta.requests) == 1
+    assert retry_meta.requests[0].req_id == trackers[32].req_id
+    assert len(retry_meta.block_leases) == 1
+    assert impl._async_decode_save_pending_count() == 32
+
+
+def test_async_decode_save_abort_drains_issued_job_without_final_tail() -> None:
+    impl = _make_scheduler_impl()
+    _enable_async_decode_save(impl)
+    impl.async_loading = False
+    impl._decode_window_save_window_size = 256
+    tracker = RequestTracker(
+        req_id="async-abort",
+        prompt_len=256,
+        token_ids=list(range(600)),
+        allocated_block_ids=list(range(64)),
+        num_saved_tokens=256,
+        decode_window_save_generation=5,
+    )
+    tracker.is_decode_phase = True
+    impl._request_trackers[tracker.req_id] = tracker
+    first_meta = LMCacheConnectorMetadata()
+    impl._add_decode_window_save_metas(first_meta, tracker)
+    assert first_meta.requests[0].decode_window_end == 512
+
+    request = SimpleNamespace(
+        request_id=tracker.req_id,
+        status=RequestStatus.FINISHED_ABORTED,
+        num_computed_tokens=600,
+        kv_transfer_params=None,
+    )
+    delay_free, _ = impl.request_finished(request, [])
+    assert delay_free
+    assert not tracker.decode_window_save_finish_pending
+
+    scheduler_output = StubSchedulerOutput(
+        finished_req_ids={tracker.req_id},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=StubCachedRequestData([], [], []),
+        num_scheduled_tokens={},
+    )
+    finished_meta = impl.build_connector_meta(scheduler_output)
+    assert finished_meta.requests == []
+    assert finished_meta.block_leases == []
+    assert tracker.req_id in impl._request_trackers
+
+
 def test_prefill_completion_publishes_only_chunk_aligned_frontier() -> None:
     impl = _make_scheduler_impl()
     impl._completed_decode_window_saves = {}
@@ -790,6 +1055,10 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert first.load_spec.dsa_cold_compact_resume is True
         assert not hasattr(first.load_spec, "dsa_cold_compact_load")
 
+        impl._unfinished_requests[req_id] = SimpleNamespace(
+            num_computed_tokens=prompt_len,
+            all_token_ids=list(range(prompt_len + 1)),
+        )
         second = impl.build_connector_meta(
             StubSchedulerOutput(
                 finished_req_ids=set(),
