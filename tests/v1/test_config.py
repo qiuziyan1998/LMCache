@@ -129,6 +129,13 @@ def test_experimental_sampled_lookup_env_knob(monkeypatch):
     assert config.experimental_sampled_layerwise_lookup is True
 
 
+def test_npu_transfer_validation_defaults_on_and_can_be_disabled(monkeypatch):
+    assert LMCacheEngineConfig.from_defaults().enable_npu_transfer_validation is True
+
+    monkeypatch.setenv("LMCACHE_ENABLE_NPU_TRANSFER_VALIDATION", "false")
+    assert LMCacheEngineConfig.from_env().enable_npu_transfer_validation is False
+
+
 @pytest.mark.parametrize(
     ("overrides", "missing_flag"),
     [

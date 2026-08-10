@@ -5625,14 +5625,23 @@ class LMCacheConnectorV1Impl:
                     **retrieve_kwargs,
                 )
             )
-            indexer_slots = request.indexer_slot_mapping[0].to(
+            indexer_slots_cpu = request.indexer_slot_mapping[0]
+            indexer_kvcaches = self._kvcaches_for_group(1)
+            validate_slots = getattr(
+                self.lmcache_engine.gpu_connector,
+                "validate_layerwise_slot_mapping",
+                None,
+            )
+            if callable(validate_slots):
+                validate_slots(indexer_slots_cpu, indexer_kvcaches, kv_group=1)
+            indexer_slots = indexer_slots_cpu.to(
                 device=self.device,
                 dtype=torch.long,
             )
             indexer_retriever = self.lmcache_engine.retrieve_layer(
                 tokens,
                 token_mask,
-                kvcaches=self._kvcaches_for_group(1),
+                kvcaches=indexer_kvcaches,
                 slot_mapping=indexer_slots,
                 vllm_cached_tokens=0,
                 sync=True,

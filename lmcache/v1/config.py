@@ -312,6 +312,13 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "enable_npu_transfer_validation": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+        "description": "Validate NPU transfer slots, cached destinations, and "
+        "registered source spans before native kernel launch.",
+    },
     "enable_shared_cpu_cache": {
         "type": bool,
         "default": False,
