@@ -469,6 +469,25 @@ class StorageManager:
             req_id,
         )
 
+    def batched_get_external_pages(
+        self,
+        keys: Sequence[CacheEngineKey],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        owners: tuple[Any, ...],
+        req_id: str,
+    ) -> None:
+        """Load remote pages directly into externally owned buffers."""
+        backend = self.storage_backends.get("RemoteBackend")
+        if not isinstance(backend, RemoteBackend):
+            raise RuntimeError("Direct page load requires RemoteBackend")
+        with self._bypass_lock:
+            if "RemoteBackend" in self._bypassed_backends:
+                raise RuntimeError("RemoteBackend is bypassed")
+        backend.batched_get_external_pages(
+            keys, buffer_ptrs, buffer_sizes, owners, req_id
+        )
+
     def batched_external_pages_exist(
         self, keys: Sequence[CacheEngineKey]
     ) -> List[bool]:

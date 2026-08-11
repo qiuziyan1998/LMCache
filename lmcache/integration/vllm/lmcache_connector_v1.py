@@ -61,6 +61,18 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         """
         self._lmcache_engine.register_kv_caches(kv_caches)
 
+    def _take_live_split_destination_plans(
+        self, handled_groups: tuple[int, ...]
+    ) -> dict[str, dict[str, Any]]:
+        """Internal worker hook consumed by AscendMultiConnector."""
+        return self._lmcache_engine.take_live_split_destination_plans(
+            handled_groups
+        )
+
+    def _accept_live_split_results(self, results: dict[str, str]) -> None:
+        """Internal worker hook for negotiated live-transfer acknowledgements."""
+        self._lmcache_engine.accept_live_split_results(results)
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """
         Start loading the KV cache from the connector to vLLM's paged
@@ -171,6 +183,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
 
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         return self._lmcache_engine.get_completed_decode_window_saves()
+
+    def build_connector_worker_meta(self):
+        build = getattr(self._lmcache_engine, "build_connector_worker_meta", None)
+        return build() if callable(build) else None
 
     def shutdown(self):
         """

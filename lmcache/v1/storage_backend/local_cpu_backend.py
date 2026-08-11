@@ -949,14 +949,21 @@ class LocalCPUBackend(AllocatorBackendInterface):
         num_layers: int,
         fmt: MemoryFormat,
         busy_loop: bool = True,
+        valid_tokens: Optional[Union[int, list[int]]] = None,
+        full_tokens: Optional[int] = None,
     ) -> Optional[list[LayerPageMemoryObj]]:
-        """Allocate layer pages, evicting cache entries when required."""
+        """Allocate exact-size layer pages, evicting entries when required."""
         allocate = getattr(
             self.memory_allocator, "batched_allocate_layer_pages", None
         )
         if not callable(allocate):
             return None
-        pages = allocate(shapes, dtypes, batch_size, num_layers, fmt)
+        allocation_args = (shapes, dtypes, batch_size, num_layers, fmt)
+        pages = allocate(
+            *allocation_args,
+            valid_tokens,
+            full_tokens,
+        )
         evicted = 0
         deadline = time.monotonic() + float(
             getattr(self.config, "blocking_timeout_secs", 60)
@@ -992,7 +999,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 if not busy_loop or time.monotonic() >= deadline:
                     break
                 time.sleep(0.1)
-            pages = allocate(shapes, dtypes, batch_size, num_layers, fmt)
+            pages = allocate(
+                *allocation_args,
+                valid_tokens,
+                full_tokens,
+            )
         self.stats_monitor.update_local_cpu_evict_metrics(evicted)
         return pages
 

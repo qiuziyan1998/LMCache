@@ -2,6 +2,7 @@
 """Tests for worker-local sparse decode retrieve state cache."""
 
 # Standard
+from concurrent.futures import Future
 from contextlib import contextmanager
 import inspect
 from types import SimpleNamespace
@@ -48,6 +49,143 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     impl.kv_role = "kv_both"
     impl._late_finished_sending = set()
     return impl
+
+
+def test_cold_compact_executor_is_bounded_to_two_io_jobs() -> None:
+    impl = _make_impl()
+    executor = impl._get_dsa_cold_load_executor()
+    try:
+        assert executor._max_workers == 2
+    finally:
+        executor.shutdown(wait=True)
+
+
+def test_cold_compact_drain_waits_for_both_dependencies() -> None:
+    impl = _make_impl()
+    latent_future: Future = Future()
+    indexer_future: Future = Future()
+    latent_future.set_result(WorkerRetrieveState(req_id="request"))
+    request = SimpleNamespace(load_spec=SimpleNamespace(dsa_cold_load_generation=1))
+    impl._dsa_cold_load_futures = {
+        "request": (1, latent_future, request, set(), 0.0, indexer_future)
+    }
+
+    assert impl._drain_dsa_cold_load_futures() is None
+    assert "request" in impl._dsa_cold_load_futures
+
+
+def test_cold_compact_indexer_uses_direct_sparse_retrieve_path() -> None:
+    impl = _make_impl()
+    impl.num_layers = 2
+    impl.device = "cpu"
+    owner = object()
+    readiness = object()
+
+    def sparse_kwargs(_request, state, _bound_state, **_kwargs):
+        state.cached_memory_objs_indexer = [[owner], [owner]]
+        return ({"marker": "sparse"}, None, None)
+
+    def direct_retrieve(_tokens, _mask, **kwargs):
+        assert kwargs["marker"] == "sparse"
+        assert kwargs["direct_external_pages"] is True
+        assert kwargs["_defer_direct_load_readiness"] is True
+        yield None
+        yield torch.ones(4, dtype=torch.bool)
+        yield torch.ones(4, dtype=torch.bool)
+
+    impl._sparse_retrieve_kwargs = MagicMock(side_effect=sparse_kwargs)
+    impl.lmcache_engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(
+            record_dense_load_readiness=lambda: readiness,
+        ),
+        retrieve_layer=MagicMock(
+            side_effect=AssertionError("generic retrieve path is CPU staged")
+        ),
+        retrieve_layer_head_token_wise=MagicMock(side_effect=direct_retrieve),
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        request_configs=None,
+        load_spec=SimpleNamespace(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=4,
+        ),
+    )
+    plan = {
+        "request": request,
+        "tokens": [1, 2, 3, 4],
+        "token_mask": torch.ones(4, dtype=torch.bool),
+        "token_count": 4,
+        "indexer_slots_cpu": torch.arange(4),
+        "indexer_kvcaches": [object(), object()],
+        "planned_at": adapter_mod.cold_start_perf_now(),
+    }
+
+    result = impl._run_dsa_cold_indexer_load(plan, None)
+
+    assert torch.equal(result[0], torch.ones(4, dtype=torch.bool))
+    assert result[1] is readiness
+    assert plan["indexer_source_owners"] == (owner,)
+    impl.lmcache_engine.retrieve_layer.assert_not_called()
+    impl.lmcache_engine.retrieve_layer_head_token_wise.assert_called_once()
+
+
+@pytest.mark.parametrize("failure", ("incomplete", "transfer"))
+def test_failed_cold_indexer_releases_transient_memory_owner(failure) -> None:
+    class Owner:
+        def __init__(self):
+            self.released = 0
+
+        def is_valid(self):
+            return True
+
+        def ref_count_down(self):
+            self.released += 1
+
+    impl = _make_impl()
+    impl.num_layers = 1
+    impl.device = "cpu"
+    owner = Owner()
+    connector = SimpleNamespace(
+        synchronize_dense_load_stream=MagicMock(),
+        record_dense_load_readiness=MagicMock(),
+    )
+
+    def sparse_kwargs(_request, state, _bound_state, **_kwargs):
+        state.cached_memory_objs_indexer = [[owner]]
+        return ({}, None, None)
+
+    def incomplete_retrieve(*_args, **_kwargs):
+        yield None
+        if failure == "transfer":
+            raise RuntimeError("transfer failed")
+        yield torch.zeros(4, dtype=torch.bool)
+
+    impl._sparse_retrieve_kwargs = MagicMock(side_effect=sparse_kwargs)
+    impl.lmcache_engine = SimpleNamespace(
+        gpu_connector=connector,
+        retrieve_layer_head_token_wise=MagicMock(
+            side_effect=incomplete_retrieve
+        ),
+    )
+    plan = {
+        "request": SimpleNamespace(req_id="request", request_configs=None),
+        "tokens": [1, 2, 3, 4],
+        "token_mask": torch.ones(4, dtype=torch.bool),
+        "token_count": 4,
+        "indexer_slots_cpu": torch.arange(4),
+        "indexer_kvcaches": [object()],
+        "planned_at": adapter_mod.cold_start_perf_now(),
+    }
+
+    expected = "transfer failed|indexer retrieve was incomplete"
+    with pytest.raises(RuntimeError, match=expected):
+        impl._run_dsa_cold_indexer_load(plan, None)
+
+    connector.synchronize_dense_load_stream.assert_called_once_with()
+    connector.record_dense_load_readiness.assert_not_called()
+    assert owner.released == 1
+    assert "indexer_source_owners" not in plan
 
 
 def _make_shared_engine(
@@ -1032,6 +1170,69 @@ class TestWorkerRetrieveState:
 
         engine.release_shared_cpu_sparse_request.assert_called_once_with("req-1")
         assert state.shared_request_active is False
+
+    def test_dense_load_readiness_waits_once_and_retains_source_owners(self):
+        owner_a = object()
+        owner_b = object()
+        direct_owner = object()
+        readiness = object()
+        connector = SimpleNamespace(
+            record_dense_load_readiness=MagicMock(return_value=readiness),
+            consume_dense_load_readiness=MagicMock(),
+            synchronize_dense_load_stream=MagicMock(),
+        )
+        impl = _make_impl()
+        impl._manager = SimpleNamespace(
+            lmcache_engine=SimpleNamespace(gpu_connector=connector)
+        )
+        state = WorkerRetrieveState(
+            cached_memory_objs=[[owner_a]],
+            cached_memory_objs_indexer=[[owner_b, owner_a]],
+        )
+
+        impl._record_dsa_cold_dense_load_readiness(
+            state, additional_owners=(direct_owner, owner_a)
+        )
+        impl._consume_dsa_cold_dense_load_readiness(state)
+        impl._consume_dsa_cold_dense_load_readiness(state)
+
+        connector.record_dense_load_readiness.assert_called_once_with()
+        connector.consume_dense_load_readiness.assert_called_once_with(readiness)
+        connector.synchronize_dense_load_stream.assert_not_called()
+        assert state.dense_load_source_owners == (direct_owner, owner_a)
+        assert state.dense_load_readiness is None
+
+    def test_unconsumed_dense_load_readiness_synchronizes_before_owner_release(self):
+        class Owner:
+            def __init__(self):
+                self.released = 0
+
+            def is_valid(self):
+                return True
+
+            def ref_count_down(self):
+                self.released += 1
+
+        owner = Owner()
+        connector = SimpleNamespace(
+            synchronize_dense_load_stream=MagicMock(),
+        )
+        engine = SimpleNamespace(
+            gpu_connector=connector,
+            release_shared_cpu_sparse_request=MagicMock(),
+        )
+        state = WorkerRetrieveState(
+            req_id="req-1",
+            dense_load_readiness=object(),
+            dense_load_source_owners=(owner,),
+        )
+
+        LMCacheConnectorV1Impl._release_shared_worker_retrieve_state(state, engine)
+
+        connector.synchronize_dense_load_stream.assert_called_once_with()
+        assert owner.released == 1
+        assert state.dense_load_readiness is None
+        assert state.dense_load_source_owners == ()
 
     def test_finished_worker_request_releases_request_owned_cache_state(self):
         storer_closed: list[bool] = []
@@ -4902,3 +5103,440 @@ class TestWorkerRetrieveState:
         non_sparse.is_sparse_decode = False
         impl._maybe_lookup_unpin_for_request(non_sparse)
         engine.lookup_unpin.assert_called_once_with("req-1")
+
+    def test_live_split_success_publishes_only_indexer_dependency(self):
+        impl = _make_impl()
+        readiness = object()
+        impl.lmcache_engine = SimpleNamespace(
+            _commit_live_split_import=MagicMock(),
+            _release_live_split_import=MagicMock(),
+            gpu_connector=SimpleNamespace(
+                record_dense_load_readiness=lambda: readiness
+            ),
+        )
+        dependency = Future()
+        latent_gate = Future()
+        context = {"handled_groups": (1,), "pages": []}
+        impl._dsa_live_split_pending = {
+            "req-live": {
+                "context": context,
+                "indexer_completion": dependency,
+                "latent_gate": latent_gate,
+            }
+        }
+        impl._fallback_live_split_indexer = MagicMock()
+        impl._publish_worker_retrieve_state = MagicMock()
+
+        impl.accept_live_split_results({"req-live": "success"})
+
+        assert dependency.result() == (None, readiness, 0.0, 0.0)
+        assert latent_gate.done()
+        impl.lmcache_engine._commit_live_split_import.assert_called_once_with(
+            context
+        )
+        impl.lmcache_engine._release_live_split_import.assert_not_called()
+        impl._fallback_live_split_indexer.assert_not_called()
+        impl._publish_worker_retrieve_state.assert_not_called()
+
+        # A duplicate ACK is a no-op after ownership moved out of pending.
+        impl.accept_live_split_results({"req-live": "success"})
+        impl.lmcache_engine._commit_live_split_import.assert_called_once_with(
+            context
+        )
+
+    @pytest.mark.parametrize("status", ["failure", "fallback", "timeout"])
+    def test_live_split_failure_releases_and_uses_persistent_indexer(
+        self, status
+    ):
+        impl = _make_impl()
+        context = {"handled_groups": (1,), "pages": []}
+        entry = {
+            "context": context,
+            "indexer_completion": Future(),
+            "latent_gate": Future(),
+        }
+        impl._dsa_live_split_pending = {"req-live": entry}
+        impl.lmcache_engine = SimpleNamespace(
+            _release_live_split_import=MagicMock()
+        )
+        impl._fallback_live_split_indexer = MagicMock()
+
+        impl.accept_live_split_results({"req-live": status})
+
+        impl.lmcache_engine._release_live_split_import.assert_called_once_with(
+            context
+        )
+        impl._fallback_live_split_indexer.assert_called_once_with(entry)
+        assert entry["latent_gate"].done()
+
+    def test_live_split_rejects_unknown_group_layout(self):
+        impl = _make_impl()
+        entry = {
+            "offered": False,
+            "latent_gate": Future(),
+            "indexer_completion": Future(),
+        }
+        impl._dsa_live_split_pending = {"req-live": entry}
+        impl._fallback_live_split_indexer = MagicMock()
+
+        assert impl.take_live_split_destination_plans((0,)) == {}
+        impl._fallback_live_split_indexer.assert_called_once_with(entry)
+        assert impl._dsa_live_split_pending == {}
+
+    def test_live_split_group1_plan_uses_tp_rank_and_preserves_group0(self):
+        impl = _make_impl()
+        impl._block_size = 16
+        impl._vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_rank_local=1)
+        )
+        request = SimpleNamespace(
+            live_split_remote_block_ids=[3, 4],
+            request_configs={"purpose": "test"},
+        )
+        plan = {
+            "tokens": list(range(17)),
+            "token_count": 17,
+            "indexer_slots_cpu": torch.arange(17),
+            "latent_kvcaches": [object()],
+            "indexer_kvcaches": [object()],
+        }
+        destination = {
+            "segments": [{"group_id": 1}],
+            "group_byte_totals": (0, 128),
+        }
+        context = {
+            "pages": [],
+            "destination_owners": (object(),),
+        }
+        prepare = MagicMock(return_value=(destination, context))
+        impl.lmcache_engine = SimpleNamespace(
+            _prepare_live_split_import=prepare
+        )
+        impl._dsa_live_split_pending = {
+            "req-live": {
+                "request": request,
+                "plan": plan,
+                "context": None,
+                "offered": False,
+                "indexer_completion": Future(),
+                "latent_gate": Future(),
+            }
+        }
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                adapter_mod, "get_tensor_model_parallel_rank", lambda: 7
+            )
+            offered = impl.take_live_split_destination_plans((1,))
+
+        assert offered == {"req-live": destination}
+        assert destination["requested_groups"] == (1,)
+        prepare.assert_called_once()
+        kwargs = prepare.call_args.kwargs
+        assert kwargs["handled_groups"] == (1,)
+        assert kwargs["tp_rank"] == 7
+        assert kwargs["dp_rank"] == 1
+        assert impl._dsa_live_split_pending["req-live"]["context"] is context
+        assert context["pages"] == []
+        assert impl._dsa_live_split_pending["req-live"][
+            "latent_gate"
+        ].done()
+
+    def test_live_split_full_plan_holds_latent_until_success_ack(self):
+        impl = _make_impl()
+        impl._block_size = 16
+        impl._vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_rank_local=0)
+        )
+        gate = Future()
+        context = {"pages": [object()], "destination_owners": ()}
+        destination = {"segments": [], "group_byte_totals": (8, 4)}
+        impl.lmcache_engine = SimpleNamespace(
+            _prepare_live_split_import=MagicMock(
+                return_value=(destination, context)
+            ),
+            _commit_live_split_import=MagicMock(),
+            _release_live_split_import=MagicMock(),
+            gpu_connector=SimpleNamespace(
+                record_dense_load_readiness=lambda: object()
+            ),
+        )
+        impl._dsa_live_split_pending = {
+            "req-live": {
+                "request": SimpleNamespace(
+                    live_split_remote_block_ids=[1], request_configs=None
+                ),
+                "plan": {
+                    "tokens": [1],
+                    "token_count": 1,
+                    "indexer_slots_cpu": torch.arange(1),
+                    "latent_kvcaches": [],
+                    "indexer_kvcaches": [],
+                },
+                "context": None,
+                "offered": False,
+                "indexer_completion": Future(),
+                "latent_gate": gate,
+            }
+        }
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                adapter_mod, "get_tensor_model_parallel_rank", lambda: 0
+            )
+            assert impl.take_live_split_destination_plans((0, 1)) == {
+                "req-live": destination
+            }
+        assert not gate.done()
+
+        impl.accept_live_split_results({"req-live": "success"})
+
+        impl.lmcache_engine._commit_live_split_import.assert_called_once_with(
+            context
+        )
+        assert gate.done()
+
+    def test_live_split_success_skips_persistent_group0_get(self):
+        impl = _make_impl()
+        impl.num_layers = 1
+        impl.device = "cpu"
+        impl._num_layers_for_group = lambda _group: 1
+        impl._record_dsa_cold_dense_load_readiness = MagicMock()
+        impl._refresh_prepared_sparse_sources = lambda state, _tokens: (
+            state.prepared_sparse_sources.setdefault(0, object())
+        )
+        retrieve = MagicMock()
+        impl.lmcache_engine = SimpleNamespace(
+            retrieve_layer_head_token_wise=retrieve
+        )
+        request = SimpleNamespace(
+            req_id="req-live",
+            load_spec=SimpleNamespace(lmcache_cached_tokens=2),
+        )
+        plan = {
+            "request": request,
+            "token_count": 2,
+            "tokens": [1, 2],
+            "token_mask": torch.ones(2, dtype=torch.bool),
+            "latent_kvcaches": [],
+            "planned_at": 0.0,
+            "plan_started": 0.0,
+        }
+        dependency = Future()
+        dependency.set_result((None, None, 0.0, 0.0))
+        live_state = WorkerRetrieveState(
+            req_id="req-live",
+            cached_keys=[[object()]],
+            cached_starts=[0],
+            cached_ends=[2],
+        )
+
+        result = impl._run_dsa_cold_compact_load(
+            plan, None, dependency, live_state=live_state
+        )
+
+        assert result is live_state
+        retrieve.assert_not_called()
+
+    def test_live_split_failure_runs_one_persistent_group0_get(self):
+        impl = _make_impl()
+        impl.num_layers = 1
+        impl.device = "cpu"
+        impl._num_layers_for_group = lambda _group: 1
+        impl._record_dsa_cold_dense_load_readiness = MagicMock()
+        impl._refresh_prepared_sparse_sources = lambda state, _tokens: (
+            state.prepared_sparse_sources.setdefault(0, object())
+        )
+
+        def latent_retriever():
+            while True:
+                yield torch.ones(2, dtype=torch.bool)
+
+        retrieve = MagicMock(side_effect=lambda *args, **kwargs: latent_retriever())
+        impl.lmcache_engine = SimpleNamespace(
+            retrieve_layer_head_token_wise=retrieve
+        )
+        impl._sparse_retrieve_kwargs = MagicMock(
+            return_value=({"cached_retrieve_location": "RemoteBackend"}, None, None)
+        )
+        request = SimpleNamespace(
+            req_id="req-live",
+            load_spec=SimpleNamespace(lmcache_cached_tokens=2),
+        )
+        plan = {
+            "request": request,
+            "token_count": 2,
+            "tokens": [1, 2],
+            "token_mask": torch.ones(2, dtype=torch.bool),
+            "latent_kvcaches": [],
+            "planned_at": 0.0,
+            "plan_started": 0.0,
+        }
+        dependency = Future()
+        dependency.set_result((None, None, 0.0, 0.0))
+
+        impl._run_dsa_cold_compact_load(plan, None, dependency)
+
+        retrieve.assert_called_once()
+
+    def test_live_split_state_is_published_only_after_success_ack(self):
+        impl = _make_impl()
+        impl._invalid_block_ids = set()
+        impl._publish_worker_retrieve_state = MagicMock()
+        readiness = object()
+        context = {"pages": [], "pin_marker": object()}
+        dependency = Future()
+        pinned_owner = object()
+        prepared_source = object()
+        state = WorkerRetrieveState(
+            req_id="req-live",
+            location="LocalCPUBackend",
+            metadata_warm=True,
+            token_count=32,
+            indexer_npu_resident=True,
+            cached_memory_objs=[[pinned_owner]],
+        )
+        state.prepared_sparse_sources[0] = prepared_source
+        latent = Future()
+        latent.set_result(state)
+        load_spec = SimpleNamespace(
+            dsa_cold_load_generation=4,
+            lmcache_cached_tokens=32,
+            dsa_committed_end=32,
+            dsa_remap_frontier=31,
+        )
+        request = SimpleNamespace(load_spec=load_spec)
+        impl._dsa_cold_load_futures = {
+            "req-live": (4, latent, request, {9}, 0.0, dependency)
+        }
+        impl._dsa_live_split_pending = {
+            "req-live": {
+                "context": context,
+                "indexer_completion": dependency,
+                "latent_gate": Future(),
+            }
+        }
+        impl.lmcache_engine = SimpleNamespace(
+            _commit_live_split_import=MagicMock(),
+            _release_live_split_import=MagicMock(),
+            gpu_connector=SimpleNamespace(
+                record_dense_load_readiness=lambda: readiness
+            ),
+        )
+
+        assert impl._drain_dsa_cold_load_futures() is None
+        impl._publish_worker_retrieve_state.assert_not_called()
+
+        impl.accept_live_split_results({"req-live": "success"})
+        assert impl._drain_dsa_cold_load_futures() == {"req-live"}
+
+        published_state = impl._publish_worker_retrieve_state.call_args.args[0]
+        assert published_state is state
+        assert load_spec.dsa_committed_end == 32
+        assert load_spec.dsa_remap_frontier == 31
+        assert context["pin_marker"] is not None
+        assert state.indexer_npu_resident is True
+        assert state.cached_memory_objs == [[pinned_owner]]
+        assert state.prepared_sparse_sources[0] is prepared_source
+
+    def test_live_split_plan_failure_releases_pending_without_ack(self):
+        impl = _make_impl()
+        impl._block_size = 16
+        impl._vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_rank_local=0)
+        )
+        completion = Future()
+        entry = {
+            "request": SimpleNamespace(
+                live_split_remote_block_ids=[1],
+                request_configs=None,
+            ),
+            "plan": {
+                "tokens": [1],
+                "token_count": 1,
+                "indexer_slots_cpu": torch.arange(1),
+                "latent_kvcaches": [],
+                "indexer_kvcaches": [],
+            },
+            "context": None,
+            "offered": False,
+            "indexer_completion": completion,
+            "latent_gate": Future(),
+        }
+        impl._dsa_live_split_pending = {"req-live": entry}
+        impl.lmcache_engine = SimpleNamespace(
+            _prepare_live_split_import=MagicMock(
+                side_effect=RuntimeError("unsupported")
+            )
+        )
+        impl._fallback_live_split_indexer = MagicMock()
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                adapter_mod, "get_tensor_model_parallel_rank", lambda: 0
+            )
+            assert impl.take_live_split_destination_plans((1,)) == {}
+
+        impl._fallback_live_split_indexer.assert_called_once_with(entry)
+        assert entry["latent_gate"].done()
+        assert impl._dsa_live_split_pending == {}
+
+    def test_live_split_cancel_releases_context_and_both_dependencies(self):
+        impl = _make_impl()
+        context = {"pages": [object()]}
+        entry = {
+            "context": context,
+            "latent_gate": Future(),
+            "indexer_completion": Future(),
+        }
+        impl.lmcache_engine = SimpleNamespace(
+            _release_live_split_import=MagicMock()
+        )
+
+        impl._cancel_live_split_entry(entry, "cancelled")
+
+        impl.lmcache_engine._release_live_split_import.assert_called_once_with(
+            context
+        )
+        assert entry["context"] is None
+        with pytest.raises(RuntimeError, match="cancelled"):
+            entry["latent_gate"].result()
+        with pytest.raises(RuntimeError, match="cancelled"):
+            entry["indexer_completion"].result()
+
+    @pytest.mark.parametrize("live_requested", [True, False])
+    def test_live_split_reused_id_preserves_active_generation(
+        self, live_requested
+    ):
+        impl = _make_impl()
+        old_context = {"pages": [object()]}
+        old_dependency = Future()
+        old_pending = {
+            "context": old_context,
+            "indexer_completion": old_dependency,
+        }
+        old_future = object()
+        impl._dsa_live_split_pending = {"req-live": old_pending}
+        impl._dsa_cold_load_futures = {"req-live": old_future}
+        impl._get_dsa_cold_load_executor = MagicMock()
+        impl.lmcache_engine = SimpleNamespace(
+            _prepare_live_split_import=MagicMock()
+        )
+        request = SimpleNamespace(
+            req_id="req-live",
+            live_split_requested=live_requested,
+            live_split_remote_block_ids=[1],
+        )
+
+        with pytest.raises(RuntimeError, match="generation is still active"):
+            impl._try_prepare_dsa_live_split(request)
+
+        assert impl._dsa_live_split_pending == {"req-live": old_pending}
+        assert impl._dsa_live_split_pending["req-live"] is old_pending
+        assert impl._dsa_live_split_pending["req-live"]["context"] is old_context
+        assert impl._dsa_live_split_pending["req-live"][
+            "indexer_completion"
+        ] is old_dependency
+        assert impl._dsa_cold_load_futures["req-live"] is old_future
+        impl._get_dsa_cold_load_executor.assert_not_called()
+        impl.lmcache_engine._prepare_live_split_import.assert_not_called()

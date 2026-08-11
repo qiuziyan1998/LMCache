@@ -11,7 +11,7 @@ import sys
 import pytest
 import torch
 
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1 import cache_engine as cache_engine_module
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.memory_management import (
@@ -495,15 +495,57 @@ def test_layer_page_location_plan_probes_one_remote_key_per_chunk():
         == ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"]
     )
     assert calls == [
-        ([keys_by_chunk[1][0], keys_by_chunk[2][0]], ["RemoteBackend"])
+        (
+            [
+                keys_by_chunk[1][0].without_layer(),
+                keys_by_chunk[2][0].without_layer(),
+            ],
+            ["RemoteBackend"],
+        )
     ]
     pages[0].ref_count_down()
 
 
-@pytest.mark.parametrize("tail_complete", [True, False])
-def test_layer_page_batch_plan_keeps_partial_tail_on_legacy_lookup(
-    tail_complete,
-):
+def test_layer_page_location_plan_accepts_base_keys_without_layer_expansion():
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        enable_shared_cpu_cache=True,
+        use_layerwise=True,
+        remote_url="mooncakestore://metadata/",
+        extra_config={
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+            "save_only_first_rank": True,
+        },
+    )
+    engine.retrieve_locations = ["RemoteBackend"]
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        cpu_lock=nullcontext(), hot_cache={}
+    )
+    keys = [replace(_make_key(), chunk_hash=index) for index in range(3)]
+    calls = []
+    remote = SimpleNamespace(
+        connection=SimpleNamespace(
+            batched_contains_layer_pages=lambda page_keys: len(page_keys)
+        )
+    )
+    engine.storage_manager = SimpleNamespace(
+        get_active_storage_backends=lambda search_range=None: iter(
+            [("RemoteBackend", remote)]
+        ),
+        batched_contains_layer_pages=lambda page_keys, search_range: (
+            calls.append(list(page_keys))
+            or (len(page_keys), {"RemoteBackend": list(page_keys)})
+        ),
+    )
+
+    assert engine._shared_page_first_location_plan(keys) == [
+        "RemoteBackend"
+    ] * len(keys)
+    assert calls == [keys]
+
+
+def test_layer_page_batch_plan_lazily_expands_legacy_suffix():
     engine = object.__new__(LMCacheEngine)
     engine.config = SimpleNamespace(
         chunk_size=4,
@@ -530,16 +572,7 @@ def test_layer_page_batch_plan_keeps_partial_tail_on_legacy_lookup(
     )
     planned = []
     engine._shared_page_first_location_plan = lambda chunks: (
-        planned.extend(chunks) or ["RemoteBackend"] * len(chunks)
-    )
-    tail_batches = []
-    engine.storage_manager.batched_contains = lambda batch, locations: (
-        tail_batches.append((batch, locations))
-        or (
-            (len(batch), {"RemoteBackend": list(batch)})
-            if tail_complete
-            else (0, {})
-        )
+        planned.extend(chunks) or ["RemoteBackend"] * (len(chunks) - 1)
     )
     tail_probes = []
     engine._find_shared_rank0_chunk_location = lambda key: (
@@ -555,15 +588,23 @@ def test_layer_page_batch_plan_keeps_partial_tail_on_legacy_lookup(
 
     list(engine.retrieve_layer(list(range(10)), req_id="req-partial"))
 
-    assert len(planned) == 2
-    assert len(tail_batches) == 1
-    assert len(tail_batches[0][0]) == engine.num_layers
-    assert len(tail_probes) == (0 if tail_complete else engine.num_layers)
+    assert planned == keys
+    assert len(tail_probes) == engine.num_layers
+    assert all(
+        not isinstance(key, LayerCacheEngineKey)
+        for layer in resolved["keys_layer_major"]
+        for key in layer[:2]
+    )
+    assert all(
+        isinstance(layer[-1], LayerCacheEngineKey)
+        for layer in resolved["keys_layer_major"]
+    )
     assert resolved["starts"] == [0, 4, 8]
     assert resolved["chunk_locations_layer_major"] == [
         ["RemoteBackend"] * 3,
         ["RemoteBackend"] * 3,
     ]
+    assert resolved["planned_page_chunks"] == 2
 
 
 @pytest.mark.parametrize(
@@ -2464,6 +2505,40 @@ def test_runtime_capacity_aligns_one_combined_layer_page():
 
     assert details["missing_chunk_count"] == 2
     assert details["required_bytes"] == 12288
+
+
+def test_runtime_capacity_aligns_partial_page_once():
+    engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    engine.config.extra_config.update(
+        mooncake_layer_merged_page_objects=True,
+        mooncake_page_first_multi_buffer=True,
+        save_only_first_rank=True,
+    )
+    engine.config.enable_shared_cpu_cache = engine.config.use_layerwise = True
+    engine.config.remote_url = "mooncakestore://test/"
+    engine.config.chunk_size = 4
+    engine.num_layers = 2
+    engine._estimate_shared_cpu_bytes_per_layer = (
+        lambda _group, num_tokens: num_tokens * 1000
+    )
+    engine._shared_local_cpu_backend = lambda: _FakeLocalCPUBackend(
+        free_bytes=0, hot_cache={}
+    )
+    keys = _make_key().split_layers(2)
+
+    details = engine._shared_cpu_runtime_capacity_details(
+        req_id="req-partial-page",
+        phase="dense_prefix",
+        kv_group=0,
+        keys_layer_major=[[keys[0]], [keys[1]]],
+        chunk_locations_layer_major=[
+            ["RemoteBackend"],
+            ["RemoteBackend"],
+        ],
+        chunk_token_lengths=[1],
+    )
+
+    assert details["required_bytes"] == 4096
 
 
 def test_remote_layer_pages_skip_eviction_scan_when_free_space_suffices():

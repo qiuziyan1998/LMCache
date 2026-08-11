@@ -15,6 +15,10 @@ import torch
 # First Party
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat, TensorMemoryAllocator
+from lmcache.v1.mooncake_layout import (
+    MOONCAKE_VALID_TOKENS_TAG,
+    mooncake_page_key,
+)
 from lmcache.v1.storage_backend.connector import (
     mooncakestore_connector as mooncake_connector,
 )
@@ -372,6 +376,41 @@ def test_mooncake_zero_copy_metadata_reuses_homogeneous_group() -> None:
     assert mode == "individual"
 
 
+@pytest.mark.parametrize(
+    "fmt",
+    (MemoryFormat.KV_MLA_LATENT_FMT, MemoryFormat.KV_DSA_INDEX_FMT),
+)
+def test_mooncake_partial_flat_buffer_uses_exact_token_bytes(fmt) -> None:
+    backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=4),
+        batched_allocate=Mock(return_value=[_MemoryObj()]),
+        allocate=Mock(),
+    )
+    connector = object.__new__(MooncakestoreConnector)
+    connector._metadata_for_raw_key = lambda _key: (
+        [torch.Size([16])],
+        [torch.float16],
+        fmt,
+        8,
+    )
+    connector.local_cpu_backend = backend
+    connector._page_first_multi_buffer = True
+    key = LayerCacheEngineKey(
+        "test",
+        1,
+        0,
+        9,
+        torch.float16,
+        {MOONCAKE_VALID_TOKENS_TAG: 3},
+        layer_id=0,
+        kv_group=1 if fmt == MemoryFormat.KV_DSA_INDEX_FMT else 0,
+    )
+
+    connector._allocate_zero_copy_buffers([key])
+
+    assert backend.batched_allocate.call_args.args[0] == [torch.Size([12])]
+
+
 def test_mooncake_batch_status_failure_is_not_silenced() -> None:
     connector = object.__new__(MooncakestoreConnector)
     connector.config = SimpleNamespace(transfer_timeout=1)
@@ -441,8 +480,201 @@ def test_mooncake_page_get_scatter_returns_layer_objects() -> None:
     assert [memory_obj.ref_count for memory_obj in allocated] == [1, 1, 0, 0]
 
 
-def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
+def test_mooncake_direct_external_get_registers_storage_and_validates_bytes() -> None:
+    calls = []
+
+    class _Store:
+        def register_buffer(self, ptr, size):
+            calls.append(("register", ptr, size))
+            return 0
+
+        def unregister_buffer(self, ptr):
+            calls.append(("unregister", ptr))
+            return 0
+
+        def batch_get_into_multi_buffers(self, keys, ptrs, sizes):
+            calls.append(("get", keys, ptrs, sizes))
+            return [sum(page_sizes) for page_sizes in sizes]
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector.config = SimpleNamespace(transfer_timeout=1)
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (None, None, None, 2)
+    connector._external_buffers = {}
+    connector._external_put_lock = asyncio.Lock()
+    connector._inflight_put_tasks = set()
+    connector.store = _Store()
+    owner = torch.empty(32, dtype=torch.uint8)
+
+    asyncio.run(
+        connector.batched_get_external_pages(
+            [_key(1)], [[owner.data_ptr()]], [[32]], (owner,), "request"
+        )
+    )
+    asyncio.run(
+        connector.batched_get_external_pages(
+            [_key(1)], [[owner.data_ptr()]], [[32]], (owner,), "request"
+        )
+    )
+
+    assert [call[0] for call in calls].count("register") == 1
+    assert [call[0] for call in calls].count("get") == 2
+
+
+@pytest.mark.parametrize("pointer,size", ((99, 1), (119, 2)))
+def test_direct_external_buffer_validation_rejects_partial_owner_overlap(
+    pointer, size
+) -> None:
+    class _Storage:
+        def __init__(self, pointer, size):
+            self._pointer = pointer
+            self._size = size
+
+        def data_ptr(self):
+            return self._pointer
+
+        def nbytes(self):
+            return self._size
+
+    class _Owner:
+        def __init__(self, pointer, size):
+            self._storage = _Storage(pointer, size)
+
+        def untyped_storage(self):
+            return self._storage
+
+    owners = (_Owner(100, 20), _Owner(105, 5))
+    MooncakestoreConnector._validate_external_buffer_owners(
+        [[110]], [[10]], owners
+    )
+    with pytest.raises(ValueError, match="outside registered storage"):
+        MooncakestoreConnector._validate_external_buffer_owners(
+            [[pointer]], [[size]], owners
+        )
+
+
+@pytest.mark.parametrize("statuses", ([], [31]))
+def test_mooncake_direct_external_get_rejects_partial_status(statuses) -> None:
+    owner = torch.empty(32, dtype=torch.uint8)
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector.config = SimpleNamespace(transfer_timeout=1)
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (None, None, None, 2)
+    connector._register_external_owners = lambda owners: None
+    connector._external_put_lock = asyncio.Lock()
+    connector._inflight_put_tasks = set()
+    connector.store = SimpleNamespace(
+        batch_get_into_multi_buffers=lambda *args: statuses
+    )
+
+    with pytest.raises(RuntimeError, match="invalid status count|failed or was short"):
+        asyncio.run(
+            connector.batched_get_external_pages(
+                [_key(1)], [[owner.data_ptr()]], [[32]], (owner,), "request"
+            )
+        )
+
+
+def test_remote_direct_get_timeout_drains_before_next_registration() -> None:
+    calls = []
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    class _Store:
+        def register_buffer(self, ptr, size):
+            calls.append(("register", ptr, size))
+            return 0
+
+        def unregister_buffer(self, ptr):
+            calls.append(("unregister", ptr))
+            return 0
+
+        def batch_get_into_multi_buffers(self, keys, ptrs, sizes):
+            calls.append(("get", keys))
+            if not first_started.is_set():
+                first_started.set()
+                release_first.wait()
+            return [sum(page_sizes) for page_sizes in sizes]
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector.config = SimpleNamespace(transfer_timeout=60)
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (None, None, None, 2)
+    connector._external_buffers = {}
+    connector._external_put_lock = asyncio.Lock()
+    connector._inflight_put_tasks = set()
+    connector.store = _Store()
+
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever)
+    loop_thread.start()
+    backend = object.__new__(RemoteBackend)
+    backend.connection = connector
+    backend.loop = loop
+    backend.config = SimpleNamespace(blocking_timeout_secs=0.01)
+    backend._mla_worker_id_as0_mode = False
+    owners = [torch.empty(32, dtype=torch.uint8) for _ in range(2)]
+    errors = []
+
+    def load(index):
+        try:
+            backend.batched_get_external_pages(
+                [_key(index + 1)],
+                [[owners[index].data_ptr()]],
+                [[32]],
+                (owners[index],),
+                f"request-{index}",
+            )
+        except TimeoutError as error:
+            errors.append(error)
+
+    first = threading.Thread(target=load, args=(0,))
+    second = threading.Thread(target=load, args=(1,))
+    try:
+        first.start()
+        assert first_started.wait(timeout=1)
+        second.start()
+        second.join(timeout=0.05)
+        assert second.is_alive()
+        assert [call[0] for call in calls] == ["register", "get"]
+        release_first.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+        assert not first.is_alive() and not second.is_alive()
+        assert len(errors) == 1
+        assert [call[0] for call in calls] == [
+            "register",
+            "get",
+            "unregister",
+            "register",
+            "get",
+        ]
+    finally:
+        release_first.set()
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=1)
+        loop.close()
+
+
+@pytest.mark.parametrize("canonical_keys", [False, True])
+def test_mooncake_layer_page_get_allocates_exact_full_and_tail_pages(
     monkeypatch: pytest.MonkeyPatch,
+    canonical_keys: bool,
 ) -> None:
     class _PageStore:
         def __init__(self) -> None:
@@ -458,6 +690,7 @@ def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
                 torch.zeros(16384, dtype=torch.uint8)
             )
             self.submitted = None
+            self.metadata = SimpleNamespace(chunk_size=8)
 
         def batched_allocate_layer_pages(self, *args):
             return self.allocator.batched_allocate_layer_pages(*args)
@@ -483,7 +716,22 @@ def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
         )
 
     connector._metadata_for_raw_key = metadata_for_raw_key
-    keys = [_layer_key(chunk_hash, 0) for chunk_hash in (1, 2)]
+    base_keys = [
+        _key(1),
+        CacheEngineKey(
+            "test",
+            1,
+            0,
+            2,
+            torch.float16,
+            {MOONCAKE_VALID_TOKENS_TAG: 3},
+        ),
+    ]
+    keys = (
+        base_keys
+        if canonical_keys
+        else [key.get_first_layer() for key in base_keys]
+    )
     events = []
     monkeypatch.setattr(
         mooncake_connector, "cold_start_perf_enabled", lambda: True
@@ -497,14 +745,17 @@ def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
     pages = asyncio.run(connector.batched_get_layer_pages(keys))
 
     assert len(pages) == 2
-    assert connector.store.args[2] == [[16, 16], [16, 16]]
+    assert connector.store.args[0] == [
+        mooncake_page_key(key, 2) for key in base_keys
+    ]
+    assert connector.store.args[2] == [[16, 16], [6, 6]]
     assert connector.store.args[1] == [
         [page.layer_data_ptr(0), page.layer_data_ptr(1)] for page in pages
     ]
     assert len(metadata_calls) == 1
     submitted_keys, submitted_pages = connector.local_cpu_backend.submitted
     assert submitted_pages == pages
-    assert submitted_keys == [keys[0].without_layer(), keys[1].without_layer()]
+    assert submitted_keys == base_keys
     event, fields = events.pop()
     assert event == "mooncake_page_get"
     assert fields["layout"] == "layer_merged"
@@ -515,7 +766,7 @@ def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
     assert fields["completed_pages"] == 2
     assert fields["layers"] == 2
     assert fields["buffers"] == 4
-    assert fields["bytes"] == 64
+    assert fields["bytes"] == 44
     assert fields["status"] == "ok"
     assert all(
         fields[name] >= 0
@@ -572,13 +823,51 @@ def test_mooncake_page_alias_requires_complete_batch() -> None:
     assert connector.batched_contains(keys[:1]) == 0
     assert connector.batched_contains(keys) == 2
     assert connector.batched_contains_layer_pages(keys[:1]) == 1
+    assert connector.batched_contains_layer_pages([keys[0].without_layer()]) == 1
+
+
+def test_partial_page_lookup_falls_back_to_legacy_layer_keys() -> None:
+    class _Store:
+        seen = []
+
+        @classmethod
+        def batch_is_exist(cls, keys):
+            cls.seen.append(keys)
+            return [
+                int(
+                    not key.startswith("__lmcache_page_v1__")
+                    and "internal.valid_tokens" not in key
+                )
+                for key in keys
+            ]
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector.store = _Store()
+    keys = [
+        LayerCacheEngineKey(
+            "test",
+            1,
+            0,
+            9,
+            torch.float16,
+            {MOONCAKE_VALID_TOKENS_TAG: 3},
+            layer_id=layer_id,
+        )
+        for layer_id in range(2)
+    ]
+
+    assert connector.batched_contains(keys) == 2
+    assert len(_Store.seen) == 2
+    assert all("internal.valid_tokens" not in key for key in _Store.seen[1])
     assert not asyncio.run(connector.exists(keys[0]))
 
     del _Store.batch_is_exist
     assert connector.batched_contains_layer_pages(keys[:1]) == 1
 
 
-def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout(
+def test_mooncake_page_put_merges_exact_partial_tail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _PageStore:
@@ -603,7 +892,12 @@ def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout(
     connector.local_cpu_backend = SimpleNamespace(
         metadata=SimpleNamespace(chunk_size=4)
     )
-    connector._metadata_for_raw_key = lambda _key: ([], [], None, 4)
+    connector._metadata_for_raw_key = lambda _key: (
+        [],
+        [],
+        MemoryFormat.KV_MLA_LATENT_FMT,
+        4,
+    )
     connector.store = _PageStore()
     events = []
     monkeypatch.setattr(
@@ -614,12 +908,23 @@ def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout(
         "cold_start_perf_log",
         lambda _logger, event, **fields: events.append((event, fields)),
     )
-    keys = [
+    full_keys = [
         _layer_key(1, 0),
-        _layer_key(2, 0),
         _layer_key(1, 1),
-        _layer_key(2, 1),
     ]
+    partial_keys = [
+        LayerCacheEngineKey(
+            "test",
+            1,
+            0,
+            2,
+            torch.float16,
+            {MOONCAKE_VALID_TOKENS_TAG: 2},
+            layer_id=layer_id,
+        )
+        for layer_id in range(2)
+    ]
+    keys = [full_keys[0], partial_keys[0], full_keys[1], partial_keys[1]]
     memory_objs = [
         _MemoryObj(16, 100),
         _MemoryObj(8, 200),
@@ -629,20 +934,19 @@ def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout(
 
     asyncio.run(connector._batched_put_zero_copy(keys, memory_objs))
 
-    assert connector.store.page_args[1] == [[100, 300]]
-    assert connector.store.page_args[2] == [[16, 16]]
-    assert connector.store.legacy_args[1] == [200, 400]
-    assert connector.store.legacy_args[2] == [8, 8]
+    assert connector.store.page_args[1] == [[100, 300], [200, 400]]
+    assert connector.store.page_args[2] == [[16, 16], [8, 8]]
+    assert connector.store.legacy_args is None
     assert all(memory_obj.ref_count == 1 for memory_obj in memory_objs)
     event, fields = events[0]
     assert event == "mooncake_page_put"
-    assert fields["pages"] == 1
-    assert fields["buffers"] == 2
-    assert fields["bytes"] == 32
+    assert fields["pages"] == 2
+    assert fields["buffers"] == 4
+    assert fields["bytes"] == 48
     assert fields["kv_groups"] == [0]
     assert fields["first_page_key"] == connector.store.page_args[0][0]
-    assert fields["last_page_key"] == connector.store.page_args[0][0]
-    assert fields["legacy_objects"] == 2
+    assert fields["last_page_key"] == connector.store.page_args[0][-1]
+    assert fields["legacy_objects"] == 0
 
 
 def test_mooncake_page_put_selects_each_layer_buffer() -> None:
