@@ -1385,16 +1385,23 @@ class MooncakestoreConnector(RemoteConnector):
                 else 0.0
             )
             logger.debug(f"batch_get_into returned: {bytes_read_list}")
+            if bytes_read_list is None or len(bytes_read_list) != len(valid_idx):
+                raise RuntimeError(
+                    "Mooncake batch_get_into returned an invalid result count: "
+                    f"expected={len(valid_idx)}, actual="
+                    f"{0 if bytes_read_list is None else len(bytes_read_list)}"
+                )
 
             # Assemble the final result list
             results: list[Optional[MemoryObj]] = [None] * len(keys)
 
-            for i, n_read in zip(valid_idx, bytes_read_list, strict=False):
+            for i, n_read in zip(valid_idx, bytes_read_list, strict=True):
                 if n_read <= 0:
                     logger.warning(
                         f"batch_get_into failed for key {keys[i]} (code={n_read})"
                     )
                     memory_objs[i].ref_count_down()  # type: ignore
+                    memory_objs[i] = None
                     continue
 
                 try:
@@ -1406,9 +1413,7 @@ class MooncakestoreConnector(RemoteConnector):
                 except Exception as exc:
                     logger.error(f"Reshape failed for key {keys[i]}: {exc}")
                     memory_objs[i].ref_count_down()  # type: ignore
-
-            for i in valid_idx[len(bytes_read_list) :]:
-                memory_objs[i].ref_count_down()  # type: ignore
+                    memory_objs[i] = None
 
             if perf_enabled:
                 cold_start_perf_log(
@@ -1439,7 +1444,8 @@ class MooncakestoreConnector(RemoteConnector):
             logger.error(f"batch_get_into threw exception: {str(exc)}")
             # Release any buffers we successfully allocated
             for i in valid_idx:
-                memory_objs[i].ref_count_down()  # type: ignore
+                if memory_objs[i] is not None:
+                    memory_objs[i].ref_count_down()
             if perf_enabled:
                 cold_start_perf_log(
                     logger,

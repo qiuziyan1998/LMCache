@@ -5504,6 +5504,34 @@ class TestWorkerRetrieveState:
         with pytest.raises(RuntimeError, match="cancelled"):
             entry["indexer_completion"].result()
 
+    def test_live_split_cancel_holds_destinations_until_transfer_terminal(self):
+        impl = _make_impl()
+        context = {"pages": [object()]}
+        entry = {
+            "context": context,
+            "offered": True,
+            "latent_gate": Future(),
+            "indexer_completion": Future(),
+        }
+        release = MagicMock()
+        impl.lmcache_engine = SimpleNamespace(
+            _release_live_split_import=release
+        )
+        impl._fallback_live_split_indexer = MagicMock()
+
+        impl._cancel_live_split_entry(
+            entry, "cancelled", release_context=False
+        )
+        assert entry["context"] is context
+        release.assert_not_called()
+
+        impl._dsa_live_split_pending = {"req-live": entry}
+        impl.accept_live_split_results({"req-live": "cancelled"})
+
+        release.assert_called_once_with(context)
+        impl._fallback_live_split_indexer.assert_not_called()
+        assert impl._dsa_live_split_pending == {}
+
     @pytest.mark.parametrize("live_requested", [True, False])
     def test_live_split_reused_id_preserves_active_generation(
         self, live_requested

@@ -396,6 +396,20 @@ def test_flat_layer_pages_preserve_full_and_tail_byte_layout(fmt, width) -> None
     assert allocator.memcheck()
 
 
+def test_flat_layer_pages_require_explicit_full_token_count() -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(8192, dtype=torch.uint8))
+
+    with pytest.raises(ValueError, match="requires full_tokens"):
+        allocator.batched_allocate_layer_pages(
+            torch.Size([4 * 9]),
+            torch.float16,
+            batch_size=1,
+            num_layers=2,
+            fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+            valid_tokens=3,
+        )
+
+
 def test_partial_layer_page_batch_rolls_back_on_allocation_failure() -> None:
     allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
 
@@ -421,6 +435,7 @@ def test_layer_page_rejects_pointer_access_after_release() -> None:
         batch_size=1,
         num_layers=2,
         fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        full_tokens=8,
     )
     assert pages is not None
     page = pages[0]

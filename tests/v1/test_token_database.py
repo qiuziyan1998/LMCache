@@ -69,6 +69,17 @@ def test_chunked_token_database(chunk_length, save_unfull_chunk):
             assert ed == original_results[j + i][1]
 
 
+def test_chunked_token_database_rejects_mismatched_key_inputs():
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+    tokens = generate_tokens(16, "cpu")
+
+    with pytest.raises(ValueError, match="mask length"):
+        list(db.process_tokens(tokens=tokens, mask=torch.ones(15, dtype=torch.bool)))
+    with pytest.raises(ValueError, match="counts must match"):
+        list(db.process_tokens(hashes=[1, 2], offsets=[16]))
+
+
 def test_mooncake_page_keys_include_payload_layout_signature(monkeypatch):
     cfg = LMCacheEngineConfig.from_legacy(chunk_size=256, backend="cpu")
     cfg.extra_config = {"mooncake_page_first_multi_buffer": True}

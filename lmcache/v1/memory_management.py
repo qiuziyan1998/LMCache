@@ -144,6 +144,8 @@ def _layer_page_shape(
         MemoryFormat.KV_DSA_INDEX_FMT,
     ):
         raise ValueError("Layer-page shape has no token dimension")
+    if full_tokens is None and len(shape) == 1:
+        raise ValueError("Flat layer-page shape requires full_tokens")
     source_tokens = full_tokens or int(shape[0])
     if valid_tokens > source_tokens or shape.numel() % source_tokens:
         raise ValueError("Flat layer-page shape is not token divisible")
@@ -791,7 +793,15 @@ class TensorMemoryObj(MemoryObj):
 
     def get_num_tokens(self) -> int:
         with self.lock:
+            if self.meta.valid_tokens is not None:
+                return int(self.meta.valid_tokens)
+            if self.meta.cached_positions is not None:
+                return len(self.meta.cached_positions)
             token_dim = self.meta.fmt.token_dim()
+            if token_dim >= len(self.meta.shape):
+                raise ValueError(
+                    "Flat memory object requires valid_tokens metadata"
+                )
             return self.meta.shape[token_dim]
 
     def pin(self) -> bool:
@@ -993,6 +1003,8 @@ class LayerPageMemoryObj(TensorMemoryObj):
         self.layer_size = sizes.pop()
         if valid_tokens is None:
             token_dim = metadata.fmt.token_dim()
+            if token_dim >= len(metadata.shape) and len(metadata.shape) == 1:
+                raise ValueError("Flat layer page requires valid_tokens")
             valid_tokens = int(
                 metadata.shape[token_dim]
                 if token_dim < len(metadata.shape)
@@ -1755,6 +1767,8 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             return None
         token_dim = fmt.token_dim()
         if full_tokens is None:
+            if token_dim >= len(shapes[0]) and len(shapes[0]) == 1:
+                raise ValueError("Flat layer-page shape requires full_tokens")
             full_tokens = int(
                 shapes[0][token_dim]
                 if token_dim < len(shapes[0])

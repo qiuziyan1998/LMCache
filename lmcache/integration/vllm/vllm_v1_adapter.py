@@ -5798,12 +5798,17 @@ class LMCacheConnectorV1Impl:
         return True
 
     def _cancel_live_split_entry(
-        self, entry: dict[str, Any], reason: str
+        self,
+        entry: dict[str, Any],
+        reason: str,
+        *,
+        release_context: bool = True,
     ) -> None:
         context = entry.get("context")
-        if context is not None:
+        if context is not None and release_context:
             self.lmcache_engine._release_live_split_import(context)
             entry["context"] = None
+        entry["cancelled"] = True
         error = RuntimeError(reason)
         for name in ("latent_gate", "indexer_completion"):
             future = entry[name]
@@ -5894,6 +5899,11 @@ class LMCacheConnectorV1Impl:
             context = entry["context"]
             completion = entry["indexer_completion"]
             live_state: Optional[WorkerRetrieveState] = None
+            if entry.get("cancelled"):
+                if context is not None:
+                    self.lmcache_engine._release_live_split_import(context)
+                    entry["context"] = None
+                continue
             if status == "success":
                 try:
                     if context is None:
@@ -8448,10 +8458,15 @@ class LMCacheConnectorV1Impl:
         live_pending = getattr(self, "_dsa_live_split_pending", None)
         if live_pending and finished_req_ids:
             for req_id in finished_req_ids.intersection(live_pending):
-                entry = live_pending.pop(req_id)
+                entry = live_pending[req_id]
+                offered = bool(entry.get("offered"))
                 self._cancel_live_split_entry(
-                    entry, f"Live split request was cancelled: {req_id}"
+                    entry,
+                    f"Live split request was cancelled: {req_id}",
+                    release_context=not offered,
                 )
+                if not offered:
+                    live_pending.pop(req_id, None)
         cold_futures = getattr(self, "_dsa_cold_load_futures", None)
         if cold_futures and finished_req_ids:
             aborted_cold = finished_req_ids.intersection(cold_futures)

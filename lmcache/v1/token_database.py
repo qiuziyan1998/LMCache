@@ -431,6 +431,8 @@ class ChunkedTokenDatabase(TokenDatabase):
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
+        if mask is not None and tokens is not None and mask.numel() != len(tokens):
+            raise ValueError("The mask length must match the token length.")
         if mask is not None:
             num_falses = mask.numel() - mask.long().sum().item()
         else:
@@ -468,8 +470,10 @@ class ChunkedTokenDatabase(TokenDatabase):
             assert offsets is not None, (
                 "If hashes are provided, offsets must also be provided."
             )
+            if len(hashes) != len(offsets):
+                raise ValueError("Hash and offset counts must match.")
             start_idx = 0
-            for hash_val, offset in zip(hashes, offsets, strict=False):
+            for hash_val, offset in zip(hashes, offsets, strict=True):
                 end_idx = start_idx + offset
                 if make_key:
                     yield (

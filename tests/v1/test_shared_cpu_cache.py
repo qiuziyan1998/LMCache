@@ -4449,6 +4449,42 @@ def test_compact_shared_handle_batch_preserves_layer_pages_and_tail():
         )
 
 
+@pytest.mark.parametrize(
+    "fmt", [MemoryFormat.KV_MLA_LATENT_FMT, MemoryFormat.KV_DSA_INDEX_FMT]
+)
+def test_compact_flat_page_view_preserves_tail_token_count(fmt):
+    batch = SharedHandleBatch(
+        shm_name="/lmcache-flat-tail",
+        producer_rank=0,
+        num_layers=2,
+        num_chunks=1,
+        physical_sizes=[30],
+        chunk_hashes=[11],
+        offsets=[],
+        page_offsets=[0],
+        page_physical_sizes=[60],
+    )
+    allocator = PassiveSharedViewAllocator(
+        slab_tensor=torch.arange(64, dtype=torch.uint8),
+        shm_name=batch.shm_name,
+        generation=1,
+    )
+
+    page = allocator.create_page_view(
+        batch,
+        chunk_index=0,
+        shape=torch.Size([15]),
+        dtype=torch.float16,
+        fmt=fmt,
+        cached_positions=range(3),
+    )
+
+    assert page.valid_tokens == 3
+    assert page.metadata.valid_tokens == 3
+    assert page.get_num_tokens() == 3
+    assert page.layer_tensor(0).shape == torch.Size([15])
+
+
 def test_shared_envelope_rejects_missing_required_field():
     envelope = SharedHandleEnvelope(
         request_id="req-1",
