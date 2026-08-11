@@ -1866,6 +1866,9 @@ class LMCacheEngine:
             base_key.chunk_hash,
             request_configs,
             kv_group=kv_group,
+            valid_tokens=mooncake_valid_tokens(
+                base_key, int(self.config.chunk_size)
+            ),
         )
 
     def _shared_local_cpu_backend(self):

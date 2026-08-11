@@ -989,7 +989,16 @@ class _FakeLookupTokenDatabase:
             ),
         )
 
-    def _make_key_by_hash(self, chunk_hash, request_configs=None, kv_group=0):
+    def _make_key_by_hash(
+        self,
+        chunk_hash,
+        request_configs=None,
+        kv_group=0,
+        valid_tokens=None,
+    ):
+        if valid_tokens is not None and valid_tokens != 4:
+            request_configs = dict(request_configs or {})
+            request_configs["lmcache.tag.internal.valid_tokens"] = valid_tokens
         return CacheEngineKey(
             model_name="model",
             world_size=1,
@@ -1021,6 +1030,7 @@ class _FakeMultiChunkLookupTokenDatabase(_FakeLookupTokenDatabase):
                     0x100 + chunk_index,
                     request_configs,
                     kv_group=0,
+                    valid_tokens=end - start,
                 ),
             )
             start = end
@@ -1045,8 +1055,36 @@ def _make_dsa_lookup_engine(present):
     engine.lookup_pins = defaultdict(lambda: defaultdict(list))
     engine.use_layerwise = True
     engine.num_layers = 2
-    engine.config = SimpleNamespace(dsa_two_groups=True)
+    engine.config = SimpleNamespace(dsa_two_groups=True, chunk_size=4)
     return engine
+
+
+def test_lookup_key_for_indexer_preserves_partial_tail_length() -> None:
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(chunk_size=4)
+    calls = []
+    expected = object()
+    engine.token_database = SimpleNamespace(
+        _make_key_by_hash=lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or expected
+        )
+    )
+    base_key = CacheEngineKey(
+        model_name="model",
+        world_size=1,
+        worker_id=0,
+        chunk_hash=0xABC,
+        dtype=torch.float16,
+        request_configs={"lmcache.tag.internal.valid_tokens": 2},
+        kv_group=0,
+    )
+
+    result = engine._lookup_key_for_kv_group(
+        base_key, kv_group=1, request_configs=None
+    )
+
+    assert result is expected
+    assert calls == [((0xABC, None), {"kv_group": 1, "valid_tokens": 2})]
 
 
 class _RecordingRemoteSampleStorageManager:
@@ -1100,10 +1138,13 @@ class _RecordingRemoteSampleStorageManager:
 
 def _sampled_keys_for_chunk(token_db, chunk_index, num_layers=4):
     sampled = []
+    start = 0 if chunk_index == 0 else token_db.chunk_ends[chunk_index - 1]
+    valid_tokens = token_db.chunk_ends[chunk_index] - start
     for kv_group in (0, 1):
         group_key = token_db._make_key_by_hash(
             0x100 + chunk_index,
             kv_group=kv_group,
+            valid_tokens=valid_tokens,
         )
         layer_keys = group_key.split_layers(num_layers)
         sampled.extend((layer_keys[0], layer_keys[-1]))
@@ -1111,9 +1152,11 @@ def _sampled_keys_for_chunk(token_db, chunk_index, num_layers=4):
 
 
 def _layer_keys_for_chunk(token_db, chunk_index, kv_group, num_layers=4):
+    start = 0 if chunk_index == 0 else token_db.chunk_ends[chunk_index - 1]
     return token_db._make_key_by_hash(
         0x100 + chunk_index,
         kv_group=kv_group,
+        valid_tokens=token_db.chunk_ends[chunk_index] - start,
     ).split_layers(num_layers)
 
 
@@ -1288,9 +1331,7 @@ def test_sampled_lookup_pins_remote_prefix_and_local_suffix() -> None:
     token_db = _FakeMultiChunkLookupTokenDatabase()
     remote_prefix = _sampled_keys_for_chunk(token_db, 0)
     local_pages = [
-        token_db._make_key_by_hash(
-            0x100 + chunk, kv_group=group
-        ).get_first_layer()
+        _layer_keys_for_chunk(token_db, chunk, group)[0]
         for chunk in range(1, 4)
         for group in (0, 1)
     ]
