@@ -1206,6 +1206,30 @@ def test_sampled_lookup_batches_local_page_pins_by_group():
     assert len(engine.lookup_pins["req"]["LocalCPUBackend"]) == 14
 
 
+def test_sampled_lookup_pins_merged_partial_tail_without_legacy_probes():
+    engine = _make_sampled_lookup_engine([])
+    engine.config.chunk_size = 4
+    engine.config.extra_config = {
+        "mooncake_page_first_multi_buffer": True,
+        "mooncake_layer_merged_page_objects": True,
+    }
+    page_calls = []
+
+    def contains_pages(keys, search_range=None, pin=False):
+        keys = list(keys)
+        page_calls.append((keys, search_range, pin))
+        return len(keys), {"LocalCPUBackend": keys}
+
+    engine.storage_manager.batched_contains_layer_pages = contains_pages
+
+    assert engine.lookup(list(range(14)), lookup_id="req", pin=True) == 14
+    pin_calls = [call for call in page_calls if call[2]]
+    assert len(pin_calls) == 2
+    assert all(len(keys) == 4 for keys, _, _ in pin_calls)
+    assert engine.storage_manager.local_calls == []
+    assert len(engine.lookup_pins["req"]["LocalCPUBackend"]) == 8
+
+
 def test_sampled_lookup_logs_first_chunk_page_miss_by_group(monkeypatch):
     engine = _make_sampled_lookup_engine([])
     engine.config.extra_config = {"mooncake_page_first_multi_buffer": True}

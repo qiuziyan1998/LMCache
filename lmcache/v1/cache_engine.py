@@ -1583,18 +1583,6 @@ class LMCacheEngine:
 
             try:
                 if pin and local_page_lookup and len(base_keys) > 1:
-                    page_count = next(
-                        (
-                            index
-                            for index, (end, _) in enumerate(
-                                chunks[: len(base_keys)]
-                            )
-                            if end
-                            - (chunks[index - 1][0] if index else 0)
-                            != self.config.chunk_size
-                        ),
-                        len(base_keys),
-                    )
                     for kv_group in kv_groups:
                         page_keys = [
                             self._lookup_key_for_kv_group(
@@ -1602,26 +1590,24 @@ class LMCacheEngine:
                                 kv_group=kv_group,
                                 request_configs=request_configs,
                             ).get_first_layer()
-                            for key in base_keys[:page_count]
+                            for key in base_keys
                         ]
                         hits, pages = (
                             self.storage_manager.batched_contains_layer_pages(
                                 page_keys, ["LocalCPUBackend"], True
                             )
                         )
-                        if hits != len(page_keys):
-                            for location, keys in pages.items():
-                                self.storage_manager.batched_unpin(
-                                    keys, [location]
-                                )
-                            rollback()
-                            mapping.clear()
-                            break
+                        if not 0 <= hits <= len(page_keys) or sum(
+                            len(keys) for keys in pages.values()
+                        ) != hits:
+                            raise ValueError(
+                                "Local layer-page lookup returned an invalid prefix"
+                            )
                         for location, keys in pages.items():
                             mapping[location].extend(keys)
                         tail_keys = [
                             layer_key
-                            for key in base_keys[page_count:]
+                            for key in base_keys[hits:]
                             for layer_key in self._lookup_key_for_kv_group(
                                 key,
                                 kv_group=kv_group,
