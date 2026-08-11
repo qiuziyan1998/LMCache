@@ -159,6 +159,195 @@ def test_layerwise_retrieve_preserves_cleanup_locations(
     )
 
 
+def test_layerwise_retrieve_forwards_per_layer_request(monkeypatch):
+    class FakeKey:
+        def split_layers(self, num_layers):
+            return [SimpleNamespace(layer_id=i) for i in range(num_layers)]
+
+    class FakeMemoryObj:
+        def ref_count_down(self):
+            pass
+
+    class FakeStorageManager:
+        @staticmethod
+        def contains(_key, _locations):
+            return "LocalCPUBackend"
+
+        @staticmethod
+        def layerwise_batched_get(keys, location=None):
+            del location
+            for _ in keys:
+                obj = FakeMemoryObj()
+                yield SimpleNamespace(result=lambda obj=obj: [obj])
+
+    received = []
+
+    class FakeGPUConnector:
+        @staticmethod
+        def batched_to_gpu(_starts, _ends, **_kwargs):
+            payload = yield
+            received.append(payload)
+            payload = yield
+            received.append(payload)
+            yield
+            yield
+
+    monkeypatch.setattr(cache_engine_module, "CacheEngineKey", FakeKey)
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.retrieve_locations = ["LocalCPUBackend"]
+    engine.storage_manager = FakeStorageManager()
+    engine.gpu_connector = FakeGPUConnector()
+    engine.token_database = SimpleNamespace(
+        process_tokens=lambda **_kwargs: iter([(0, 1, FakeKey())])
+    )
+    engine.stats_monitor = SimpleNamespace(
+        on_retrieve_request=lambda _num_tokens: "monitor-id",
+        on_retrieve_finished=lambda _monitor_id, _num_tokens: None,
+    )
+    engine.is_healthy = lambda: True
+    engine._get_req_id = lambda _kwargs: "req"
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: False
+    engine._is_passive = lambda: False
+    engine._maybe_unpin_retrieved_objs = lambda _objs, _location: None
+
+    retriever = engine.retrieve_layer([1])
+    assert int(next(retriever)) == 1
+    first = {"slot_mapping": torch.tensor([10])}
+    second = {"slot_mapping": torch.tensor([20])}
+    assert retriever.send(first) is None
+    assert retriever.send(second) is None
+    next(retriever)
+
+    assert received[0]["layer_request"] is first
+    assert received[1]["layer_request"] is second
+
+
+def test_deferred_layerwise_store_persists_only_after_source_done(monkeypatch):
+    class FakeKey:
+        def split_layers(self, num_layers):
+            return [SimpleNamespace(layer_id=i) for i in range(num_layers)]
+
+    class FakeMemoryObj:
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+            self.valid = True
+
+        @staticmethod
+        def get_size():
+            return 1
+
+        def is_valid(self):
+            return self.valid
+
+        def ref_count_down(self):
+            self.valid = False
+
+    events = []
+
+    class FakeFuture:
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+
+        def result(self):
+            events.append(("persist_done", self.layer_id))
+
+    class FakeStorageManager:
+        @staticmethod
+        def batched_allocate(_shape, _dtype, batch_size, **_kwargs):
+            return [FakeMemoryObj(i) for i in range(batch_size)]
+
+        @staticmethod
+        def batched_put(keys, _memory_objs, location=None):
+            del location
+            layer_id = keys[0].layer_id
+            events.append(("persist_submit", layer_id))
+            return [FakeFuture(layer_id)]
+
+    commands = []
+
+    class FakeGPUConnector:
+        @staticmethod
+        def get_shape(_num_tokens, kv_group=0):
+            del kv_group
+            return torch.Size([1])
+
+        @staticmethod
+        def batched_from_gpu(_memory_objs, _starts, _ends, **_kwargs):
+            command = yield None
+            commands.append(command)
+            command = yield None
+            events.append(("source_done", 0))
+            commands.append(command)
+            yield 0
+            events.append(("source_done", 1))
+            yield 1
+
+    monkeypatch.setattr(cache_engine_module, "CacheEngineKey", FakeKey)
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.storage_manager = FakeStorageManager()
+    engine.gpu_connector = FakeGPUConnector()
+    engine.token_database = SimpleNamespace(
+        process_tokens=lambda **_kwargs: iter([(0, 1, FakeKey())])
+    )
+    engine.stats_monitor = SimpleNamespace(
+        on_store_request=lambda _num_tokens: "monitor-id",
+        on_store_finished=lambda _monitor_id, _num_tokens: None,
+    )
+    engine.config = SimpleNamespace(
+        get_extra_config_value=lambda _name, default: default
+    )
+    engine.store_location = "LocalCPUBackend"
+    engine.kv_events_enabled = False
+    engine.is_healthy = lambda: True
+    engine.is_frozen = lambda: False
+    engine._is_passive = lambda: False
+    engine._get_req_id = lambda _kwargs: "req"
+    engine._log_kvcache_for_check = lambda **_kwargs: None
+    engine._shared_cpu_dtype_for_kv_group = lambda _group: torch.float32
+    engine._memory_format_for_kv_group = lambda _group: None
+    engine._layerwise_chunk_fully_stored = lambda *_args, **_kwargs: False
+
+    storer = engine.store_layer(
+        [1],
+        deferred_layerwise_put=True,
+        req_id="req",
+    )
+    assert next(storer) is None
+    first = {"slot_mapping": torch.tensor([10])}
+    second = {"slot_mapping": torch.tensor([20])}
+    assert storer.send(first) is None
+    assert events == []
+    assert storer.send(second) is None
+    assert events == [("source_done", 0), ("persist_submit", 0)]
+    result = next(storer)
+
+    assert result is not None
+    assert result.request_id == "req"
+    assert commands == [first, second]
+    assert events == [
+        ("source_done", 0),
+        ("persist_submit", 0),
+        ("source_done", 1),
+        ("persist_submit", 1),
+        ("persist_done", 0),
+        ("persist_done", 1),
+    ]
+
+
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
     not torch.cuda.is_available(),

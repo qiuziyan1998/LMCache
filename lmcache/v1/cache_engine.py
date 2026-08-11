@@ -4649,7 +4649,7 @@ class LMCacheEngine:
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Generator[Optional[LayerwiseStoreResult], None, None]:
+    ) -> Generator[Optional[LayerwiseStoreResult], Any, None]:
         """
         Store the KV cache in a layerwise manner.
 
@@ -4676,10 +4676,16 @@ class LMCacheEngine:
             request_id=str(kwargs.get("req_id", "unspecified")),
             kv_group=int(kwargs.get("kv_group", 0) or 0),
         )
+        deferred_layerwise_put = bool(
+            kwargs.get("deferred_layerwise_put", False)
+        )
 
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
+            for _ in range(self.num_layers + int(deferred_layerwise_put)):
+                yield
+            yield store_result
             return
 
         # Passive rank guard: when save_only_first_rank is enabled, only rank 0
@@ -4690,7 +4696,7 @@ class LMCacheEngine:
             logger.debug(
                 "Passive rank (save_only_first_rank), skipping store_layer"
             )
-            for layer_id in range(self.num_layers):
+            for _ in range(self.num_layers + int(deferred_layerwise_put)):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
             yield store_result
@@ -4727,7 +4733,7 @@ class LMCacheEngine:
                 num_to_store_tokens,
             )
             # Still need to yield to avoid StopIteration
-            for layer_id in range(self.num_layers):
+            for _ in range(self.num_layers + int(deferred_layerwise_put)):
                 yield
             yield store_result
             return
@@ -4840,6 +4846,19 @@ class LMCacheEngine:
                 for layer_objs in memory_objs
                 for mem_obj in layer_objs
             }
+            pending_persist_futures: list[Any] = []
+            max_pending_persist = 8
+            if deferred_layerwise_put:
+                max_pending_persist = int(
+                    self.config.get_extra_config_value(
+                        "layerwise_prefill_max_pending_puts",
+                        8,
+                    )
+                )
+                if max_pending_persist <= 0:
+                    raise ValueError(
+                        "layerwise_prefill_max_pending_puts must be positive"
+                    )
             mem_obj_generator = None
 
             # Calculate total KV size for logging
@@ -4857,16 +4876,79 @@ class LMCacheEngine:
 
                 next(mem_obj_generator)
 
-                for layer_id in range(self.num_layers):
-                    yield
-                    next(mem_obj_generator)
-                    self.storage_manager.batched_put(
+                def persist_layer(layer_id: int) -> None:
+                    put_futures = self.storage_manager.batched_put(
                         keys[layer_id],
                         memory_objs[layer_id],
                         location=self.store_location,
                     )
                     for mem_obj in memory_objs[layer_id]:
                         pending_store_release.pop(id(mem_obj), None)
+                    if not deferred_layerwise_put or not put_futures:
+                        return
+                    pending_persist_futures.extend(put_futures)
+                    while len(pending_persist_futures) >= max_pending_persist:
+                        pending_persist_futures.pop(0).result()
+
+                if deferred_layerwise_put:
+                    persisted_layers: set[int] = set()
+                    layer_request = yield
+                    for layer_id in range(self.num_layers):
+                        source_done_layer = mem_obj_generator.send(layer_request)
+                        if source_done_layer is not None:
+                            if not isinstance(source_done_layer, int):
+                                raise TypeError(
+                                    "Deferred layerwise GPU connector must yield "
+                                    "a completed layer index or None"
+                                )
+                            if source_done_layer in persisted_layers:
+                                raise RuntimeError(
+                                    "Layerwise source completion was reported twice: "
+                                    f"layer={source_done_layer}"
+                                )
+                            persist_layer(source_done_layer)
+                            persisted_layers.add(source_done_layer)
+                        if layer_id + 1 < self.num_layers:
+                            layer_request = yield
+
+                    # Keep the final D2H and persistence wait out of the last
+                    # attention hook. wait_for_save() (or indexer finalization)
+                    # resumes this drain point before request completion.
+                    yield
+                    while len(persisted_layers) < self.num_layers:
+                        try:
+                            source_done_layer = next(mem_obj_generator)
+                        except StopIteration as exc:
+                            raise RuntimeError(
+                                "Layerwise GPU connector ended before all "
+                                "source buffers completed"
+                            ) from exc
+                        if source_done_layer is None:
+                            continue
+                        if not isinstance(source_done_layer, int):
+                            raise TypeError(
+                                "Deferred layerwise GPU connector must yield "
+                                "a completed layer index or None"
+                            )
+                        if source_done_layer in persisted_layers:
+                            raise RuntimeError(
+                                "Layerwise source completion was reported twice: "
+                                f"layer={source_done_layer}"
+                            )
+                        persist_layer(source_done_layer)
+                        persisted_layers.add(source_done_layer)
+                    try:
+                        next(mem_obj_generator)
+                    except StopIteration:
+                        pass
+                    for future in pending_persist_futures:
+                        future.result()
+                    pending_persist_futures.clear()
+                else:
+                    for layer_id in range(self.num_layers):
+                        yield
+                        next(mem_obj_generator)
+                        persist_layer(layer_id)
 
                 tot_time = time.perf_counter() - t_start
                 logger.info(
@@ -4895,7 +4977,7 @@ class LMCacheEngine:
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
-            for layer_id in range(self.num_layers):
+            for _ in range(self.num_layers + int(deferred_layerwise_put)):
                 yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
@@ -5060,7 +5142,7 @@ class LMCacheEngine:
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Generator[Optional[torch.Tensor], None, None]:
+    ) -> Generator[Optional[torch.Tensor], Any, None]:
         """
         Retrieve the KV cache in a layerwise manner.
 
@@ -5412,16 +5494,24 @@ class LMCacheEngine:
                 if layer_id == 0:
                     # NOTE(Yuwei): For sglang integration we need to provide retrieved
                     # tokens number in the first layer loading since there is no lookup
-                    yield torch.sum(ret_mask)
+                    layer_request = yield torch.sum(ret_mask)
                 else:
-                    yield None
+                    layer_request = yield None
 
                 mem_objs_layer = []
                 for segment, task in zip(segments, tasks, strict=True):
                     segment_mem_objs = task.result()
                     mem_objs_layer.extend(segment_mem_objs)
                     retrieved_by_location[segment[0]].extend(segment_mem_objs)
-                mem_obj_consumer.send(mem_objs_layer)
+                if layer_request is None:
+                    mem_obj_consumer.send(mem_objs_layer)
+                else:
+                    mem_obj_consumer.send(
+                        {
+                            "memory_objs": mem_objs_layer,
+                            "layer_request": layer_request,
+                        }
+                    )
                 to_count_down.extend(mem_objs_layer)
 
             for mem_obj in to_count_down:

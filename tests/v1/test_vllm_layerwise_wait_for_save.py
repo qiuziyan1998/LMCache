@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from copy import deepcopy
 from types import SimpleNamespace
 
 # Third Party
@@ -19,6 +20,185 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     SaveSpec,
 )
 from lmcache.v1.cache_engine import LayerwiseStoreResult
+
+
+def _make_banked_tracker() -> RequestTracker:
+    return RequestTracker(
+        req_id="req-banks",
+        prompt_len=8,
+        token_ids=[0, 1, 2, 3],
+        allocated_block_ids=[2, 3],
+        allocated_block_ids_indexer=[20, 21],
+        allocated_block_ids_by_bank=(
+            ([2, 3], [20, 21]),
+            ([12, 13], [30, 31]),
+            ([22, 23], [40, 41]),
+        ),
+        block_allocation_mode="prefill_child",
+    )
+
+
+def test_request_tracker_builds_and_extends_three_bank_slot_mappings() -> None:
+    tracker = _make_banked_tracker()
+    tracker.prompt_len = 6
+    tracker.update(
+        [4, 5],
+        ([4], [22]),
+        new_block_ids_by_bank=(
+            ([4], [22]),
+            ([14], [32]),
+            ([24], [42]),
+        ),
+    )
+
+    meta = ReqMeta.from_request_tracker(
+        tracker,
+        block_size=2,
+        lmcache_chunk_size=2,
+        discard_partial_chunks=False,
+        dsa_two_groups=True,
+    )
+    assert meta is not None
+    assert meta.slot_mappings_by_bank is not None
+    assert meta.block_allocation_mode == "prefill_child"
+    assert len(meta.slot_mappings_by_bank) == 3
+    assert meta.slot_mappings_by_bank[0][0].tolist() == [4, 5, 6, 7, 8, 9]
+    assert meta.slot_mappings_by_bank[1][0].tolist() == [24, 25, 26, 27, 28, 29]
+    assert meta.slot_mappings_by_bank[2][1].tolist() == [80, 81, 82, 83, 84, 85]
+
+
+@pytest.mark.parametrize(
+    ("bank_delta", "mode", "error"),
+    [
+        (
+            (
+                ([4], [22]),
+                ([14], [32]),
+                ([24], [42]),
+            ),
+            "full_parent",
+            "allocation mode changed",
+        ),
+        (
+            (
+                ([4], [22]),
+                ([14], [32]),
+            ),
+            "prefill_child",
+            "bank count changed",
+        ),
+        (
+            (
+                ([4], [22]),
+                ([14],),
+                ([24], [42]),
+            ),
+            "prefill_child",
+            "KV-group count changed",
+        ),
+        (
+            (
+                ([99], [22]),
+                ([14], [32]),
+                ([24], [42]),
+            ),
+            "prefill_child",
+            "differs from bank 0",
+        ),
+    ],
+)
+def test_request_tracker_rejects_invalid_bank_delta_atomically(
+    bank_delta, mode, error
+) -> None:
+    tracker = _make_banked_tracker()
+    state_before = deepcopy(tracker)
+
+    with pytest.raises(RuntimeError, match=error):
+        tracker.update(
+            [4, 5],
+            ([4], [22]),
+            new_block_ids_by_bank=bank_delta,
+            new_block_allocation_mode=mode,
+        )
+
+    assert tracker.token_ids == state_before.token_ids
+    assert tracker.allocated_block_ids == state_before.allocated_block_ids
+    assert (
+        tracker.allocated_block_ids_indexer
+        == state_before.allocated_block_ids_indexer
+    )
+    assert (
+        tracker.allocated_block_ids_by_bank
+        == state_before.allocated_block_ids_by_bank
+    )
+    assert tracker.block_allocation_mode == state_before.block_allocation_mode
+
+
+def test_request_tracker_rejects_banked_delta_for_ordinary_request() -> None:
+    tracker = _make_banked_tracker()
+    tracker.allocated_block_ids_by_bank = None
+    blocks_before = tracker.allocated_block_ids.copy()
+
+    with pytest.raises(RuntimeError, match="ordinary request"):
+        tracker.update(
+            [4],
+            ([4], [22]),
+            new_block_ids_by_bank=(
+                ([4], [22]),
+                ([14], [32]),
+                ([24], [42]),
+            ),
+            new_block_allocation_mode="prefill_child",
+        )
+
+    assert tracker.allocated_block_ids == blocks_before
+
+
+def test_request_tracker_preemption_replaces_all_bank_state() -> None:
+    tracker = _make_banked_tracker()
+
+    tracker.update(
+        [6, 7],
+        ([5], [25]),
+        preempted=True,
+        lmcache_cached_tokens=2,
+        vllm_cached_tokens=2,
+        all_token_ids=list(range(8)),
+        new_block_ids_by_bank=(
+            ([5], [25]),
+            ([15], [35]),
+            ([25], [45]),
+        ),
+        new_block_allocation_mode="prefill_child",
+    )
+
+    assert tracker.allocated_block_ids == [5]
+    assert tracker.allocated_block_ids_indexer == [25]
+    assert tracker.allocated_block_ids_by_bank == (
+        ([5], [25]),
+        ([15], [35]),
+        ([25], [45]),
+    )
+    assert tracker.block_allocation_mode == "prefill_child"
+    assert tracker.token_ids == [0, 1, 2, 3]
+
+
+def test_request_metadata_requires_exactly_three_banks() -> None:
+    tracker = _make_banked_tracker()
+    assert tracker.allocated_block_ids_by_bank is not None
+    tracker.allocated_block_ids_by_bank = (
+        tracker.allocated_block_ids_by_bank[0],
+        tracker.allocated_block_ids_by_bank[1],
+    )
+
+    with pytest.raises(RuntimeError, match="exactly three banks"):
+        ReqMeta.from_request_tracker(
+            tracker,
+            block_size=2,
+            lmcache_chunk_size=2,
+            discard_partial_chunks=False,
+            dsa_two_groups=True,
+        )
 
 
 class _FakeParent:
@@ -111,10 +291,110 @@ def _make_connector(requests):
     connector._finished_req_ids_waiting_for_save = set()
     connector._late_finished_sending = set()
     connector._completed_decode_window_saves = {}
+    connector._cold_perf_dense_load_started = {}
+    connector._cold_perf_dense_load_completed = {}
     connector._decode_window_save_completed_groups = set()
     connector._prefill_save_completed_groups = {}
     connector._decode_window_save_expected_start = {}
     return connector, metadata, engine
+
+
+def test_p_node_save_rotates_dynamic_bank_mapping(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request = _make_req("req-p")
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = (
+        (torch.tensor([0, 1, 2, 3]),),
+        (torch.tensor([10, 11, 12, 13]),),
+        (torch.tensor([20, 21, 22, 23]),),
+    )
+    connector, _, engine = _make_connector([request])
+    connector.kv_caches = {
+        "layer0": torch.zeros(1),
+        "layer1": torch.zeros(1),
+        "layer2": torch.zeros(1),
+    }
+    connector._kvcaches_list = []
+    received = []
+
+    def store_layer(_token_ids, **kwargs):
+        engine.store_kwargs.append(dict(kwargs))
+
+        def storer():
+            command = yield
+            for _ in range(3):
+                received.append(command)
+                command = yield
+            yield LayerwiseStoreResult(request_id="req-p", kv_group=0)
+
+        return storer()
+
+    engine.store_layer = store_layer
+
+    for layer_name in ("layer0", "layer1", "layer2"):
+        connector.save_kv_layer(
+            layer_name,
+            torch.zeros(1),
+            SimpleNamespace(),
+        )
+    connector.wait_for_save()
+
+    assert engine.store_kwargs[0]["deferred_layerwise_put"] is True
+    assert [item["slot_mapping"].tolist() for item in received] == [
+        [0, 1, 2, 3],
+        [10, 11, 12, 13],
+        [20, 21, 22, 23],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("layer_index", "expected"),
+    [(0, [0, 1]), (1, [10, 11]), (2, [20, 21]), (3, [0, 1])],
+)
+def test_p_node_slot_mapping_rotates_by_layer(
+    monkeypatch, layer_index, expected
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request = _make_req("req-p")
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = (
+        (torch.tensor([0, 1]),),
+        (torch.tensor([10, 11]),),
+        (torch.tensor([20, 21]),),
+    )
+    connector, _, _ = _make_connector([request])
+
+    mapping = connector._layerwise_prefill_slot_mapping(
+        request, kv_group=0, layer_index=layer_index
+    )
+
+    assert mapping is not None
+    assert mapping.dtype == torch.long
+    assert mapping.tolist() == expected
+
+
+def test_p_node_slot_mapping_rejects_invalid_identity(monkeypatch) -> None:
+    request = _make_req("req-p")
+    connector, _, _ = _make_connector([request])
+
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    assert (
+        connector._layerwise_prefill_slot_mapping(request, 0, 0) is None
+    )
+
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request.block_allocation_mode = "full_parent"
+    with pytest.raises(RuntimeError, match="wrong KV block allocation mode"):
+        connector._layerwise_prefill_slot_mapping(request, 0, 0)
+
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = None
+    with pytest.raises(RuntimeError, match="missing banked slot mappings"):
+        connector._layerwise_prefill_slot_mapping(request, 0, 0)
+
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "1")
+    with pytest.raises(ValueError, match="must be 'true' or 'false'"):
+        connector._layerwise_prefill_slot_mapping(request, 0, 0)
 
 
 def test_layerwise_storer_is_request_scoped_across_interleaved_finalize() -> None:

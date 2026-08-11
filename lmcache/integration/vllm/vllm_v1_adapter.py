@@ -109,6 +109,34 @@ ASYNC_DECODE_SAVE_MAX_PER_WORKER_DEFAULT = 32
 LayerwiseSaveKey = tuple[str, str, int, int, int]
 
 
+def _layerwise_prefill_p_node_enabled() -> bool:
+    raw = os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    normalized = raw.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(
+        "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE must be 'true' or 'false', "
+        f"got {raw!r}"
+    )
+
+
+def _copy_block_ids_by_bank(value):
+    if value is None:
+        return None
+    return tuple(
+        tuple(list(group_ids) for group_ids in bank_groups)
+        for bank_groups in value
+    )
+
+
+def _block_allocation_mode_value(value) -> Optional[str]:
+    if value is None:
+        return None
+    return str(getattr(value, "value", value))
+
+
 def _async_decode_save_enabled(
     env_value: Optional[str],
     window_size: int,
@@ -553,6 +581,10 @@ class RequestTracker:
     # NOTE: allocated blocks could be more than the number of tokens
     allocated_block_ids: list[int]
     allocated_block_ids_indexer: Optional[list[int]] = None
+    allocated_block_ids_by_bank: Optional[
+        tuple[tuple[list[int], ...], ...]
+    ] = None
+    block_allocation_mode: Optional[str] = None
 
     # The number of tokens that has been saved
     num_saved_tokens: int = 0
@@ -659,6 +691,12 @@ class RequestTracker:
             token_ids=new_request.prompt_token_ids[:num_tokens_to_track].copy(),
             allocated_block_ids=unfolded_block_ids,
             allocated_block_ids_indexer=indexer_block_ids,
+            allocated_block_ids_by_bank=_copy_block_ids_by_bank(
+                getattr(new_request, "block_ids_by_bank", None)
+            ),
+            block_allocation_mode=_block_allocation_mode_value(
+                getattr(new_request, "block_allocation_mode", None)
+            ),
             num_saved_tokens=lmcache_cached_tokens,
             disagg_spec=disagg_spec,
             mm_hashes=mm_hashes,
@@ -677,6 +715,8 @@ class RequestTracker:
         lmcache_cached_tokens: int = 0,
         vllm_cached_tokens: int = 0,
         all_token_ids: Optional[list[int]] = None,
+        new_block_ids_by_bank=None,
+        new_block_allocation_mode=None,
     ) -> None:
         """Update the request tracker when a running request is
         scheduled again
@@ -708,6 +748,12 @@ class RequestTracker:
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
             self.allocated_block_ids_indexer = new_indexer_block_ids
+            self.allocated_block_ids_by_bank = _copy_block_ids_by_bank(
+                new_block_ids_by_bank
+            )
+            self.block_allocation_mode = _block_allocation_mode_value(
+                new_block_allocation_mode
+            )
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
             self.num_lmcache_cached_tokens = lmcache_cached_tokens
@@ -729,11 +775,82 @@ class RequestTracker:
             )
             self.token_ids = all_token_ids[:num_tokens_needed]
         else:
+            normalized_mode = _block_allocation_mode_value(
+                new_block_allocation_mode
+            )
+            if (
+                normalized_mode is not None
+                and normalized_mode != self.block_allocation_mode
+            ):
+                raise RuntimeError(
+                    "KV block allocation mode changed during request: "
+                    f"request_id={self.req_id}, "
+                    f"current={self.block_allocation_mode}, "
+                    f"new={normalized_mode}"
+                )
+            if new_block_ids_by_bank is not None:
+                if self.allocated_block_ids_by_bank is None:
+                    raise RuntimeError(
+                        "received banked KV block delta for an ordinary request"
+                    )
+                if len(self.allocated_block_ids_by_bank) != len(
+                    new_block_ids_by_bank
+                ):
+                    raise RuntimeError(
+                        "layerwise-prefill bank count changed during request"
+                    )
+                if not self.allocated_block_ids_by_bank:
+                    raise RuntimeError(
+                        "layerwise-prefill request has no physical banks"
+                    )
+                expected_group_count = len(
+                    self.allocated_block_ids_by_bank[0]
+                )
+                if any(
+                    len(bank) != expected_group_count
+                    for bank in self.allocated_block_ids_by_bank
+                ) or any(
+                    len(bank) != expected_group_count
+                    for bank in new_block_ids_by_bank
+                ):
+                    raise RuntimeError(
+                        "layerwise-prefill KV-group count changed during request"
+                    )
+                primary_delta = (
+                    (new_block_ids,)
+                    if new_indexer_block_ids is None
+                    else (new_block_ids, new_indexer_block_ids)
+                )
+                if tuple(new_block_ids_by_bank[0]) != primary_delta:
+                    raise RuntimeError(
+                        "layerwise-prefill primary block delta differs from bank 0"
+                    )
+
             self.allocated_block_ids.extend(new_block_ids)
             if new_indexer_block_ids is not None:
                 if self.allocated_block_ids_indexer is None:
                     self.allocated_block_ids_indexer = []
                 self.allocated_block_ids_indexer.extend(new_indexer_block_ids)
+            if new_block_ids_by_bank is not None:
+                if self.allocated_block_ids_by_bank is None:
+                    raise RuntimeError(
+                        "received banked KV block delta for an ordinary request"
+                    )
+                if len(self.allocated_block_ids_by_bank) != len(
+                    new_block_ids_by_bank
+                ):
+                    raise RuntimeError(
+                        "layerwise-prefill bank count changed during request"
+                    )
+                for current_bank, new_bank in zip(
+                    self.allocated_block_ids_by_bank,
+                    new_block_ids_by_bank,
+                    strict=True,
+                ):
+                    for current_group, new_group in zip(
+                        current_bank, new_bank, strict=True
+                    ):
+                        current_group.extend(new_group)
             self.token_ids.extend(new_token_ids)
 
         if len(self.token_ids) > self.prompt_len:
@@ -858,6 +975,11 @@ class ReqMeta:
     # reference.
     slot_mapping: list[torch.Tensor] = field(default_factory=list)
     indexer_slot_mapping: list[torch.Tensor] = field(default_factory=list)
+    # Layerwise-prefill full-prefix mappings, bank-major then group-major.
+    slot_mappings_by_bank: Optional[
+        tuple[tuple[torch.Tensor, ...], ...]
+    ] = None
+    block_allocation_mode: Optional[str] = None
     # Save-only mappings for the exact sparse-layerwise write window. Chunk
     # ranges remain absolute; the worker/connector subtracts this base before
     # indexing these tensors.
@@ -1378,6 +1500,24 @@ class ReqMeta:
                 tracker.req_id,
             )
 
+        slot_mappings_by_bank = None
+        if tracker.allocated_block_ids_by_bank is not None:
+            if len(tracker.allocated_block_ids_by_bank) != 3:
+                raise RuntimeError(
+                    "Layerwise-prefill request must carry exactly three banks"
+                )
+            slot_mappings_by_bank = tuple(
+                tuple(
+                    _build_slot_mapping(
+                        group_block_ids,
+                        block_size,
+                        len(token_ids),
+                    )
+                    for group_block_ids in bank_groups
+                )
+                for bank_groups in tracker.allocated_block_ids_by_bank
+            )
+
         decode_token_mask: Optional[torch.Tensor] = None
         decode_ret_mask: Optional[torch.Tensor] = None
         if is_sparse_decode and load_spec is not None:
@@ -1409,6 +1549,8 @@ class ReqMeta:
             token_ids=token_ids,
             slot_mapping=slot_mapping,
             indexer_slot_mapping=indexer_slot_mapping,
+            slot_mappings_by_bank=slot_mappings_by_bank,
+            block_allocation_mode=tracker.block_allocation_mode,
             save_slot_mapping=save_slot_mapping,
             save_indexer_slot_mapping=save_indexer_slot_mapping,
             save_slot_mapping_base=save_slot_mapping_base,
@@ -2179,6 +2321,37 @@ class LMCacheConnectorV1Impl:
 
     def _layerwise_wait_group(self, layer_name: str) -> int:
         return 1 if self._is_indexer_layer_wait(layer_name) else 0
+
+    def _layerwise_prefill_slot_mapping(
+        self,
+        request: ReqMeta,
+        kv_group: int,
+        layer_index: int,
+    ) -> Optional[torch.Tensor]:
+        if not _layerwise_prefill_p_node_enabled():
+            return None
+        if request.block_allocation_mode != "prefill_child":
+            raise RuntimeError(
+                "P-node request has the wrong KV block allocation mode: "
+                f"req_id={request.req_id}, "
+                f"mode={request.block_allocation_mode}"
+            )
+        mappings = request.slot_mappings_by_bank
+        if mappings is None:
+            raise RuntimeError(
+                "P-node layerwise prefill request is missing banked slot mappings: "
+                f"req_id={request.req_id}"
+            )
+        bank = layer_index % 3
+        if len(mappings) != 3 or kv_group >= len(mappings[bank]):
+            raise RuntimeError(
+                "P-node layerwise prefill slot-mapping layout is invalid: "
+                f"req_id={request.req_id}, bank={bank}, kv_group={kv_group}"
+            )
+        return mappings[bank][kv_group].to(
+            device=self.device,
+            dtype=torch.long,
+        )
 
     @staticmethod
     def _layerwise_layer_id_from_name(layer_name: str) -> Optional[int]:
@@ -7198,12 +7371,41 @@ class LMCacheConnectorV1Impl:
                                 ret_token_mask = indexer_ret_mask
                     decode_row += row_count
                 else:
+                    # Dense retrievers pre-load layer 0 during start_load_kv.
+                    # Each wait hook advances the transfer for the following
+                    # layer; the last hook only drains the generator.
+                    transfer_layer = min(
+                        self.current_layer + 1,
+                        self.num_layers - 1,
+                    )
                     if wait_group == 1:
                         if indexer_retriever is not None:
-                            next(indexer_retriever)
+                            dynamic_mapping = (
+                                self._layerwise_prefill_slot_mapping(
+                                    request,
+                                    1,
+                                    transfer_layer,
+                                )
+                            )
+                            if dynamic_mapping is None:
+                                next(indexer_retriever)
+                            else:
+                                indexer_retriever.send(
+                                    {"slot_mapping": dynamic_mapping}
+                                )
                         ret_token_mask = None
                     else:
-                        ret_token_mask = next(layerwise_retriever)
+                        dynamic_mapping = self._layerwise_prefill_slot_mapping(
+                            request,
+                            0,
+                            transfer_layer,
+                        )
+                        if dynamic_mapping is None:
+                            ret_token_mask = next(layerwise_retriever)
+                        else:
+                            ret_token_mask = layerwise_retriever.send(
+                                {"slot_mapping": dynamic_mapping}
+                            )
 
                 if (
                     wait_group == 0
@@ -7296,6 +7498,8 @@ class LMCacheConnectorV1Impl:
         return
 
     def _should_defer_latent_save_under_tp(self) -> bool:
+        if _layerwise_prefill_p_node_enabled():
+            return False
         if not getattr(self.config, "dsa_two_groups", False):
             return False
         meta = getattr(self.lmcache_engine, "metadata", None)
@@ -7778,10 +7982,17 @@ class LMCacheConnectorV1Impl:
                     slot_mapping=slot_mapping,
                     offset=skip_leading_tokens,
                     sync=sync,
+                    deferred_layerwise_put=(
+                        _layerwise_prefill_p_node_enabled()
+                    ),
                     req_id=request.req_id,
                     **store_kwargs,
                 )
                 self._layerwise_save_storers[storer_key] = layerwise_storer
+                if _layerwise_prefill_p_node_enabled():
+                    # P-node storers accept a per-layer bank mapping. Prime the
+                    # generator once so this layer's mapping can be sent now.
+                    next(layerwise_storer)
 
             indexer_group_last = (
                 is_indexer_layer
@@ -7790,7 +8001,35 @@ class LMCacheConnectorV1Impl:
             )
 
             try:
-                next(layerwise_storer)
+                layer_names = (
+                    self._indexer_layer_names
+                    if kv_group == 1
+                    else self._latent_layer_names
+                )
+                if _layerwise_prefill_p_node_enabled():
+                    try:
+                        layer_index = layer_names.index(layer_name)
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            "P-node layerwise save received an unknown layer: "
+                            f"layer={layer_name}, kv_group={kv_group}"
+                        ) from exc
+                    dynamic_slot_mapping = (
+                        self._layerwise_prefill_slot_mapping(
+                            request,
+                            kv_group,
+                            layer_index,
+                        )
+                    )
+                    assert dynamic_slot_mapping is not None
+                    layerwise_storer.send(
+                        {
+                            "slot_mapping": dynamic_slot_mapping,
+                            "slot_mapping_base": 0,
+                        }
+                    )
+                else:
+                    next(layerwise_storer)
                 if indexer_group_last:
                     indexer_completed, store_result = (
                         self._finalize_layerwise_storer(
@@ -9316,6 +9555,12 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens=lmcache_cached_tokens,
                     vllm_cached_tokens=vllm_cached_tokens,
                     all_token_ids=all_token_ids,
+                    new_block_ids_by_bank=getattr(
+                        req, "new_block_ids_by_bank", None
+                    ),
+                    new_block_allocation_mode=getattr(
+                        req, "new_block_allocation_mode", None
+                    ),
                 )
 
                 self._add_decode_window_save_metas(meta, request_tracker)
@@ -9348,6 +9593,18 @@ class LMCacheConnectorV1Impl:
                     f"but it is scheduled to be cached"
                 )
             new_block_ids = cached_reqs.new_block_ids[i]
+            banked_deltas = getattr(cached_reqs, "new_block_ids_by_bank", None)
+            new_block_ids_by_bank = (
+                banked_deltas[i] if banked_deltas is not None else None
+            )
+            allocation_modes = getattr(
+                cached_reqs,
+                "new_block_allocation_modes",
+                None,
+            )
+            new_block_allocation_mode = (
+                allocation_modes[i] if allocation_modes is not None else None
+            )
 
             load_spec = self.load_specs.pop(req_id, None)
             lmcache_cached_tokens = 0
@@ -9461,6 +9718,8 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens=lmcache_cached_tokens,
                 vllm_cached_tokens=vllm_cached_tokens,
                 all_token_ids=all_token_ids,
+                new_block_ids_by_bank=new_block_ids_by_bank,
+                new_block_allocation_mode=new_block_allocation_mode,
             )
 
             self._add_decode_window_save_metas(meta, request_tracker)
