@@ -8,6 +8,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -27,7 +28,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
+class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -270,3 +271,12 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             returned by the engine.
         """
         return self._lmcache_engine.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        # LMCache's layerwise DSA path owns both groups, while its scheduler
+        # completion bookkeeping is keyed by the primary group's block table.
+        return self.request_finished(request, block_ids[0])
