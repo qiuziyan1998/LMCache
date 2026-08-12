@@ -3,9 +3,10 @@
 
 # Standard
 from concurrent.futures import Future, TimeoutError
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 import asyncio
+import sys
 import threading
 
 # Third Party
@@ -14,7 +15,9 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
+from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, TensorMemoryAllocator
+from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
     MOONCAKE_VALID_TOKENS_TAG,
     mooncake_page_key,
@@ -29,6 +32,148 @@ from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
     MooncakestoreConnector,
 )
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+
+
+def _make_mooncake_connector(
+    monkeypatch: pytest.MonkeyPatch,
+    extra_config: dict,
+    calls: list,
+) -> tuple[MooncakestoreConnector, asyncio.AbstractEventLoop]:
+    class _Store:
+        def setup(self, *args):
+            calls.append(("setup", args))
+            return 0
+
+        def register_buffer(self, ptr, size):
+            calls.append(("register", ptr, size))
+            return 0
+
+        def unregister_buffer(self, ptr):
+            calls.append(("unregister", ptr))
+            return 0
+
+        def close(self):
+            calls.append(("close",))
+
+    package = ModuleType("mooncake")
+    package.__path__ = []  # type: ignore[attr-defined]
+    store_module = ModuleType("mooncake.store")
+    store_module.MooncakeDistributedStore = _Store
+    store_module.ReplicateConfig = type("ReplicateConfig", (), {})
+    package.store = store_module
+    monkeypatch.setitem(sys.modules, "mooncake", package)
+    monkeypatch.setitem(sys.modules, "mooncake.store", store_module)
+    monkeypatch.setattr(
+        mooncake_connector.NUMADetector,
+        "get_numa_mapping",
+        lambda _config: None,
+    )
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=8,
+        extra_config={
+            "local_hostname": "configured-host",
+            "metadata_server": "metadata",
+            "master_server_address": "master",
+            "protocol": "ascend",
+            **extra_config,
+        },
+    )
+    metadata = LMCacheMetadata(
+        model_name="test",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(1, 2, 8, 1, 1),
+        chunk_size=8,
+    )
+    local_cpu = SimpleNamespace(
+        config=config,
+        metadata=metadata,
+        memory_allocator=SimpleNamespace(),
+    )
+    loop = asyncio.new_event_loop()
+    return MooncakestoreConnector("", 0, "", loop, local_cpu, config), loop
+
+
+def test_mooncake_reuses_vllm_engine_and_registration_registry(monkeypatch) -> None:
+    calls = []
+
+    class _Engine:
+        @staticmethod
+        def get_rpc_port():
+            return 12345
+
+        @staticmethod
+        def get_engine():
+            return "native-engine"
+
+    global_te = SimpleNamespace(
+        get_transfer_engine=lambda hostname, device_name: (
+            calls.append(("engine", hostname, device_name)) or _Engine()
+        ),
+        register_buffer=lambda ptrs, sizes: calls.append(
+            ("shared-register", ptrs, sizes)
+        ),
+    )
+    modules = {
+        "vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine": (
+            SimpleNamespace(global_te=global_te)
+        ),
+        "vllm.utils.network_utils": SimpleNamespace(get_ip=lambda: "10.0.0.1"),
+    }
+    monkeypatch.setattr(mooncake_connector, "import_module", modules.__getitem__)
+
+    connector, loop = _make_mooncake_connector(
+        monkeypatch,
+        {"mooncake_reuse_vllm_transfer_engine": True},
+        calls,
+    )
+    tensor = torch.empty(16, dtype=torch.uint8)
+    owner = SimpleNamespace(
+        device=SimpleNamespace(type="npu"),
+        untyped_storage=tensor.untyped_storage,
+    )
+    cpu_owner = torch.empty(8, dtype=torch.uint8)
+    try:
+        connector._register_external_owners((owner,))
+        connector._register_external_owners((owner,))
+        connector._register_external_owners((cpu_owner,))
+        asyncio.run(connector.close())
+    finally:
+        loop.close()
+
+    setup = next(call for call in calls if call[0] == "setup")
+    assert setup[1][0] == "10.0.0.1:12345"
+    assert setup[1][-1] == "native-engine"
+    assert [call[0] for call in calls].count("shared-register") == 1
+    assert [call[0] for call in calls].count("register") == 1
+    assert [call[0] for call in calls].count("unregister") == 1
+
+
+def test_mooncake_shared_engine_is_strictly_opt_in(monkeypatch) -> None:
+    calls = []
+    connector, loop = _make_mooncake_connector(monkeypatch, {}, calls)
+    try:
+        asyncio.run(connector.close())
+    finally:
+        loop.close()
+
+    setup = next(call for call in calls if call[0] == "setup")
+    assert len(setup[1]) == 7
+
+
+def test_mooncake_shared_engine_rejects_non_ascend_protocol(monkeypatch) -> None:
+    with pytest.raises(ValueError, match="requires protocol=ascend"):
+        _make_mooncake_connector(
+            monkeypatch,
+            {
+                "protocol": "tcp",
+                "mooncake_reuse_vllm_transfer_engine": True,
+            },
+            [],
+        )
 
 
 class _MemoryObj:

@@ -2,6 +2,7 @@
 # Standard
 from bisect import bisect_right
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Any, Callable, List, Optional, cast, no_type_check
 import asyncio
 import json
@@ -38,6 +39,16 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.system_detection import NUMADetector
 
 logger = init_logger(__name__)
+
+
+def _shared_vllm_mooncake_transport() -> tuple[Any, str, Any]:
+    """Borrow vLLM-Ascend's process-wide Mooncake engine and registry."""
+    global_te = import_module(
+        "vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine"
+    ).global_te
+    hostname = import_module("vllm.utils.network_utils").get_ip()
+    engine = global_te.get_transfer_engine(hostname, device_name=None)
+    return global_te, f"{hostname}:{engine.get_rpc_port()}", engine.get_engine()
 
 
 @dataclass
@@ -185,6 +196,27 @@ class MooncakestoreConnector(RemoteConnector):
                 self.config.device_name = dev_name
             logger.info("Mooncake Configuration loaded. config: %s", self.config)
 
+            reuse_vllm_engine = (
+                False
+                if lmcache_config is None
+                else lmcache_config.get_extra_config_value(
+                    "mooncake_reuse_vllm_transfer_engine", False
+                )
+            )
+            if not isinstance(reuse_vllm_engine, bool):
+                raise ValueError(
+                    "mooncake_reuse_vllm_transfer_engine must be a boolean"
+                )
+            self._shared_global_te = None
+            if reuse_vllm_engine:
+                if self.config.protocol != "ascend":
+                    raise ValueError(
+                        "mooncake_reuse_vllm_transfer_engine requires protocol=ascend"
+                    )
+                self._shared_global_te, local_segment, native_engine = (
+                    _shared_vllm_mooncake_transport()
+                )
+
             # Check if storage_root_dir exists and set environment variable
             if (
                 self.config.storage_root_dir is not None
@@ -243,7 +275,7 @@ class MooncakestoreConnector(RemoteConnector):
                     f"Failed to determine NUMA mapping before Mooncake setup: {e}"
                 )
 
-            status = self.store.setup(
+            setup_args = [
                 self.config.local_hostname,
                 self.config.metadata_server,
                 self.config.global_segment_size,
@@ -251,7 +283,12 @@ class MooncakestoreConnector(RemoteConnector):
                 self.config.protocol,
                 self.config.device_name,
                 self.config.master_server_address,
-            )
+            ]
+            if reuse_vllm_engine:
+                setup_args[0] = local_segment
+                setup_args.append(native_engine)
+                logger.info("Reusing vLLM-Ascend's process-wide Mooncake engine")
+            status = self.store.setup(*setup_args)
             if status not in (None, 0):
                 raise RuntimeError(f"Mooncake setup failed: status={status}")
 
@@ -299,6 +336,7 @@ class MooncakestoreConnector(RemoteConnector):
         self.registered_buffer_ptr = None
         self.registered_buffer_size = 0
         self._external_buffers: dict[int, int] = {}
+        self._shared_external_buffers: dict[int, int] = {}
         self._external_put_lock = asyncio.Lock()
         self._inflight_put_tasks: set[asyncio.Task[Any]] = set()
         # Initialize ReplicateConfig
@@ -580,6 +618,7 @@ class MooncakestoreConnector(RemoteConnector):
     def _register_external_owners(self, owners: tuple[Any, ...]) -> None:
         """Register tensor storages once in this Mooncake transport context."""
         active: dict[int, int] = {}
+        shared: dict[int, int] = {}
         cpu_ptr = getattr(self, "registered_buffer_ptr", None)
         cpu_size = int(getattr(self, "registered_buffer_size", 0))
         for owner in owners:
@@ -591,7 +630,27 @@ class MooncakestoreConnector(RemoteConnector):
                 and size <= cpu_size
             ):
                 continue
-            active[ptr] = size
+            target = (
+                shared
+                if getattr(self, "_shared_global_te", None) is not None
+                and getattr(getattr(owner, "device", None), "type", None) == "npu"
+                else active
+            )
+            target[ptr] = size
+        shared_global_te = getattr(self, "_shared_global_te", None)
+        if shared:
+            # Stable NPU KV regions stay registered for the process lifetime;
+            # CPU staging remains store-scoped below.
+            registered = getattr(self, "_shared_external_buffers", {})
+            pending = {
+                ptr: size
+                for ptr, size in shared.items()
+                if registered.get(ptr) != size
+            }
+            if pending:
+                shared_global_te.register_buffer(list(pending), list(pending.values()))
+                registered.update(pending)
+            self._shared_external_buffers = registered
         for ptr in self._external_buffers.keys() - active.keys():
             self.store.unregister_buffer(ptr)
             self._external_buffers.pop(ptr, None)
@@ -2191,6 +2250,7 @@ class MooncakestoreConnector(RemoteConnector):
         for ptr in tuple(self._external_buffers):
             self.store.unregister_buffer(ptr)
         self._external_buffers.clear()
+        getattr(self, "_shared_external_buffers", {}).clear()
 
         self.store.close()
         logger.info("Closed the mooncake store connection")
