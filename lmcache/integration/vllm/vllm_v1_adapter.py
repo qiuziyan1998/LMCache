@@ -5657,6 +5657,7 @@ class LMCacheConnectorV1Impl:
             "indexer_kvcaches": self._kvcaches_for_group(1),
             "planned_at": cold_start_perf_now(),
             "plan_started": plan_started,
+            "latent_shared_ready": Future(),
         }
         submitted_at = cold_start_perf_now()
         cold_start_perf_log(
@@ -5732,6 +5733,7 @@ class LMCacheConnectorV1Impl:
             "indexer_kvcaches": self._kvcaches_for_group(1),
             "planned_at": cold_start_perf_now(),
             "plan_started": plan_started,
+            "latent_shared_ready": Future(),
         }
         indexer_completion: Future = Future()
         generation = request.load_spec.dsa_cold_load_generation
@@ -5948,7 +5950,7 @@ class LMCacheConnectorV1Impl:
     def _run_dsa_cold_indexer_load(
         self, plan: dict[str, Any], npu_device_id: Optional[int]
     ) -> tuple[torch.Tensor, Any, float, float]:
-        """Run the group-1 dependency without participating in TP collectives."""
+        """Load group 1 directly, or after group 0 in shared-CPU mode."""
         if npu_device_id is not None:
             torch.npu.set_device(npu_device_id)
         assert self.lmcache_engine is not None
@@ -5969,6 +5971,14 @@ class LMCacheConnectorV1Impl:
             dtype=torch.long,
         )
         retrieve_state = WorkerRetrieveState(req_id=request.req_id)
+        shared_retrieve = getattr(
+            self.lmcache_engine, "_should_use_shared_layerwise_retrieve", None
+        )
+        shared_cpu_enabled = bool(
+            callable(shared_retrieve) and shared_retrieve(1)
+        )
+        if shared_cpu_enabled:
+            plan["latent_shared_ready"].result()
         retrieve_kwargs, _, _ = self._sparse_retrieve_kwargs(
             request,
             retrieve_state,
@@ -5980,11 +5990,12 @@ class LMCacheConnectorV1Impl:
             request_ordinal=0,
             dsa_two_groups=True,
             token_count=plan["token_count"],
-            shared_cpu_enabled=False,
+            shared_cpu_enabled=shared_cpu_enabled,
             shared_cpu_preflight_state=None,
         )
-        retrieve_kwargs["direct_external_pages"] = True
-        retrieve_kwargs["_defer_direct_load_readiness"] = True
+        if not shared_cpu_enabled:
+            retrieve_kwargs["direct_external_pages"] = True
+            retrieve_kwargs["_defer_direct_load_readiness"] = True
         retriever = self.lmcache_engine.retrieve_layer_head_token_wise(
             plan["tokens"],
             plan["token_mask"],
@@ -6095,6 +6106,9 @@ class LMCacheConnectorV1Impl:
                 retrieve_location = retrieve_kwargs.get(
                     "cached_retrieve_location"
                 )
+            latent_shared_ready = plan["latent_shared_ready"]
+            if not latent_shared_ready.done():
+                latent_shared_ready.set_result(None)
             dependency_wait_started = cold_start_perf_now()
             (
                 _,
@@ -6137,6 +6151,9 @@ class LMCacheConnectorV1Impl:
             )
             return state
         except BaseException as exc:
+            latent_shared_ready = plan["latent_shared_ready"]
+            if not latent_shared_ready.done():
+                latent_shared_ready.set_exception(exc)
             # Do not release scheduler blocks or registered tensor storage while
             # the sibling native transfer can still be writing into it.
             if not indexer_future.done():

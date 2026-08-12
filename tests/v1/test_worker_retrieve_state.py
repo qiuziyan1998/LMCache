@@ -2,7 +2,7 @@
 """Tests for worker-local sparse decode retrieve state cache."""
 
 # Standard
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 import inspect
 from types import SimpleNamespace
@@ -128,6 +128,54 @@ def test_cold_compact_indexer_uses_direct_sparse_retrieve_path() -> None:
     assert plan["indexer_source_owners"] == (owner,)
     impl.lmcache_engine.retrieve_layer.assert_not_called()
     impl.lmcache_engine.retrieve_layer_head_token_wise.assert_called_once()
+
+
+def test_cold_compact_shared_indexer_waits_for_latent_publication() -> None:
+    impl = _make_impl()
+    impl.num_layers = 1
+    impl.device = "cpu"
+    readiness = object()
+    entered = Future()
+
+    def sparse_kwargs(_request, _state, _bound_state, **kwargs):
+        assert kwargs["shared_cpu_enabled"] is True
+        return ({}, None, None)
+
+    def shared_retrieve(_tokens, _mask, **kwargs):
+        assert "direct_external_pages" not in kwargs
+        entered.set_result(None)
+        yield None
+        yield torch.ones(4, dtype=torch.bool)
+
+    impl._sparse_retrieve_kwargs = MagicMock(side_effect=sparse_kwargs)
+    impl.lmcache_engine = SimpleNamespace(
+        _should_use_shared_layerwise_retrieve=lambda group: group == 1,
+        gpu_connector=SimpleNamespace(
+            record_dense_load_readiness=lambda: readiness,
+        ),
+        retrieve_layer_head_token_wise=MagicMock(side_effect=shared_retrieve),
+    )
+    request = SimpleNamespace(req_id="request", request_configs=None)
+    gate = Future()
+    plan = {
+        "request": request,
+        "tokens": [1, 2, 3, 4],
+        "token_mask": torch.ones(4, dtype=torch.bool),
+        "token_count": 4,
+        "indexer_slots_cpu": torch.arange(4),
+        "indexer_kvcaches": [object()],
+        "planned_at": adapter_mod.cold_start_perf_now(),
+        "latent_shared_ready": gate,
+    }
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(impl._run_dsa_cold_indexer_load, plan, None)
+        assert not entered.done()
+        gate.set_result(None)
+        result = future.result(timeout=1)
+
+    assert torch.equal(result[0], torch.ones(4, dtype=torch.bool))
+    assert result[1] is readiness
 
 
 @pytest.mark.parametrize("failure", ("incomplete", "transfer"))
