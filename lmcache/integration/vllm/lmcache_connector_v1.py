@@ -255,6 +255,15 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         """
         self._lmcache_engine.update_connector_output(connector_output)
 
+    def update_connector_worker_metadata(
+        self, worker_metadata: Any, active_req_ids: set[str]
+    ) -> None:
+        update = getattr(
+            self._lmcache_engine, "update_connector_worker_metadata", None
+        )
+        if callable(update):
+            update(worker_metadata, active_req_ids)
+
     def request_finished(
         self,
         request: "Request",
