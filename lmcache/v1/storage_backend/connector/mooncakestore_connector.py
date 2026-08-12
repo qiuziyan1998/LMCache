@@ -579,6 +579,7 @@ class MooncakestoreConnector(RemoteConnector):
 
     def _register_cpu_buffer(self):
         """Register CPU buffer for zero-copy operations."""
+        self._shared_cpu_buffer_adopted = False
         try:
             allocator = self.local_cpu_backend.memory_allocator
             if hasattr(allocator, "pin_allocator") and hasattr(
@@ -586,7 +587,30 @@ class MooncakestoreConnector(RemoteConnector):
             ):
                 buffer = allocator.pin_allocator.buffer
                 self.registered_buffer_ptr = buffer.data_ptr()
-                result = self.store.register_buffer(buffer.data_ptr(), buffer.numel())
+                adopt = getattr(
+                    getattr(self, "_shared_global_te", None),
+                    "adopt_registered_buffer",
+                    None,
+                )
+                if self._shared_global_te is not None and not callable(adopt):
+                    raise RuntimeError(
+                        "Shared Mooncake engine lacks external registration API"
+                    )
+                if callable(adopt):
+                    self._shared_cpu_buffer_adopted = bool(
+                        adopt(
+                            self.registered_buffer_ptr,
+                            buffer.numel(),
+                            lambda: self.store.register_buffer(
+                                self.registered_buffer_ptr, buffer.numel()
+                            ),
+                        )
+                    )
+                    result = 0
+                else:
+                    result = self.store.register_buffer(
+                        buffer.data_ptr(), buffer.numel()
+                    )
                 if result == 0:
                     self.registered_buffer_size = buffer.numel()
                     logger.info(
@@ -603,17 +627,42 @@ class MooncakestoreConnector(RemoteConnector):
             logger.error(f"Buffer registration error: {e}")
             self.registered_buffer_ptr = None
             self.registered_buffer_size = 0
+            if getattr(self, "_shared_global_te", None) is not None:
+                raise
 
-    def _unregister_cpu_buffer(self):
-        """Unregister CPU buffer."""
-        if self.registered_buffer_ptr is not None:
-            result = self.store.unregister_buffer(self.registered_buffer_ptr)
-            if result == 0:
-                logger.info(f"Unregistered buffer: {hex(self.registered_buffer_ptr)}")
-            else:
-                logger.warning(f"Buffer unregistration failed: error={result}")
+    def _unregister_cpu_buffer(self) -> bool:
+        """Unregister the CPU slab after all shared live-transfer leases end."""
+        if self.registered_buffer_ptr is None:
+            return True
+        ptr = self.registered_buffer_ptr
+        size = self.registered_buffer_size
+        if getattr(self, "_shared_cpu_buffer_adopted", False):
+            try:
+                self._shared_global_te.release_adopted_buffer(
+                    ptr,
+                    size,
+                    lambda: self.store.unregister_buffer(ptr),
+                )
+            except Exception:
+                logger.warning(
+                    "Mooncake CPU buffer is still used by a live transfer"
+                )
+                return False
+            result = 0
+        else:
+            try:
+                result = self.store.unregister_buffer(ptr)
+            except Exception:
+                result = -1
+                logger.exception("Buffer unregistration failed")
+        if result == 0:
+            self._shared_cpu_buffer_adopted = False
+            logger.info(f"Unregistered buffer: {hex(ptr)}")
             self.registered_buffer_ptr = None
             self.registered_buffer_size = 0
+            return True
+        logger.warning(f"Buffer unregistration failed: error={result}")
+        return False
 
     def _register_external_owners(self, owners: tuple[Any, ...]) -> None:
         """Register tensor storages once in this Mooncake transport context."""
@@ -2246,7 +2295,8 @@ class MooncakestoreConnector(RemoteConnector):
             )
 
         # Unregister buffer before closing the store
-        self._unregister_cpu_buffer()
+        if not self._unregister_cpu_buffer():
+            raise RuntimeError("Mooncake CPU buffer is still in use")
         for ptr in tuple(self._external_buffers):
             self.store.unregister_buffer(ptr)
         self._external_buffers.clear()

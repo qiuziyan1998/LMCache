@@ -116,6 +116,14 @@ def test_mooncake_reuses_vllm_engine_and_registration_registry(monkeypatch) -> N
         register_buffer=lambda ptrs, sizes: calls.append(
             ("shared-register", ptrs, sizes)
         ),
+        adopt_registered_buffer=lambda ptr, size, register=None: (
+            calls.append(("shared-adopt", ptr, size))
+            or (register() if register is not None else 0) == 0
+        ),
+        release_adopted_buffer=lambda ptr, size, unregister=None: (
+            calls.append(("shared-release", ptr, size))
+            or (unregister() if unregister is not None else None)
+        ),
     )
     modules = {
         "vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine": (
@@ -148,8 +156,172 @@ def test_mooncake_reuses_vllm_engine_and_registration_registry(monkeypatch) -> N
     assert setup[1][0] == "10.0.0.1:12345"
     assert setup[1][-1] == "native-engine"
     assert [call[0] for call in calls].count("shared-register") == 1
+    assert [call[0] for call in calls].count("shared-adopt") == 0
+    assert [call[0] for call in calls].count("shared-release") == 0
     assert [call[0] for call in calls].count("register") == 1
     assert [call[0] for call in calls].count("unregister") == 1
+
+
+def test_mooncake_shared_engine_tracks_cpu_slab_registration(monkeypatch) -> None:
+    calls = []
+
+    class _Engine:
+        @staticmethod
+        def get_rpc_port():
+            return 12345
+
+        @staticmethod
+        def get_engine():
+            return "native-engine"
+
+    global_te = SimpleNamespace(
+        get_transfer_engine=lambda *_args, **_kwargs: _Engine(),
+        adopt_registered_buffer=lambda ptr, size, register=None: (
+            calls.append(("adopt", ptr, size))
+            or (register() if register is not None else 0) == 0
+        ),
+        release_adopted_buffer=lambda ptr, size, unregister=None: (
+            calls.append(("release", ptr, size))
+            or (unregister() if unregister is not None else None)
+        ),
+    )
+    modules = {
+        "vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine": (
+            SimpleNamespace(global_te=global_te)
+        ),
+        "vllm.utils.network_utils": SimpleNamespace(get_ip=lambda: "10.0.0.1"),
+    }
+    monkeypatch.setattr(mooncake_connector, "import_module", modules.__getitem__)
+    buffer = torch.empty(16, dtype=torch.uint8)
+    connector, loop = _make_mooncake_connector(
+        monkeypatch,
+        {"mooncake_reuse_vllm_transfer_engine": True},
+        calls,
+    )
+    connector.local_cpu_backend.memory_allocator = SimpleNamespace(
+        pin_allocator=SimpleNamespace(buffer=buffer)
+    )
+    connector._register_cpu_buffer()
+    try:
+        connector._unregister_cpu_buffer()
+    finally:
+        loop.close()
+
+    assert calls[-2:] == [
+        ("release", buffer.data_ptr(), buffer.numel()),
+        ("unregister", buffer.data_ptr()),
+    ]
+
+
+def test_mooncake_close_retries_cpu_slab_after_live_transfer() -> None:
+    calls = []
+    releases = iter((RuntimeError("in use"), None))
+
+    def release(ptr, size, unregister=None):
+        calls.append(("release", ptr, size))
+        error = next(releases)
+        if error is not None:
+            raise error
+        assert unregister is not None
+        return unregister()
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector._inflight_put_tasks = set()
+    connector.registered_buffer_ptr = 0x1000
+    connector.registered_buffer_size = 0x1000
+    connector._shared_cpu_buffer_adopted = True
+    connector._shared_global_te = SimpleNamespace(
+        release_adopted_buffer=release,
+    )
+    connector._external_buffers = {}
+    connector._shared_external_buffers = {}
+    connector.store = SimpleNamespace(
+        unregister_buffer=lambda ptr: calls.append(("unregister", ptr)) or 0,
+        close=lambda: calls.append(("close",)),
+    )
+
+    with pytest.raises(RuntimeError, match="still in use"):
+        asyncio.run(connector.close())
+    assert connector.registered_buffer_ptr == 0x1000
+    assert ("close",) not in calls
+
+    asyncio.run(connector.close())
+    assert connector.registered_buffer_ptr is None
+    assert calls[-2:] == [("unregister", 0x1000), ("close",)]
+
+
+def test_mooncake_shared_cpu_adoption_failure_is_fail_closed(monkeypatch) -> None:
+    calls = []
+
+    class _Engine:
+        @staticmethod
+        def get_rpc_port():
+            return 12345
+
+        @staticmethod
+        def get_engine():
+            return "native-engine"
+
+    def reject_adoption(_ptr, _size, _register=None):
+        raise RuntimeError("foreign owner")
+
+    modules = {
+        "vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine": (
+            SimpleNamespace(global_te=SimpleNamespace(
+                get_transfer_engine=lambda *_args, **_kwargs: _Engine(),
+                adopt_registered_buffer=reject_adoption,
+            ))
+        ),
+        "vllm.utils.network_utils": SimpleNamespace(get_ip=lambda: "10.0.0.1"),
+    }
+    monkeypatch.setattr(mooncake_connector, "import_module", modules.__getitem__)
+    buffer = torch.empty(16, dtype=torch.uint8)
+    connector, loop = _make_mooncake_connector(
+        monkeypatch,
+        {"mooncake_reuse_vllm_transfer_engine": True},
+        calls,
+    )
+    connector.local_cpu_backend.memory_allocator = SimpleNamespace(
+        pin_allocator=SimpleNamespace(buffer=buffer)
+    )
+    with pytest.raises(RuntimeError, match="foreign owner"):
+        connector._register_cpu_buffer()
+    loop.close()
+
+    assert ("register", buffer.data_ptr(), buffer.numel()) not in calls
+
+
+def test_mooncake_shared_cpu_requires_adoption_api(monkeypatch) -> None:
+    calls = []
+
+    class _Engine:
+        get_rpc_port = staticmethod(lambda: 12345)
+        get_engine = staticmethod(lambda: "native-engine")
+
+    modules = {
+        "vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine": (
+            SimpleNamespace(global_te=SimpleNamespace(
+                get_transfer_engine=lambda *_args, **_kwargs: _Engine(),
+            ))
+        ),
+        "vllm.utils.network_utils": SimpleNamespace(get_ip=lambda: "10.0.0.1"),
+    }
+    monkeypatch.setattr(mooncake_connector, "import_module", modules.__getitem__)
+    connector, loop = _make_mooncake_connector(
+        monkeypatch,
+        {"mooncake_reuse_vllm_transfer_engine": True},
+        calls,
+    )
+    connector.local_cpu_backend.memory_allocator = SimpleNamespace(
+        pin_allocator=SimpleNamespace(buffer=torch.empty(16, dtype=torch.uint8))
+    )
+
+    with pytest.raises(RuntimeError, match="external registration API"):
+        connector._register_cpu_buffer()
+    loop.close()
+
+    assert not any(call[0] == "register" for call in calls)
+    assert connector.registered_buffer_ptr is None
 
 
 def test_mooncake_shared_engine_is_strictly_opt_in(monkeypatch) -> None:
