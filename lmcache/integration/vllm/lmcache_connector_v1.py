@@ -49,6 +49,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
     def supports_dsa_compact_external_load(self) -> bool:
         return self._lmcache_engine.supports_dsa_cold_compact_load()
 
+    @property
+    def supports_dsa_live_split_source(self) -> bool:
+        return self._lmcache_engine.supports_dsa_live_split()
+
     # ==============================
     # Worker-side methods
     # ==============================
