@@ -340,6 +340,7 @@ def test_p_node_save_rotates_dynamic_bank_mapping(monkeypatch) -> None:
     connector.wait_for_save()
 
     assert engine.store_kwargs[0]["deferred_layerwise_put"] is True
+    assert engine.store_kwargs[0]["layerwise_prefill_bank_count"] == 3
     assert [item["slot_mapping"].tolist() for item in received] == [
         [0, 1, 2, 3],
         [10, 11, 12, 13],

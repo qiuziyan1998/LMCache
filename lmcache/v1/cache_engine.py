@@ -4667,9 +4667,10 @@ class LMCacheEngine:
             the generator allocates the memory objects for all layers and moves
             the KV cache of the first layer from GPU to CPU. In the next
             iterations, it moves the KV cache of layer i from GPU to the memory
-            objects (on CPU) and puts the memory objects of layer i-1 to the
-            storage backends. In the last iteration, it puts the memory objects
-            of the last layer to the storage backends and yields the completed
+            objects (on CPU) and publishes any source layer that the GPU
+            connector reports as complete. A connector may delay completion
+            across multiple layers while rotating physical source banks. The
+            drain phase publishes the remaining layers and yields the completed
             store output.
         """
         store_result = LayerwiseStoreResult(

@@ -7985,6 +7985,9 @@ class LMCacheConnectorV1Impl:
                     deferred_layerwise_put=(
                         _layerwise_prefill_p_node_enabled()
                     ),
+                    layerwise_prefill_bank_count=(
+                        3 if _layerwise_prefill_p_node_enabled() else 1
+                    ),
                     req_id=request.req_id,
                     **store_kwargs,
                 )

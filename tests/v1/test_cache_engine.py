@@ -348,6 +348,100 @@ def test_deferred_layerwise_store_persists_only_after_source_done(monkeypatch):
     ]
 
 
+def test_deferred_layerwise_store_drains_multiple_rotating_banks(monkeypatch):
+    class FakeKey:
+        def split_layers(self, num_layers):
+            return [SimpleNamespace(layer_id=i) for i in range(num_layers)]
+
+    class FakeMemoryObj:
+        valid = True
+
+        @staticmethod
+        def get_size():
+            return 1
+
+        def is_valid(self):
+            return self.valid
+
+        def ref_count_down(self):
+            self.valid = False
+
+    persisted = []
+
+    class FakeStorageManager:
+        @staticmethod
+        def batched_allocate(_shape, _dtype, batch_size, **_kwargs):
+            return [FakeMemoryObj() for _ in range(batch_size)]
+
+        @staticmethod
+        def batched_put(keys, _memory_objs, location=None):
+            del location
+            persisted.append(keys[0].layer_id)
+            return []
+
+    class FakeGPUConnector:
+        @staticmethod
+        def get_shape(_num_tokens, kv_group=0):
+            del kv_group
+            return torch.Size([1])
+
+        @staticmethod
+        def batched_from_gpu(_memory_objs, _starts, _ends, **_kwargs):
+            yield None
+            for _ in range(4):
+                yield None
+            yield 0
+            yield 1
+            yield 2
+            yield 3
+
+    monkeypatch.setattr(cache_engine_module, "CacheEngineKey", FakeKey)
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.num_layers = 4
+    engine.storage_manager = FakeStorageManager()
+    engine.gpu_connector = FakeGPUConnector()
+    engine.token_database = SimpleNamespace(
+        process_tokens=lambda **_kwargs: iter([(0, 1, FakeKey())])
+    )
+    engine.stats_monitor = SimpleNamespace(
+        on_store_request=lambda _num_tokens: "monitor-id",
+        on_store_finished=lambda _monitor_id, _num_tokens: None,
+    )
+    engine.config = SimpleNamespace(
+        get_extra_config_value=lambda _name, default: default
+    )
+    engine.store_location = "LocalCPUBackend"
+    engine.kv_events_enabled = False
+    engine.is_healthy = lambda: True
+    engine.is_frozen = lambda: False
+    engine._is_passive = lambda: False
+    engine._get_req_id = lambda _kwargs: "req"
+    engine._log_kvcache_for_check = lambda **_kwargs: None
+    engine._shared_cpu_dtype_for_kv_group = lambda _group: torch.float32
+    engine._memory_format_for_kv_group = lambda _group: None
+    engine._layerwise_chunk_fully_stored = lambda *_args, **_kwargs: False
+
+    storer = engine.store_layer(
+        [1],
+        deferred_layerwise_put=True,
+        req_id="req",
+    )
+    assert next(storer) is None
+    for layer in range(4):
+        assert storer.send({"layer": layer}) is None
+
+    result = next(storer)
+    assert result is not None
+    assert result.request_id == "req"
+    assert persisted == [0, 1, 2, 3]
+
+
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
