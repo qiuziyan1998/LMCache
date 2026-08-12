@@ -8549,7 +8549,7 @@ class LMCacheConnectorV1Impl:
     # Scheduler side APIs
     ####################
 
-    def supports_dsa_cold_compact_load(self) -> bool:
+    def _supports_dsa_split_layout(self) -> bool:
         vllm_config = getattr(self, "_vllm_config", None)
         cache_config = getattr(vllm_config, "cache_config", None)
         prefix_caching = bool(
@@ -8557,11 +8557,24 @@ class LMCacheConnectorV1Impl:
         )
         return bool(
             not prefix_caching
-            and self.config.enable_dsa_cold_compact_load
             and self.config.enable_sparse_attention
             and self.config.dsa_two_groups
             and self.config.enable_shared_cpu_cache
             and self.config.use_layerwise
+        )
+
+    def supports_dsa_live_split(self) -> bool:
+        return bool(
+            self.config.get_extra_config_value(
+                "mooncake_direct_npu_prefill_store", False
+            )
+            and self._supports_dsa_split_layout()
+        )
+
+    def supports_dsa_cold_compact_load(self) -> bool:
+        return bool(
+            self.config.enable_dsa_cold_compact_load
+            and self._supports_dsa_split_layout()
         )
 
     def should_load_kv_async(self, req_id: str) -> bool:
@@ -9691,7 +9704,7 @@ class LMCacheConnectorV1Impl:
         if (
             params is not None
             and params.get("do_remote_decode")
-            and self.supports_dsa_cold_compact_load()
+            and self.supports_dsa_live_split()
         ):
             params["request_live_split"] = True
 

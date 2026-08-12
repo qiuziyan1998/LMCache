@@ -176,6 +176,32 @@ def test_dsa_cold_compact_is_disabled_with_vllm_prefix_caching() -> None:
     assert not impl.supports_dsa_cold_compact_load()
 
 
+def test_live_split_does_not_require_decoder_cold_load() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key == "mooncake_direct_npu_prefill_store"
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+    impl.use_layerwise = False
+    impl.async_loading = False
+    impl._release_request_lookup_pins = MagicMock()
+    impl._drop_worker_retrieve_state = MagicMock()
+    request = SimpleNamespace(
+        request_id="live-prefill",
+        status=adapter_module.RequestStatus.FINISHED_STOPPED,
+        kv_transfer_params={"do_remote_decode": True},
+    )
+
+    assert impl.supports_dsa_live_split()
+    assert not impl.supports_dsa_cold_compact_load()
+    impl.request_finished(request, [])
+    assert request.kv_transfer_params["request_live_split"] is True
+
+
 def test_dsa_cold_compact_alloc_metadata_has_only_indexer_slots() -> None:
     impl = _make_scheduler_impl()
     impl.config.enable_dsa_cold_compact_load = True
