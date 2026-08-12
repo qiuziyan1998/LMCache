@@ -297,6 +297,7 @@ class MooncakestoreConnector(RemoteConnector):
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
         self.registered_buffer_ptr = None
+        self.registered_buffer_size = 0
         self._external_buffers: dict[int, int] = {}
         self._external_put_lock = asyncio.Lock()
         self._inflight_put_tasks: set[asyncio.Task[Any]] = set()
@@ -549,17 +550,21 @@ class MooncakestoreConnector(RemoteConnector):
                 self.registered_buffer_ptr = buffer.data_ptr()
                 result = self.store.register_buffer(buffer.data_ptr(), buffer.numel())
                 if result == 0:
+                    self.registered_buffer_size = buffer.numel()
                     logger.info(
                         f"Registered: {hex(buffer.data_ptr())}, {buffer.numel()} bytes"
                     )
                 else:
                     logger.warning(f"Buffer registration failed: error={result}")
                     self.registered_buffer_ptr = None
+                    self.registered_buffer_size = 0
             else:
                 self.registered_buffer_ptr = None
+                self.registered_buffer_size = 0
         except Exception as e:
             logger.error(f"Buffer registration error: {e}")
             self.registered_buffer_ptr = None
+            self.registered_buffer_size = 0
 
     def _unregister_cpu_buffer(self):
         """Unregister CPU buffer."""
@@ -570,13 +575,22 @@ class MooncakestoreConnector(RemoteConnector):
             else:
                 logger.warning(f"Buffer unregistration failed: error={result}")
             self.registered_buffer_ptr = None
+            self.registered_buffer_size = 0
 
     def _register_external_owners(self, owners: tuple[Any, ...]) -> None:
         """Register tensor storages once in this Mooncake transport context."""
         active: dict[int, int] = {}
+        cpu_ptr = getattr(self, "registered_buffer_ptr", None)
+        cpu_size = int(getattr(self, "registered_buffer_size", 0))
         for owner in owners:
             storage = owner.untyped_storage()
             ptr, size = int(storage.data_ptr()), int(storage.nbytes())
+            if (
+                getattr(getattr(owner, "device", None), "type", None) == "cpu"
+                and ptr == cpu_ptr
+                and size <= cpu_size
+            ):
+                continue
             active[ptr] = size
         for ptr in self._external_buffers.keys() - active.keys():
             self.store.unregister_buffer(ptr)
@@ -723,21 +737,33 @@ class MooncakestoreConnector(RemoteConnector):
         str,
     ]:
         chunk_size = self.local_cpu_backend.metadata.chunk_size
+        base_metadata = {}
+        scaled_metadata = {}
         key_metadata = []
         for key in keys:
-            shapes, dtypes, fmt, single_token_size = self._metadata_for_raw_key(key)
             valid_tokens = mooncake_valid_tokens(key, chunk_size)
-            if valid_tokens != chunk_size:
-                shapes = [
-                    _layer_page_shape(
-                        shape,
-                        fmt,
-                        valid_tokens,
-                        full_tokens=chunk_size,
-                    )
-                    for shape in shapes
-                ]
-            key_metadata.append((shapes, dtypes, fmt, single_token_size))
+            base_key = self._raw_layout_cache_key(key)
+            metadata_key = (*base_key, valid_tokens)
+            metadata = scaled_metadata.get(metadata_key)
+            if metadata is None:
+                base = base_metadata.get(base_key)
+                if base is None:
+                    base = self._metadata_for_raw_key(key)
+                    base_metadata[base_key] = base
+                shapes, dtypes, fmt, single_token_size = base
+                if valid_tokens != chunk_size:
+                    shapes = [
+                        _layer_page_shape(
+                            shape,
+                            fmt,
+                            valid_tokens,
+                            full_tokens=chunk_size,
+                        )
+                        for shape in shapes
+                    ]
+                metadata = (shapes, dtypes, fmt, single_token_size)
+                scaled_metadata[metadata_key] = metadata
+            key_metadata.append(metadata)
         memory_objs: list[Optional[MemoryObj]] = []
         allocation_mode = "individual"
         first_shapes, first_dtypes, first_fmt, _ = key_metadata[0]
@@ -1649,6 +1675,47 @@ class MooncakestoreConnector(RemoteConnector):
                         "Direct page buffer lies outside registered storage"
                     )
 
+    @staticmethod
+    def _raw_layout_cache_key(key: CacheEngineKey) -> tuple:
+        return (
+            int(key.kv_group),
+            key.dtype,
+            key.tags,
+        )
+
+    def _external_page_key(
+        self, key: CacheEngineKey, sizes: List[int]
+    ) -> str:
+        valid_tokens = mooncake_valid_tokens(
+            key, self.local_cpu_backend.metadata.chunk_size
+        )
+        layer_key = isinstance(key, LayerCacheEngineKey)
+        cache = getattr(self, "_external_page_bytes", None)
+        if cache is None:
+            cache = self._external_page_bytes = {}
+        cache_key = (
+            *self._raw_layout_cache_key(key),
+            key.layer_id if layer_key else None,
+            valid_tokens,
+        )
+        expected = cache.get(cache_key)
+        if expected is None:
+            expected = self._metadata_for_raw_key(key)[3] * valid_tokens
+            if not layer_key:
+                expected *= self._page_num_layers
+            cache[cache_key] = expected
+        actual = sum(sizes)
+        if actual != expected:
+            raise ValueError(
+                "Direct page buffer byte count mismatch: "
+                f"key={key} expected={expected} actual={actual}"
+            )
+        return (
+            key.to_string()
+            if layer_key
+            else mooncake_page_key(key, self._page_num_layers)
+        )
+
     async def batched_put(
         self,
         keys: List[CacheEngineKey],
@@ -1691,10 +1758,8 @@ class MooncakestoreConnector(RemoteConnector):
         self._validate_external_buffer_owners(buffer_ptrs, buffer_sizes, owners)
         legacy_objects = sum(isinstance(key, LayerCacheEngineKey) for key in keys)
         page_keys = [
-            key.to_string()
-            if isinstance(key, LayerCacheEngineKey)
-            else mooncake_page_key(key, self._page_num_layers)
-            for key in keys
+            self._external_page_key(key, sizes)
+            for key, sizes in zip(keys, buffer_sizes, strict=True)
         ]
         started = cold_start_perf_now() if cold_start_perf_enabled() else None
 
@@ -1732,7 +1797,7 @@ class MooncakestoreConnector(RemoteConnector):
             except asyncio.TimeoutError:
                 logger.error(
                     "Mooncake direct page put exceeded %ss; waiting for the "
-                    "uncancellable native read before releasing NPU blocks",
+                    "uncancellable native read before releasing source buffers",
                     self.config.transfer_timeout,
                 )
                 try:
@@ -1780,6 +1845,11 @@ class MooncakestoreConnector(RemoteConnector):
                 ),
                 event_wait_ms=wait_ms,
                 transfer_ms=transfer_ms,
+                source_device=(
+                    getattr(getattr(owners[0], "device", None), "type", "unknown")
+                    if owners
+                    else "unknown"
+                ),
                 status="ok",
             )
 
@@ -1800,25 +1870,10 @@ class MooncakestoreConnector(RemoteConnector):
             raise ValueError("Direct page keys and buffers have different lengths")
         self._validate_external_buffer_owners(buffer_ptrs, buffer_sizes, owners)
 
-        page_keys: list[str] = []
-        for key, sizes in zip(keys, buffer_sizes, strict=True):
-            valid_tokens = mooncake_valid_tokens(
-                key, self.local_cpu_backend.metadata.chunk_size
-            )
-            expected = self._metadata_for_raw_key(key)[3] * valid_tokens
-            if not isinstance(key, LayerCacheEngineKey):
-                expected *= self._page_num_layers
-            actual = sum(sizes)
-            if actual != expected:
-                raise ValueError(
-                    "Direct page destination byte count mismatch: "
-                    f"key={key} expected={expected} actual={actual}"
-                )
-            page_keys.append(
-                key.to_string()
-                if isinstance(key, LayerCacheEngineKey)
-                else mooncake_page_key(key, self._page_num_layers)
-            )
+        page_keys = [
+            self._external_page_key(key, sizes)
+            for key, sizes in zip(keys, buffer_sizes, strict=True)
+        ]
 
         started = cold_start_perf_now() if cold_start_perf_enabled() else None
 

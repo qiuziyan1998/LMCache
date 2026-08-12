@@ -1361,8 +1361,7 @@ class LMCacheEngine:
         """Return the backend location only when all layers already exist."""
         assert self.storage_manager is not None
         if (
-            end - start == self.config.chunk_size
-            and keys_multi_layer
+            keys_multi_layer
             and isinstance(keys_multi_layer[0], LayerCacheEngineKey)
             and mooncake_layer_pages_enabled(self.config)
         ):
@@ -2723,10 +2722,12 @@ class LMCacheEngine:
                 )
                 if local_chunks == len(keys_by_chunk):
                     return ["LocalCPUBackend"] * local_chunks
-                # A legacy per-layer suffix still needs the general planner.
+                # Only a complete legacy chunk should suppress its page probe.
                 first_miss = keys_by_chunk[local_chunks]
                 legacy_keys = first_miss if isinstance(first_miss, list) else []
-                if not any(key in hot_cache for key in legacy_keys):
+                if not legacy_keys or not all(
+                    key in hot_cache for key in legacy_keys
+                ):
                     page_keys = base_keys[local_chunks:]
             if not page_keys:
                 missed_layers: set[int] = set()
@@ -3173,7 +3174,7 @@ class LMCacheEngine:
                 if local_count < page_chunks
                 else []
             )
-            legacy_suffix = local_count < page_chunks and local.contains_any_exact(
+            legacy_suffix = local_count < page_chunks and local.contains_all_exact(
                 legacy_probe
             )
             if legacy_suffix:
@@ -5750,9 +5751,12 @@ class LMCacheEngine:
             f"Trying to send {len(memory_objs)} memory objects to {new_position}"
         )
 
-        # TODO: reduce loops
-        token_dim = memory_objs[0].meta.fmt.token_dim()  # type: ignore
-        offsets = [m.meta.shape[token_dim] for m in memory_objs]  # type: ignore
+        offsets = [
+            int(memory_obj.meta.valid_tokens)
+            if memory_obj.meta.valid_tokens is not None
+            else memory_obj.meta.shape[memory_obj.meta.fmt.token_dim()]
+            for memory_obj in memory_objs
+        ]
 
         transfer_spec = {
             "target_peer_init_url": new_position[0],

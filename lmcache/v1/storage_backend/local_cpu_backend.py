@@ -2,7 +2,16 @@
 # Standard
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Union,
+)
 import threading
 import time
 
@@ -17,12 +26,12 @@ from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_ann
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
+    LayerPageMemoryObj,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
     MixedMemoryAllocator,
     PagedCpuGpuMemoryAllocator,
-    LayerPageMemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import mooncake_layer_pages_enabled
@@ -332,6 +341,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
         """Return whether any key exists without resolving page aliases."""
         with self.cpu_lock:
             return any(key in self.hot_cache for key in keys)
+
+    def contains_all_exact(self, keys: Iterable[CacheEngineKey]) -> bool:
+        """Return whether every exact key exists under one cache lock."""
+        with self.cpu_lock:
+            return all(key in self.hot_cache for key in keys)
 
     def get_blocking(
         self,
@@ -951,6 +965,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         busy_loop: bool = True,
         valid_tokens: Optional[Union[int, list[int]]] = None,
         full_tokens: Optional[int] = None,
+        eviction: bool = True,
     ) -> Optional[list[LayerPageMemoryObj]]:
         """Allocate exact-size layer pages, evicting entries when required."""
         allocate = getattr(
@@ -964,6 +979,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             valid_tokens,
             full_tokens,
         )
+        if pages is None and not eviction:
+            return None
         evicted = 0
         deadline = time.monotonic() + float(
             getattr(self.config, "blocking_timeout_secs", 60)

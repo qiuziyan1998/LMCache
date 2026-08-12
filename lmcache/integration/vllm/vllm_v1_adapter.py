@@ -7791,6 +7791,10 @@ class LMCacheConnectorV1Impl:
             store_kwargs,
             _,
         ) = store_inputs
+        # All latent layers are complete once the final indexer callback
+        # reaches this flush. Ascend can therefore use its existing all-layer
+        # transfer without reintroducing latent/indexer stream interleaving.
+        store_kwargs["all_layers_ready"] = True
 
         storer = self.lmcache_engine.store_layer(
             token_ids,

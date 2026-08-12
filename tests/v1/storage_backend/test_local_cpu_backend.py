@@ -125,6 +125,26 @@ class TestLocalCPUBackend:
         LMCStatsMonitor.DestroyInstance()
         PinMonitor.DestroyInstance()
 
+    def test_layer_page_allocation_can_skip_eviction(self):
+        backend = object.__new__(LocalCPUBackend)
+        backend.memory_allocator = Mock()
+        backend.memory_allocator.batched_allocate_layer_pages.return_value = None
+        backend.use_hot = True
+
+        assert (
+            backend.batched_allocate_layer_pages(
+                [torch.Size([8])],
+                [torch.float16],
+                batch_size=1,
+                num_layers=2,
+                fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+                valid_tokens=8,
+                full_tokens=8,
+                eviction=False,
+            )
+            is None
+        )
+
     def test_layer_page_uses_explicit_page_key(self):
         config = create_test_config(use_layerwise=True)
         config.enable_shared_cpu_cache = True
@@ -145,6 +165,8 @@ class TestLocalCPUBackend:
             batch_size=1,
             num_layers=4,
             fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+            valid_tokens=8,
+            full_tokens=8,
         )
         assert pages is not None
         key = LayerCacheEngineKey(

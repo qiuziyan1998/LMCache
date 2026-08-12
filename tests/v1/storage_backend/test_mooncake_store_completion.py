@@ -266,6 +266,10 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
     connector.store = _Store()
     connector.replica_config = object()
     connector.config = SimpleNamespace(transfer_timeout=5)
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (None, None, None, 1)
     owner = torch.empty(16, dtype=torch.uint8)
     event = _Event()
 
@@ -282,14 +286,14 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
 
     assert event.waited
     put = next(call for call in calls if call[0] == "put")
-    assert put[1] == ["__lmcache_page_v1__@2@test@1@0@7@float16@0"]
+    assert put[1] == [mooncake_page_key(_key(7), 2)]
     assert put[2:] == ([[owner.data_ptr()]], [[owner.numel()]])
     layer_key = _key(8).get_layer(1)
     asyncio.run(
         connector.batched_put_external_pages(
             [layer_key],
             [[owner.data_ptr()]],
-            [[owner.numel()]],
+            [[8]],
             (owner,),
             event,
             "request",
@@ -298,9 +302,20 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
     assert [call for call in calls if call[0] == "put"][-1][1] == [
         layer_key.to_string()
     ]
+    with pytest.raises(ValueError, match="byte count mismatch"):
+        asyncio.run(
+            connector.batched_put_external_pages(
+                [_key(9)],
+                [[owner.data_ptr()]],
+                [[owner.numel() - 1]],
+                (owner,),
+                event,
+                "request",
+            )
+        )
     assert connector.batched_external_pages_exist([_key(7)]) == [True]
     exists = next(call for call in calls if call[0] == "exists")
-    assert exists[1] == ["__lmcache_page_v1__@2@test@1@0@7@float16@0"]
+    assert exists[1] == [mooncake_page_key(_key(7), 2)]
 
 
 def test_instrumented_connector_delegates_direct_pages() -> None:
@@ -338,6 +353,7 @@ def test_mooncake_zero_copy_metadata_reuses_homogeneous_group() -> None:
 
     metadata = Mock(side_effect=metadata_for_key)
     backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=4),
         batched_allocate=Mock(
             side_effect=lambda *args, batch_size, **kwargs: [
                 _MemoryObj() for _ in range(batch_size)
@@ -365,7 +381,7 @@ def test_mooncake_zero_copy_metadata_reuses_homogeneous_group() -> None:
     keys[1].kv_group = 1
     _, key_metadata, mode = connector._allocate_zero_copy_buffers(keys)
 
-    assert metadata.call_count == len(keys)
+    assert metadata.call_count == 2
     assert backend.batched_allocate.call_count == 0
     assert backend.allocate.call_count == len(keys)
     assert [value[2] for value in key_metadata] == [
@@ -526,6 +542,25 @@ def test_mooncake_direct_external_get_registers_storage_and_validates_bytes() ->
     assert [call[0] for call in calls].count("get") == 2
 
 
+def test_external_page_reuses_registered_cpu_allocator_storage() -> None:
+    calls = []
+    owner = torch.empty(64, dtype=torch.uint8)
+    storage = owner.untyped_storage()
+    connector = object.__new__(MooncakestoreConnector)
+    connector.registered_buffer_ptr = storage.data_ptr()
+    connector.registered_buffer_size = storage.nbytes()
+    connector._external_buffers = {}
+    connector.store = SimpleNamespace(
+        register_buffer=lambda ptr, size: calls.append(("register", ptr, size)),
+        unregister_buffer=lambda ptr: calls.append(("unregister", ptr)),
+    )
+
+    connector._register_external_owners((owner[8:16],))
+
+    assert calls == []
+    assert connector._external_buffers == {}
+
+
 @pytest.mark.parametrize("pointer,size", ((99, 1), (119, 2)))
 def test_direct_external_buffer_validation_rejects_partial_owner_overlap(
     pointer, size
@@ -556,6 +591,23 @@ def test_direct_external_buffer_validation_rejects_partial_owner_overlap(
         MooncakestoreConnector._validate_external_buffer_owners(
             [[pointer]], [[size]], owners
         )
+
+
+def test_external_page_size_cache_preserves_legacy_layer_layouts() -> None:
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_num_layers = 2
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (
+        None,
+        None,
+        None,
+        2 + key.layer_id,
+    )
+
+    connector._external_page_key(_layer_key(1, 0), [16])
+    connector._external_page_key(_layer_key(1, 1), [24])
 
 
 @pytest.mark.parametrize("statuses", ([], [31]))
@@ -648,6 +700,7 @@ def test_remote_direct_get_timeout_drains_before_next_registration() -> None:
     try:
         first.start()
         assert first_started.wait(timeout=1)
+        backend.config.blocking_timeout_secs = 1
         second.start()
         second.join(timeout=0.05)
         assert second.is_alive()
@@ -692,8 +745,8 @@ def test_mooncake_layer_page_get_allocates_exact_full_and_tail_pages(
             self.submitted = None
             self.metadata = SimpleNamespace(chunk_size=8)
 
-        def batched_allocate_layer_pages(self, *args):
-            return self.allocator.batched_allocate_layer_pages(*args)
+        def batched_allocate_layer_pages(self, *args, **kwargs):
+            return self.allocator.batched_allocate_layer_pages(*args, **kwargs)
 
         def batched_submit_layer_pages(self, keys, pages):
             self.submitted = (keys, pages)
@@ -830,6 +883,10 @@ def test_partial_page_lookup_falls_back_to_legacy_layer_keys() -> None:
     class _Store:
         seen = []
 
+        @staticmethod
+        def is_exist(key):
+            return int(key.startswith("__lmcache_page_v1__"))
+
         @classmethod
         def batch_is_exist(cls, keys):
             cls.seen.append(keys)
@@ -877,7 +934,7 @@ def test_mooncake_page_put_merges_exact_partial_tail(
 
         def batch_put_from_multi_buffers(self, *args):
             self.page_args = args
-            return [0]
+            return [0] * len(args[0])
 
         def batch_put_from(self, *args):
             self.legacy_args = args
@@ -967,6 +1024,8 @@ def test_mooncake_page_put_selects_each_layer_buffer() -> None:
         batch_size=1,
         num_layers=2,
         fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=[4],
+        full_tokens=4,
     )
     assert pages is not None
     page = pages[0]

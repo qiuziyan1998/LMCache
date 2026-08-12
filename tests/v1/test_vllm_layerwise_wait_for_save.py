@@ -807,9 +807,11 @@ def test_deferred_latent_flush_drains_full_store_layer() -> None:
     connector._refresh_kvcaches_list = lambda: None
     engine.num_layers = 4
     engine.store_steps["req-1"] = 0
+    store_kwargs = []
 
     def _finite_store_layer(_token_ids, **kwargs):
         engine.store_calls.append(kwargs["req_id"])
+        store_kwargs.append(kwargs)
 
         def _storer():
             for _ in range(engine.num_layers + 1):
@@ -824,6 +826,7 @@ def test_deferred_latent_flush_drains_full_store_layer() -> None:
 
     assert engine.store_calls == ["req-1"]
     assert engine.store_steps["req-1"] == engine.num_layers + 1
+    assert store_kwargs[0]["all_layers_ready"] is True
     assert not connector._deferred_latent_pending
 
 

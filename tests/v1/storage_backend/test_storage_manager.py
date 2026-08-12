@@ -21,15 +21,23 @@ Key scenarios tested:
 
 # Standard
 import asyncio
+import threading
+from collections import OrderedDict
+from concurrent.futures import Future
+from types import SimpleNamespace
 
 # Third Party
 import pytest
 import torch
 
 # First Party
+from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventType
+from lmcache.v1.memory_management import MemoryFormat, TensorMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 
 
@@ -57,6 +65,240 @@ class MockAsyncLookupServer:
 
     def send_response_to_scheduler(self, lookup_id: str, retrieved_length: int):
         self.responses.append((lookup_id, retrieved_length))
+
+
+@pytest.mark.parametrize(
+    "fmt,shape,kv_group",
+    (
+        (MemoryFormat.KV_MLA_LATENT_FMT, torch.Size([16]), 0),
+        (MemoryFormat.KV_DSA_INDEX_FMT, torch.Size([8]), 1),
+    ),
+)
+def test_batched_put_layer_pages_uses_one_local_and_remote_page(
+    monkeypatch, fmt, shape, kv_group
+):
+    allocator = TensorMemoryAllocator(torch.zeros(16384, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        shape,
+        torch.float16,
+        batch_size=2,
+        num_layers=3,
+        fmt=fmt,
+        valid_tokens=[8, 3],
+        full_tokens=8,
+    )
+    assert pages is not None
+    assert pages[0].layer_tensor(0).numel() == shape.numel()
+    assert pages[1].layer_tensor(0).numel() == shape.numel() * 3 // 8
+    keys = [
+        CacheEngineKey("model", 1, 0, 0, torch.float16, kv_group=kv_group),
+        CacheEngineKey(
+            "model",
+            1,
+            0,
+            1,
+            torch.float16,
+            {"lmcache.tag.internal.valid_tokens": 3},
+            kv_group=kv_group,
+        ),
+    ]
+    local = object.__new__(LocalCPUBackend)
+    remote = object.__new__(RemoteBackend)
+    local.use_hot = True
+    remote.connection = SimpleNamespace(batched_put_external_pages=lambda: None)
+    local_calls = []
+    remote_calls = []
+    remote_futures = []
+
+    def submit_local(page_keys, submitted_pages):
+        local_calls.append((list(page_keys), list(submitted_pages)))
+        for page in submitted_pages:
+            page.ref_count_up()
+
+    def submit_remote(page_keys, ptrs, sizes, owners, ready_event, req_id):
+        remote_calls.append(
+            (list(page_keys), ptrs, sizes, owners, ready_event, req_id)
+        )
+        future = Future()
+        remote_futures.append(future)
+        return future
+
+    monkeypatch.setattr(local, "batched_submit_layer_pages", submit_local)
+    monkeypatch.setattr(remote, "batched_submit_external_pages", submit_remote)
+    manager = object.__new__(StorageManager)
+    manager.storage_backends = OrderedDict(
+        (("LocalCPUBackend", local), ("RemoteBackend", remote))
+    )
+    manager.config = SimpleNamespace(chunk_size=8)
+    manager._bypassed_backends = set()
+    manager._bypass_lock = threading.Lock()
+    manager._freeze = False
+    manager._freeze_lock = threading.Lock()
+
+    futures = manager.batched_put_layer_pages(keys, pages, req_id="request")
+
+    assert len(futures) == 1
+    remote_keys, ptrs, sizes, owners, ready_event, req_id = remote_calls[0]
+    assert remote_keys == keys
+    assert ptrs == [
+        [page.layer_data_ptr(layer) for layer in range(3)] for page in pages
+    ]
+    assert sizes == [[page.layer_size] * 3 for page in pages]
+    assert len(owners) == 1
+    assert ready_event is None
+    assert req_id == "request"
+    assert all(page.get_ref_count() == 1 for page in pages)
+    assert local_calls == []
+    remote_futures[0].set_result(None)
+    assert local_calls == [(keys, pages)]
+    assert futures[0].result() is None
+    assert all(page.get_ref_count() == 1 for page in pages)
+
+
+def test_batched_put_layer_pages_preserves_caller_refs_on_remote_error(monkeypatch):
+    allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=1,
+        num_layers=2,
+        fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+        valid_tokens=2,
+        full_tokens=2,
+    )
+    assert pages is not None
+    key = CacheEngineKey("model", 1, 0, 0, torch.float16, kv_group=1)
+    local = object.__new__(LocalCPUBackend)
+    remote = object.__new__(RemoteBackend)
+    local.use_hot = True
+    remote.connection = SimpleNamespace(batched_put_external_pages=lambda: None)
+
+    def submit_local(submitted_keys, held):
+        for page in held:
+            page.ref_count_up()
+
+    def fail_remote(*_args):
+        raise RuntimeError("remote failed")
+
+    monkeypatch.setattr(
+        local,
+        "batched_submit_layer_pages",
+        submit_local,
+    )
+    monkeypatch.setattr(
+        remote,
+        "batched_submit_external_pages",
+        fail_remote,
+    )
+    manager = object.__new__(StorageManager)
+    manager.storage_backends = OrderedDict(
+        (("LocalCPUBackend", local), ("RemoteBackend", remote))
+    )
+    manager.config = SimpleNamespace(chunk_size=2)
+    manager._bypassed_backends = set()
+    manager._bypass_lock = threading.Lock()
+    manager._freeze = False
+    manager._freeze_lock = threading.Lock()
+
+    with pytest.raises(RuntimeError, match="remote failed"):
+        manager.batched_put_layer_pages([key], pages)
+
+    # The failed durable write never becomes visible in LocalCPU.
+    assert pages[0].get_ref_count() == 1
+    pages[0].ref_count_down()
+    assert pages[0].get_ref_count() == 0
+
+
+def test_batched_put_layer_pages_hides_async_remote_failure(monkeypatch):
+    allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=1,
+        num_layers=2,
+        fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+        valid_tokens=2,
+        full_tokens=2,
+    )
+    assert pages is not None
+    key = CacheEngineKey("model", 1, 0, 0, torch.float16, kv_group=1)
+    local = object.__new__(LocalCPUBackend)
+    remote = object.__new__(RemoteBackend)
+    local.use_hot = True
+    remote.connection = SimpleNamespace(batched_put_external_pages=lambda: None)
+    local_calls = []
+
+    def submit_local(submitted_keys, held):
+        local_calls.append((list(submitted_keys), list(held)))
+        held[0].ref_count_up()
+
+    future = Future()
+    monkeypatch.setattr(local, "batched_submit_layer_pages", submit_local)
+    monkeypatch.setattr(
+        remote, "batched_submit_external_pages", lambda *_args: future
+    )
+    manager = object.__new__(StorageManager)
+    manager.storage_backends = OrderedDict(
+        (("LocalCPUBackend", local), ("RemoteBackend", remote))
+    )
+    manager.config = SimpleNamespace(chunk_size=2)
+    manager._bypassed_backends = set()
+    manager._bypass_lock = threading.Lock()
+    manager._freeze = False
+    manager._freeze_lock = threading.Lock()
+
+    completions = manager.batched_put_layer_pages([key], pages)
+    assert len(completions) == 1 and not completions[0].done()
+    assert local_calls == []
+    future.set_exception(RuntimeError("remote failed"))
+
+    with pytest.raises(RuntimeError, match="remote failed"):
+        completions[0].result()
+    assert local_calls == []
+    assert pages[0].get_ref_count() == 0
+
+
+@pytest.mark.parametrize("local_keys", ({"a", "b"}, {"a"}))
+def test_layerwise_remote_hint_prefers_only_complete_local_hit(
+    monkeypatch, local_keys
+):
+    calls = []
+
+    async def done():
+        return []
+
+    def get(name):
+        calls.append(name)
+        return done()
+
+    local = SimpleNamespace(
+        contains_all_exact=lambda keys: all(key in local_keys for key in keys),
+        batched_get_non_blocking=lambda *_args: get("local"),
+    )
+    remote = SimpleNamespace(
+        batched_get_non_blocking=lambda *_args: get("remote")
+    )
+    manager = object.__new__(StorageManager)
+    manager.storage_backends = {
+        "LocalCPUBackend": local,
+        "RemoteBackend": remote,
+    }
+    manager.loop = object()
+    manager._layerwise_get_prefers_blocking = lambda *_args: False
+
+    def submit(coro, _loop):
+        coro.close()
+        return Future()
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+
+    next(
+        manager.layerwise_batched_get(
+            [["a", "b"]], location="RemoteBackend"
+        )
+    )
+
+    assert calls == ["local" if len(local_keys) == 2 else "remote"]
 
 
 @pytest.fixture
