@@ -5334,6 +5334,7 @@ class TestWorkerRetrieveState:
         request = SimpleNamespace(
             req_id="req-live",
             live_split_requested=True,
+            live_split_compact=True,
             live_split_remote_block_ids=[1],
             load_spec=SimpleNamespace(
                 dsa_cold_load_generation=1,
@@ -5349,6 +5350,24 @@ class TestWorkerRetrieveState:
         entry = impl._dsa_live_split_pending["req-live"]
         assert entry["latent_gate"].done()
         executor.submit.assert_called_once()
+
+    def test_live_split_without_compact_capability_uses_persistent_path(self):
+        impl = _make_impl()
+        impl._dsa_live_split_pending = {}
+        impl._dsa_cold_load_futures = {}
+        impl.lmcache_engine = SimpleNamespace(
+            _prepare_live_split_import=MagicMock()
+        )
+        request = SimpleNamespace(
+            req_id="req-live",
+            live_split_requested=True,
+            live_split_compact=False,
+            live_split_remote_block_ids=[1],
+        )
+
+        assert not impl._try_prepare_dsa_live_split(request)
+        assert impl._dsa_live_split_pending == {}
+        impl.lmcache_engine._prepare_live_split_import.assert_not_called()
         assert executor.submit.call_args.args[-1] is None
         impl.lmcache_engine._prepare_live_split_import.assert_not_called()
 
@@ -5684,6 +5703,7 @@ class TestWorkerRetrieveState:
         request = SimpleNamespace(
             req_id="req-live",
             live_split_requested=live_requested,
+            live_split_compact=True,
             live_split_remote_block_ids=[1],
         )
 

@@ -875,6 +875,7 @@ class ReqMeta:
     live_source_indexer_slot_mapping: list[torch.Tensor] = field(
         default_factory=list
     )
+    live_split_compact: bool = False
 
     def retrieve_token_count(self) -> int:
         """Return the logical retrieve prefix represented by this metadata."""
@@ -5751,6 +5752,8 @@ class LMCacheConnectorV1Impl:
             )
         if not getattr(request, "live_split_requested", False):
             return False
+        if not getattr(request, "live_split_compact", False):
+            return False
         remote_block_ids = getattr(request, "live_split_remote_block_ids", None)
         prepare = getattr(self.lmcache_engine, "_prepare_live_split_import", None)
         if not remote_block_ids or not callable(prepare):
@@ -8910,6 +8913,9 @@ class LMCacheConnectorV1Impl:
             if remote_block_ids:
                 req_meta.live_split_requested = True
                 req_meta.live_split_remote_block_ids = list(remote_block_ids)
+                req_meta.live_split_compact = (
+                    "ascend_live_split_compact_v1" in capabilities
+                )
         return req_meta
 
     @_lmcache_nvtx_annotate
