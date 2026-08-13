@@ -5651,17 +5651,26 @@ class LMCacheConnectorV1Impl:
                 shared_cpu_request_ordinal=0,
             )
 
+            sync_started = cold_start_perf_now()
             try:
-                latent_result = next(latent_retriever)
-                next(indexer_retriever)
-                next(indexer_retriever)
-                indexer_result = None
-                for _ in range(self.num_layers):
-                    latent_result = latent_retriever.send(None)
-                    indexer_result = next(indexer_retriever)
+                try:
+                    latent_result = next(latent_retriever)
+                    next(indexer_retriever)
+                    next(indexer_retriever)
+                    indexer_result = None
+                    for _ in range(self.num_layers):
+                        latent_result = latent_retriever.send(None)
+                        indexer_result = next(indexer_retriever)
+                finally:
+                    # Shared passive retrievers own the CPU MemoryObjs backing
+                    # the device pointers consumed by the asynchronous dense
+                    # copy kernels. Keep them alive until every submitted copy
+                    # has completed, including when retrieval exits early.
+                    self._synchronize_dsa_cold_dense_load()
             finally:
                 latent_retriever.close()
                 indexer_retriever.close()
+            sync_ms = (cold_start_perf_now() - sync_started) * 1000
 
             if (
                 latent_result is None
@@ -5673,10 +5682,6 @@ class LMCacheConnectorV1Impl:
                 or int(indexer_result.sum().item()) != token_count
             ):
                 raise RuntimeError("Cold compact indexer retrieve was incomplete")
-
-            sync_started = cold_start_perf_now()
-            self._synchronize_dsa_cold_dense_load()
-            sync_ms = (cold_start_perf_now() - sync_started) * 1000
 
             seal_started = cold_start_perf_now()
             state.indexer_npu_resident = True
