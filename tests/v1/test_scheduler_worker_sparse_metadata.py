@@ -345,11 +345,55 @@ def test_dsa_cold_compact_worker_syncs_before_retrievers_release_sources(
     state = impl._run_dsa_cold_compact_load(request, None)
 
     assert state.req_id == request.req_id
-    assert events.count("sync") == 1
-    assert events.index("sync") < events.index("latent:close")
-    assert events.index("sync") < events.index("indexer:close")
+    assert events == [
+        "latent:next",
+        "indexer:next",
+        "indexer:next",
+        "latent:send",
+        "sync",
+        "indexer:next",
+        "latent:close",
+        "indexer:close",
+    ]
     impl._release_unadopted_shared_request_objects.assert_not_called()
     impl._release_shared_worker_retrieve_state.assert_not_called()
+
+
+def test_dsa_cold_collective_fence_waits_in_submission_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    first = MagicMock()
+    first.done.return_value = False
+    first.result.side_effect = lambda: events.append("first")
+    second = MagicMock()
+    second.done.return_value = True
+    second.result.side_effect = lambda: events.append("second")
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    impl._dsa_cold_load_futures = {
+        "first": (1, first, object(), set(), 0.0),
+        "second": (1, second, object(), set(), 0.0),
+    }
+    perf_events = []
+    perf_times = iter((10.0, 10.25))
+    monkeypatch.setattr(
+        adapter_module, "cold_start_perf_now", lambda: next(perf_times)
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "cold_start_perf_log",
+        lambda _logger, event, **fields: perf_events.append((event, fields)),
+    )
+
+    impl._wait_for_dsa_cold_collectives_before_foreground()
+
+    assert events == ["first", "second"]
+    assert perf_events == [
+        (
+            "cold_compact_collective_fence",
+            {"started": 10.0, "requests": 2, "pending": 1, "wait_ms": 250.0},
+        )
+    ]
 
 
 def test_dsa_cold_compact_finished_signal_waits_for_future(

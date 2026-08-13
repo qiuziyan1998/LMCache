@@ -5535,6 +5535,25 @@ class LMCacheConnectorV1Impl:
             raise RuntimeError("NPU connector has no dense load-stream sync API")
         synchronize()
 
+    def _wait_for_dsa_cold_collectives_before_foreground(self) -> None:
+        """Keep background and foreground shared collectives in FIFO order."""
+        futures = getattr(self, "_dsa_cold_load_futures", None)
+        if not futures:
+            return
+        pending = sum(not entry[1].done() for entry in futures.values())
+        started = cold_start_perf_now()
+        for entry in list(futures.values()):
+            entry[1].result()
+        if pending:
+            cold_start_perf_log(
+                logger,
+                "cold_compact_collective_fence",
+                started=started,
+                requests=len(futures),
+                pending=pending,
+                wait_ms=round((cold_start_perf_now() - started) * 1000, 3),
+            )
+
     def _submit_dsa_cold_compact_load(self, request: ReqMeta) -> None:
         futures = getattr(self, "_dsa_cold_load_futures", None)
         if futures is None:
@@ -5658,15 +5677,19 @@ class LMCacheConnectorV1Impl:
                     next(indexer_retriever)
                     next(indexer_retriever)
                     indexer_result = None
-                    for _ in range(self.num_layers):
+                    for layer_id in range(self.num_layers):
                         latent_result = latent_retriever.send(None)
-                        indexer_result = next(indexer_retriever)
-                finally:
-                    # Shared passive retrievers own the CPU MemoryObjs backing
-                    # the device pointers consumed by the asynchronous dense
-                    # copy kernels. Keep them alive until every submitted copy
-                    # has completed, including when retrieval exits early.
+                        if layer_id + 1 < self.num_layers:
+                            next(indexer_retriever)
+                except BaseException:
                     self._synchronize_dsa_cold_dense_load()
+                    raise
+                # The dense indexer retriever is now suspended at its final
+                # pre-result yield. Advancing it again releases the shared CPU
+                # MemoryObjs, so fence all submitted copies first. The latent
+                # retriever has also consumed its compact commit sentinel here.
+                self._synchronize_dsa_cold_dense_load()
+                indexer_result = next(indexer_retriever)
             finally:
                 latent_retriever.close()
                 indexer_retriever.close()
@@ -5810,6 +5833,14 @@ class LMCacheConnectorV1Impl:
             loadable_requests.append((idx, request))
             if self.use_layerwise and not request.is_sparse_decode:
                 staged_load_count += 1
+
+        if loadable_requests and bool(
+            getattr(self.lmcache_engine, "enable_shared_cpu_cache", False)
+        ):
+            # Background cold compact and foreground dense/sparse retrieves
+            # share one ordered broadcast channel. A foreground receive must
+            # never overtake a cold compact envelope or its final sentinel.
+            self._wait_for_dsa_cold_collectives_before_foreground()
 
         self._prune_worker_retrieve_state(active_req_ids, resumed_req_ids)
 
