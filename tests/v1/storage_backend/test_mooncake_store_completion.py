@@ -813,6 +813,61 @@ def test_mooncake_page_get_scatter_returns_layer_objects() -> None:
     assert [memory_obj.ref_count for memory_obj in allocated] == [1, 1, 0, 0]
 
 
+@pytest.mark.parametrize("layout", ("page", "legacy"))
+def test_mooncake_cancelled_get_drains_native_read(layout: str) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    memory_obj = _MemoryObj()
+    native_validity = []
+
+    class _BlockingStore:
+        def batch_get_into_multi_buffers(self, *_args):
+            entered.set()
+            native_validity.append(memory_obj.is_valid())
+            assert release.wait(5)
+            native_validity.append(memory_obj.is_valid())
+            return [memory_obj.get_size()]
+
+        def batch_get_into(self, *_args):
+            entered.set()
+            native_validity.append(memory_obj.is_valid())
+            assert release.wait(5)
+            native_validity.append(memory_obj.is_valid())
+            return [memory_obj.get_size()]
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.store = _BlockingStore()
+    connector._allocate_zero_copy_buffers = lambda _keys: (
+        [memory_obj],
+        [([torch.Size([8])], [torch.float16], MemoryFormat.KV_MLA_LATENT_FMT, 2)],
+        "individual",
+    )
+    connector.meta_shapes = [torch.Size([8])]
+    connector.meta_dtypes = [torch.float16]
+    connector.meta_fmt = MemoryFormat.KV_MLA_LATENT_FMT
+
+    async def cancel_get() -> None:
+        if layout == "page":
+            get = connector._batch_get_pages([_key(1)], [("page-1", [0])])
+        else:
+            get = connector._batch_get_into_legacy([_key(1)])
+        task = asyncio.create_task(get)
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert memory_obj.is_valid()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_get())
+
+    assert native_validity == [True, True]
+    assert memory_obj.ref_count == 0
+
+
 def test_mooncake_direct_external_get_registers_storage_and_validates_bytes() -> None:
     calls = []
 

@@ -6,7 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 import inspect
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 # Third Party
 import pytest
@@ -1326,15 +1326,18 @@ class TestWorkerRetrieveState:
     def test_get_finished_releases_worker_state_after_save(self):
         impl = _make_impl()
         impl._wait_for_save_done = True
-        impl._release_finished_worker_requests = MagicMock()
+        impl._finalize_worker_requests_after_store = MagicMock(return_value=set())
 
         assert impl.get_finished(set()) == (None, None)
-        impl._release_finished_worker_requests.assert_not_called()
+        impl._finalize_worker_requests_after_store.assert_called_once_with(set())
 
         result = impl.get_finished({"req-1"})
 
         assert result == (None, None)
-        impl._release_finished_worker_requests.assert_called_once_with({"req-1"})
+        assert impl._finalize_worker_requests_after_store.call_args_list == [
+            call(set()),
+            call({"req-1"}),
+        ]
 
     def test_get_finished_defers_cleanup_until_wait_for_save(self):
         request = SimpleNamespace(

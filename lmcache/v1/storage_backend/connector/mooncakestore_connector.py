@@ -41,6 +41,19 @@ from lmcache.v1.system_detection import NUMADetector
 logger = init_logger(__name__)
 
 
+async def _drain_native_read(task: asyncio.Task[Any]) -> None:
+    """Keep native destination buffers alive through coroutine cancellation."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+    if not task.cancelled():
+        task.exception()
+
+
 def _shared_vllm_mooncake_transport() -> tuple[Any, str, Any]:
     """Borrow vLLM-Ascend's process-wide Mooncake engine and registry."""
     global_te = import_module(
@@ -1127,12 +1140,15 @@ class MooncakestoreConnector(RemoteConnector):
             if not submitted_groups:
                 return results
             transfer_started = cold_start_perf_now() if perf_enabled else 0.0
-            statuses = await asyncio.to_thread(
-                self.store.batch_get_into_multi_buffers,
-                [page_key for page_key, _, _ in submitted_groups],
-                all_buffer_ptrs,
-                all_buffer_sizes,
+            native_read = asyncio.create_task(
+                asyncio.to_thread(
+                    self.store.batch_get_into_multi_buffers,
+                    [page_key for page_key, _, _ in submitted_groups],
+                    all_buffer_ptrs,
+                    all_buffer_sizes,
+                )
             )
+            statuses = await asyncio.shield(native_read)
             transfer_ms = (
                 (cold_start_perf_now() - transfer_started) * 1000
                 if perf_enabled
@@ -1172,6 +1188,10 @@ class MooncakestoreConnector(RemoteConnector):
                     memory_objs[position] = None
 
             return results
+        except asyncio.CancelledError:
+            result_status = "cancelled"
+            await _drain_native_read(native_read)
+            raise
         except Exception as exc:
             result_status = "error"
             logger.error("Mooncake page-first get failed: %s", exc)
@@ -1510,9 +1530,15 @@ class MooncakestoreConnector(RemoteConnector):
             # Single RPC call for multiple chunks
             logger.debug(f"Calling batch_get_into with {len(key_strs)} keys")
             transfer_started = cold_start_perf_now() if perf_enabled else 0.0
-            bytes_read_list = await asyncio.to_thread(
-                self.store.batch_get_into, key_strs, buffer_ptrs, buffer_sizes
+            native_read = asyncio.create_task(
+                asyncio.to_thread(
+                    self.store.batch_get_into,
+                    key_strs,
+                    buffer_ptrs,
+                    buffer_sizes,
+                )
             )
+            bytes_read_list = await asyncio.shield(native_read)
             transfer_ms = (
                 (cold_start_perf_now() - transfer_started) * 1000
                 if perf_enabled
@@ -1574,6 +1600,12 @@ class MooncakestoreConnector(RemoteConnector):
                 )
             return results
 
+        except asyncio.CancelledError:
+            await _drain_native_read(native_read)
+            for i in valid_idx:
+                if memory_objs[i] is not None:
+                    memory_objs[i].ref_count_down()
+            raise
         except Exception as exc:
             logger.error(f"batch_get_into threw exception: {str(exc)}")
             # Release any buffers we successfully allocated

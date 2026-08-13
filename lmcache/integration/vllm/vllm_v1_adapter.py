@@ -8516,10 +8516,8 @@ class LMCacheConnectorV1Impl:
                 self._finished_req_ids_waiting_for_save.update(waiting_req_ids)
                 releasable_req_ids -= waiting_req_ids
 
-        finished_sending = (
-            self._finalize_worker_requests_after_store(releasable_req_ids)
-            if releasable_req_ids
-            else set()
+        finished_sending = self._finalize_worker_requests_after_store(
+            releasable_req_ids
         )
         finished_sending.update(self._late_finished_sending)
         self._late_finished_sending.clear()
@@ -8854,7 +8852,7 @@ class LMCacheConnectorV1Impl:
         )
         params = getattr(request, "kv_transfer_params", None)
         capabilities = params.get("live_split_capabilities", ()) if params else ()
-        if "ascend_live_split_v1" in capabilities:
+        if "ascend_live_split_v2" in capabilities:
             remote_block_ids = params.get("remote_block_ids")
             if remote_block_ids:
                 req_meta.live_split_requested = True
