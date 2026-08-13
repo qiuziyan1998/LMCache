@@ -9719,14 +9719,6 @@ class LMCacheConnectorV1Impl:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        cold_start_perf_log(
-            logger,
-            "live_source_lmcache_base_finish_entry",
-            req_id=request.request_id,
-            request_param_keys=sorted(
-                getattr(request, "kv_transfer_params", None) or {}
-            ),
-        )
         # This callback runs in the scheduler process. Worker-owned state is
         # released when the same request ID reaches worker-side get_finished().
         self._cold_perf_lookup_started.pop(request.request_id, None)
