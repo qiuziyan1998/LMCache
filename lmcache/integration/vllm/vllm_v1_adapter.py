@@ -5847,6 +5847,9 @@ class LMCacheConnectorV1Impl:
                 self._fallback_live_split_indexer(entry)
                 pending.pop(req_id, None)
             return {}
+        # Shared-CPU group 0 is rank-0-owned and must keep using its collective
+        # persistent path; the current live destination protocol is group 1 only.
+        handled_groups = (1,)
         parallel = getattr(self._vllm_config, "parallel_config", None)
         result: dict[str, dict[str, Any]] = {}
         for req_id, entry in list(pending.items()):

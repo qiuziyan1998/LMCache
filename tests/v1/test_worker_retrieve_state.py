@@ -5164,12 +5164,18 @@ class TestWorkerRetrieveState:
         )
         dependency = Future()
         latent_gate = Future()
-        context = {"handled_groups": (1,), "pages": []}
+        context = {
+            "handled_groups": (1,),
+            "pages": [],
+            "destination_owners": (),
+        }
         impl._dsa_live_split_pending = {
             "req-live": {
                 "context": context,
                 "indexer_completion": dependency,
                 "latent_gate": latent_gate,
+                "handled_groups": (1,),
+                "plan": {},
             }
         }
         impl._fallback_live_split_indexer = MagicMock()
@@ -5179,18 +5185,14 @@ class TestWorkerRetrieveState:
 
         assert dependency.result() == (None, readiness, 0.0, 0.0)
         assert latent_gate.done()
-        impl.lmcache_engine._commit_live_split_import.assert_called_once_with(
-            context
-        )
+        impl.lmcache_engine._commit_live_split_import.assert_not_called()
         impl.lmcache_engine._release_live_split_import.assert_not_called()
         impl._fallback_live_split_indexer.assert_not_called()
         impl._publish_worker_retrieve_state.assert_not_called()
 
         # A duplicate ACK is a no-op after ownership moved out of pending.
         impl.accept_live_split_results({"req-live": "success"})
-        impl.lmcache_engine._commit_live_split_import.assert_called_once_with(
-            context
-        )
+        impl.lmcache_engine._commit_live_split_import.assert_not_called()
 
     @pytest.mark.parametrize("status", ["failure", "fallback", "timeout"])
     def test_live_split_failure_releases_and_uses_persistent_indexer(
@@ -5217,7 +5219,7 @@ class TestWorkerRetrieveState:
         impl._fallback_live_split_indexer.assert_called_once_with(entry)
         assert entry["latent_gate"].done()
 
-    def test_live_split_rejects_unknown_group_layout(self):
+    def test_live_split_group0_only_uses_persistent_fallback(self):
         impl = _make_impl()
         entry = {
             "offered": False,
@@ -5229,6 +5231,7 @@ class TestWorkerRetrieveState:
 
         assert impl.take_live_split_destination_plans((0,)) == {}
         impl._fallback_live_split_indexer.assert_called_once_with(entry)
+        assert entry["latent_gate"].done()
         assert impl._dsa_live_split_pending == {}
 
     def test_live_split_group1_plan_uses_tp_rank_and_preserves_group0(self):
@@ -5290,14 +5293,14 @@ class TestWorkerRetrieveState:
             "latent_gate"
         ].done()
 
-    def test_live_split_full_plan_holds_latent_until_success_ack(self):
+    def test_live_split_full_plan_is_narrowed_to_indexer(self):
         impl = _make_impl()
         impl._block_size = 16
         impl._vllm_config = SimpleNamespace(
             parallel_config=SimpleNamespace(data_parallel_rank_local=0)
         )
         gate = Future()
-        context = {"pages": [object()], "destination_owners": ()}
+        context = {"pages": [], "destination_owners": ()}
         destination = {"segments": [], "group_byte_totals": (8, 4)}
         impl.lmcache_engine = SimpleNamespace(
             _prepare_live_split_import=MagicMock(
@@ -5335,27 +5338,36 @@ class TestWorkerRetrieveState:
             assert impl.take_live_split_destination_plans((0, 1)) == {
                 "req-live": destination
             }
-        assert not gate.done()
+        assert destination["requested_groups"] == (1,)
+        assert gate.done()
+        prepare = impl.lmcache_engine._prepare_live_split_import
+        assert prepare.call_args.kwargs["handled_groups"] == (1,)
 
         impl.accept_live_split_results({"req-live": "success"})
 
-        impl.lmcache_engine._commit_live_split_import.assert_called_once_with(
-            context
-        )
-        assert gate.done()
+        impl.lmcache_engine._commit_live_split_import.assert_not_called()
 
-    def test_live_split_success_skips_persistent_group0_get(self):
+    def test_live_split_indexer_success_still_loads_persistent_group0(self):
         impl = _make_impl()
         impl.num_layers = 1
         impl.device = "cpu"
         impl._num_layers_for_group = lambda _group: 1
         impl._record_dsa_cold_dense_load_readiness = MagicMock()
+        impl._release_unadopted_shared_request_objects = MagicMock()
         impl._refresh_prepared_sparse_sources = lambda state, _tokens: (
             state.prepared_sparse_sources.setdefault(0, object())
         )
-        retrieve = MagicMock()
+
+        def latent_retriever():
+            while True:
+                yield torch.ones(2, dtype=torch.bool)
+
+        retrieve = MagicMock(side_effect=lambda *args, **kwargs: latent_retriever())
         impl.lmcache_engine = SimpleNamespace(
             retrieve_layer_head_token_wise=retrieve
+        )
+        impl._sparse_retrieve_kwargs = MagicMock(
+            return_value=({"cached_retrieve_location": "RemoteBackend"}, None, None)
         )
         request = SimpleNamespace(
             req_id="req-live",
@@ -5369,22 +5381,14 @@ class TestWorkerRetrieveState:
             "latent_kvcaches": [],
             "planned_at": 0.0,
             "plan_started": 0.0,
+            "latent_shared_ready": Future(),
         }
         dependency = Future()
         dependency.set_result((None, None, 0.0, 0.0))
-        live_state = WorkerRetrieveState(
-            req_id="req-live",
-            cached_keys=[[object()]],
-            cached_starts=[0],
-            cached_ends=[2],
-        )
 
-        result = impl._run_dsa_cold_compact_load(
-            plan, None, dependency, live_state=live_state
-        )
+        impl._run_dsa_cold_compact_load(plan, None, dependency)
 
-        assert result is live_state
-        retrieve.assert_not_called()
+        retrieve.assert_called_once()
 
     def test_live_split_failure_runs_one_persistent_group0_get(self):
         impl = _make_impl()
@@ -5419,6 +5423,7 @@ class TestWorkerRetrieveState:
             "latent_kvcaches": [],
             "planned_at": 0.0,
             "plan_started": 0.0,
+            "latent_shared_ready": Future(),
         }
         dependency = Future()
         dependency.set_result((None, None, 0.0, 0.0))
