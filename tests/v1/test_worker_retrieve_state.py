@@ -3092,6 +3092,30 @@ class TestWorkerRetrieveState:
         assert cache_fields.isdisjoint(vars(tracker))
         assert cache_fields.isdisjoint(vars(req_meta))
 
+    def test_live_source_metadata_survives_skip_save(self):
+        tracker = RequestTracker(
+            req_id="req-live",
+            prompt_len=3,
+            token_ids=[1, 2, 3],
+            allocated_block_ids=[0],
+            allocated_block_ids_indexer=[1],
+            skip_save=True,
+        )
+
+        req_meta = ReqMeta.from_request_tracker(
+            tracker,
+            block_size=4,
+            lmcache_chunk_size=4,
+            dsa_two_groups=True,
+            live_source_requested=True,
+        )
+
+        assert req_meta is not None
+        assert not req_meta.save_spec.can_save
+        assert req_meta.live_source_token_ids == [1, 2, 3]
+        assert req_meta.live_source_slot_mapping[0].tolist() == [0, 1, 2]
+        assert req_meta.live_source_indexer_slot_mapping[0].tolist() == [4, 5, 6]
+
     def test_sparse_reqmeta_does_not_allocate_full_true_decode_mask(self):
         tracker = RequestTracker(
             req_id="req-1",

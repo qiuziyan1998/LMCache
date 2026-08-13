@@ -870,6 +870,11 @@ class ReqMeta:
     request_configs: Optional[dict] = None
     # Producer-side live P/D handoff requested by the routing connector.
     live_source_requested: bool = False
+    live_source_token_ids: list[int] = field(default_factory=list)
+    live_source_slot_mapping: list[torch.Tensor] = field(default_factory=list)
+    live_source_indexer_slot_mapping: list[torch.Tensor] = field(
+        default_factory=list
+    )
 
     def retrieve_token_count(self) -> int:
         """Return the logical retrieve prefix represented by this metadata."""
@@ -1003,6 +1008,7 @@ class ReqMeta:
         dsa_two_groups: bool = False,
         windowed_sparse_layerwise_save: bool = False,
         save_entire_prefix: bool = False,
+        live_source_requested: bool = False,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -1115,7 +1121,7 @@ class ReqMeta:
             if new_boundary <= tracker.num_saved_tokens:
                 skip_save = True
 
-        if skip_save and load_spec is None:
+        if skip_save and load_spec is None and not live_source_requested:
             return None
 
         # Calculate number of tokens to save based on discard_partial_chunks
@@ -1372,6 +1378,31 @@ class ReqMeta:
                 )
             decode_ret_mask = tracker.sparse_decode_ret_mask
 
+        live_source_token_ids: list[int] = []
+        live_source_slot_mapping: list[torch.Tensor] = []
+        live_source_indexer_slot_mapping: list[torch.Tensor] = []
+        if live_source_requested and not is_sparse_decode:
+            live_source_token_ids = _apply_mm_hashes(
+                input_token_ids,
+                tracker.mm_hashes,
+                tracker.mm_positions,
+            )
+            live_source_slot_mapping = [
+                _build_slot_mapping(
+                    tracker.allocated_block_ids,
+                    block_size,
+                    len(live_source_token_ids),
+                )
+            ]
+            if dsa_two_groups and tracker.allocated_block_ids_indexer:
+                live_source_indexer_slot_mapping = [
+                    _build_slot_mapping(
+                        tracker.allocated_block_ids_indexer,
+                        block_size,
+                        len(live_source_token_ids),
+                    )
+                ]
+
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
         req_meta = ReqMeta(
             req_id=tracker.req_id,
@@ -1390,6 +1421,10 @@ class ReqMeta:
             request_configs=tracker.request_configs,
             decode_token_mask=decode_token_mask,
             decode_ret_mask=decode_ret_mask,
+            live_source_requested=live_source_requested,
+            live_source_token_ids=live_source_token_ids,
+            live_source_slot_mapping=live_source_slot_mapping,
+            live_source_indexer_slot_mapping=live_source_indexer_slot_mapping,
         )
         if (
             is_sparse_decode
@@ -9073,6 +9108,11 @@ class LMCacheConnectorV1Impl:
         *,
         is_sparse_decode: bool = False,
     ) -> Optional[ReqMeta]:
+        request = self._unfinished_requests.get(tracker.req_id)
+        params = getattr(request, "kv_transfer_params", None)
+        live_source_requested = bool(
+            params and params.get("do_remote_decode")
+        )
         metadata = ReqMeta.from_request_tracker(
             tracker,
             self._block_size,
@@ -9091,13 +9131,8 @@ class LMCacheConnectorV1Impl:
                 self._windowed_sparse_layerwise_save_enabled()
             ),
             save_entire_prefix=self.kv_role == "kv_producer",
+            live_source_requested=live_source_requested,
         )
-        if metadata is not None:
-            request = self._unfinished_requests.get(tracker.req_id)
-            params = getattr(request, "kv_transfer_params", None)
-            metadata.live_source_requested = bool(
-                params and params.get("do_remote_decode")
-            )
         return metadata
 
     def _add_decode_window_save_metas(
