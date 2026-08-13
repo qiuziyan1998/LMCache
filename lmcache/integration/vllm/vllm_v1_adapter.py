@@ -5871,6 +5871,12 @@ class LMCacheConnectorV1Impl:
         self, handled_groups: tuple[int, ...]
     ) -> dict[str, dict[str, Any]]:
         pending = getattr(self, "_dsa_live_split_pending", None)
+        cold_start_perf_log(
+            logger,
+            "live_source_destination_provider_entry",
+            pending_count=len(pending or {}),
+            handled_groups=handled_groups,
+        )
         if not pending:
             return {}
         handled_groups = tuple(handled_groups)
@@ -5929,6 +5935,13 @@ class LMCacheConnectorV1Impl:
 
     def accept_live_split_results(self, results: dict[str, str]) -> None:
         pending = getattr(self, "_dsa_live_split_pending", None)
+        cold_start_perf_log(
+            logger,
+            "live_source_result_accept_entry",
+            pending_count=len(pending or {}),
+            result_ids=sorted(results),
+            statuses=results,
+        )
         if not pending:
             return
         assert self.lmcache_engine is not None
@@ -9706,6 +9719,14 @@ class LMCacheConnectorV1Impl:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
+        cold_start_perf_log(
+            logger,
+            "live_source_lmcache_base_finish_entry",
+            req_id=request.request_id,
+            request_param_keys=sorted(
+                getattr(request, "kv_transfer_params", None) or {}
+            ),
+        )
         # This callback runs in the scheduler process. Worker-owned state is
         # released when the same request ID reaches worker-side get_finished().
         self._cold_perf_lookup_started.pop(request.request_id, None)
