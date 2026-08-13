@@ -5832,6 +5832,9 @@ class LMCacheConnectorV1Impl:
             "context": None,
             "offered": False,
         }
+        # Live import only owns group 1. Start the existing persistent group-0
+        # collective immediately while its destination plan is being prepared.
+        latent_gate.set_result(None)
         return True
 
     def _cancel_live_split_entry(
@@ -5919,7 +5922,9 @@ class LMCacheConnectorV1Impl:
                 entry["offered"] = True
                 result[req_id] = destination
                 if 0 not in handled_groups:
-                    entry["latent_gate"].set_result(None)
+                    gate = entry["latent_gate"]
+                    if not gate.done():
+                        gate.set_result(None)
             except Exception:
                 logger.warning(
                     "Live split destination preparation failed; falling back",

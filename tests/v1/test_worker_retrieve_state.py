@@ -5320,6 +5320,57 @@ class TestWorkerRetrieveState:
             "latent_gate"
         ].done()
 
+    def test_live_split_starts_persistent_group0_before_destination_plan(self):
+        impl = _make_impl()
+        impl._block_size = 16
+        impl.device = "cpu"
+        impl._kvcaches_for_group = MagicMock(return_value=[])
+        impl.lmcache_engine = SimpleNamespace(
+            _prepare_live_split_import=MagicMock()
+        )
+        latent_task = Future()
+        executor = SimpleNamespace(submit=MagicMock(return_value=latent_task))
+        impl._get_dsa_cold_load_executor = MagicMock(return_value=executor)
+        request = SimpleNamespace(
+            req_id="req-live",
+            live_split_requested=True,
+            live_split_remote_block_ids=[1],
+            load_spec=SimpleNamespace(
+                dsa_cold_load_generation=1,
+                lmcache_cached_tokens=2,
+            ),
+            token_ids=[1, 2],
+            indexer_slot_mapping=[torch.arange(2)],
+            request_configs=None,
+        )
+
+        assert impl._try_prepare_dsa_live_split(request)
+
+        entry = impl._dsa_live_split_pending["req-live"]
+        assert entry["latent_gate"].done()
+        executor.submit.assert_called_once()
+        assert executor.submit.call_args.args[-1] is None
+        impl.lmcache_engine._prepare_live_split_import.assert_not_called()
+
+        destination = {"segments": [], "group_byte_totals": (0, 1)}
+        context = {"pages": [], "destination_owners": ()}
+        impl._vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_rank_local=0)
+        )
+        impl.lmcache_engine._prepare_live_split_import.return_value = (
+            destination,
+            context,
+        )
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                adapter_mod, "get_tensor_model_parallel_rank", lambda: 0
+            )
+            assert impl.take_live_split_destination_plans((1,)) == {
+                "req-live": destination
+            }
+
+        executor.submit.assert_called_once()
+
     def test_live_split_full_plan_is_narrowed_to_indexer(self):
         impl = _make_impl()
         impl._block_size = 16
