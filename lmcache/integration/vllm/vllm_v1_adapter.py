@@ -8248,6 +8248,37 @@ class LMCacheConnectorV1Impl:
             and min_retrieve > 0
             and need_to_allocate < min_retrieve
         )
+        returned_external_tokens = (
+            0
+            if below_min_retrieve or need_to_allocate <= 0
+            else need_to_allocate
+        )
+        max_loadable_tokens = max(request.num_tokens - num_computed_tokens, 0)
+        accounting_valid = (
+            0 <= returned_external_tokens <= max_loadable_tokens
+            and 0 <= num_external_hit_tokens <= request.num_tokens
+        )
+        if num_external_hit_tokens > 0 or not accounting_valid:
+            logger.info(
+                "[LMCACHE_TOKEN_ACCOUNTING_LOOKUP] req=%s request_tokens=%d "
+                "prompt_tokens=%d vllm_cached=%d lmcache_hit=%d "
+                "need_to_allocate=%d returned_external=%d max_loadable=%d "
+                "full_hit=%s dsa_prefix_hit=%s dsa_cold_compact=%s "
+                "below_min_retrieve=%s accounting_valid=%s",
+                req_id,
+                request.num_tokens,
+                request.num_prompt_tokens,
+                num_computed_tokens,
+                num_external_hit_tokens,
+                need_to_allocate,
+                returned_external_tokens,
+                max_loadable_tokens,
+                num_external_hit_tokens == request.num_tokens,
+                dsa_prefix_hit,
+                dsa_cold_compact_load,
+                below_min_retrieve,
+                accounting_valid,
+            )
 
         if below_min_retrieve:
             logger.debug(
