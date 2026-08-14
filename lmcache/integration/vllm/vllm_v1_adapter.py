@@ -122,6 +122,19 @@ def _layerwise_prefill_p_node_enabled() -> bool:
     )
 
 
+def _prefill_timing_debug_enabled() -> bool:
+    raw = os.getenv("VLLM_ASCEND_PREFILL_TIMING_DEBUG", "false")
+    normalized = raw.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(
+        "VLLM_ASCEND_PREFILL_TIMING_DEBUG must be 'true' or 'false', "
+        f"got {raw!r}"
+    )
+
+
 def _copy_block_ids_by_bank(value):
     if value is None:
         return None
@@ -270,6 +283,7 @@ def _dsa_debug_minmax_count(value: Any) -> Any:
         return (min(seq), max(seq), len(seq))
     except Exception as exc:
         return f"{type(value).__name__}:minmax_failed:{exc}"
+
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
@@ -1711,6 +1725,11 @@ class LMCacheConnectorV1Impl:
         # after all indexer layers in a forward to avoid interleaved latent/
         # indexer GPU transfers on store_stream (MTE OOB on chunk 2+).
         self._deferred_latent_pending: set[LayerwiseSaveKey] = set()
+        self._prefill_timing_debug = _prefill_timing_debug_enabled()
+        self._prefill_timing_save_callback_ms: dict[str, float] = {}
+        self._prefill_timing_save_callback_count: dict[str, int] = {}
+        self._prefill_timing_load_wait_ms: dict[str, float] = {}
+        self._prefill_timing_load_wait_count: dict[str, int] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.enable_sparse_attention = config.enable_sparse_attention
         self._retrieve_stats_interval_seconds = (
@@ -6112,6 +6131,8 @@ class LMCacheConnectorV1Impl:
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start this step's KV loads and atomically discard partial setup."""
+        timing_debug = getattr(self, "_prefill_timing_debug", False)
+        timing_started = time.perf_counter() if timing_debug else 0.0
         try:
             self._start_load_kv(forward_context, **kwargs)
         except BaseException:
@@ -6126,6 +6147,26 @@ class LMCacheConnectorV1Impl:
                 )
             )
             raise
+        finally:
+            if timing_debug:
+                metadata = self._parent._get_connector_metadata()
+                assert isinstance(metadata, LMCacheConnectorMetadata)
+                elapsed_ms = (time.perf_counter() - timing_started) * 1000
+                for request in metadata.requests:
+                    load_spec = request.load_spec
+                    logger.info(
+                        "[PREFILL_TIMING] lmcache_start_load mode=%s "
+                        "request=%s prefix_tokens=%d can_load=%s "
+                        "load_tokens=%d elapsed_ms=%.3f",
+                        "on" if _layerwise_prefill_p_node_enabled() else "off",
+                        request.req_id,
+                        len(request.token_ids),
+                        bool(load_spec is not None and load_spec.can_load),
+                        int(load_spec.lmcache_cached_tokens)
+                        if load_spec is not None and load_spec.can_load
+                        else 0,
+                        elapsed_ms,
+                    )
 
     def _start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -7062,6 +7103,58 @@ class LMCacheConnectorV1Impl:
         payload_event=None,
         selected_token_counts=None,
     ) -> None:
+        """Load one layer and accumulate diagnostic wall time per request."""
+        timing_debug = getattr(self, "_prefill_timing_debug", False)
+        if not timing_debug:
+            self._wait_for_layer_load_impl(
+                layer_name,
+                selected_tokens,
+                token_start_index,
+                request_ids,
+                target_slot_mapping,
+                payload_event,
+                selected_token_counts,
+            )
+            return
+
+        timing_started = time.perf_counter()
+        metadata = self._parent._get_connector_metadata()
+        assert isinstance(metadata, LMCacheConnectorMetadata)
+        timing_request_ids = tuple(
+            request.req_id
+            for request in metadata.requests
+            if request.load_spec is not None and request.load_spec.can_load
+        )
+        try:
+            self._wait_for_layer_load_impl(
+                layer_name,
+                selected_tokens,
+                token_start_index,
+                request_ids,
+                target_slot_mapping,
+                payload_event,
+                selected_token_counts,
+            )
+        finally:
+            elapsed_ms = (time.perf_counter() - timing_started) * 1000
+            for req_id in timing_request_ids:
+                self._prefill_timing_load_wait_ms[req_id] = (
+                    self._prefill_timing_load_wait_ms.get(req_id, 0.0) + elapsed_ms
+                )
+                self._prefill_timing_load_wait_count[req_id] = (
+                    self._prefill_timing_load_wait_count.get(req_id, 0) + 1
+                )
+
+    def _wait_for_layer_load_impl(
+        self,
+        layer_name: str,
+        selected_tokens: list = None,
+        token_start_index: list = None,
+        request_ids: list = None,
+        target_slot_mapping=None,
+        payload_event=None,
+        selected_token_counts=None,
+    ) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
 
@@ -7768,6 +7861,9 @@ class LMCacheConnectorV1Impl:
             **kwargs: additional arguments for the save operation.
         """
         assert self.lmcache_engine is not None
+        timing_debug = getattr(self, "_prefill_timing_debug", False)
+        timing_started = time.perf_counter() if timing_debug else 0.0
+        timing_request_ids: tuple[str, ...] = ()
 
         if not self.use_layerwise:
             return
@@ -7782,6 +7878,10 @@ class LMCacheConnectorV1Impl:
             return
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+        if timing_debug:
+            timing_request_ids = tuple(
+                request.req_id for request in connector_metadata.requests
+            )
 
         assert len(self.kv_caches) > 0
 
@@ -8069,6 +8169,15 @@ class LMCacheConnectorV1Impl:
             except BaseException:
                 self._abort_save_step((request,))
                 raise
+        if timing_debug and timing_request_ids:
+            elapsed_ms = (time.perf_counter() - timing_started) * 1000
+            for req_id in timing_request_ids:
+                self._prefill_timing_save_callback_ms[req_id] = (
+                    self._prefill_timing_save_callback_ms.get(req_id, 0.0) + elapsed_ms
+                )
+                self._prefill_timing_save_callback_count[req_id] = (
+                    self._prefill_timing_save_callback_count.get(req_id, 0) + 1
+                )
 
     def _effective_skip_leading_tokens(
         self,
@@ -8128,11 +8237,47 @@ class LMCacheConnectorV1Impl:
 
         save_context: dict[str, Any] = {}
         save_fence_complete = False
+        wait_impl_ms = 0.0
+        finish_batch_ms = 0.0
+        timing_debug = getattr(self, "_prefill_timing_debug", False)
+        active_storers_before = (
+            len(self._layerwise_save_storers) if timing_debug else 0
+        )
+        pending_sync_before_finish = -1
+        pending_sync_after_finish = -1
+        wait_started = time.perf_counter() if timing_debug else 0.0
+        timing_requests: tuple[ReqMeta, ...] = ()
+        if timing_debug:
+            metadata = self._parent._get_connector_metadata()
+            assert isinstance(metadata, LMCacheConnectorMetadata)
+            timing_requests = tuple(metadata.requests)
         try:
             try:
+                phase_started = time.perf_counter() if timing_debug else 0.0
                 self._wait_for_save_impl(save_context)
+                if timing_debug:
+                    wait_impl_ms = (time.perf_counter() - phase_started) * 1000
             finally:
+                phase_started = time.perf_counter() if timing_debug else 0.0
+                if timing_debug and self.lmcache_engine is not None:
+                    pending_sync_before_finish = len(
+                        getattr(
+                            self.lmcache_engine,
+                            "_pending_sync_store_futures",
+                            (),
+                        )
+                    )
                 self._finish_save_batch(save_context)
+                if timing_debug:
+                    finish_batch_ms = (time.perf_counter() - phase_started) * 1000
+                    if self.lmcache_engine is not None:
+                        pending_sync_after_finish = len(
+                            getattr(
+                                self.lmcache_engine,
+                                "_pending_sync_store_futures",
+                                (),
+                            )
+                        )
                 save_fence_complete = True
         except BaseException:
             metadata = self._parent._get_connector_metadata()
@@ -8145,6 +8290,39 @@ class LMCacheConnectorV1Impl:
             for request in save_context.get("decode_window_saves", ()):
                 self._mark_decode_window_save_completed(request)
             self._complete_worker_save_step()
+        finally:
+            if timing_debug:
+                total_ms = (time.perf_counter() - wait_started) * 1000
+                for request in timing_requests:
+                    req_id = request.req_id
+                    save_spec = request.save_spec
+                    logger.info(
+                        "[PREFILL_TIMING] lmcache_save_fence mode=%s "
+                        "request=%s prefix_tokens=%d save_from=%d "
+                        "load_wait_count=%d load_wait_ms=%.3f "
+                        "callback_count=%d callback_ms=%.3f "
+                        "active_storers_before=%d "
+                        "pending_sync_before_finish=%d "
+                        "pending_sync_after_finish=%d wait_impl_ms=%.3f "
+                        "finish_batch_ms=%.3f "
+                        "total_ms=%.3f",
+                        "on" if _layerwise_prefill_p_node_enabled() else "off",
+                        req_id,
+                        len(request.token_ids),
+                        int(save_spec.skip_leading_tokens)
+                        if save_spec is not None
+                        else -1,
+                        self._prefill_timing_load_wait_count.pop(req_id, 0),
+                        self._prefill_timing_load_wait_ms.pop(req_id, 0.0),
+                        self._prefill_timing_save_callback_count.pop(req_id, 0),
+                        self._prefill_timing_save_callback_ms.pop(req_id, 0.0),
+                        active_storers_before,
+                        pending_sync_before_finish,
+                        pending_sync_after_finish,
+                        wait_impl_ms,
+                        finish_batch_ms,
+                        total_ms,
+                    )
 
     def _wait_for_save_impl(self, save_context: dict[str, Any]) -> None:
         connector_metadata = self._parent._get_connector_metadata()

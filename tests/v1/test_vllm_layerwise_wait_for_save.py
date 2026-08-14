@@ -18,6 +18,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     ReqMeta,
     RequestTracker,
     SaveSpec,
+    _prefill_timing_debug_enabled,
 )
 from lmcache.v1.cache_engine import LayerwiseStoreResult
 
@@ -296,7 +297,56 @@ def _make_connector(requests):
     connector._decode_window_save_completed_groups = set()
     connector._prefill_save_completed_groups = {}
     connector._decode_window_save_expected_start = {}
+    connector._prefill_timing_debug = False
+    connector._prefill_timing_save_callback_ms = {}
+    connector._prefill_timing_save_callback_count = {}
+    connector._prefill_timing_load_wait_ms = {}
+    connector._prefill_timing_load_wait_count = {}
     return connector, metadata, engine
+
+
+def test_prefill_timing_debug_env_is_strict_boolean(monkeypatch) -> None:
+    name = "VLLM_ASCEND_PREFILL_TIMING_DEBUG"
+    monkeypatch.delenv(name, raising=False)
+    assert _prefill_timing_debug_enabled() is False
+
+    monkeypatch.setenv(name, "true")
+    assert _prefill_timing_debug_enabled() is True
+    monkeypatch.setenv(name, "false")
+    assert _prefill_timing_debug_enabled() is False
+
+    monkeypatch.setenv(name, "1")
+    with pytest.raises(ValueError, match="must be 'true' or 'false'"):
+        _prefill_timing_debug_enabled()
+
+
+def test_prefill_timing_debug_reports_and_clears_connector_phases(
+    caplog,
+) -> None:
+    request = _make_req("timed-request")
+    connector, _, _ = _make_connector([request])
+    connector._prefill_timing_debug = True
+    connector._prefill_timing_save_callback_ms[request.req_id] = 1.25
+    connector._prefill_timing_save_callback_count[request.req_id] = 3
+    connector._prefill_timing_load_wait_ms[request.req_id] = 2.5
+    connector._prefill_timing_load_wait_count[request.req_id] = 4
+
+    with caplog.at_level("INFO"):
+        connector.wait_for_save()
+
+    message = next(
+        record.message
+        for record in caplog.records
+        if "[PREFILL_TIMING] lmcache_save_fence" in record.message
+    )
+    assert "request=timed-request" in message
+    assert "load_wait_count=4 load_wait_ms=2.500" in message
+    assert "callback_count=3 callback_ms=1.250" in message
+    assert "active_storers_before=0" in message
+    assert "pending_sync_before_finish=0" in message
+    assert "pending_sync_after_finish=0" in message
+    assert request.req_id not in connector._prefill_timing_load_wait_ms
+    assert request.req_id not in connector._prefill_timing_save_callback_ms
 
 
 def test_p_node_save_rotates_dynamic_bank_mapping(monkeypatch) -> None:
