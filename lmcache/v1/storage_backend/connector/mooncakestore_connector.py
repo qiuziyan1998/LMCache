@@ -41,8 +41,8 @@ from lmcache.v1.system_detection import NUMADetector
 logger = init_logger(__name__)
 
 
-async def _drain_native_read(task: asyncio.Task[Any]) -> None:
-    """Keep native destination buffers alive through coroutine cancellation."""
+async def _drain_native_task(task: asyncio.Task[Any]) -> None:
+    """Keep native transfer buffers alive through coroutine cancellation."""
     while not task.done():
         try:
             await asyncio.shield(task)
@@ -353,6 +353,7 @@ class MooncakestoreConnector(RemoteConnector):
         self._external_put_lock = asyncio.Lock()
         self._inflight_put_tasks: set[asyncio.Task[Any]] = set()
         # Initialize ReplicateConfig
+        self._replicate_config_cls = ReplicateConfig
         self.replica_config = ReplicateConfig()
         self.replica_config.replica_num = 1
 
@@ -1190,7 +1191,7 @@ class MooncakestoreConnector(RemoteConnector):
             return results
         except asyncio.CancelledError:
             result_status = "cancelled"
-            await _drain_native_read(native_read)
+            await _drain_native_task(native_read)
             raise
         except Exception as exc:
             result_status = "error"
@@ -1601,7 +1602,7 @@ class MooncakestoreConnector(RemoteConnector):
             return results
 
         except asyncio.CancelledError:
-            await _drain_native_read(native_read)
+            await _drain_native_task(native_read)
             for i in valid_idx:
                 if memory_objs[i] is not None:
                     memory_objs[i].ref_count_down()
@@ -1784,6 +1785,126 @@ class MooncakestoreConnector(RemoteConnector):
                 )
 
     @staticmethod
+    def _preferred_segment_for_key(key: CacheEngineKey) -> Optional[str]:
+        """Return the request placement hint accepted by the latent group."""
+        if int(key.kv_group) != 0 or not isinstance(key.request_configs, dict):
+            return None
+        segment = key.request_configs.get("lmcache.mooncake_preferred_segment")
+        if not isinstance(segment, str):
+            return None
+        segment = segment.strip()
+        return segment or None
+
+    def _replica_config_for_segment(self, segment: str) -> Any:
+        config_cls = getattr(
+            self, "_replicate_config_cls", type(self.replica_config)
+        )
+        config = config_cls()
+        config.replica_num = 1
+        config.preferred_segment = segment
+        return config
+
+    def _batch_put_multi_buffers_by_segment(
+        self,
+        keys: List[CacheEngineKey],
+        store_keys: List[str],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+    ) -> tuple[Any, list[str], int, int, int]:
+        """Submit placement-homogeneous batches and restore input status order."""
+        if not (
+            len(keys) == len(store_keys) == len(buffer_ptrs) == len(buffer_sizes)
+        ):
+            raise ValueError("Mooncake page placement inputs have different lengths")
+
+        first_preferred: tuple[int, str] | None = None
+        for index, key in enumerate(keys):
+            segment = self._preferred_segment_for_key(key)
+            if segment is not None:
+                first_preferred = (index, segment)
+                break
+
+        if first_preferred is None:
+            statuses = self.store.batch_put_from_multi_buffers(
+                store_keys,
+                buffer_ptrs,
+                buffer_sizes,
+                self.replica_config,
+            )
+            return statuses, [], 0, len(keys), 1
+
+        first_index, first_segment = first_preferred
+        default_indices = list(range(first_index))
+        segment_indices = {first_segment: [first_index]}
+        partition_order: list[Optional[str]] = (
+            [None, first_segment] if default_indices else [first_segment]
+        )
+        default_partition_seen = bool(default_indices)
+        for index in range(first_index + 1, len(keys)):
+            segment = self._preferred_segment_for_key(keys[index])
+            if segment is None:
+                if not default_partition_seen:
+                    partition_order.append(None)
+                    default_partition_seen = True
+                default_indices.append(index)
+            else:
+                if segment not in segment_indices:
+                    segment_indices[segment] = []
+                    partition_order.append(segment)
+                segment_indices[segment].append(index)
+
+        if not default_indices and len(segment_indices) == 1:
+            segment = next(iter(segment_indices))
+            statuses = self.store.batch_put_from_multi_buffers(
+                store_keys,
+                buffer_ptrs,
+                buffer_sizes,
+                self._replica_config_for_segment(segment),
+            )
+            return statuses, [segment], len(keys), 0, 1
+
+        partitions = [
+            (
+                segment,
+                default_indices if segment is None else segment_indices[segment],
+            )
+            for segment in partition_order
+        ]
+
+        ordered_statuses = [0] * len(keys)
+        saw_statuses = False
+        for segment, indices in partitions:
+            replica_config = (
+                self.replica_config
+                if segment is None
+                else self._replica_config_for_segment(segment)
+            )
+            statuses = self.store.batch_put_from_multi_buffers(
+                [store_keys[index] for index in indices],
+                [buffer_ptrs[index] for index in indices],
+                [buffer_sizes[index] for index in indices],
+                replica_config,
+            )
+            if statuses is None:
+                continue
+            if len(statuses) != len(indices):
+                raise RuntimeError(
+                    "Mooncake page put returned invalid subgroup status count"
+                )
+            saw_statuses = True
+            for index, status in zip(indices, statuses, strict=True):
+                ordered_statuses[index] = status
+
+        preferred_pages = sum(map(len, segment_indices.values()))
+        return (
+            ordered_statuses if saw_statuses else None,
+            sorted(segment_indices),
+            preferred_pages,
+            len(default_indices),
+            len(partitions),
+        )
+
+    @staticmethod
     def _validate_external_buffer_owners(
         buffer_ptrs: List[List[int]],
         buffer_sizes: List[List[int]],
@@ -1916,36 +2037,46 @@ class MooncakestoreConnector(RemoteConnector):
             )
             self._register_external_owners(owners)
             transfer_started = cold_start_perf_now() if started is not None else None
-            statuses = self.store.batch_put_from_multi_buffers(
-                page_keys, buffer_ptrs, buffer_sizes, self.replica_config
+            placement = self._batch_put_multi_buffers_by_segment(
+                keys, page_keys, buffer_ptrs, buffer_sizes
             )
             transfer_ms = (
                 (cold_start_perf_now() - transfer_started) * 1000
                 if transfer_started is not None
                 else 0.0
             )
-            return statuses, wait_ms, transfer_ms
+            return placement, wait_ms, transfer_ms
 
         async with self._external_put_lock:
             task = asyncio.create_task(asyncio.to_thread(put))
             self._inflight_put_tasks.add(task)
             task.add_done_callback(self._inflight_put_tasks.discard)
             try:
-                statuses, wait_ms, transfer_ms = await asyncio.wait_for(
+                placement, wait_ms, transfer_ms = await asyncio.wait_for(
                     asyncio.shield(task), timeout=self.config.transfer_timeout
                 )
+            except asyncio.CancelledError:
+                await _drain_native_task(task)
+                raise
             except asyncio.TimeoutError:
                 logger.error(
                     "Mooncake direct page put exceeded %ss; waiting for the "
-                    "uncancellable native read before releasing source buffers",
+                    "uncancellable native transfer before releasing source buffers",
                     self.config.transfer_timeout,
                 )
                 try:
-                    statuses, wait_ms, transfer_ms = await task
+                    placement, wait_ms, transfer_ms = await task
                 except BaseException as native_error:
                     raise TimeoutError(
                         "Mooncake direct page put failed after timing out"
                     ) from native_error
+        (
+            statuses,
+            preferred_segments,
+            preferred_pages,
+            default_pages,
+            placement_batches,
+        ) = placement
         trace_mooncake_keys(
             "put",
             page_keys,
@@ -1985,6 +2116,10 @@ class MooncakestoreConnector(RemoteConnector):
                 ),
                 event_wait_ms=wait_ms,
                 transfer_ms=transfer_ms,
+                preferred_segments=preferred_segments,
+                preferred_pages=preferred_pages,
+                default_pages=default_pages,
+                placement_batches=placement_batches,
                 source_device=(
                     getattr(getattr(owners[0], "device", None), "type", "unknown")
                     if owners
@@ -2150,17 +2285,44 @@ class MooncakestoreConnector(RemoteConnector):
             put_started = (
                 cold_start_perf_now() if cold_start_perf_enabled() else None
             )
-            statuses = await self._run_blocking_put(
+            page_source_keys = []
+            for _, indices in page_groups:
+                source_key = keys[indices[0]]
+                placement = (
+                    int(source_key.kv_group),
+                    self._preferred_segment_for_key(source_key),
+                )
+                if any(
+                    (
+                        int(keys[index].kv_group),
+                        self._preferred_segment_for_key(keys[index]),
+                    )
+                    != placement
+                    for index in indices[1:]
+                ):
+                    raise ValueError(
+                        "Mooncake page group has inconsistent KV group or "
+                        "preferred segment"
+                    )
+                page_source_keys.append(source_key)
+            placement = await self._run_blocking_put(
                 "batch_put_from_multi_buffers",
-                self.store.batch_put_from_multi_buffers,
+                self._batch_put_multi_buffers_by_segment,
                 (
+                    page_source_keys,
                     page_keys,
                     all_buffer_ptrs,
                     all_buffer_sizes,
-                    self.replica_config,
                 ),
                 page_memory_objs,
             )
+            (
+                statuses,
+                preferred_segments,
+                preferred_pages,
+                default_pages,
+                placement_batches,
+            ) = placement
             trace_mooncake_keys(
                 "put",
                 page_keys,
@@ -2196,6 +2358,10 @@ class MooncakestoreConnector(RemoteConnector):
                     first_page_key=page_keys[0],
                     last_page_key=page_keys[-1],
                     legacy_objects=len(legacy_indices),
+                    preferred_segments=preferred_segments,
+                    preferred_pages=preferred_pages,
+                    default_pages=default_pages,
+                    placement_batches=placement_batches,
                     status="ok",
                 )
         if legacy_indices:

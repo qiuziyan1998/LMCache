@@ -548,6 +548,202 @@ def test_mooncake_requires_put_completion() -> None:
     assert connector.requires_put_completion()
 
 
+def test_mooncake_page_put_partitions_latent_placement_and_restores_order() -> None:
+    class _ReplicateConfig:
+        pass
+
+    calls = []
+
+    class _Store:
+        @staticmethod
+        def batch_put_from_multi_buffers(keys, ptrs, sizes, replica):
+            calls.append((keys, ptrs, sizes, replica))
+            return [int(key) + 10 for key in keys]
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.store = _Store()
+    connector._replicate_config_cls = _ReplicateConfig
+    connector.replica_config = _ReplicateConfig()
+    connector.replica_config.replica_num = 3
+    keys = [
+        CacheEngineKey(
+            "test",
+            1,
+            0,
+            index,
+            torch.float16,
+            request_configs=(
+                {"lmcache.mooncake_preferred_segment": segment}
+                if segment is not None
+                else {}
+            ),
+            kv_group=kv_group,
+        )
+        for index, kv_group, segment in (
+            (0, 0, "segment-b"),
+            (1, 1, "ignored-for-indexer"),
+            (2, 0, None),
+            (3, 0, "segment-a"),
+            (4, 0, "segment-b"),
+        )
+    ]
+
+    result = connector._batch_put_multi_buffers_by_segment(
+        keys,
+        [str(index) for index in range(5)],
+        [[index] for index in range(5)],
+        [[1] for _ in range(5)],
+    )
+
+    statuses, segments, preferred, default, batches = result
+    assert statuses == [10, 11, 12, 13, 14]
+    assert (segments, preferred, default, batches) == (
+        ["segment-a", "segment-b"],
+        3,
+        2,
+        3,
+    )
+    assert calls[0][0] == ["0", "4"]
+    assert calls[0][3].preferred_segment == "segment-b"
+    assert calls[1][0] == ["1", "2"]
+    assert calls[1][3] is connector.replica_config
+    assert calls[2][0] == ["3"]
+    assert calls[2][3].preferred_segment == "segment-a"
+    assert calls[0][3] is not calls[2][3]
+    assert calls[0][3].replica_num == calls[2][3].replica_num == 1
+
+
+def test_mooncake_page_put_fast_paths_reuse_input_arrays() -> None:
+    class _ReplicateConfig:
+        pass
+
+    calls = []
+
+    class _Store:
+        @staticmethod
+        def batch_put_from_multi_buffers(keys, ptrs, sizes, replica):
+            calls.append((keys, ptrs, sizes, replica))
+            return None
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.store = _Store()
+    connector._replicate_config_cls = _ReplicateConfig
+    connector.replica_config = _ReplicateConfig()
+    connector.replica_config.replica_num = 2
+    connector.replica_config.preferred_segment = "local-segment"
+    store_keys = ["0", "1", "2", "3", "4"]
+    ptrs = [[10], [20], [30], [40], [50]]
+    sizes = [[1], [1], [1], [1], [1]]
+    default_keys = [
+        _key(0),
+        CacheEngineKey(
+            "test",
+            1,
+            0,
+            1,
+            torch.float16,
+            request_configs={"lmcache.mooncake_preferred_segment": 123},
+            kv_group=0,
+        ),
+        CacheEngineKey(
+            "test",
+            1,
+            0,
+            2,
+            torch.float16,
+            request_configs={"lmcache.mooncake_preferred_segment": ""},
+            kv_group=0,
+        ),
+        CacheEngineKey(
+            "test",
+            1,
+            0,
+            3,
+            torch.float16,
+            request_configs={"lmcache.mooncake_preferred_segment": "   "},
+            kv_group=0,
+        ),
+        CacheEngineKey(
+            "test",
+            1,
+            0,
+            4,
+            torch.float16,
+            request_configs={"lmcache.mooncake_preferred_segment": "ignored"},
+            kv_group=1,
+        ),
+    ]
+
+    default_result = connector._batch_put_multi_buffers_by_segment(
+        default_keys, store_keys, ptrs, sizes
+    )
+    assert default_result == (None, [], 0, 5, 1)
+    assert calls[-1][0] is store_keys
+    assert calls[-1][1] is ptrs
+    assert calls[-1][2] is sizes
+    assert calls[-1][3] is connector.replica_config
+    assert connector.replica_config.preferred_segment == "local-segment"
+
+    hinted_keys = [
+        CacheEngineKey(
+            "test",
+            1,
+            0,
+            index,
+            torch.float16,
+            request_configs={
+                "lmcache.mooncake_preferred_segment": "decoder-segment"
+            },
+            kv_group=0,
+        )
+        for index in range(5)
+    ]
+    hinted_result = connector._batch_put_multi_buffers_by_segment(
+        hinted_keys, store_keys, ptrs, sizes
+    )
+    assert hinted_result == (None, ["decoder-segment"], 5, 0, 1)
+    assert calls[-1][0] is store_keys
+    assert calls[-1][1] is ptrs
+    assert calls[-1][2] is sizes
+    assert calls[-1][3].preferred_segment == "decoder-segment"
+    assert calls[-1][3].replica_num == 1
+    assert connector.replica_config.preferred_segment == "local-segment"
+
+
+def test_mooncake_page_put_mixed_none_statuses_remain_aligned() -> None:
+    class _ReplicateConfig:
+        pass
+
+    class _Store:
+        @staticmethod
+        def batch_put_from_multi_buffers(keys, ptrs, sizes, replica):
+            if replica is connector.replica_config:
+                return None
+            return [7] * len(keys)
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.store = _Store()
+    connector._replicate_config_cls = _ReplicateConfig
+    connector.replica_config = _ReplicateConfig()
+    connector.replica_config.replica_num = 1
+    hinted = CacheEngineKey(
+        "test",
+        1,
+        0,
+        1,
+        torch.float16,
+        request_configs={
+            "lmcache.mooncake_preferred_segment": "decoder-segment"
+        },
+        kv_group=0,
+    )
+
+    statuses, *_ = connector._batch_put_multi_buffers_by_segment(
+        [_key(0), hinted], ["0", "1"], [[10], [20]], [[1], [1]]
+    )
+    assert statuses == [0, 7]
+
+
 def test_mooncake_direct_pages_use_existing_page_keys() -> None:
     calls = []
 
@@ -633,6 +829,237 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
     assert connector.batched_external_pages_exist([_key(7)]) == [True]
     exists = next(call for call in calls if call[0] == "exists")
     assert exists[1] == [mooncake_page_key(_key(7), 2)]
+
+
+def test_mooncake_direct_page_put_uses_latent_segment_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ReplicateConfig:
+        pass
+
+    calls = []
+
+    class _Store:
+        @staticmethod
+        def register_buffer(ptr, size):
+            return 0
+
+        @staticmethod
+        def batch_put_from_multi_buffers(keys, ptrs, sizes, replica):
+            calls.append((keys, replica))
+            return [0] * len(keys)
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector._external_put_lock = asyncio.Lock()
+    connector._external_buffers = {}
+    connector._inflight_put_tasks = set()
+    connector.store = _Store()
+    connector._replicate_config_cls = _ReplicateConfig
+    connector.replica_config = _ReplicateConfig()
+    connector.replica_config.replica_num = 1
+    connector.config = SimpleNamespace(transfer_timeout=5)
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (None, None, None, 1)
+    owner = torch.empty(32, dtype=torch.uint8)
+    hinted = CacheEngineKey(
+        "test",
+        1,
+        0,
+        10,
+        torch.float16,
+        request_configs={
+            "lmcache.mooncake_preferred_segment": "decoder-segment"
+        },
+        kv_group=0,
+    )
+    events = []
+    monkeypatch.setattr(
+        mooncake_connector, "cold_start_perf_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        mooncake_connector,
+        "cold_start_perf_log",
+        lambda _logger, event, **fields: events.append((event, fields)),
+    )
+
+    asyncio.run(
+        connector.batched_put_external_pages(
+            [hinted, _key(11)],
+            [[owner.data_ptr()], [owner.data_ptr() + 16]],
+            [[16], [16]],
+            (owner,),
+            None,
+            "request",
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[0][1].preferred_segment == "decoder-segment"
+    assert calls[1][1] is connector.replica_config
+    event, fields = events[-1]
+    assert event == "direct_npu_page_put"
+    assert fields["preferred_segments"] == ["decoder-segment"]
+    assert fields["preferred_pages"] == 1
+    assert fields["default_pages"] == 1
+    assert fields["placement_batches"] == 2
+
+
+def test_mooncake_direct_page_put_attributes_preferred_failure_and_retries() -> None:
+    class _ReplicateConfig:
+        pass
+
+    class _Store:
+        def __init__(self) -> None:
+            self.calls = []
+            self.fail_preferred = True
+
+        @staticmethod
+        def register_buffer(ptr, size):
+            return 0
+
+        def batch_put_from_multi_buffers(self, keys, ptrs, sizes, replica):
+            self.calls.append((keys, ptrs, sizes, replica))
+            preferred = getattr(replica, "preferred_segment", None)
+            if self.fail_preferred and preferred == "decoder-segment":
+                return [-7] * len(keys)
+            return [0] * len(keys)
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector._external_put_lock = asyncio.Lock()
+    connector._external_buffers = {}
+    connector._inflight_put_tasks = set()
+    connector.store = _Store()
+    connector._replicate_config_cls = _ReplicateConfig
+    connector.replica_config = _ReplicateConfig()
+    connector.replica_config.replica_num = 1
+    connector.config = SimpleNamespace(transfer_timeout=5)
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (None, None, None, 1)
+    owner = torch.empty(32, dtype=torch.uint8)
+    default = _key(30)
+    preferred = CacheEngineKey(
+        "test",
+        1,
+        0,
+        31,
+        torch.float16,
+        request_configs={
+            "lmcache.mooncake_preferred_segment": "decoder-segment"
+        },
+        kv_group=0,
+    )
+    keys = [default, preferred]
+    store_keys = [mooncake_page_key(key, 2) for key in keys]
+    ptrs = [[owner.data_ptr()], [owner.data_ptr() + 16]]
+    sizes = [[16], [16]]
+
+    with pytest.raises(RuntimeError, match="direct page put failed") as exc_info:
+        asyncio.run(
+            connector.batched_put_external_pages(
+                keys, ptrs, sizes, (owner,), None, "request"
+            )
+        )
+
+    assert exc_info.value.failed_pages == [store_keys[1]]
+    assert connector.store.calls[0][:3] == (
+        [store_keys[0]],
+        [ptrs[0]],
+        [sizes[0]],
+    )
+    assert connector.store.calls[1][:3] == (
+        [store_keys[1]],
+        [ptrs[1]],
+        [sizes[1]],
+    )
+
+    connector.store.calls.clear()
+    connector.store.fail_preferred = False
+    placement = connector._batch_put_multi_buffers_by_segment(
+        keys, store_keys, ptrs, sizes
+    )
+
+    assert placement[0] == [0, 0]
+    assert store_keys == [
+        mooncake_page_key(default, 2),
+        mooncake_page_key(preferred, 2),
+    ]
+    assert ptrs == [[owner.data_ptr()], [owner.data_ptr() + 16]]
+    assert sizes == [[16], [16]]
+    assert connector.store.calls[0][:3] == (
+        [store_keys[0]],
+        [ptrs[0]],
+        [sizes[0]],
+    )
+    assert connector.store.calls[1][:3] == (
+        [store_keys[1]],
+        [ptrs[1]],
+        [sizes[1]],
+    )
+
+
+def test_mooncake_cancelled_direct_page_put_drains_native_transfer() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _Store:
+        @staticmethod
+        def register_buffer(ptr, size):
+            return 0
+
+        @staticmethod
+        def batch_put_from_multi_buffers(keys, ptrs, sizes, replica):
+            entered.set()
+            assert release.wait(5)
+            return [0] * len(keys)
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector._external_put_lock = asyncio.Lock()
+    connector._external_buffers = {}
+    connector._inflight_put_tasks = set()
+    connector.store = _Store()
+    connector.replica_config = object()
+    connector.config = SimpleNamespace(transfer_timeout=5)
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (None, None, None, 1)
+    owner = torch.empty(16, dtype=torch.uint8)
+
+    async def cancel_put() -> None:
+        task = asyncio.create_task(
+            connector.batched_put_external_pages(
+                [_key(12)],
+                [[owner.data_ptr()]],
+                [[16]],
+                (owner,),
+                None,
+                "request",
+            )
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert connector._external_put_lock.locked()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_put())
 
 
 def test_instrumented_connector_delegates_direct_pages() -> None:
@@ -1376,6 +1803,117 @@ def test_mooncake_page_put_merges_exact_partial_tail(
     assert fields["first_page_key"] == connector.store.page_args[0][0]
     assert fields["last_page_key"] == connector.store.page_args[0][-1]
     assert fields["legacy_objects"] == 0
+    assert fields["preferred_segments"] == []
+    assert fields["preferred_pages"] == 0
+    assert fields["default_pages"] == 2
+    assert fields["placement_batches"] == 1
+
+
+def test_mooncake_cpu_page_put_uses_latent_segment_hint() -> None:
+    class _ReplicateConfig:
+        pass
+
+    class _PageStore:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def batch_put_from_multi_buffers(self, keys, ptrs, sizes, replica):
+            self.calls.append((keys, ptrs, sizes, replica))
+            return [0] * len(keys)
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector.config = SimpleNamespace(transfer_timeout=1)
+    connector._replicate_config_cls = _ReplicateConfig
+    connector.replica_config = _ReplicateConfig()
+    connector.replica_config.replica_num = 1
+    connector._inflight_put_tasks = set()
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=4)
+    )
+    connector._metadata_for_raw_key = lambda _key: (
+        [],
+        [],
+        MemoryFormat.KV_MLA_LATENT_FMT,
+        4,
+    )
+    connector.store = _PageStore()
+    default = _key(20)
+    hinted = CacheEngineKey(
+        "test",
+        1,
+        0,
+        21,
+        torch.float16,
+        request_configs={
+            "lmcache.mooncake_preferred_segment": "decoder-segment"
+        },
+        kv_group=0,
+    )
+    keys = [
+        default.get_layer(0),
+        hinted.get_layer(0),
+        default.get_layer(1),
+        hinted.get_layer(1),
+    ]
+    memory_objs = [
+        _MemoryObj(16, 100),
+        _MemoryObj(16, 200),
+        _MemoryObj(16, 300),
+        _MemoryObj(16, 400),
+    ]
+
+    asyncio.run(connector._batched_put_zero_copy(keys, memory_objs))
+
+    assert len(connector.store.calls) == 2
+    assert connector.store.calls[0][3] is connector.replica_config
+    assert connector.store.calls[1][3].preferred_segment == "decoder-segment"
+    assert all(memory_obj.ref_count == 1 for memory_obj in memory_objs)
+
+
+def test_mooncake_cpu_page_put_rejects_inconsistent_layer_hint() -> None:
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector.config = SimpleNamespace(transfer_timeout=1)
+    connector.replica_config = object()
+    connector._inflight_put_tasks = set()
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=4)
+    )
+    connector._metadata_for_raw_key = lambda _key: (
+        [],
+        [],
+        MemoryFormat.KV_MLA_LATENT_FMT,
+        4,
+    )
+    native_calls = []
+    connector.store = SimpleNamespace(
+        batch_put_from_multi_buffers=lambda *args: native_calls.append(args)
+    )
+    base = _key(22)
+    hinted = CacheEngineKey(
+        "test",
+        1,
+        0,
+        22,
+        torch.float16,
+        request_configs={
+            "lmcache.mooncake_preferred_segment": "decoder-segment"
+        },
+        kv_group=0,
+    )
+
+    with pytest.raises(ValueError, match="inconsistent KV group"):
+        asyncio.run(
+            connector._batched_put_zero_copy(
+                [base.get_layer(0), hinted.get_layer(1)],
+                [_MemoryObj(16, 100), _MemoryObj(16, 200)],
+            )
+        )
+
+    assert native_calls == []
 
 
 def test_mooncake_page_put_selects_each_layer_buffer() -> None:
