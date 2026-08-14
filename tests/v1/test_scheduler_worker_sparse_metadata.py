@@ -20,6 +20,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LoadSpec,
     RequestTracker,
     WorkerRetrieveState,
+    _has_live_latent_source_for_dp,
 )
 from tests.v1.connector_test_utils import make_worker_impl
 
@@ -180,11 +181,19 @@ def test_live_split_does_not_require_decoder_cold_load() -> None:
     impl = _make_scheduler_impl()
     impl.config.dsa_two_groups = True
     impl.config.enable_shared_cpu_cache = True
+    impl.config.use_layerwise = True
     impl.config.get_extra_config_value.side_effect = (
         lambda key, default=False: key == "mooncake_direct_npu_prefill_store"
     )
     impl._vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(enable_prefix_caching=False)
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        kv_transfer_config=SimpleNamespace(
+            get_from_extra_config=lambda side, default: {
+                "prefill": {"tp_size": 2},
+                "decode": {"tp_size": 2},
+            }.get(side, default)
+        ),
     )
     impl.use_layerwise = False
     impl.async_loading = False
@@ -197,9 +206,301 @@ def test_live_split_does_not_require_decoder_cold_load() -> None:
     )
 
     assert impl.supports_dsa_live_split()
+    assert not impl.supports_dsa_live_latent_split()
     assert not impl.supports_dsa_cold_compact_load()
     impl.request_finished(request, [])
     assert request.kv_transfer_params["request_live_split"] is True
+
+
+def test_live_latent_split_requires_explicit_opt_in() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "mooncake_direct_npu_prefill_store",
+            "enable_dsa_live_latent_split",
+            "mooncake_reuse_vllm_transfer_engine",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        kv_transfer_config=SimpleNamespace(
+            get_from_extra_config=lambda side, default: {
+                "prefill": {"tp_size": 2},
+                "decode": {"tp_size": 2},
+            }.get(side, default)
+        ),
+    )
+
+    assert impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_source_activation_requires_transport_negotiation() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "mooncake_direct_npu_prefill_store",
+            "enable_dsa_live_latent_split",
+            "mooncake_reuse_vllm_transfer_engine",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+    impl._live_latent_split_requested = False
+
+    assert impl.supports_dsa_live_latent_split()
+    assert impl._live_latent_split_requested is False
+
+    impl.configure_live_latent_source(True)
+    assert impl._live_latent_split_requested is True
+
+    impl.configure_live_latent_source(False)
+    assert impl._live_latent_split_requested is False
+
+
+def test_live_latent_split_requires_shared_transfer_engine() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "mooncake_direct_npu_prefill_store",
+            "enable_dsa_live_latent_split",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+
+    assert not impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_decoder_does_not_require_prefill_direct_store() -> None:
+    impl = _make_scheduler_impl()
+    impl.kv_role = "kv_consumer"
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "enable_dsa_live_latent_split",
+            "mooncake_reuse_vllm_transfer_engine",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+
+    assert not impl.supports_dsa_live_split()
+    assert impl.supports_dsa_cold_compact_load()
+    assert impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_producer_still_requires_direct_store() -> None:
+    impl = _make_scheduler_impl()
+    impl.kv_role = "kv_producer"
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "enable_dsa_live_latent_split",
+            "mooncake_reuse_vllm_transfer_engine",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+
+    assert not impl.supports_dsa_live_split()
+    assert not impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_kv_both_accepts_each_local_protocol_half() -> None:
+    impl = _make_scheduler_impl()
+    impl.kv_role = "kv_both"
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.use_layerwise = True
+    enabled = {
+        "mooncake_direct_npu_prefill_store",
+        "enable_dsa_live_latent_split",
+        "mooncake_reuse_vllm_transfer_engine",
+    }
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key in enabled
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        kv_transfer_config=SimpleNamespace(
+            get_from_extra_config=lambda side, default: {
+                "prefill": {"tp_size": 2},
+                "decode": {"tp_size": 2},
+            }.get(side, default)
+        ),
+    )
+
+    assert impl.supports_dsa_live_split()
+    assert impl.supports_dsa_cold_compact_load()
+    assert impl.supports_dsa_live_latent_split()
+
+    impl.config.enable_dsa_cold_compact_load = False
+    assert impl.supports_dsa_live_latent_split()
+
+    impl.config.enable_dsa_cold_compact_load = True
+    enabled.remove("mooncake_direct_npu_prefill_store")
+    assert impl.supports_dsa_live_latent_split()
+
+    impl.config.enable_dsa_cold_compact_load = False
+    assert not impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_source_gate_requires_exact_tp0_dp_descriptor() -> None:
+    hybrid = {
+        "format": "layer_slot_runs_v1",
+        "tp_rank": 0,
+        "dp_rank": 2,
+        "group_byte_totals": [0, 64],
+        "latent_group_byte_total": 128,
+        "compact_layout": {
+            "group_id": 1,
+            "token_count": 4,
+            "layers": [{"layer_id": 0}],
+            "runs": [{"token_count": 4}],
+        },
+        "latent_layout": {
+            "group_id": 0,
+            "token_count": 4,
+            "layers": [{"layer_id": 0}],
+            "pages": [{"token_count": 4}],
+        },
+    }
+    params = {
+        "ascend_live_split_source_v1": {"descriptors": [hybrid]}
+    }
+
+    assert _has_live_latent_source_for_dp(params, 2, 4)
+    assert not _has_live_latent_source_for_dp(params, 1, 4)
+    assert not _has_live_latent_source_for_dp(params, 2, 5)
+    assert not _has_live_latent_source_for_dp({}, 2, 4)
+    assert not _has_live_latent_source_for_dp(
+        {
+            "ascend_live_split_source_v1": {
+                "descriptors": [{**hybrid, "latent_layout": None}]
+            }
+        },
+        2,
+        4,
+    )
+    for malformed in (
+        {**hybrid, "tp_rank": None},
+        {**hybrid, "tp_rank": 0.0},
+        {**hybrid, "dp_rank": "bad"},
+        {
+            **hybrid,
+            "latent_layout": {
+                **hybrid["latent_layout"],
+                "token_count": "bad",
+            },
+        },
+        {
+            **hybrid,
+            "latent_layout": {
+                **hybrid["latent_layout"],
+                "token_count": 4.0,
+            },
+        },
+    ):
+        assert not _has_live_latent_source_for_dp(
+            {
+                "ascend_live_split_source_v1": {
+                    "descriptors": [malformed]
+                }
+            },
+            2,
+            4,
+        )
+
+
+@pytest.mark.parametrize("negotiated", [False, True])
+def test_cold_meta_requires_two_sided_latent_activation(
+    negotiated: bool,
+) -> None:
+    impl = _make_scheduler_impl()
+    impl._block_size = 2
+    impl._dsa_cold_indexer_block_ids = {}
+    impl._live_latent_split_requested = negotiated
+    impl._vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_rank_local=0)
+    )
+    tokens = [1, 2, 3, 4]
+    request = SimpleNamespace(
+        request_id="req-live",
+        all_token_ids=tokens,
+        prompt_token_ids=tokens,
+        sampling_params=SimpleNamespace(extra_args=None),
+        mm_features=None,
+        mm_hashes=None,
+        kv_transfer_params={
+            "live_split_capabilities": (
+                "ascend_live_split_v2",
+                "ascend_live_split_compact_v1",
+                "ascend_live_split_latent_cpu_v1",
+            ),
+            "remote_block_ids": [1, 2],
+            "ascend_live_split_source_v1": {
+                "descriptors": [{
+                    "tp_rank": 0,
+                    "dp_rank": 0,
+                    "format": "layer_slot_runs_v1",
+                    "group_byte_totals": [0, 64],
+                    "latent_group_byte_total": 128,
+                    "compact_layout": {
+                        "group_id": 1,
+                        "token_count": len(tokens),
+                        "layers": [{"layer_id": 0}],
+                        "runs": [{"token_count": len(tokens)}],
+                    },
+                    "latent_layout": {
+                        "group_id": 0,
+                        "token_count": len(tokens),
+                        "layers": [{"layer_id": 0}],
+                        "pages": [{"token_count": len(tokens)}],
+                    },
+                }]
+            },
+        },
+    )
+    load_spec = LoadSpec(
+        vllm_cached_tokens=0,
+        lmcache_cached_tokens=len(tokens),
+        can_load=True,
+    )
+    load_spec.dsa_cold_load_generation = 1
+    blocks = SimpleNamespace(
+        get_unhashed_block_ids_all_groups=lambda: [[], [10, 11]]
+    )
+
+    meta = impl._build_dsa_cold_compact_meta(request, blocks, load_spec)
+
+    assert meta.live_split_latent_cpu is negotiated
 
 
 def test_dsa_cold_compact_alloc_metadata_has_only_indexer_slots() -> None:

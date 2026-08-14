@@ -53,6 +53,27 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
     def supports_dsa_live_split_source(self) -> bool:
         return self._lmcache_engine.supports_dsa_live_split()
 
+    @property
+    def supports_dsa_live_latent_split_source(self) -> bool:
+        return self._lmcache_engine.supports_dsa_live_latent_source()
+
+    @property
+    def supports_dsa_live_latent_split_destination(self) -> bool:
+        return self._lmcache_engine.supports_dsa_live_latent_destination()
+
+    def configure_live_latent_source(self, enabled: bool) -> None:
+        """Enable latent live-source capture after transport negotiation.
+
+        The implementation deliberately defaults this feature to disabled so
+        that upgrading LMCache without a hybrid-capable transport cannot make
+        an older consumer reject the otherwise valid group-1 descriptor.
+        """
+        configure = getattr(
+            self._lmcache_engine, "configure_live_latent_source", None
+        )
+        if callable(configure):
+            configure(enabled)
+
     # ==============================
     # Worker-side methods
     # ==============================

@@ -5183,7 +5183,7 @@ class TestWorkerRetrieveState:
         impl = _make_impl()
         readiness = object()
         impl.lmcache_engine = SimpleNamespace(
-            _commit_live_split_import=MagicMock(),
+            admit_live_split_pages=MagicMock(),
             _release_live_split_import=MagicMock(),
             gpu_connector=SimpleNamespace(
                 record_dense_load_readiness=lambda: readiness
@@ -5212,14 +5212,14 @@ class TestWorkerRetrieveState:
 
         assert dependency.result() == (None, readiness, 0.0, 0.0)
         assert latent_gate.done()
-        impl.lmcache_engine._commit_live_split_import.assert_not_called()
+        impl.lmcache_engine.admit_live_split_pages.assert_not_called()
         impl.lmcache_engine._release_live_split_import.assert_not_called()
         impl._fallback_live_split_indexer.assert_not_called()
         impl._publish_worker_retrieve_state.assert_not_called()
 
         # A duplicate ACK is a no-op after ownership moved out of pending.
         impl.accept_live_split_results({"req-live": "success"})
-        impl.lmcache_engine._commit_live_split_import.assert_not_called()
+        impl.lmcache_engine.admit_live_split_pages.assert_not_called()
 
     @pytest.mark.parametrize("status", ["failure", "fallback", "timeout"])
     def test_live_split_failure_releases_and_uses_persistent_indexer(
@@ -5245,6 +5245,62 @@ class TestWorkerRetrieveState:
         )
         impl._fallback_live_split_indexer.assert_called_once_with(entry)
         assert entry["latent_gate"].done()
+
+    def test_live_split_release_failure_keeps_result_retryable(self):
+        impl = _make_impl()
+        context = {"handled_groups": (1,), "pages": [object()]}
+        entry = {
+            "context": context,
+            "indexer_completion": Future(),
+            "latent_gate": Future(),
+        }
+        release = MagicMock(side_effect=[RuntimeError("retry"), None])
+        impl._dsa_live_split_pending = {"req-live": entry}
+        impl.lmcache_engine = SimpleNamespace(
+            _release_live_split_import=release
+        )
+        impl._fallback_live_split_indexer = MagicMock()
+
+        with pytest.raises(RuntimeError, match="retry"):
+            impl.accept_live_split_results({"req-live": "failure"})
+        assert impl._dsa_live_split_pending["req-live"] is entry
+        impl._fallback_live_split_indexer.assert_not_called()
+
+        impl.accept_live_split_results({"req-live": "failure"})
+        assert impl._dsa_live_split_pending == {}
+        impl._fallback_live_split_indexer.assert_called_once_with(entry)
+
+    def test_cancelled_offered_latent_waits_for_dma_result_before_fallback(self):
+        impl = _make_impl()
+        context = {"pages": [object()]}
+        entry = {
+            "request": SimpleNamespace(live_split_latent_cpu=True),
+            "context": context,
+            "offered": True,
+            "indexer_completion": Future(),
+            "latent_gate": Future(),
+        }
+        impl.lmcache_engine = SimpleNamespace(
+            _release_live_split_import=MagicMock()
+        )
+
+        impl._cancel_live_split_entry(
+            entry, "cancelled", release_context=False
+        )
+
+        assert not entry["latent_gate"].done()
+        assert not entry["indexer_completion"].done()
+        impl.lmcache_engine._release_live_split_import.assert_not_called()
+
+        impl._dsa_live_split_pending = {"req-live": entry}
+        impl.accept_live_split_results({"req-live": "failure"})
+
+        impl.lmcache_engine._release_live_split_import.assert_called_once_with(
+            context
+        )
+        assert entry["latent_gate"].result() is None
+        with pytest.raises(RuntimeError, match="cancelled"):
+            entry["indexer_completion"].result()
 
     def test_live_split_group0_only_uses_persistent_fallback(self):
         impl = _make_impl()
@@ -5335,6 +5391,7 @@ class TestWorkerRetrieveState:
             req_id="req-live",
             live_split_requested=True,
             live_split_compact=True,
+            live_split_latent_cpu=False,
             live_split_remote_block_ids=[1],
             load_spec=SimpleNamespace(
                 dsa_cold_load_generation=1,
@@ -5350,6 +5407,41 @@ class TestWorkerRetrieveState:
         entry = impl._dsa_live_split_pending["req-live"]
         assert entry["latent_gate"].done()
         executor.submit.assert_called_once()
+
+    def test_live_split_rank0_holds_latent_until_live_result(self):
+        impl = _make_impl()
+        impl._block_size = 16
+        impl.device = "cpu"
+        impl._kvcaches_for_group = MagicMock(return_value=[])
+        impl.lmcache_engine = SimpleNamespace(
+            _prepare_live_split_import=MagicMock()
+        )
+        executor = SimpleNamespace(submit=MagicMock())
+        impl._get_dsa_cold_load_executor = MagicMock(return_value=executor)
+        request = SimpleNamespace(
+            req_id="req-live",
+            live_split_requested=True,
+            live_split_compact=True,
+            live_split_latent_cpu=True,
+            live_split_remote_block_ids=[1],
+            load_spec=SimpleNamespace(
+                dsa_cold_load_generation=1,
+                lmcache_cached_tokens=2,
+            ),
+            token_ids=[1, 2],
+            indexer_slot_mapping=[torch.arange(2)],
+            request_configs=None,
+        )
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                adapter_mod, "get_tensor_model_parallel_rank", lambda: 0
+            )
+            assert impl._try_prepare_dsa_live_split(request)
+
+        entry = impl._dsa_live_split_pending["req-live"]
+        assert not entry["latent_gate"].done()
+        executor.submit.assert_not_called()
 
     def test_live_split_without_compact_capability_uses_persistent_path(self):
         impl = _make_impl()
@@ -5368,29 +5460,8 @@ class TestWorkerRetrieveState:
         assert not impl._try_prepare_dsa_live_split(request)
         assert impl._dsa_live_split_pending == {}
         impl.lmcache_engine._prepare_live_split_import.assert_not_called()
-        assert executor.submit.call_args.args[-1] is None
-        impl.lmcache_engine._prepare_live_split_import.assert_not_called()
 
-        destination = {"segments": [], "group_byte_totals": (0, 1)}
-        context = {"pages": [], "destination_owners": ()}
-        impl._vllm_config = SimpleNamespace(
-            parallel_config=SimpleNamespace(data_parallel_rank_local=0)
-        )
-        impl.lmcache_engine._prepare_live_split_import.return_value = (
-            destination,
-            context,
-        )
-        with pytest.MonkeyPatch.context() as monkeypatch:
-            monkeypatch.setattr(
-                adapter_mod, "get_tensor_model_parallel_rank", lambda: 0
-            )
-            assert impl.take_live_split_destination_plans((1,)) == {
-                "req-live": destination
-            }
-
-        executor.submit.assert_called_once()
-
-    def test_live_split_full_plan_is_narrowed_to_indexer(self):
+    def test_live_split_full_plan_uses_latent_cpu_when_enabled(self):
         impl = _make_impl()
         impl._block_size = 16
         impl._vllm_config = SimpleNamespace(
@@ -5403,7 +5474,7 @@ class TestWorkerRetrieveState:
             _prepare_live_split_import=MagicMock(
                 return_value=(destination, context)
             ),
-            _commit_live_split_import=MagicMock(),
+            admit_live_split_pages=MagicMock(),
             _release_live_split_import=MagicMock(),
             gpu_connector=SimpleNamespace(
                 record_dense_load_readiness=lambda: object()
@@ -5412,7 +5483,9 @@ class TestWorkerRetrieveState:
         impl._dsa_live_split_pending = {
             "req-live": {
                 "request": SimpleNamespace(
-                    live_split_remote_block_ids=[1], request_configs=None
+                    live_split_remote_block_ids=[1],
+                    live_split_latent_cpu=True,
+                    request_configs=None,
                 ),
                 "plan": {
                     "tokens": [1],
@@ -5435,14 +5508,17 @@ class TestWorkerRetrieveState:
             assert impl.take_live_split_destination_plans((0, 1)) == {
                 "req-live": destination
             }
-        assert destination["requested_groups"] == (1,)
-        assert gate.done()
+        assert destination["requested_groups"] == (0, 1)
+        assert not gate.done()
         prepare = impl.lmcache_engine._prepare_live_split_import
-        assert prepare.call_args.kwargs["handled_groups"] == (1,)
+        assert prepare.call_args.kwargs["handled_groups"] == (0, 1)
 
         impl.accept_live_split_results({"req-live": "success"})
 
-        impl.lmcache_engine._commit_live_split_import.assert_not_called()
+        impl.lmcache_engine.admit_live_split_pages.assert_called_once_with(
+            context
+        )
+        assert gate.done()
 
     def test_live_split_indexer_success_still_loads_persistent_group0(self):
         impl = _make_impl()
@@ -5567,7 +5643,7 @@ class TestWorkerRetrieveState:
             }
         }
         impl.lmcache_engine = SimpleNamespace(
-            _commit_live_split_import=MagicMock(),
+            admit_live_split_pages=MagicMock(),
             _release_live_split_import=MagicMock(),
             gpu_connector=SimpleNamespace(
                 record_dense_load_readiness=lambda: readiness
@@ -5673,12 +5749,15 @@ class TestWorkerRetrieveState:
             entry, "cancelled", release_context=False
         )
         assert entry["context"] is context
+        assert not entry["indexer_completion"].done()
         release.assert_not_called()
 
         impl._dsa_live_split_pending = {"req-live": entry}
         impl.accept_live_split_results({"req-live": "cancelled"})
 
         release.assert_called_once_with(context)
+        with pytest.raises(RuntimeError, match="cancelled"):
+            entry["indexer_completion"].result()
         impl._fallback_live_split_indexer.assert_not_called()
         assert impl._dsa_live_split_pending == {}
 

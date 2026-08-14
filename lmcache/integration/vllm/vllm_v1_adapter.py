@@ -98,6 +98,114 @@ RETRIEVE_STATS_INTERVAL_SECONDS_ENV = (
 LayerwiseSaveKey = tuple[str, str, int, int, int]
 
 
+def _has_live_latent_source_for_dp(
+    params: Any,
+    dp_rank: int,
+    token_count: int,
+) -> bool:
+    """Require one complete TP0 hybrid source before allocating group 0."""
+    if not isinstance(params, dict):
+        return False
+    envelope = params.get("ascend_live_split_source_v1")
+    if not isinstance(envelope, dict):
+        return False
+    descriptors = envelope.get("descriptors", ())
+    if not isinstance(descriptors, (tuple, list)):
+        return False
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict):
+            continue
+        try:
+            tp_value = descriptor.get("tp_rank", -1)
+            dp_value = descriptor.get("dp_rank", -1)
+            if (
+                isinstance(tp_value, bool)
+                or not isinstance(tp_value, int)
+                or isinstance(dp_value, bool)
+                or not isinstance(dp_value, int)
+            ):
+                continue
+            if (
+                tp_value != 0
+                or dp_value != dp_rank
+            ):
+                continue
+            latent = descriptor.get("latent_layout")
+            compact = descriptor.get("compact_layout")
+            group_value = (
+                latent.get("group_id", -1)
+                if isinstance(latent, dict)
+                else None
+            )
+            token_value = (
+                latent.get("token_count", 0)
+                if isinstance(latent, dict)
+                else None
+            )
+            compact_group = (
+                compact.get("group_id", -1)
+                if isinstance(compact, dict)
+                else None
+            )
+            compact_tokens = (
+                compact.get("token_count", 0)
+                if isinstance(compact, dict)
+                else None
+            )
+            totals = descriptor.get("group_byte_totals")
+            latent_total = descriptor.get("latent_group_byte_total")
+            legacy_hybrid = (
+                descriptor.get("format") == "hybrid_compact_v1"
+                and isinstance(totals, (tuple, list))
+                and len(totals) == 2
+                and all(
+                    not isinstance(value, bool)
+                    and isinstance(value, int)
+                    and value > 0
+                    for value in totals
+                )
+                and latent_total is None
+            )
+            extension_hybrid = (
+                isinstance(totals, (tuple, list))
+                and len(totals) == 2
+                and not isinstance(totals[0], bool)
+                and isinstance(totals[0], int)
+                and totals[0] == 0
+                and not isinstance(totals[1], bool)
+                and isinstance(totals[1], int)
+                and totals[1] > 0
+                and not isinstance(latent_total, bool)
+                and isinstance(latent_total, int)
+                and latent_total > 0
+            )
+            if (
+                isinstance(latent, dict)
+                and not isinstance(group_value, bool)
+                and isinstance(group_value, int)
+                and group_value == 0
+                and not isinstance(token_value, bool)
+                and isinstance(token_value, int)
+                and token_value == token_count
+                and bool(latent.get("layers"))
+                and bool(latent.get("pages"))
+                and isinstance(compact, dict)
+                and not isinstance(compact_group, bool)
+                and isinstance(compact_group, int)
+                and compact_group == 1
+                and not isinstance(compact_tokens, bool)
+                and isinstance(compact_tokens, int)
+                and compact_tokens == token_count
+                and bool(compact.get("layers"))
+                and bool(compact.get("runs"))
+                and (extension_hybrid or legacy_hybrid)
+            ):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _mtp_dw_diag_enabled() -> bool:
     return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
 
@@ -876,6 +984,7 @@ class ReqMeta:
         default_factory=list
     )
     live_split_compact: bool = False
+    live_split_latent_cpu: bool = False
 
     def retrieve_token_count(self) -> int:
         """Return the logical retrieve prefix represented by this metadata."""
@@ -1468,6 +1577,10 @@ class LMCacheConnectorV1Impl:
         self._role = role
         self.device = vllm_config.device_config.device
         self.kv_role = vllm_config.kv_transfer_config.kv_role
+        # Hybrid source capture is a two-sided in-process protocol.  Keep it
+        # off until AscendMulti has verified that both the LMCache provider
+        # and Mooncake borrower support the same transport.
+        self._live_latent_split_requested = False
 
         # Load and configure LMCache config
         config = lmcache_get_or_create_config()
@@ -5835,9 +5948,14 @@ class LMCacheConnectorV1Impl:
             "context": None,
             "offered": False,
         }
-        # Live import only owns group 1. Start the existing persistent group-0
-        # collective immediately while its destination plan is being prepared.
-        latent_gate.set_result(None)
+        # Passive ranks never own the shared slab allocation.  They can enter
+        # the existing receive side immediately while rank 0 keeps its gate
+        # closed until live group-0 DMA is admitted or falls back.
+        if (
+            not getattr(request, "live_split_latent_cpu", False)
+            or get_tensor_model_parallel_rank() != 0
+        ):
+            latent_gate.set_result(None)
         return True
 
     def _cancel_live_split_entry(
@@ -5853,10 +5971,30 @@ class LMCacheConnectorV1Impl:
             entry["context"] = None
         entry["cancelled"] = True
         error = RuntimeError(reason)
-        for name in ("latent_gate", "indexer_completion"):
-            future = entry[name]
-            if not future.done():
-                future.set_exception(error)
+        entry["cancel_error"] = error
+        gate = entry["latent_gate"]
+        request = entry.get("request")
+        rank0_latent = bool(
+            getattr(request, "live_split_latent_cpu", False)
+            and not gate.done()
+        )
+        if rank0_latent:
+            # Passive ranks have already entered the ordinary group-0
+            # collective. Preserve that collective slot. Before an offer the
+            # fallback may start now; after an offer the result callback first
+            # fences native DMA and then opens this gate.
+            if release_context:
+                gate.set_result(None)
+        elif not gate.done():
+            gate.set_exception(error)
+        completion = entry["indexer_completion"]
+        # An offered destination can still be owned by Mooncake's synchronous
+        # native DMA.  Do not make the group-1 dependency terminal until the
+        # worker result callback proves that DMA has returned.  Pre-offer
+        # cancellation (and shutdown after Mooncake has been fenced) may finish
+        # immediately because no writer can still target these blocks.
+        if release_context and not completion.done():
+            completion.set_exception(error)
 
     def _fallback_live_split_indexer(self, entry: dict[str, Any]) -> None:
         completion = entry["indexer_completion"]
@@ -5894,9 +6032,6 @@ class LMCacheConnectorV1Impl:
                 self._fallback_live_split_indexer(entry)
                 pending.pop(req_id, None)
             return {}
-        # Shared-CPU group 0 is rank-0-owned and must keep using its collective
-        # persistent path; the current live destination protocol is group 1 only.
-        handled_groups = (1,)
         parallel = getattr(self._vllm_config, "parallel_config", None)
         result: dict[str, dict[str, Any]] = {}
         for req_id, entry in list(pending.items()):
@@ -5904,10 +6039,16 @@ class LMCacheConnectorV1Impl:
                 continue
             request = entry["request"]
             plan = entry["plan"]
+            request_groups = handled_groups
+            if not getattr(request, "live_split_latent_cpu", False):
+                request_groups = tuple(
+                    group for group in request_groups if group == 1
+                )
             try:
                 destination, context = (
                     self.lmcache_engine._prepare_live_split_import(
                         tokens=plan["tokens"],
+                        latent_kvcaches=plan["latent_kvcaches"],
                         indexer_slots=plan["indexer_slots_cpu"],
                         indexer_kvcaches=plan["indexer_kvcaches"],
                         request_configs=request.request_configs,
@@ -5916,15 +6057,15 @@ class LMCacheConnectorV1Impl:
                             getattr(parallel, "data_parallel_rank_local", 0)
                             or 0
                         ),
-                        handled_groups=handled_groups,
+                        handled_groups=request_groups,
                     )
                 )
-                destination["requested_groups"] = handled_groups
+                destination["requested_groups"] = request_groups
                 entry["context"] = context
-                entry["handled_groups"] = handled_groups
+                entry["handled_groups"] = request_groups
                 entry["offered"] = True
                 result[req_id] = destination
-                if 0 not in handled_groups:
+                if 0 not in request_groups:
                     gate = entry["latent_gate"]
                     if not gate.done():
                         gate.set_result(None)
@@ -5954,28 +6095,45 @@ class LMCacheConnectorV1Impl:
             return
         assert self.lmcache_engine is not None
         for req_id, status in results.items():
-            entry = pending.pop(req_id, None)
+            entry = pending.get(req_id)
             if entry is None:
                 continue
             context = entry["context"]
             completion = entry["indexer_completion"]
-            live_state: Optional[WorkerRetrieveState] = None
             if entry.get("cancelled"):
                 if context is not None:
                     self.lmcache_engine._release_live_split_import(context)
                     entry["context"] = None
+                if not completion.done():
+                    completion.set_exception(
+                        entry.get(
+                            "cancel_error",
+                            RuntimeError(
+                                f"Live split request was cancelled: {req_id}"
+                            ),
+                        )
+                    )
+                gate = entry["latent_gate"]
+                if not gate.done():
+                    # Native transfer has returned before Mooncake publishes
+                    # this result, so persistent fallback can safely occupy
+                    # TP0's existing collective slot now.
+                    gate.set_result(None)
+                pending.pop(req_id, None)
                 continue
             if status == "success":
                 try:
                     if context is None:
                         raise RuntimeError("live split ACK has no destination")
                     if 0 in entry.get("handled_groups", (1,)):
-                        latent_cache = (
-                            self.lmcache_engine._commit_live_split_import(context)
+                        admit = getattr(
+                            self.lmcache_engine, "admit_live_split_pages", None
                         )
-                        live_state = WorkerRetrieveState(req_id=req_id)
-                        for name, values in latent_cache.items():
-                            setattr(live_state, name, values)
+                        if not callable(admit):
+                            raise RuntimeError(
+                                "live split engine cannot admit latent pages"
+                            )
+                        admit(context)
                     record = getattr(
                         self.lmcache_engine.gpu_connector,
                         "record_dense_load_readiness",
@@ -5988,23 +6146,19 @@ class LMCacheConnectorV1Impl:
                     completion.set_result((None, readiness, 0.0, 0.0))
                     gate = entry["latent_gate"]
                     if not gate.done():
-                        gate.set_result(live_state)
+                        gate.set_result(None)
+                    pending.pop(req_id, None)
                     continue
                 except BaseException:
                     logger.exception("Live split commit failed for %s", req_id)
-                    if live_state is not None:
-                        self._release_unadopted_shared_request_objects(
-                            live_state, entry["request"]
-                        )
-                        self._release_shared_worker_retrieve_state(
-                            live_state, self.lmcache_engine
-                        )
             if context is not None:
                 self.lmcache_engine._release_live_split_import(context)
+                entry["context"] = None
             gate = entry["latent_gate"]
             if not gate.done():
                 gate.set_result(None)
             self._fallback_live_split_indexer(entry)
+            pending.pop(req_id, None)
 
     def _run_dsa_cold_indexer_load(
         self, plan: dict[str, Any], npu_device_id: Optional[int]
@@ -8628,6 +8782,55 @@ class LMCacheConnectorV1Impl:
             and self._supports_dsa_split_layout()
         )
 
+    def _supports_dsa_live_latent_common(self) -> bool:
+        return bool(
+            self.config.get_extra_config_value(
+                "enable_dsa_live_latent_split", False
+            )
+            and self.config.get_extra_config_value(
+                "mooncake_reuse_vllm_transfer_engine", False
+            )
+        )
+
+    def supports_dsa_live_latent_source(self) -> bool:
+        return bool(
+            self._supports_dsa_live_latent_common()
+            and self.supports_dsa_live_split()
+        )
+
+    def supports_dsa_live_latent_destination(self) -> bool:
+        return bool(
+            self._supports_dsa_live_latent_common()
+            and self.supports_dsa_cold_compact_load()
+        )
+
+    def supports_dsa_live_latent_split(self) -> bool:
+        """Whether this deployment opts into rank-0 latent live transfer."""
+        # Source capture needs the producer's direct-NPU store layout, whereas
+        # a pure decoder only needs the cold-compact destination/import path.
+        # Requiring the producer-only flag on kv_consumer silently prevented
+        # group-0 negotiation in the normal role-specific deployment.
+        if self.kv_role == "kv_consumer":
+            role_capable = self.supports_dsa_live_latent_destination()
+        elif self.kv_role == "kv_producer":
+            role_capable = self.supports_dsa_live_latent_source()
+        else:
+            # kv_both is used by the disaggregated deployment on each side.
+            # Activate when this local process owns either half of the
+            # protocol; request metadata still admits group 0 only on an
+            # actual cold-compact destination with an exact TP0 source.
+            role_capable = (
+                self.supports_dsa_live_latent_source()
+                or self.supports_dsa_live_latent_destination()
+            )
+        return bool(role_capable)
+
+    def configure_live_latent_source(self, enabled: bool) -> None:
+        """Apply the two-sided hybrid-transport capability decision."""
+        self._live_latent_split_requested = bool(
+            enabled and self.supports_dsa_live_latent_split()
+        )
+
     def supports_dsa_cold_compact_load(self) -> bool:
         return bool(
             self.config.enable_dsa_cold_compact_load
@@ -8915,6 +9118,25 @@ class LMCacheConnectorV1Impl:
                 req_meta.live_split_remote_block_ids = list(remote_block_ids)
                 req_meta.live_split_compact = (
                     "ascend_live_split_compact_v1" in capabilities
+                )
+                req_meta.live_split_latent_cpu = bool(
+                    req_meta.live_split_compact
+                    and "ascend_live_split_latent_cpu_v1" in capabilities
+                    and getattr(
+                        self, "_live_latent_split_requested", False
+                    )
+                    and _has_live_latent_source_for_dp(
+                        params,
+                        int(
+                            getattr(
+                                self._vllm_config.parallel_config,
+                                "data_parallel_rank_local",
+                                0,
+                            )
+                            or 0
+                        ),
+                        load_spec.lmcache_cached_tokens,
+                    )
                 )
         return req_meta
 

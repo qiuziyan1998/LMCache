@@ -182,6 +182,21 @@ class TestLocalCPUBackend:
                 [page_key, other_page_key], [pages[0], pages[0]]
             )
         backend.batched_submit_layer_pages([page_key], pages)
+        assert backend.contains_compatible_layer_pages_exact(
+            [page_key], pages
+        )
+        assert not backend.contains_compatible_layer_pages_exact(
+            [other_page_key], pages
+        )
+        legacy = create_test_memory_obj([8], torch.float16)
+        assert legacy is not None
+        with backend.cpu_lock:
+            pages[0].ref_count_down()
+            backend.hot_cache[page_key] = legacy
+        backend.batched_submit_layer_pages([page_key], pages)
+        assert backend.contains_compatible_layer_pages_exact(
+            [page_key], pages
+        )
 
         assert backend.batched_contains(layer_keys, pin=True) == 0
         assert backend.get_blocking(layer_keys[0]) is None

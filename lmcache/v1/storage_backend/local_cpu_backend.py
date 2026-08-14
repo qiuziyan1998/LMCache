@@ -321,7 +321,30 @@ class LocalCPUBackend(AllocatorBackendInterface):
             raise ValueError("Layer-page admission requires one unique key per page")
         if any(not page.is_valid() for page in pages):
             raise ValueError("Layer-page admission cannot store invalid pages")
-        self.batched_submit_put_task(keys, pages)
+        if not self.use_hot:
+            return
+        stored_keys: list[CacheEngineKey] = []
+        with self.cpu_lock:
+            for key, page in zip(keys, pages, strict=True):
+                existing = self.hot_cache.get(key)
+                if self._compatible_layer_page(existing, page):
+                    continue
+                page.ref_count_up()
+                self.hot_cache[key] = page
+                stored_keys.append(key)
+                if existing is not None:
+                    # Other request owners retain their own references. Only
+                    # the cache mapping's reference is transferred here.
+                    self.cache_policy.update_on_force_evict(key)
+                    existing.ref_count_down()
+            for key in stored_keys:
+                if self.batched_msg_sender is not None:
+                    self.batched_msg_sender.add_kv_op(
+                        op_type=OpType.ADMIT,
+                        key=key.chunk_hash,
+                    )
+            if stored_keys:
+                self.cache_policy.update_on_put_many(stored_keys)
 
     def batched_get_layer_page_prefix(
         self, keys: Sequence[CacheEngineKey]
@@ -346,6 +369,39 @@ class LocalCPUBackend(AllocatorBackendInterface):
         """Return whether every exact key exists under one cache lock."""
         with self.cpu_lock:
             return all(key in self.hot_cache for key in keys)
+
+    def contains_compatible_layer_pages_exact(
+        self,
+        keys: Sequence[CacheEngineKey],
+        expected_pages: Sequence[LayerPageMemoryObj],
+    ) -> bool:
+        """Validate exact-key winners before publishing a live page import."""
+        if len(keys) != len(expected_pages):
+            return False
+        with self.cpu_lock:
+            for key, expected in zip(keys, expected_pages, strict=True):
+                actual = self.hot_cache.get(key)
+                if not self._compatible_layer_page(actual, expected):
+                    return False
+        return True
+
+    @staticmethod
+    def _compatible_layer_page(
+        actual: Optional[MemoryObj], expected: LayerPageMemoryObj
+    ) -> bool:
+        return bool(
+            isinstance(actual, LayerPageMemoryObj)
+            and actual.is_valid()
+            and actual.get_size() == expected.get_size()
+            and actual.valid_tokens == expected.valid_tokens
+            and actual.num_layers == expected.num_layers
+            and actual.layer_size == expected.layer_size
+            and actual.meta.fmt == expected.meta.fmt
+            and actual.meta.shape == expected.meta.shape
+            and actual.meta.dtype == expected.meta.dtype
+            and actual.meta.shapes == expected.meta.shapes
+            and actual.meta.dtypes == expected.meta.dtypes
+        )
 
     def get_blocking(
         self,
