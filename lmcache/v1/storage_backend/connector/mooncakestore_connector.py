@@ -2175,6 +2175,12 @@ class MooncakestoreConnector(RemoteConnector):
                 statuses, transfer_ms = await asyncio.wait_for(
                     asyncio.shield(task), timeout=self.config.transfer_timeout
                 )
+            except asyncio.CancelledError:
+                # The native read is not cancellable and still owns the destination
+                # buffers. Do not let their allocator storage be reused until DMA
+                # has stopped writing into it.
+                await _drain_native_task(task)
+                raise
             except asyncio.TimeoutError:
                 # Native transfers cannot be cancelled safely while their destination
                 # tensors are live. Drain the call, then force the caller to fallback.

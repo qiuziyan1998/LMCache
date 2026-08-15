@@ -1341,6 +1341,52 @@ def test_mooncake_direct_external_get_registers_storage_and_validates_bytes() ->
     assert [call[0] for call in calls].count("get") == 2
 
 
+def test_mooncake_cancelled_direct_external_get_drains_native_read() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _Store:
+        @staticmethod
+        def batch_get_into_multi_buffers(keys, ptrs, sizes):
+            entered.set()
+            assert release.wait(5)
+            return [sum(page_sizes) for page_sizes in sizes]
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector.config = SimpleNamespace(transfer_timeout=5)
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (None, None, None, 2)
+    connector._register_external_owners = lambda owners: None
+    connector._external_put_lock = asyncio.Lock()
+    connector._inflight_put_tasks = set()
+    connector.store = _Store()
+    owner = torch.empty(32, dtype=torch.uint8)
+
+    async def cancel_get() -> None:
+        task = asyncio.create_task(
+            connector.batched_get_external_pages(
+                [_key(1)], [[owner.data_ptr()]], [[32]], (owner,), "request"
+            )
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert connector._external_put_lock.locked()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not connector._external_put_lock.locked()
+
+    asyncio.run(cancel_get())
+
+
 def test_external_page_reuses_registered_cpu_allocator_storage() -> None:
     calls = []
     owner = torch.empty(64, dtype=torch.uint8)
