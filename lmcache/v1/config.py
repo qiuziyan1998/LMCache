@@ -328,6 +328,17 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "description": "Validate NPU transfer slots, cached destinations, and "
         "registered source spans before native kernel launch.",
     },
+    "enable_npu_content_diagnostics": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": (
+            "Fingerprint sampled Group-1 source, P2P destination, first "
+            "decoder-consume, and selected top-k tensors. Diagnostic NPU-to-CPU "
+            "readback may synchronize device work; keep disabled outside "
+            "correctness investigations."
+        ),
+    },
     "enable_shared_cpu_cache": {
         "type": bool,
         "default": False,

@@ -137,6 +137,14 @@ def test_npu_transfer_validation_defaults_on_and_can_be_disabled(monkeypatch):
     assert LMCacheEngineConfig.from_env().enable_npu_transfer_validation is False
 
 
+def test_npu_content_diagnostics_defaults_off_and_can_be_enabled(monkeypatch):
+    config = LMCacheEngineConfig.from_defaults()
+    assert config.enable_npu_content_diagnostics is False
+
+    monkeypatch.setenv("LMCACHE_ENABLE_NPU_CONTENT_DIAGNOSTICS", "true")
+    assert LMCacheEngineConfig.from_env().enable_npu_content_diagnostics is True
+
+
 def test_group1_load_mode_defaults_to_p2p_preferred():
     config = LMCacheEngineConfig.from_defaults()
 
