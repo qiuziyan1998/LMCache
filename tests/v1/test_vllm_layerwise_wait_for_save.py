@@ -388,8 +388,17 @@ def test_p_node_last_index_save_defers_finalize_until_wait_for_save(
             torch.tensor([110, 111, 112, 113]),
         ),
     )
+    # Sparse-attention chunked prefill marks this as a windowed save even for
+    # a producer, whose mapping still covers the complete current prefix.
+    # P-node preparation must accept that normal prefill metadata; only an
+    # actual sparse-decode request is invalid here.
+    request.windowed_sparse_save = True
+    request.indexer_slot_mapping = [
+        torch.tensor([100, 101, 102, 103])
+    ]
     connector, metadata, engine = _make_connector([request])
     connector.config = SimpleNamespace(dsa_two_groups=True)
+    connector.enable_sparse_attention = True
     latent_name = "model.layers.0.self_attn.attn.k_cache"
     indexer_name = "model.layers.0.self_attn.indexer.k_cache"
     connector.kv_caches = {
@@ -436,6 +445,10 @@ def test_p_node_last_index_save_defers_finalize_until_wait_for_save(
     assert created == [0, 1]
     assert primed == [0, 1]
     assert len(connector._layerwise_save_storers) == 2
+    assert all(
+        kwargs["windowed_sparse_save"] is True
+        for kwargs in engine.store_kwargs
+    )
 
     connector.save_kv_layer(latent_name, torch.zeros(1), attn_metadata)
     connector.save_kv_layer(indexer_name, torch.zeros(1), attn_metadata)
@@ -455,6 +468,28 @@ def test_p_node_last_index_save_defers_finalize_until_wait_for_save(
 
     assert finalized == [0, 1]
     assert connector._layerwise_save_storers == {}
+
+
+def test_p_node_storer_preparation_rejects_sparse_decode(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request = _make_req("req-p-decode")
+    request.is_sparse_decode = True
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = (
+        (torch.tensor([0, 1, 2, 3]),),
+        (torch.tensor([10, 11, 12, 13]),),
+    )
+    connector, metadata, _ = _make_connector([request])
+    connector.kv_caches = {"layer0": torch.zeros(1)}
+    connector._kvcaches_list = []
+    connector._refresh_kvcaches_list()
+    connector._materialize_layerwise_prefill_slot_mappings(
+        request,
+        force=True,
+    )
+
+    with pytest.raises(RuntimeError, match="decode save request"):
+        connector._prepare_p_node_layerwise_save_storers(metadata)
 
 
 @pytest.mark.parametrize(

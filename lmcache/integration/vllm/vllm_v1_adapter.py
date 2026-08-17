@@ -8145,12 +8145,12 @@ class LMCacheConnectorV1Impl:
             store_mask,
             skip_leading_tokens,
             store_kwargs,
-            windowed_sparse_save,
+            _,
         ) = store_inputs
-        if windowed_sparse_save or request.is_sparse_decode:
+        if request.is_sparse_decode:
             raise RuntimeError(
                 "P-node layerwise prefill storer preparation received a "
-                f"sparse save request: req_id={request.req_id}"
+                f"decode save request: req_id={request.req_id}"
             )
         slot_mapping = self._layerwise_prefill_slot_mapping(
             request,
