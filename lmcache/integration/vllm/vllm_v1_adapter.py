@@ -8585,12 +8585,21 @@ class LMCacheConnectorV1Impl:
                         )
                     )
                     assert dynamic_slot_mapping is not None
-                    layerwise_storer.send(
-                        {
-                            "slot_mapping": dynamic_slot_mapping,
-                            "slot_mapping_base": 0,
-                        }
+                    yielded = self._store_result_from_yield(
+                        layerwise_storer.send(
+                            {
+                                "slot_mapping": dynamic_slot_mapping,
+                                "slot_mapping_base": 0,
+                            }
+                        )
                     )
+                    if yielded is not None:
+                        raise RuntimeError(
+                            "P-node layerwise storer completed in the "
+                            "pre-HCOM save hook: "
+                            f"request={request.req_id}, kv_group={kv_group}, "
+                            f"layer={layer_name}"
+                        )
                     pending_finishes[storer_key] = layer_name
                 else:
                     next(layerwise_storer)

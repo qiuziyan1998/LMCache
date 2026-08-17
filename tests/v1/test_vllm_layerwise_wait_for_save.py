@@ -366,6 +366,35 @@ def test_p_node_save_rotates_dynamic_bank_mapping(monkeypatch) -> None:
     ]
 
 
+def test_p_node_rejects_completion_in_pre_hcom_save_hook(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request = _make_req("req-p")
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = (
+        (torch.tensor([0, 1, 2, 3]),),
+        (torch.tensor([10, 11, 12, 13]),),
+    )
+    connector, _, engine = _make_connector([request])
+
+    def store_layer(_token_ids, **_kwargs):
+        def storer():
+            yield
+            yield LayerwiseStoreResult(
+                request_id="req-p",
+                kv_group=0,
+            )
+
+        return storer()
+
+    engine.store_layer = store_layer
+
+    with pytest.raises(RuntimeError, match="pre-HCOM save hook"):
+        connector.save_kv_layer("layer0", torch.zeros(1), SimpleNamespace())
+
+    assert connector._layerwise_save_storers == {}
+    assert connector._layerwise_prefill_pending_store_finishes == {}
+
+
 def test_p_node_last_index_save_defers_finalize_until_wait_for_save(
     monkeypatch,
 ) -> None:
