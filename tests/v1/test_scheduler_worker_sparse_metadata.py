@@ -21,6 +21,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     RequestTracker,
     WorkerRetrieveState,
     _has_live_latent_source_for_dp,
+    _live_split_source_dp_rank,
 )
 from tests.v1.connector_test_utils import make_worker_impl
 
@@ -52,6 +53,7 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl.config.enable_sparse_attention = True
     impl.config.enable_shared_cpu_cache = False
     impl.config.use_layerwise = True
+    impl.config.dsa_group1_load_mode = "p2p_preferred"
     impl.config.priority_limit = None
     impl.kv_role = "kv_both"
     impl.force_skip_save = False
@@ -210,6 +212,36 @@ def test_live_split_does_not_require_decoder_cold_load() -> None:
     assert not impl.supports_dsa_cold_compact_load()
     impl.request_finished(request, [])
     assert request.kv_transfer_params["request_live_split"] is True
+
+
+def test_live_split_honors_shared_cpu_flag_from_extra_config() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = False
+    impl.config.extra_config = {"enable_shared_cpu_cache": True}
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key == "mooncake_direct_npu_prefill_store"
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+
+    assert impl.supports_dsa_live_split()
+
+
+@pytest.mark.parametrize(
+    "mode", ("persistent_serial", "persistent_parallel_prefetch")
+)
+def test_persistent_group1_modes_disable_live_split(mode: str) -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.dsa_group1_load_mode = mode
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key == "mooncake_direct_npu_prefill_store"
+    )
+
+    assert not impl.supports_dsa_live_split()
 
 
 def test_live_latent_split_requires_explicit_opt_in() -> None:
@@ -439,16 +471,27 @@ def test_live_latent_source_gate_requires_exact_tp0_dp_descriptor() -> None:
         )
 
 
-@pytest.mark.parametrize("negotiated", [False, True])
+@pytest.mark.parametrize(
+    ("negotiated", "mode", "expected"),
+    [
+        (False, "p2p_preferred", False),
+        (True, "p2p_preferred", True),
+        (True, "persistent_serial", False),
+        (True, "persistent_parallel_prefetch", False),
+    ],
+)
 def test_cold_meta_requires_two_sided_latent_activation(
     negotiated: bool,
+    mode: str,
+    expected: bool,
 ) -> None:
     impl = _make_scheduler_impl()
     impl._block_size = 2
     impl._dsa_cold_indexer_block_ids = {}
     impl._live_latent_split_requested = negotiated
+    impl.config.dsa_group1_load_mode = mode
     impl._vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(data_parallel_rank_local=0)
+        parallel_config=SimpleNamespace(data_parallel_index=1)
     )
     tokens = [1, 2, 3, 4]
     request = SimpleNamespace(
@@ -465,6 +508,7 @@ def test_cold_meta_requires_two_sided_latent_activation(
                 "ascend_live_split_latent_cpu_v1",
             ),
             "remote_block_ids": [1, 2],
+            "remote_dp_rank": 0,
             "ascend_live_split_source_v1": {
                 "descriptors": [{
                     "tp_rank": 0,
@@ -500,7 +544,33 @@ def test_cold_meta_requires_two_sided_latent_activation(
 
     meta = impl._build_dsa_cold_compact_meta(request, blocks, load_spec)
 
-    assert meta.live_split_latent_cpu is negotiated
+    assert meta.live_split_latent_cpu is expected
+
+
+def test_dp2_live_split_requires_explicit_global_source_route() -> None:
+    parallel = SimpleNamespace(data_parallel_size=2, data_parallel_index=1)
+    base = {
+        "live_split_capabilities": ("ascend_live_split_v2",),
+        "remote_dp_rank": 0,
+    }
+
+    assert _live_split_source_dp_rank(base, parallel) is None
+    assert _live_split_source_dp_rank(
+        {
+            **base,
+            "live_split_capabilities": (
+                "ascend_live_split_v2",
+                "ascend_live_split_dp_routing_v1",
+            ),
+        },
+        parallel,
+    ) == 0
+    assert _live_split_source_dp_rank(
+        {**base, "remote_dp_rank": True}, parallel
+    ) is None
+    assert _live_split_source_dp_rank(
+        {**base, "remote_dp_rank": 2}, parallel
+    ) is None
 
 
 def test_dsa_cold_compact_alloc_metadata_has_only_indexer_slots() -> None:

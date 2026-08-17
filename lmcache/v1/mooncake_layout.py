@@ -125,10 +125,9 @@ def mooncake_layer_pages_enabled(config: object) -> bool:
     """Return whether the experimental LocalCPU layer-page layout is enabled."""
     extra_config = getattr(config, "extra_config", None) or {}
     shared = bool(
-        getattr(
-            config,
+        extra_config.get(
             "enable_shared_cpu_cache",
-            extra_config.get("enable_shared_cpu_cache", False),
+            getattr(config, "enable_shared_cpu_cache", False),
         )
     )
     return (

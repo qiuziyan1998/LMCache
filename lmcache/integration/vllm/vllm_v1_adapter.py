@@ -206,6 +206,43 @@ def _has_live_latent_source_for_dp(
     return False
 
 
+def _live_split_source_dp_rank(
+    params: Any,
+    parallel_config: Any,
+) -> int | None:
+    """Validate the source DP identity used by the live-split protocol.
+
+    DP1 accepts an older peer that omits the identity. DP>1 requires the
+    explicit routing capability and an in-range, non-boolean global DP rank.
+    """
+    if not isinstance(params, dict):
+        return None
+    try:
+        dp_size = int(getattr(parallel_config, "data_parallel_size", 1) or 1)
+    except (TypeError, ValueError):
+        return None
+    if dp_size <= 0:
+        return None
+    raw_rank = params.get("remote_dp_rank")
+    if raw_rank is None:
+        return 0 if dp_size == 1 else None
+    if (
+        isinstance(raw_rank, bool)
+        or not isinstance(raw_rank, int)
+        or raw_rank < 0
+        or raw_rank >= dp_size
+    ):
+        return None
+    capabilities = params.get("live_split_capabilities", ())
+    if dp_size > 1 and (
+        not isinstance(capabilities, (tuple, list, set, frozenset))
+        or not all(isinstance(item, str) for item in capabilities)
+        or "ascend_live_split_dp_routing_v1" not in capabilities
+    ):
+        return None
+    return raw_rank
+
+
 def _mtp_dw_diag_enabled() -> bool:
     return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
 
@@ -3951,19 +3988,28 @@ class LMCacheConnectorV1Impl:
 
     @staticmethod
     def _release_dense_load_source_owners(
-        owners: tuple[Any, ...], engine: Optional[Any]
+        owners: tuple[Any, ...],
+        engine: Optional[Any],
+        *,
+        synchronize: bool = True,
     ) -> None:
         if not owners:
             return
-        synchronize = getattr(
-            getattr(engine, "gpu_connector", None),
-            "synchronize_dense_load_stream",
-            None,
-        )
-        if synchronize is None:
-            raise RuntimeError("NPU connector has no dense load-stream sync API")
-        synchronize()
+        if synchronize:
+            synchronize_fn = getattr(
+                getattr(engine, "gpu_connector", None),
+                "synchronize_dense_load_stream",
+                None,
+            )
+            if synchronize_fn is None:
+                raise RuntimeError(
+                    "NPU connector has no dense load-stream sync API"
+                )
+            synchronize_fn()
         for owner in owners:
+            unpin = getattr(owner, "unpin", None)
+            if callable(unpin) and getattr(owner, "is_pinned", False):
+                unpin()
             release = getattr(owner, "ref_count_down", None)
             valid = getattr(owner, "is_valid", None)
             if callable(release) and (not callable(valid) or valid()):
@@ -6054,7 +6100,7 @@ class LMCacheConnectorV1Impl:
                         request_configs=request.request_configs,
                         tp_rank=get_tensor_model_parallel_rank(),
                         dp_rank=int(
-                            getattr(parallel, "data_parallel_rank_local", 0)
+                            getattr(parallel, "data_parallel_index", 0)
                             or 0
                         ),
                         handled_groups=request_groups,
@@ -6190,8 +6236,6 @@ class LMCacheConnectorV1Impl:
         shared_cpu_enabled = bool(
             callable(shared_retrieve) and shared_retrieve(1)
         )
-        if shared_cpu_enabled:
-            plan["latent_shared_ready"].result()
         retrieve_kwargs, _, _ = self._sparse_retrieve_kwargs(
             request,
             retrieve_state,
@@ -6206,6 +6250,62 @@ class LMCacheConnectorV1Impl:
             shared_cpu_enabled=shared_cpu_enabled,
             shared_cpu_preflight_state=None,
         )
+        load_mode = str(
+            getattr(
+                getattr(self, "config", None),
+                "dsa_group1_load_mode",
+                "p2p_preferred",
+            )
+        )
+        if shared_cpu_enabled and load_mode == "persistent_parallel_prefetch":
+            prefetch = getattr(
+                self.lmcache_engine, "prefetch_shared_layer_pages", None
+            )
+            if callable(prefetch):
+                prefetch_started = cold_start_perf_now()
+                cold_start_perf_log(
+                    logger,
+                    "group1_persistent_prefetch_start",
+                    req_id=request.req_id,
+                    tokens=plan["token_count"],
+                )
+                try:
+                    location = prefetch(
+                        plan["tokens"],
+                        plan["token_mask"],
+                        retrieve_kwargs=retrieve_kwargs,
+                    )
+                    retrieve_state.location = location
+                    retrieve_kwargs["cached_retrieve_location"] = location
+                except Exception as error:
+                    owners = self._dense_load_source_owners(retrieve_state)
+                    self._release_dense_load_source_owners(
+                        owners, self.lmcache_engine
+                    )
+                    retrieve_state.clear_group(1)
+                    cold_start_perf_log(
+                        logger,
+                        "group1_persistent_prefetch_fallback",
+                        started=prefetch_started,
+                        req_id=request.req_id,
+                        error=repr(error),
+                    )
+                    logger.warning(
+                        "Group-1 persistent prefetch failed for %s; using "
+                        "the serial persistent path: %s",
+                        request.req_id,
+                        error,
+                    )
+        if shared_cpu_enabled:
+            try:
+                plan["latent_shared_ready"].result()
+            except BaseException:
+                owners = self._dense_load_source_owners(retrieve_state)
+                self._release_dense_load_source_owners(
+                    owners, self.lmcache_engine
+                )
+                retrieve_state.clear_group(1)
+                raise
         if not shared_cpu_enabled:
             retrieve_kwargs["direct_external_pages"] = True
             retrieve_kwargs["_defer_direct_load_readiness"] = True
@@ -6374,15 +6474,39 @@ class LMCacheConnectorV1Impl:
                     indexer_future.result()
                 except BaseException:
                     pass
+            owners_by_id = {
+                id(owner): owner
+                for owner in (
+                    *state.dense_load_source_owners,
+                    *tuple(plan.get("indexer_source_owners", ())),
+                )
+            }
+            combined_owners = tuple(owners_by_id.values())
             try:
                 self._synchronize_dsa_cold_dense_load()
             except BaseException:
+                # The transfer may still be writing. Preserve every owner on
+                # the surfaced state so the scheduler can retain the blocks
+                # and a later safe cleanup cannot lose the indexer future's
+                # source allocation.
+                state.dense_load_source_owners = combined_owners
+                plan["indexer_source_owners"] = ()
                 exc._lmcache_dsa_cold_state = state
                 logger.exception(
                     "Cold compact cleanup could not synchronize the dense "
                     "load stream; scheduler blocks must remain retained"
                 )
             else:
+                # The stream is already fenced. Release both adopted and
+                # not-yet-adopted indexer owners exactly once, without a
+                # redundant second device synchronization.
+                self._release_dense_load_source_owners(
+                    combined_owners,
+                    self.lmcache_engine,
+                    synchronize=False,
+                )
+                state.dense_load_source_owners = ()
+                plan["indexer_source_owners"] = ()
                 self._release_unadopted_shared_request_objects(state, request)
                 self._release_shared_worker_retrieve_state(
                     state, self.lmcache_engine
@@ -8766,17 +8890,33 @@ class LMCacheConnectorV1Impl:
         prefix_caching = bool(
             getattr(cache_config, "enable_prefix_caching", False)
         )
+        extra_config = getattr(self.config, "extra_config", None)
+        shared_cpu_enabled = bool(
+            extra_config.get(
+                "enable_shared_cpu_cache",
+                self.config.enable_shared_cpu_cache,
+            )
+            if isinstance(extra_config, dict)
+            else self.config.enable_shared_cpu_cache
+        )
         return bool(
             not prefix_caching
             and self.config.enable_sparse_attention
             and self.config.dsa_two_groups
-            and self.config.enable_shared_cpu_cache
+            and shared_cpu_enabled
             and self.config.use_layerwise
+        )
+
+    def _group1_p2p_preferred(self) -> bool:
+        return (
+            getattr(self.config, "dsa_group1_load_mode", "p2p_preferred")
+            == "p2p_preferred"
         )
 
     def supports_dsa_live_split(self) -> bool:
         return bool(
-            self.config.get_extra_config_value(
+            self._group1_p2p_preferred()
+            and self.config.get_extra_config_value(
                 "mooncake_direct_npu_prefill_store", False
             )
             and self._supports_dsa_split_layout()
@@ -8823,7 +8963,7 @@ class LMCacheConnectorV1Impl:
                 self.supports_dsa_live_latent_source()
                 or self.supports_dsa_live_latent_destination()
             )
-        return bool(role_capable)
+        return bool(self._group1_p2p_preferred() and role_capable)
 
     def configure_live_latent_source(self, enabled: bool) -> None:
         """Apply the two-sided hybrid-transport capability decision."""
@@ -9110,8 +9250,28 @@ class LMCacheConnectorV1Impl:
             request_configs=extract_request_configs(request.sampling_params),
         )
         params = getattr(request, "kv_transfer_params", None)
-        capabilities = params.get("live_split_capabilities", ()) if params else ()
-        if "ascend_live_split_v2" in capabilities:
+        raw_capabilities = (
+            params.get("live_split_capabilities", ())
+            if isinstance(params, dict)
+            else ()
+        )
+        capabilities = (
+            raw_capabilities
+            if isinstance(
+                raw_capabilities, (tuple, list, set, frozenset)
+            )
+            and all(isinstance(item, str) for item in raw_capabilities)
+            else ()
+        )
+        source_dp_rank = _live_split_source_dp_rank(
+            params,
+            self._vllm_config.parallel_config,
+        )
+        if (
+            self._group1_p2p_preferred()
+            and "ascend_live_split_v2" in capabilities
+            and source_dp_rank is not None
+        ):
             remote_block_ids = params.get("remote_block_ids")
             if remote_block_ids:
                 req_meta.live_split_requested = True
@@ -9127,14 +9287,7 @@ class LMCacheConnectorV1Impl:
                     )
                     and _has_live_latent_source_for_dp(
                         params,
-                        int(
-                            getattr(
-                                self._vllm_config.parallel_config,
-                                "data_parallel_rank_local",
-                                0,
-                            )
-                            or 0
-                        ),
+                        source_dp_rank,
                         load_spec.lmcache_cached_tokens,
                     )
                 )

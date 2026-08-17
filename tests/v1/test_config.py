@@ -9,6 +9,7 @@ import pytest
 # First Party
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import apply_remote_configs, validate_and_set_config_value
+from lmcache.v1.mooncake_layout import mooncake_layer_pages_enabled
 
 BASE_DIR = Path(__file__).parent
 
@@ -134,6 +135,52 @@ def test_npu_transfer_validation_defaults_on_and_can_be_disabled(monkeypatch):
 
     monkeypatch.setenv("LMCACHE_ENABLE_NPU_TRANSFER_VALIDATION", "false")
     assert LMCacheEngineConfig.from_env().enable_npu_transfer_validation is False
+
+
+def test_group1_load_mode_defaults_to_p2p_preferred():
+    config = LMCacheEngineConfig.from_defaults()
+
+    assert config.dsa_group1_load_mode == "p2p_preferred"
+
+
+def test_group1_load_mode_rejects_unknown_value():
+    config = LMCacheEngineConfig.from_defaults(dsa_group1_load_mode="race_both")
+
+    with pytest.raises(ValueError, match="dsa_group1_load_mode"):
+        config.validate()
+
+
+def test_group1_parallel_prefetch_rejects_silent_serial_fallback():
+    config = LMCacheEngineConfig.from_defaults(
+        dsa_group1_load_mode="persistent_parallel_prefetch"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="persistent_parallel_prefetch requires",
+    ):
+        config.validate()
+
+
+def test_group1_parallel_prefetch_accepts_complete_page_layout_contract():
+    config = LMCacheEngineConfig.from_defaults(
+        use_layerwise=True,
+        enable_sparse_attention=True,
+        save_unfull_chunk=True,
+        dsa_two_groups=True,
+        enable_dsa_cold_compact_load=True,
+        dsa_group1_load_mode="persistent_parallel_prefetch",
+        remote_url="mooncakestore://metadata",
+        extra_config={
+            "enable_shared_cpu_cache": True,
+            "save_only_first_rank": True,
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+        },
+    )
+
+    config.validate()
+    assert mooncake_layer_pages_enabled(config)
 
 
 @pytest.mark.parametrize(
