@@ -5451,6 +5451,44 @@ class LMCacheEngine:
 
             to_count_down = []
             retrieved_by_location: dict[str, list[MemoryObj]] = defaultdict(list)
+
+            def release_completed_layers_after_failure(
+                failed_results: list[list[MemoryObj]],
+                failed_segments: list[tuple],
+            ) -> None:
+                for segment, mem_objs in zip(
+                    failed_segments, failed_results, strict=True
+                ):
+                    retrieved_by_location[segment[0]].extend(mem_objs)
+                if to_count_down:
+                    synchronize = getattr(
+                        self.gpu_connector,
+                        "synchronize_dense_load_stream",
+                        None,
+                    )
+                    if callable(synchronize):
+                        synchronize()
+                    else:
+                        load_stream = getattr(
+                            self.gpu_connector, "load_stream", None
+                        )
+                        stream_synchronize = getattr(
+                            load_stream, "synchronize", None
+                        )
+                        if callable(stream_synchronize):
+                            stream_synchronize()
+                    for mem_obj in to_count_down:
+                        mem_obj.ref_count_down()
+                    to_count_down.clear()
+                for mem_objs in failed_results:
+                    for mem_obj in mem_objs:
+                        mem_obj.ref_count_down()
+                try:
+                    mem_obj_consumer.close()
+                finally:
+                    for location, mem_objs in retrieved_by_location.items():
+                        self._maybe_unpin_retrieved_objs(mem_objs, location)
+
             for layer_id in range(self.num_layers):
                 tasks = [next(get_generator) for get_generator in get_generators]
                 for task in tasks:
@@ -5463,9 +5501,60 @@ class LMCacheEngine:
                 else:
                     yield None
 
+                segment_results: list[list[MemoryObj]] = []
+                try:
+                    for task in tasks:
+                        segment_results.append(task.result())
+                except BaseException:
+                    # Every task for this layer was already submitted. Drain
+                    # the remainder so successful peer segments do not leak
+                    # their temporary MemoryObj references when one backend
+                    # future fails.
+                    completed_segments = segments[: len(segment_results)]
+                    for pending_index, pending_task in enumerate(
+                        tasks[len(segment_results) :],
+                        start=len(segment_results),
+                    ):
+                        try:
+                            pending_objs = pending_task.result()
+                        except BaseException:
+                            continue
+                        segment_results.append(pending_objs)
+                        completed_segments.append(segments[pending_index])
+                    release_completed_layers_after_failure(
+                        segment_results,
+                        completed_segments,
+                    )
+                    raise
+
+                incomplete_segments = [
+                    {
+                        "location": segment[0],
+                        "expected_chunks": len(segment[1]),
+                        "retrieved_chunks": len(segment_mem_objs),
+                    }
+                    for segment, segment_mem_objs in zip(
+                        segments, segment_results, strict=True
+                    )
+                    if len(segment_mem_objs) != len(segment[1])
+                ]
+                if incomplete_segments:
+                    release_completed_layers_after_failure(
+                        segment_results,
+                        segments,
+                    )
+                    raise RuntimeError(
+                        "Layerwise retrieve returned an incomplete layer; "
+                        "refusing to keep the prefix success mask because "
+                        "missing NPU rows would remain stale: "
+                        f"req_id={req_id}, kv_group={kv_group}, "
+                        f"layer_id={layer_id}, segments={incomplete_segments}"
+                    )
+
                 mem_objs_layer = []
-                for segment, task in zip(segments, tasks, strict=True):
-                    segment_mem_objs = task.result()
+                for segment, segment_mem_objs in zip(
+                    segments, segment_results, strict=True
+                ):
                     mem_objs_layer.extend(segment_mem_objs)
                     retrieved_by_location[segment[0]].extend(segment_mem_objs)
                 mem_obj_consumer.send(mem_objs_layer)

@@ -159,6 +159,110 @@ def test_layerwise_retrieve_preserves_cleanup_locations(
     )
 
 
+def test_layerwise_retrieve_rejects_incomplete_later_layer(monkeypatch):
+    class FakeKey:
+        def __init__(self, chunk_id):
+            self.chunk_id = chunk_id
+
+        def split_layers(self, num_layers):
+            return [
+                SimpleNamespace(chunk_id=self.chunk_id, layer_id=layer_id)
+                for layer_id in range(num_layers)
+            ]
+
+    class FakeMemoryObj:
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+            self.ref_count_down_calls = 0
+            self.is_pinned = True
+            self.unpin_calls = 0
+
+        def ref_count_down(self):
+            self.ref_count_down_calls += 1
+
+        def unpin(self):
+            self.unpin_calls += 1
+            self.is_pinned = False
+
+    class FakeStorageManager:
+        def __init__(self):
+            self.returned = []
+
+        @staticmethod
+        def contains(_key, _retrieve_locations):
+            return "RemoteBackend"
+
+        def layerwise_batched_get(self, keys, location=None):
+            del location
+            for layer_id, layer_keys in enumerate(keys):
+                count = len(layer_keys) if layer_id == 0 else len(layer_keys) - 1
+                mem_objs = [FakeMemoryObj(layer_id) for _ in range(count)]
+                self.returned.extend(mem_objs)
+                yield SimpleNamespace(result=lambda objs=mem_objs: objs)
+
+    class FakeLoadStream:
+        def __init__(self):
+            self.synchronize_calls = 0
+
+        def synchronize(self):
+            self.synchronize_calls += 1
+
+    class FakeGPUConnector:
+        def __init__(self):
+            self.load_stream = FakeLoadStream()
+            self.layers_sent = 0
+            self.closed = False
+
+        def batched_to_gpu(self, _starts, _ends, **_kwargs):
+            try:
+                while True:
+                    yield
+                    self.layers_sent += 1
+            finally:
+                self.closed = True
+
+    monkeypatch.setattr(cache_engine_module, "CacheEngineKey", FakeKey)
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.retrieve_locations = ["RemoteBackend"]
+    engine.storage_manager = FakeStorageManager()
+    engine.gpu_connector = FakeGPUConnector()
+    engine.token_database = SimpleNamespace(
+        process_tokens=lambda **_kwargs: iter(
+            [(0, 1, FakeKey(0)), (1, 2, FakeKey(1))]
+        )
+    )
+    engine.stats_monitor = SimpleNamespace(
+        on_retrieve_request=lambda _num_tokens: "monitor-id",
+        on_retrieve_finished=lambda _monitor_id, _num_tokens: None,
+    )
+    engine.is_healthy = lambda: True
+    engine._get_req_id = lambda _kwargs: "req"
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: False
+    engine._is_passive = lambda: False
+
+    with pytest.raises(RuntimeError, match="incomplete layer"):
+        list(engine.retrieve_layer([1, 2]))
+
+    assert engine.gpu_connector.layers_sent == 1
+    assert engine.gpu_connector.load_stream.synchronize_calls == 1
+    assert engine.gpu_connector.closed is True
+    assert engine.storage_manager.returned
+    assert all(
+        mem_obj.ref_count_down_calls == 1
+        for mem_obj in engine.storage_manager.returned
+    )
+    assert all(
+        mem_obj.unpin_calls == 1 for mem_obj in engine.storage_manager.returned
+    )
+
+
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
     not torch.cuda.is_available(),

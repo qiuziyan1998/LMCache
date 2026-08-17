@@ -794,6 +794,108 @@ class TestWorkerRetrieveState:
 
         assert missing_blocks == {1}
 
+    def test_dense_group1_short_retrieve_invalidates_indexer_blocks(self):
+        impl = _make_impl()
+        impl._block_size = 4
+        impl._lmcache_chunk_size = 4
+        impl._invalid_block_ids = set()
+        request = ReqMeta(
+            req_id="req-1",
+            token_ids=[1, 2, 3, 4],
+            slot_mapping=[torch.tensor([0, 1, 2, 3])],
+            indexer_slot_mapping=[torch.tensor([40, 41, 42, 43])],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=4,
+                can_load=True,
+            ),
+        )
+
+        impl._validate_dense_retrieve_result(
+            request,
+            torch.tensor([True, True, False, False]),
+            kv_group=1,
+        )
+
+        assert impl._invalid_block_ids == {10}
+
+    def test_dense_group0_short_retrieve_uses_indexer_validation_blocks(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._block_size = 4
+        impl._lmcache_chunk_size = 4
+        impl._invalid_block_ids = set()
+        request = ReqMeta(
+            req_id="req-1",
+            token_ids=[1, 2, 3, 4],
+            slot_mapping=[torch.tensor([0, 1, 2, 3])],
+            indexer_slot_mapping=[torch.tensor([40, 41, 42, 43])],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=4,
+                can_load=True,
+            ),
+        )
+
+        impl._validate_dense_retrieve_result(
+            request,
+            torch.tensor([True, True, False, False]),
+            kv_group=0,
+            slot_mapping=request.slot_mapping[0],
+        )
+
+        assert impl._invalid_block_ids == {10}
+
+    def test_dense_full_hit_allows_recomputed_boundary_token(self):
+        impl = _make_impl()
+        impl._block_size = 4
+        impl._lmcache_chunk_size = 4
+        impl._invalid_block_ids = set()
+        request = ReqMeta(
+            req_id="req-1",
+            token_ids=[1, 2, 3, 4],
+            slot_mapping=[torch.tensor([0, 1, 2, 3])],
+            indexer_slot_mapping=[torch.tensor([40, 41, 42, 43])],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=4,
+                can_load=True,
+            ),
+        )
+
+        impl._validate_dense_retrieve_result(
+            request,
+            torch.tensor([True, True, True, False]),
+            kv_group=1,
+        )
+
+        assert impl._invalid_block_ids == set()
+
+    def test_dense_full_hit_does_not_allow_missing_non_boundary_token(self):
+        impl = _make_impl()
+        impl._block_size = 4
+        impl._lmcache_chunk_size = 4
+        impl._invalid_block_ids = set()
+        request = ReqMeta(
+            req_id="req-1",
+            token_ids=[1, 2, 3, 4],
+            slot_mapping=[torch.tensor([0, 1, 2, 3])],
+            indexer_slot_mapping=[torch.tensor([40, 41, 42, 43])],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=4,
+                can_load=True,
+            ),
+        )
+
+        impl._validate_dense_retrieve_result(
+            request,
+            torch.tensor([True, True, False, True]),
+            kv_group=1,
+        )
+
+        assert impl._invalid_block_ids == {10}
+
     def test_sparse_decode_load_tokens_reuses_full_prefix_list(self):
         tokens = [1, 2, 3, 4]
 
@@ -859,6 +961,30 @@ class TestWorkerRetrieveState:
         assert groups[1].layer_names == [
             "model.layers.0.self_attn.indexer.k_cache"
         ]
+
+    def test_dsa_two_groups_rejects_missing_indexer_cache(self):
+        impl = _make_group_order_impl(
+            {
+                "model.layers.0.self_attn.attn.k_cache": torch.empty(
+                    (1, 8, 512), dtype=torch.bfloat16
+                )
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="no indexer KV caches"):
+            impl._refresh_kvcaches_list()
+
+    def test_dsa_two_groups_rejects_missing_latent_cache(self):
+        impl = _make_group_order_impl(
+            {
+                "model.layers.0.self_attn.indexer.k_cache": torch.empty(
+                    (1, 8, 1, 4), dtype=torch.uint8
+                )
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="no latent KV caches"):
+            impl._refresh_kvcaches_list()
 
     def test_shared_cpu_cache_state_tracks_skipped_index(self):
         state = WorkerRetrieveState(
@@ -2962,6 +3088,68 @@ class TestWorkerRetrieveState:
         assert captured == ["latent", "indexer"]
         assert impl.current_layer == 1
 
+    def test_layer_wait_rejects_request_retriever_count_mismatch(self):
+        requests = [
+            ReqMeta(
+                req_id=req_id,
+                token_ids=[1, 2],
+                load_spec=LoadSpec(
+                    vllm_cached_tokens=0,
+                    lmcache_cached_tokens=2,
+                    can_load=True,
+                ),
+            )
+            for req_id in ("req-0", "req-1")
+        ]
+        impl, _, _ = make_worker_connector(requests, use_layerwise=True)
+        impl._layerwise_requests = requests
+        impl._layerwise_retriever_is_sparse = [False]
+
+        def _retriever():
+            while True:
+                yield torch.ones(2, dtype=torch.bool)
+
+        impl.layerwise_retrievers = [(_retriever(), None)]
+        impl._abort_layerwise_retrieve_step = MagicMock()
+
+        with pytest.raises(RuntimeError, match="request/retriever count mismatch"):
+            impl.wait_for_layer_load("model.layers.0.self_attn.attn")
+
+        impl._abort_layerwise_retrieve_step.assert_called_once_with(requests)
+
+    def test_dense_two_group_wait_rejects_missing_indexer_retriever(self):
+        req = ReqMeta(
+            req_id="req-1",
+            token_ids=[1, 2],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=2,
+                can_load=True,
+            ),
+            is_sparse_decode=False,
+        )
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = True
+        impl._indexer_layer_names = [
+            "model.layers.0.self_attn.indexer.k_cache"
+        ]
+        impl._layerwise_requests = [req]
+        impl._layerwise_retriever_is_sparse = [False]
+
+        def _retriever():
+            while True:
+                yield torch.ones(2, dtype=torch.bool)
+
+        impl.layerwise_retrievers = [(_retriever(), None)]
+        impl._abort_layerwise_retrieve_step = MagicMock()
+
+        with pytest.raises(RuntimeError, match="without a Group-1 retriever"):
+            impl.wait_for_layer_load(
+                "model.layers.0.self_attn.indexer.k_cache"
+            )
+
+        impl._abort_layerwise_retrieve_step.assert_called_once_with([req])
+
     def test_bind_keeps_scheduler_metadata_payload_free(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)
@@ -3395,6 +3583,28 @@ class TestWorkerRetrieveState:
         assert req_meta.live_source_slot_mapping[0].tolist() == [0, 1, 2]
         assert req_meta.live_source_indexer_slot_mapping[0].tolist() == [4, 5, 6]
 
+    def test_two_group_metadata_rejects_missing_indexer_blocks(self):
+        tracker = RequestTracker(
+            req_id="req-missing-indexer",
+            prompt_len=4,
+            token_ids=[1, 2, 3, 4],
+            allocated_block_ids=[0],
+            allocated_block_ids_indexer=None,
+        )
+
+        with pytest.raises(RuntimeError, match="requires Group-1 indexer block ids"):
+            ReqMeta.from_request_tracker(
+                tracker,
+                block_size=4,
+                lmcache_chunk_size=4,
+                dsa_two_groups=True,
+                load_spec=LoadSpec(
+                    vllm_cached_tokens=0,
+                    lmcache_cached_tokens=4,
+                    can_load=True,
+                ),
+            )
+
     def test_sparse_reqmeta_does_not_allocate_full_true_decode_mask(self):
         tracker = RequestTracker(
             req_id="req-1",
@@ -3785,6 +3995,105 @@ class TestWorkerRetrieveState:
         assert calls == [("sparse", False), ("dense", True)]
         impl._drain_layerwise_retrievers()
 
+    def test_dense_two_group_load_rejects_missing_indexer_mapping(self):
+        dense = make_sparse_req_meta("dense", token_count=4)
+        dense.is_sparse_decode = False
+        impl, _, engine = make_worker_connector(
+            [dense], use_layerwise=True
+        )
+        impl.config.dsa_two_groups = True
+        impl.num_layers = 1
+        impl.kv_caches = {
+            "model.layers.0.self_attn.attn.k_cache": torch.zeros(1),
+            "model.layers.0.self_attn.indexer.k_cache": torch.zeros(1),
+        }
+        impl._refresh_kvcaches_list()
+        impl.layerwise_retrievers = []
+        impl._layerwise_requests = []
+        impl._layerwise_retriever_is_sparse = []
+        impl._layerwise_sparse_req_ids = []
+        impl._stats_monitor = SimpleNamespace(
+            update_interval_vllm_hit_tokens=lambda *_args: None,
+            update_interval_prompt_tokens=lambda *_args: None,
+        )
+        closed = []
+
+        def _retriever():
+            try:
+                yield None
+                while True:
+                    yield torch.ones(4, dtype=torch.bool)
+            finally:
+                closed.append("latent")
+
+        engine.enable_shared_cpu_cache = False
+        engine.gpu_connector = None
+        engine.retrieve_layer = lambda *_args, **_kwargs: _retriever()
+
+        with pytest.raises(
+            RuntimeError,
+            match="could not resolve the Group-1 index slot mapping",
+        ):
+            impl.start_load_kv(
+                SimpleNamespace(attn_metadata=SimpleNamespace())
+            )
+
+        assert closed == ["latent"]
+        assert engine.unpinned == ["dense"]
+        assert impl.layerwise_retrievers == []
+        assert impl._layerwise_requests == []
+
+    def test_two_group_mapping_never_uses_generic_single_object_slots(self):
+        impl = _make_impl()
+        impl.device = "cpu"
+        generic_slots = torch.arange(4, dtype=torch.long)
+        metadata = SimpleNamespace(
+            slot_mapping=generic_slots,
+            indexer_slot_mapping=None,
+        )
+
+        assert impl._indexer_slot_mapping_from_attn_metadata(metadata) is None
+        assert impl._indexer_retrieve_slot_mapping(metadata, 4) is None
+
+    def test_two_group_mapping_prefers_explicit_indexer_slots(self):
+        impl = _make_impl()
+        impl.device = "cpu"
+        generic_slots = torch.arange(4, dtype=torch.long)
+        indexer_slots = generic_slots + 32
+        layer_name = "model.layers.0.self_attn.indexer.k_cache"
+        metadata = {
+            layer_name: SimpleNamespace(
+                slot_mapping=generic_slots,
+                indexer_slot_mapping=indexer_slots,
+            )
+        }
+
+        assert torch.equal(
+            impl._indexer_slot_mapping_from_attn_metadata(
+                metadata, layer_name
+            ),
+            indexer_slots,
+        )
+        assert torch.equal(
+            impl._indexer_retrieve_slot_mapping(
+                metadata, 4, layer_name
+            ),
+            indexer_slots,
+        )
+        request = SimpleNamespace(indexer_slot_mapping=[indexer_slots])
+        assert torch.equal(
+            impl._indexer_save_slot_mapping(
+                request,
+                SimpleNamespace(
+                    slot_mapping=generic_slots,
+                    indexer_slot_mapping=None,
+                ),
+                layer_name,
+                4,
+            ),
+            indexer_slots,
+        )
+
     def test_start_load_kv_aborts_partial_sparse_batch(self):
         requests = [
             make_sparse_req_meta("req-1", token_count=4),
@@ -3864,6 +4173,53 @@ class TestWorkerRetrieveState:
         impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
         assert impl._layerwise_sparse_req_ids == ["req-1", "req-2"]
         impl._drain_layerwise_retrievers()
+
+    def test_nonshared_sparse_load_rejects_latent_indexer_fallback(self):
+        request = make_sparse_req_meta("req-1", token_count=4)
+        impl, _, engine = make_worker_connector(
+            [request],
+            use_layerwise=True,
+            kv_role="kv_consumer",
+        )
+        impl.config.dsa_two_groups = True
+        impl.num_layers = 1
+        impl.kv_caches = {
+            "model.layers.0.self_attn.attn.k_cache": torch.zeros(1),
+            "model.layers.0.self_attn.indexer.k_cache": torch.zeros(1),
+        }
+        impl._refresh_kvcaches_list()
+        impl.layerwise_retrievers = []
+        impl._layerwise_requests = []
+        impl._layerwise_retriever_is_sparse = []
+        impl._layerwise_sparse_req_ids = []
+        impl._stats_monitor = SimpleNamespace(
+            update_interval_vllm_hit_tokens=lambda *_args: None,
+            update_interval_prompt_tokens=lambda *_args: None,
+        )
+        closed = []
+
+        def _retriever():
+            try:
+                yield None
+                while True:
+                    yield torch.ones(4, dtype=torch.bool)
+            finally:
+                closed.append("latent")
+
+        engine.enable_shared_cpu_cache = False
+        engine.retrieve_layer_head_token_wise = (
+            lambda *_args, **_kwargs: _retriever()
+        )
+
+        with pytest.raises(RuntimeError, match="full Group-1 index slot"):
+            impl.start_load_kv(
+                SimpleNamespace(attn_metadata=SimpleNamespace())
+            )
+
+        assert closed == ["latent"]
+        assert engine.unpinned == ["req-1"]
+        assert impl.layerwise_retrievers == []
+        assert impl._worker_retrieve_state == {}
 
     def test_start_load_kv_without_attention_skips_step_setup(self):
         impl = _make_impl()

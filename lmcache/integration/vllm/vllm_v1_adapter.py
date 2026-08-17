@@ -1268,6 +1268,21 @@ class ReqMeta:
             if new_boundary <= tracker.num_saved_tokens:
                 skip_save = True
 
+        requires_indexer_slots = dsa_two_groups and (
+            (load_spec is not None and load_spec.can_load)
+            or not skip_save
+            or live_source_requested
+        )
+        if requires_indexer_slots and not tracker.allocated_block_ids_indexer:
+            raise RuntimeError(
+                "dsa_two_groups requires Group-1 indexer block ids for every "
+                "load, save, and live-transfer request. Refusing to construct "
+                "one-group-only request metadata: "
+                f"req_id={tracker.req_id}, can_load="
+                f"{bool(load_spec is not None and load_spec.can_load)}, "
+                f"skip_save={skip_save}, live_source={live_source_requested}"
+            )
+
         if skip_save and load_spec is None and not live_source_requested:
             return None
 
@@ -2165,18 +2180,24 @@ class LMCacheConnectorV1Impl:
                 self._latent_kvcaches.append(kv_cache)
         # Backward-compatible flat list = latent group (the default group).
         self._kvcaches_list = self._latent_kvcaches
-        if (
-            dsa_two_groups
-            and len(self._indexer_kvcaches) == 0
-            and len(self.kv_caches) > 0
+        worker_has_caches = (
+            len(self.kv_caches) > 0
             and getattr(self, "_role", None) != KVConnectorRole.SCHEDULER
-        ):
-            logger.warning(
+        )
+        if dsa_two_groups and worker_has_caches and not self._latent_kvcaches:
+            raise RuntimeError(
+                "dsa_two_groups is enabled but no latent KV caches were "
+                "registered with the connector. Refusing to run because "
+                "Group 0 and Group 1 must be loaded and stored atomically."
+            )
+        if dsa_two_groups and worker_has_caches and not self._indexer_kvcaches:
+            raise RuntimeError(
                 "dsa_two_groups is enabled but no indexer KV caches were "
                 "registered with the connector (no layer name contains "
-                "'indexer'). Two-group store/retrieve for the indexer group "
-                "will be skipped. Ensure vLLM registers the indexer KV cache "
-                "group with this connector."
+                "'indexer'). Refusing to run because skipping Group 1 would "
+                "mix valid latent KV with stale or uninitialized index rows. "
+                "Ensure vLLM registers the indexer KV cache group with this "
+                "connector."
             )
 
     def _kvcaches_for_group(self, kv_group: int) -> list[torch.Tensor]:
@@ -2305,16 +2326,13 @@ class LMCacheConnectorV1Impl:
 
         required = {0}
         if self._is_dsa_two_groups():
-            for idx, (_, indexer_retriever) in enumerate(
-                getattr(self, "layerwise_retrievers", [])
-            ):
-                is_sparse = (
-                    idx < len(getattr(self, "_layerwise_retriever_is_sparse", []))
-                    and self._layerwise_retriever_is_sparse[idx]
-                )
-                if indexer_retriever is not None and not is_sparse:
-                    required.add(1)
-                    break
+            # Dense two-group loads are complete only after both groups have
+            # crossed the same layer boundary.  Do not infer this requirement
+            # from indexer_retriever being non-None: that makes a missing
+            # Group-1 retriever silently turn into a Group-0-only fast path.
+            sparse_flags = getattr(self, "_layerwise_retriever_is_sparse", [])
+            if any(not is_sparse for is_sparse in sparse_flags):
+                required.add(1)
         self._layerwise_required_wait_groups_cache = required
         return required
 
@@ -2689,10 +2707,12 @@ class LMCacheConnectorV1Impl:
             if layer_name is not None:
                 meta = attn_metadata.get(layer_name)
                 if meta is not None:
-                    slot_mapping = getattr(meta, "slot_mapping", None)
+                    slot_mapping = getattr(
+                        meta, "indexer_slot_mapping", None
+                    )
                     if slot_mapping is not None:
                         return slot_mapping
-                    slot_mapping = getattr(meta, "indexer_slot_mapping", None)
+                    slot_mapping = getattr(meta, "slot_mapping", None)
                     if slot_mapping is not None:
                         return slot_mapping
 
@@ -2723,7 +2743,11 @@ class LMCacheConnectorV1Impl:
         slot_mapping = getattr(attn_metadata, "indexer_slot_mapping", None)
         if slot_mapping is not None:
             return slot_mapping
-        return getattr(attn_metadata, "slot_mapping", None)
+        # This helper is used only for the independent Group-1 address space.
+        # A generic slot_mapping belongs to Group 0 on single-object SFA
+        # metadata; accepting it here silently stores index rows into latent
+        # blocks. Legacy shared-block mode does not use this two-group helper.
+        return None
 
     @staticmethod
     def _pad_chunk_local_slot_mapping(
@@ -2817,10 +2841,6 @@ class LMCacheConnectorV1Impl:
                 "attn_metadata.indexer_slot_mapping",
                 getattr(attn_metadata, "indexer_slot_mapping", None),
             )
-            add_candidate(
-                "attn_metadata.slot_mapping",
-                getattr(attn_metadata, "slot_mapping", None),
-            )
 
         idx_slot = None
         for _, candidate in candidates:
@@ -2848,10 +2868,12 @@ class LMCacheConnectorV1Impl:
         per-request save window. Other paths retain the existing metadata-based
         behavior.
         """
-        if (
-            self._is_decode_window_save_request(request)
-            and request.indexer_slot_mapping
-        ):
+        # ReqMeta builds this mapping directly from Group-1 block ids for the
+        # active scheduler step. It is the authoritative source for every
+        # two-group store, not only decode-window stores. Attention metadata
+        # is a compatibility source because single-object metadata also has a
+        # generic Group-0 slot_mapping that must never address Group 1.
+        if request.indexer_slot_mapping:
             return request.indexer_slot_mapping[0]
         _ = token_count
         return self._indexer_slot_mapping_from_attn_metadata(
@@ -2864,7 +2886,6 @@ class LMCacheConnectorV1Impl:
         latent_sparse_slots: torch.Tensor,
         lmcache_cached_tokens: int,
         request_indexer_slots: Optional[torch.Tensor] = None,
-        strict: bool = False,
     ) -> Optional[torch.Tensor]:
         """Indexer slots for sparse decode, covering the full LMCache-hit prefix.
 
@@ -2887,26 +2908,22 @@ class LMCacheConnectorV1Impl:
         )
         if idx_slot is not None and idx_slot.numel() >= indexer_len:
             return idx_slot[:indexer_len]
-        if strict:
-            request_len = (
-                int(request_indexer_slots.numel())
-                if request_indexer_slots is not None
-                else 0
-            )
-            metadata_len = int(idx_slot.numel()) if idx_slot is not None else 0
-            raise RuntimeError(
-                "Shared CPU sparse decode with dsa_two_groups=true could not "
-                "resolve full DSA index slot mapping. Refusing to fall back "
-                "to latent slots because that can load indexer KV into the "
-                "wrong cache group: "
-                f"indexer_len={indexer_len}, sparse_len={sparse_len}, "
-                f"request_indexer_slots={request_len}, "
-                f"metadata_indexer_slots={metadata_len}, "
-                f"lmcache_cached_tokens={lmcache_cached_tokens}"
-            )
-        if idx_slot is None or idx_slot.numel() == 0:
-            return latent_sparse_slots
-        return idx_slot
+        request_len = (
+            int(request_indexer_slots.numel())
+            if request_indexer_slots is not None
+            else 0
+        )
+        metadata_len = int(idx_slot.numel()) if idx_slot is not None else 0
+        raise RuntimeError(
+            "Sparse decode with dsa_two_groups=true could not resolve "
+            "the full Group-1 index slot mapping. Refusing to fall back "
+            "to Group-0 compact scratch slots because that would load "
+            "indexer KV into the wrong cache address space: "
+            f"indexer_len={indexer_len}, sparse_len={sparse_len}, "
+            f"request_indexer_slots={request_len}, "
+            f"metadata_indexer_slots={metadata_len}, "
+            f"lmcache_cached_tokens={lmcache_cached_tokens}"
+        )
 
     # TODO(chunxiaozheng): in the latest lmcache_connector, we use `register_kv_caches`
     #  to init self.kv_caches, we keep it in order to be compatible with old versions
@@ -3311,14 +3328,15 @@ class LMCacheConnectorV1Impl:
         save_spec = request.save_spec
         if save_spec is None:
             return set()
+        can_save_latent = getattr(
+            save_spec, "can_save_latent", getattr(save_spec, "can_save", False)
+        )
+        can_save_indexer = getattr(save_spec, "can_save_indexer", False)
+        if getattr(self.config, "dsa_two_groups", False):
+            return {0, 1} if can_save_latent or can_save_indexer else set()
         required: set[int] = set()
-        if getattr(save_spec, "can_save_latent", getattr(save_spec, "can_save", False)):
+        if can_save_latent:
             required.add(0)
-        if (
-            getattr(self.config, "dsa_two_groups", False)
-            and getattr(save_spec, "can_save_indexer", False)
-        ):
-            required.add(1)
         return required
 
     def _decode_window_save_has_required_groups(self, request: ReqMeta) -> bool:
@@ -3526,12 +3544,13 @@ class LMCacheConnectorV1Impl:
             return set()
         if not getattr(self.config, "dsa_two_groups", False):
             return {0}
-        required = set()
-        if save_spec.can_save_latent:
-            required.add(0)
-        if save_spec.can_save_indexer:
-            required.add(1)
-        return required
+        if save_spec.can_save_latent or save_spec.can_save_indexer:
+            # A two-group frontier is publishable only as a coherent pair.
+            # Per-group capability flags control submission, not commit
+            # semantics; accepting one completed group can expose mixed data
+            # from different executions under the same prefix frontier.
+            return {0, 1}
+        return set()
 
     def _record_prefill_save_group_completed(
         self,
@@ -6952,12 +6971,10 @@ class LMCacheConnectorV1Impl:
                         elif not materialize_index:
                             indexer_skipped = True
                         elif not indexer_kvcaches:
-                            if shared_cpu_enabled:
-                                raise RuntimeError(
-                                    "Shared CPU sparse decode with "
-                                    "dsa_two_groups=true requires DSA index "
-                                    "kvcaches for kv_group=1."
-                                )
+                            raise RuntimeError(
+                                "Sparse decode with dsa_two_groups=true "
+                                "requires DSA index kvcaches for kv_group=1."
+                            )
                         else:
                             indexer_setup_started = (
                                 cold_start_perf_now()
@@ -7002,7 +7019,6 @@ class LMCacheConnectorV1Impl:
                                 latent_sparse_slots,
                                 request.load_spec.lmcache_cached_tokens,
                                 request_indexer_slots=request_indexer_slots,
-                                strict=shared_cpu_enabled,
                             )
                             assert idx_slot is not None
                             if not request.sparse_warm_ref:
@@ -7232,11 +7248,10 @@ class LMCacheConnectorV1Impl:
                     idx_slot = None
                     if dsa_two_groups:
                         indexer_kvcaches = self._kvcaches_for_group(1)
-                        if shared_cpu_enabled and not indexer_kvcaches:
+                        if not indexer_kvcaches:
                             raise RuntimeError(
-                                "Shared CPU dense prefix with "
-                                "dsa_two_groups=true requires DSA index "
-                                "kvcaches for kv_group=1."
+                                "Dense prefix retrieval with dsa_two_groups=true "
+                                "requires DSA index kvcaches for kv_group=1."
                             )
                     if dsa_two_groups and indexer_kvcaches:
                         indexer_layer_name = (
@@ -7258,44 +7273,36 @@ class LMCacheConnectorV1Impl:
                                 lmcache_cached_tokens,
                                 indexer_layer_name,
                             )
-                        if (
-                            idx_slot is None
-                            and bool(
-                                getattr(
-                                    self.lmcache_engine,
-                                    "enable_shared_cpu_cache",
-                                    False,
-                                )
-                            )
-                        ):
+                        if idx_slot is None:
                             raise RuntimeError(
-                                "Shared CPU dense prefix with "
-                                "dsa_two_groups=true could not resolve DSA "
-                                "index slot mapping for kv_group=1."
+                                "Dense prefix retrieval with "
+                                "dsa_two_groups=true could not resolve the "
+                                "Group-1 index slot mapping. Refusing to mix "
+                                "loaded Group-0 latent KV with stale or "
+                                "uninitialized index rows."
                             )
-                        if idx_slot is not None:
-                            assert indexer_cache is not None
-                            indexer_retriever = self.lmcache_engine.retrieve_layer(
-                                retrieve_tokens,
-                                indexer_token_mask,
-                                kvcaches=indexer_kvcaches,
-                                slot_mapping=idx_slot,
-                                vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                                sync=sync,
-                                kv_group=1,
-                                req_id=request.req_id,
-                                request_configs=request.request_configs,
-                                shared_cpu_request_ordinal=idx,
-                                shared_cpu_request_preflight_state=(
-                                    dense_preflight_state
-                                ),
-                                _retain_shared_dense_cache=retain_dense_seed,
-                                **(indexer_cache if retain_dense_seed else {}),
-                            )
-                            self.layerwise_retrievers[-1] = (
-                                layerwise_retriever,
-                                indexer_retriever,
-                            )
+                        assert indexer_cache is not None
+                        indexer_retriever = self.lmcache_engine.retrieve_layer(
+                            retrieve_tokens,
+                            indexer_token_mask,
+                            kvcaches=indexer_kvcaches,
+                            slot_mapping=idx_slot,
+                            vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                            sync=sync,
+                            kv_group=1,
+                            req_id=request.req_id,
+                            request_configs=request.request_configs,
+                            shared_cpu_request_ordinal=idx,
+                            shared_cpu_request_preflight_state=(
+                                dense_preflight_state
+                            ),
+                            _retain_shared_dense_cache=retain_dense_seed,
+                            **(indexer_cache if retain_dense_seed else {}),
+                        )
+                        self.layerwise_retrievers[-1] = (
+                            layerwise_retriever,
+                            indexer_retriever,
+                        )
 
                     # Prime the same two-step window as the legacy dense path,
                     # but interleave groups so shared-cache collectives remain
@@ -7363,35 +7370,139 @@ class LMCacheConnectorV1Impl:
                     req_id=request.req_id,
                 )
 
-                # Check the result
-                num_retrieved_tokens = ret_token_mask.sum().item()
-                num_expected_tokens = (
-                    lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
+                self._validate_dense_retrieve_result(
+                    request,
+                    ret_token_mask,
+                    kv_group=0,
+                    slot_mapping=retrieve_slot_mapping,
+                    expected_mask=token_mask,
+                    recalc_last_applied=recalc_last_applied,
                 )
-                if recalc_last_applied:
-                    num_expected_tokens -= 1
-                if num_retrieved_tokens < num_expected_tokens:
-                    logger.error(
-                        "Request %s"
-                        "The number of retrieved tokens is less than the "
-                        "expected number of tokens! This should not happen!",
-                        request.req_id,
-                    )
-                    logger.error(
-                        "Num retrieved tokens: %d, num expected tokens: %d",
-                        num_retrieved_tokens,
-                        num_expected_tokens,
-                    )
-                    """
-                    Report failed block IDs in case of partial failure.
-                    """
-                    missing_blocks = self.record_failed_blocks(
-                        request.req_id,
-                        token_mask,
-                        ret_token_mask,
-                        retrieve_slot_mapping,
-                    )
-                    self._invalid_block_ids.update(missing_blocks)
+
+    def _validate_dense_retrieve_result(
+        self,
+        request: ReqMeta,
+        ret_mask: torch.Tensor,
+        *,
+        kv_group: int,
+        slot_mapping: Optional[torch.Tensor] = None,
+        expected_mask: Optional[torch.Tensor] = None,
+        recalc_last_applied: Optional[bool] = None,
+    ) -> None:
+        """Fail a cache hit when any required KV group is incomplete.
+
+        Layerwise retrieval returns one completion mask per group.  A request
+        is usable only when every enabled group reaches the scheduler's common
+        hit frontier; accepting a short Group-1 mask mixes valid latent KV with
+        missing/stale index rows and produces silent quality corruption.
+        """
+        assert request.load_spec is not None
+        load_spec = request.load_spec
+        if recalc_last_applied is None:
+            recalc_last_applied = self._full_hit_recalc_last_token(
+                load_spec,
+                request.retrieve_token_count(),
+                is_sparse_decode=request.is_sparse_decode,
+            )
+        token_count = min(
+            int(load_spec.lmcache_cached_tokens),
+            request.retrieve_token_count(),
+        )
+        if expected_mask is None:
+            expected_mask = self._load_token_mask_for_retrieve(
+                request,
+                token_count,
+                self._lmcache_chunk_size,
+            )
+        if expected_mask is None:
+            raise RuntimeError(
+                "Dense retrieve validation has no expected token mask: "
+                f"req_id={request.req_id}, kv_group={kv_group}"
+            )
+        expected_mask = expected_mask[:token_count].clone()
+        if recalc_last_applied and expected_mask.numel():
+            # vLLM only recomputes the final prompt token.  A count-only
+            # allowance would incorrectly accept a missing token anywhere in
+            # the prefix when the final token happened to load successfully.
+            expected_mask[-1] = False
+        num_expected_tokens = int(expected_mask.sum().item())
+        ret_mask_for_validation = ret_mask[:token_count]
+        masks_align = ret_mask_for_validation.shape == expected_mask.shape
+        num_retrieved_tokens = (
+            int((ret_mask_for_validation & expected_mask).sum().item())
+            if masks_align
+            else int(ret_mask.sum().item())
+        )
+        if masks_align and bool(
+            torch.all(ret_mask_for_validation | ~expected_mask).item()
+        ):
+            return
+
+        logger.error(
+            "Request %s KV group %d did not retrieve every required token: "
+            "retrieved=%d expected=%d mask_shape=%s expected_shape=%s",
+            request.req_id,
+            kv_group,
+            num_retrieved_tokens,
+            num_expected_tokens,
+            tuple(ret_mask.shape),
+            tuple(expected_mask.shape),
+        )
+        # vLLM's compact-external validation frontier is owned by the
+        # non-latent (Group-1) manager.  Therefore a short read in *either*
+        # cache group must be reported using Group-1 block ids when two-group
+        # DSA is active.  Reporting Group-0 ids here can miss the request
+        # entirely (or collide with an unrelated Group-1 allocation), letting
+        # execution continue with a mixed/incomplete cache pair.
+        validation_uses_indexer = self._is_dsa_two_groups()
+        if validation_uses_indexer:
+            mappings = request.indexer_slot_mapping
+            slot_mapping = mappings[0] if mappings else None
+        elif slot_mapping is None:
+            mappings = (
+                request.indexer_slot_mapping
+                if kv_group == 1
+                else request.slot_mapping
+            )
+            if not mappings:
+                raise RuntimeError(
+                    "Incomplete dense retrieve has no destination mapping: "
+                    f"req_id={request.req_id}, kv_group={kv_group}"
+                )
+            slot_mapping = mappings[0]
+        if slot_mapping is None:
+            raise RuntimeError(
+                "Incomplete two-group dense retrieve has no Group-1 "
+                "validation mapping: "
+                f"req_id={request.req_id}, failed_kv_group={kv_group}"
+            )
+        retrieve_slot_mapping = slot_mapping[:token_count]
+        missing_blocks = self.record_failed_blocks(
+            request.req_id,
+            expected_mask,
+            ret_mask,
+            retrieve_slot_mapping,
+        )
+        if not missing_blocks:
+            # A malformed backend mask must not bypass invalidation merely
+            # because its shape cannot be paired with the expected mask.
+            mapping_cpu = retrieve_slot_mapping.to(device="cpu", dtype=torch.long)
+            expected_cpu = expected_mask.to(device="cpu", dtype=torch.bool)
+            usable = min(int(mapping_cpu.numel()), int(expected_cpu.numel()))
+            mapped = mapping_cpu[:usable][expected_cpu[:usable]]
+            missing_blocks = {
+                int(block)
+                for block in torch.unique(mapped // self._block_size).tolist()
+                if int(block) >= 0
+            }
+        if not missing_blocks:
+            raise RuntimeError(
+                "Incomplete dense retrieve could not identify invalid blocks: "
+                f"req_id={request.req_id}, kv_group={kv_group}, "
+                f"retrieved={num_retrieved_tokens}, "
+                f"expected={num_expected_tokens}"
+            )
+        self._invalid_block_ids.update(missing_blocks)
 
     def record_failed_blocks(
         self,
@@ -7449,7 +7560,11 @@ class LMCacheConnectorV1Impl:
         missing_blocks_tensor = torch.unique(
             slot_mapping_cpu[missing_indices] // self._block_size
         )
-        missing_blocks = {int(block.item()) for block in missing_blocks_tensor}
+        missing_blocks = {
+            int(block.item())
+            for block in missing_blocks_tensor
+            if int(block.item()) >= 0
+        }
 
         if not missing_blocks:
             return set()
@@ -7593,19 +7708,36 @@ class LMCacheConnectorV1Impl:
                 join_context = defer_consumer_wait()
 
         with self._sparse_retrieve_state_guard(layerwise_requests), join_context:
+            if len(self.layerwise_retrievers) != len(layerwise_requests):
+                raise RuntimeError(
+                    "Layerwise retrieve request/retriever count mismatch; "
+                    "refusing to continue with a partially initialized cache "
+                    f"step: requests={len(layerwise_requests)}, "
+                    f"retrievers={len(self.layerwise_retrievers)}, "
+                    f"layer={layer_name}"
+                )
             idx = 0
             decode_row = 0
             for request in layerwise_requests:
                 if idx >= len(self.layerwise_retrievers):
-                    logger.warning(
-                        "wait_for_layer_load: missing retriever for request %s "
-                        "(idx=%d, retrievers=%d)",
-                        request.req_id,
-                        idx,
-                        len(self.layerwise_retrievers),
+                    raise RuntimeError(
+                        "Layerwise retrieve lost the retriever for request "
+                        f"{request.req_id}: idx={idx}, "
+                        f"retrievers={len(self.layerwise_retrievers)}, "
+                        f"layer={layer_name}"
                     )
-                    break
                 layerwise_retriever, indexer_retriever = self.layerwise_retrievers[idx]
+                if (
+                    wait_group == 1
+                    and not request.is_sparse_decode
+                    and indexer_retriever is None
+                ):
+                    raise RuntimeError(
+                        "Dense two-group prefix load reached a Group-1 layer "
+                        "without a Group-1 retriever; refusing to decode with "
+                        f"partial cache state: req_id={request.req_id}, "
+                        f"layer={layer_name}"
+                    )
                 if wait_group == 1:
                     state = self._worker_retrieve_state.get(request.req_id)
                     if state is not None:
@@ -7830,20 +7962,31 @@ class LMCacheConnectorV1Impl:
                     decode_row += row_count
                 else:
                     if wait_group == 1:
-                        if indexer_retriever is not None:
+                        ret_token_mask = (
                             next(indexer_retriever)
-                        ret_token_mask = None
+                            if indexer_retriever is not None
+                            else None
+                        )
                     else:
                         ret_token_mask = next(layerwise_retriever)
 
                 if (
-                    wait_group == 0
-                    and self.current_layer == self.num_layers - 1
+                    self.current_layer == self.num_layers - 1
                     and not request.is_sparse_decode
+                    and (wait_group == 0 or indexer_retriever is not None)
                 ):
                     assert ret_token_mask is not None
                     num_retrieved_tokens = ret_token_mask.sum().item()
-                    logger.info("Retrieved %d tokens", num_retrieved_tokens)
+                    logger.info(
+                        "Retrieved %d tokens for KV group %d",
+                        num_retrieved_tokens,
+                        wait_group,
+                    )
+                    self._validate_dense_retrieve_result(
+                        request,
+                        ret_token_mask,
+                        kv_group=wait_group,
+                    )
                 idx += 1
 
         if self.layerwise_retrievers and self._layerwise_wait_should_advance(
@@ -8131,7 +8274,11 @@ class LMCacheConnectorV1Impl:
         kvcaches = self._kvcaches_for_group(0)
         if not kvcaches:
             self._deferred_latent_pending.discard(pending_key)
-            return
+            self._abort_save_step((request,))
+            raise RuntimeError(
+                "Deferred two-group save has no Group-0 latent KV caches: "
+                f"req_id={request.req_id}"
+            )
 
         store_inputs = self._prepare_layerwise_store_inputs(request, save_spec, 0)
         if store_inputs is None:
@@ -8226,8 +8373,13 @@ class LMCacheConnectorV1Impl:
         # uses the partitioned indexer caches only.
         kvcaches = self._kvcaches_for_group(kv_group)
         if not kvcaches:
-            # No caches registered for this group (e.g. indexer not
-            # registered with the connector); nothing to store.
+            if dsa_two_groups:
+                self._abort_save_step(connector_metadata.requests)
+                raise RuntimeError(
+                    "Two-group save has no registered KV caches for "
+                    f"kv_group={kv_group}, layer={layer_name}. Refusing to "
+                    "publish or persist a one-group-only prefix."
+                )
             return
 
         for request in connector_metadata.requests:
@@ -8335,12 +8487,13 @@ class LMCacheConnectorV1Impl:
                         len(token_ids),
                     )
                     if idx_slot is None:
-                        logger.warning(
-                            "Skipping DSA indexer save for layer %s: "
-                            "indexer slot mapping is unavailable",
-                            layer_name,
+                        self._abort_save_step((request,))
+                        raise RuntimeError(
+                            "DSA two-group save could not resolve the Group-1 "
+                            "index slot mapping; the request was aborted to "
+                            "prevent a partial Group-0-only cache update: "
+                            f"req_id={request.req_id}, layer={layer_name}"
                         )
-                        continue
                     slot_mapping = idx_slot.to(
                         device=self.device, dtype=torch.long
                     )
@@ -8352,16 +8505,17 @@ class LMCacheConnectorV1Impl:
                         token_offset=skip_leading_tokens,
                     )
                     if len(slot_mapping) < len(token_ids):
-                        logger.warning(
-                            "Skipping DSA indexer save for layer %s: "
-                            "slot mapping length %d does not cover token range "
-                            "[%d, %d)",
-                            layer_name,
-                            len(slot_mapping),
-                            skip_leading_tokens,
-                            len(token_ids),
+                        self._abort_save_step((request,))
+                        raise RuntimeError(
+                            "DSA two-group save has an incomplete Group-1 "
+                            "slot mapping; the request was aborted to prevent "
+                            "a partial Group-0-only cache update: "
+                            f"req_id={request.req_id}, layer={layer_name}, "
+                            f"mapping_tokens={len(slot_mapping)}, "
+                            f"required_tokens={len(token_ids)}, "
+                            f"store_range=[{skip_leading_tokens}, "
+                            f"{len(token_ids)})"
                         )
-                        continue
 
                 logger.debug(
                     "Storing KV cache for %d out of %d tokens "
@@ -9623,17 +9777,12 @@ class LMCacheConnectorV1Impl:
                     )
             if (
                 self._is_dsa_two_groups()
-                and bool(
-                    self._shared_cpu_config_value(
-                        "enable_shared_cpu_cache", False
-                    )
-                )
                 and getattr(req_meta.save_spec, "can_save_indexer", False) is False
             ):
                 logger.warning(
                     "Skipping decode-window save for request %s because "
-                    "dsa_two_groups requires matching DSA index slots for "
-                    "shared CPU decode-save correctness: window=[%d,%d)",
+                    "dsa_two_groups requires matching DSA index slots on "
+                    "every storage backend: window=[%d,%d)",
                     tracker.req_id,
                     window_start,
                     window_end,

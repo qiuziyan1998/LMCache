@@ -2207,7 +2207,7 @@ class TestDecodeWindowSaveMetadata:
         assert list(tracker.decode_window_save_pending_commits) == []
         assert tracker.sparse_meta_frontier is None
 
-    def test_two_group_decode_window_save_without_shared_cpu_allows_latent_only(
+    def test_two_group_decode_window_save_without_shared_cpu_requires_indexer(
         self,
     ) -> None:
         impl, tracker, scheduler_output = self._build_decode_window_case(
@@ -2217,14 +2217,10 @@ class TestDecodeWindowSaveMetadata:
 
         meta = impl.build_connector_meta(scheduler_output)
 
-        assert len(meta.requests) == 1
-        req_meta = meta.requests[0]
-        assert req_meta.is_decode_window_save is True
-        assert req_meta.save_spec is not None
-        assert req_meta.save_spec.can_save_indexer is False
-        assert tracker.decode_window_save_next_start == 512
+        assert meta.requests == []
+        assert tracker.decode_window_save_next_start == 256
 
-    def test_deep_window_group_plan_explains_latent_only_commit_groups(
+    def test_deep_window_group_plan_is_not_emitted_for_partial_groups(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         impl, tracker, scheduler_output = self._build_decode_window_case(
@@ -2245,7 +2241,7 @@ class TestDecodeWindowSaveMetadata:
         plans = [
             event for event in events if event.get("event") == "window_group_plan"
         ]
-        assert len(plans) == 1
+        assert plans == []
 
         finished = StubSchedulerOutput(
             finished_req_ids={tracker.req_id},
@@ -2254,13 +2250,7 @@ class TestDecodeWindowSaveMetadata:
             num_scheduled_tokens={},
         )
         impl.build_connector_meta(finished)
-        assert tracker.req_id not in impl._mtp_dw_deep_window_group_planned_reqs
-        assert plans[0]["stage"] == "deep"
-        assert plans[0]["latent_only"] is True
-        assert plans[0]["indexer_disabled"] is True
-        assert plans[0]["kv_group0_save"] is True
-        assert plans[0]["kv_group1_save"] is False
-        assert plans[0]["required_groups"] == [0]
+        assert not hasattr(impl, "_mtp_dw_deep_window_group_planned_reqs")
 
     def test_deep_window_group_plan_requires_both_gates_and_dedupes_request(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2288,7 +2278,7 @@ class TestDecodeWindowSaveMetadata:
         monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
         deep_impl, _, deep_output = self._build_decode_window_case(
             shared_cpu=False,
-            indexer_blocks=False,
+            indexer_blocks=True,
         )
         deep_impl.build_connector_meta(deep_output)
         deep_impl.build_connector_meta(deep_output)

@@ -151,6 +151,16 @@ def test_group1_load_mode_defaults_to_p2p_preferred():
     assert config.dsa_group1_load_mode == "p2p_preferred"
 
 
+def test_dsa_two_groups_requires_layerwise_retrieve():
+    config = LMCacheEngineConfig.from_defaults(
+        dsa_two_groups=True,
+        use_layerwise=False,
+    )
+
+    with pytest.raises(ValueError, match="requires use_layerwise=true"):
+        config.validate()
+
+
 def test_group1_load_mode_rejects_unknown_value():
     config = LMCacheEngineConfig.from_defaults(dsa_group1_load_mode="race_both")
 

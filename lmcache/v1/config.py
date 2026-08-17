@@ -648,6 +648,13 @@ def _validate_config(self):
             f"{sorted(group1_load_modes)}, got {self.dsa_group1_load_mode!r}"
         )
 
+    if self.dsa_two_groups and not self.use_layerwise:
+        raise ValueError(
+            "dsa_two_groups=true requires use_layerwise=true. The dense "
+            "non-layerwise retrieve path only materializes KV group 0 and "
+            "must not run with an uninitialized Group-1 index cache."
+        )
+
     if self.enable_blending:
         if not self.save_unfull_chunk:
             logger.warning(
