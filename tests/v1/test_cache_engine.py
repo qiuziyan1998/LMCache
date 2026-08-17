@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from copy import deepcopy
+from types import SimpleNamespace
 import os
 import random
 import shlex
 import subprocess
 import tempfile
 import time
-from types import SimpleNamespace
 
 # Third Party
 import pytest
@@ -18,10 +18,10 @@ from lmcache.utils import (
     mock_up_broadcast_fn,
     mock_up_broadcast_object_fn,
 )
-import lmcache.v1.cache_engine as cache_engine_module
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventStatus, EventType
+import lmcache.v1.cache_engine as cache_engine_module
 
 # Local
 from .utils import (
@@ -229,6 +229,270 @@ def test_layerwise_retrieve_forwards_per_layer_request(monkeypatch):
     assert received[1]["layer_request"] is second
 
 
+@pytest.mark.parametrize("prime_steps", [1, 2])
+def test_layerwise_retrieve_close_releases_pending_memory_objs_once(
+    monkeypatch,
+    prime_steps,
+):
+    class FakeKey:
+        def split_layers(self, num_layers):
+            return [SimpleNamespace(layer_id=i) for i in range(num_layers)]
+
+    class FakeMemoryObj:
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+            self.ref_count_down_calls = 0
+
+        def ref_count_down(self):
+            self.ref_count_down_calls += 1
+
+    class FakeFuture:
+        def __init__(self, memory_obj):
+            self.memory_obj = memory_obj
+            self.result_calls = 0
+
+        def result(self):
+            self.result_calls += 1
+            return [self.memory_obj]
+
+    class FakeStorageManager:
+        def __init__(self):
+            self.returned = []
+            self.futures = []
+
+        @staticmethod
+        def contains(_key, _locations):
+            return "LocalCPUBackend"
+
+        def layerwise_batched_get(self, keys, location=None):
+            del location
+            for layer_id, _ in enumerate(keys):
+                memory_obj = FakeMemoryObj(layer_id)
+                future = FakeFuture(memory_obj)
+                self.returned.append(memory_obj)
+                self.futures.append(future)
+                yield future
+
+    consumer_closes = []
+
+    class FakeGPUConnector:
+        @staticmethod
+        def batched_to_gpu(_starts, _ends, **_kwargs):
+            try:
+                yield
+                yield
+                yield
+                yield
+            finally:
+                consumer_closes.append(True)
+
+    monkeypatch.setattr(cache_engine_module, "CacheEngineKey", FakeKey)
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.retrieve_locations = ["LocalCPUBackend"]
+    engine.storage_manager = FakeStorageManager()
+    engine.gpu_connector = FakeGPUConnector()
+    engine.token_database = SimpleNamespace(
+        process_tokens=lambda **_kwargs: iter([(0, 1, FakeKey())])
+    )
+    engine.stats_monitor = SimpleNamespace(
+        on_retrieve_request=lambda _num_tokens: "monitor-id",
+        on_retrieve_finished=lambda _monitor_id, _num_tokens: None,
+    )
+    engine.is_healthy = lambda: True
+    engine._get_req_id = lambda _kwargs: "req"
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: False
+    engine._is_passive = lambda: False
+    cleanup_calls = []
+    engine._maybe_unpin_retrieved_objs = (
+        lambda mem_objs, location: cleanup_calls.append(
+            (location, list(mem_objs))
+        )
+    )
+
+    retriever = engine.retrieve_layer([1])
+    next(retriever)
+    if prime_steps == 2:
+        retriever.send(None)
+    retriever.close()
+    # Repeated close must not release an already relinquished reference again.
+    retriever.close()
+
+    assert len(engine.storage_manager.returned) == prime_steps
+    assert all(
+        memory_obj.ref_count_down_calls == 1
+        for memory_obj in engine.storage_manager.returned
+    )
+    assert all(
+        future.result_calls == 1
+        for future in engine.storage_manager.futures
+    )
+    assert consumer_closes == [True]
+    assert len(cleanup_calls) == 1
+    assert cleanup_calls[0][0] == "LocalCPUBackend"
+    assert cleanup_calls[0][1] == engine.storage_manager.returned
+
+
+@pytest.mark.parametrize(
+    "completion",
+    ["normal", "abort", "send_failure", "terminal_sync_failure"],
+)
+def test_deferred_layerwise_retrieve_holds_sources_until_last_layer_entry(
+    monkeypatch,
+    completion,
+):
+    events = []
+
+    class FakeKey:
+        def split_layers(self, num_layers):
+            return [SimpleNamespace(layer_id=i) for i in range(num_layers)]
+
+    class FakeMemoryObj:
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+            self.ref_count_down_calls = 0
+
+        def ref_count_down(self):
+            self.ref_count_down_calls += 1
+            events.append(("release", self.layer_id))
+
+    class FakeStorageManager:
+        def __init__(self):
+            self.returned = []
+
+        @staticmethod
+        def contains(_key, _locations):
+            return "LocalCPUBackend"
+
+        def layerwise_batched_get(self, keys, location=None):
+            del location
+            for layer_id, _ in enumerate(keys):
+                memory_obj = FakeMemoryObj(layer_id)
+                self.returned.append(memory_obj)
+                yield SimpleNamespace(result=lambda obj=memory_obj: [obj])
+
+    class FakeGPUConnector:
+        @staticmethod
+        def batched_to_gpu(_starts, _ends, **_kwargs):
+            synchronized = False
+            try:
+                payload = yield
+                events.append(("h2d", 0, payload))
+                if completion == "send_failure":
+                    raise RuntimeError("H2D send failed after launch")
+                payload = yield
+                events.append(("h2d", 1, payload))
+                # send(final layer) stops here without synchronizing.
+                yield
+                if completion == "terminal_sync_failure":
+                    events.append(("consumer_sync_failed",))
+                    raise RuntimeError("terminal load-stream sync failed")
+                events.append(("consumer_sync",))
+                synchronized = True
+                yield
+            finally:
+                # Abort closes the consumer at the final gate. Model the
+                # Ascend connector's synchronized close before host release.
+                if not synchronized and completion == "abort":
+                    events.append(("consumer_sync",))
+
+    monkeypatch.setattr(cache_engine_module, "CacheEngineKey", FakeKey)
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.retrieve_locations = ["LocalCPUBackend"]
+    engine.storage_manager = FakeStorageManager()
+    engine.gpu_connector = FakeGPUConnector()
+    engine.token_database = SimpleNamespace(
+        process_tokens=lambda **_kwargs: iter([(0, 1, FakeKey())])
+    )
+    engine.stats_monitor = SimpleNamespace(
+        on_retrieve_request=lambda _num_tokens: "monitor-id",
+        on_retrieve_finished=lambda _monitor_id, _num_tokens: None,
+    )
+    engine.is_healthy = lambda: True
+    engine._get_req_id = lambda _kwargs: "req"
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: False
+    engine._is_passive = lambda: False
+    engine._maybe_unpin_retrieved_objs = (
+        lambda _objs, _location: events.append(("unpin",))
+    )
+
+    retriever = engine.retrieve_layer(
+        [1],
+        deferred_layerwise_get=True,
+    )
+    next(retriever)
+    if completion == "send_failure":
+        with pytest.raises(RuntimeError, match="H2D send failed after launch"):
+            retriever.send({"slot_mapping": torch.tensor([0])})
+        assert [event[0] for event in events] == ["h2d"]
+        assert len(engine.storage_manager.returned) == 1
+        assert engine.storage_manager.returned[0].ref_count_down_calls == 0
+        assert [event[0] for event in events].count("unpin") == 0
+        assert engine._unsafe_layerwise_retrieve_sources == (
+            engine.storage_manager.returned
+        )
+        return
+    retriever.send({"slot_mapping": torch.tensor([0])})
+    # N-1 submits the final H2D and returns at the cleanup gate.
+    assert retriever.send({"slot_mapping": torch.tensor([1])}) is None
+    assert [event[0] for event in events] == ["h2d", "h2d"]
+    assert all(
+        memory_obj.ref_count_down_calls == 0
+        for memory_obj in engine.storage_manager.returned
+    )
+
+    if completion == "abort":
+        # Adapter abort resets/synchronizes all transfer state before close.
+        events.append(("reset",))
+        retriever.close()
+        event_names = [event[0] for event in events]
+        assert event_names.index("reset") < event_names.index("consumer_sync")
+        assert event_names.index("consumer_sync") < event_names.index("release")
+    elif completion == "normal":
+        # The adapter's last-layer entry bank fence happens before this resume.
+        events.append(("last_layer_wait",))
+        ret_mask = retriever.send(None)
+        assert bool(torch.all(ret_mask))
+        event_names = [event[0] for event in events]
+        assert event_names.index("last_layer_wait") < event_names.index(
+            "consumer_sync"
+        )
+        assert event_names.index("consumer_sync") < event_names.index("release")
+        retriever.close()
+    else:
+        events.append(("last_layer_wait",))
+        with pytest.raises(RuntimeError, match="terminal load-stream sync failed"):
+            retriever.send(None)
+        assert all(
+            memory_obj.ref_count_down_calls == 0
+            for memory_obj in engine.storage_manager.returned
+        )
+        assert [event[0] for event in events].count("unpin") == 0
+        assert engine._unsafe_layerwise_retrieve_sources == (
+            engine.storage_manager.returned
+        )
+        return
+
+    assert all(
+        memory_obj.ref_count_down_calls == 1
+        for memory_obj in engine.storage_manager.returned
+    )
+    assert [event[0] for event in events].count("unpin") == 1
+
+
 def test_deferred_layerwise_store_persists_only_after_source_done(monkeypatch):
     class FakeKey:
         def split_layers(self, num_layers):
@@ -268,7 +532,9 @@ def test_deferred_layerwise_store_persists_only_after_source_done(monkeypatch):
             del location
             layer_id = keys[0].layer_id
             events.append(("persist_submit", layer_id))
-            return [FakeFuture(layer_id)]
+            # Exceed the old in-forward threshold with one completed source.
+            # None of these futures may be waited until the final drain.
+            return [FakeFuture(layer_id) for _ in range(8)]
 
     commands = []
 
@@ -329,9 +595,19 @@ def test_deferred_layerwise_store_persists_only_after_source_done(monkeypatch):
     assert next(storer) is None
     first = {"slot_mapping": torch.tensor([10])}
     second = {"slot_mapping": torch.tensor([20])}
+    # Pre-HCOM: only the D2H submission generator is advanced.
     assert storer.send(first) is None
     assert events == []
+    # Post-HCOM: finish layer 0 and make the storer ready for layer 1.
+    assert next(storer) is None
+    assert events == []
+
+    # Even when the GPU connector reports an old source buffer complete, the
+    # pre-HCOM callback must not call storage_manager.batched_put.
     assert storer.send(second) is None
+    assert events == [("source_done", 0)]
+    # The explicit post-HCOM finish is the first point allowed to publish it.
+    assert next(storer) is None
     assert events == [("source_done", 0), ("persist_submit", 0)]
     result = next(storer)
 
@@ -343,8 +619,8 @@ def test_deferred_layerwise_store_persists_only_after_source_done(monkeypatch):
         ("persist_submit", 0),
         ("source_done", 1),
         ("persist_submit", 1),
-        ("persist_done", 0),
-        ("persist_done", 1),
+        *[("persist_done", 0)] * 8,
+        *[("persist_done", 1)] * 8,
     ]
 
 
@@ -435,6 +711,7 @@ def test_deferred_layerwise_store_drains_multiple_rotating_banks(monkeypatch):
     assert next(storer) is None
     for layer in range(4):
         assert storer.send({"layer": layer}) is None
+        assert next(storer) is None
 
     result = next(storer)
     assert result is not None

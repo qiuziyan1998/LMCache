@@ -15,21 +15,22 @@ import torch
 pytest.importorskip("vllm")
 
 # First Party
+from vllm.v1.outputs import KVConnectorSaveCompletion
+from vllm.v1.request import RequestStatus
+
 from lmcache.integration.vllm import async_decode_save as async_decode_save_module
 from lmcache.integration.vllm import vllm_v1_adapter as adapter_module
 from lmcache.integration.vllm.async_decode_save import (
     ASYNC_DECODE_SAVE_LOG_COMPLETIONS_ENV,
 )
 from lmcache.integration.vllm.vllm_v1_adapter import (
-    LMCacheConnectorV1Impl,
     LMCacheConnectorMetadata,
+    LMCacheConnectorV1Impl,
     LoadSpec,
     RequestTracker,
     WorkerRetrieveState,
     _async_decode_save_enabled,
 )
-from vllm.v1.outputs import KVConnectorSaveCompletion
-from vllm.v1.request import RequestStatus
 from tests.v1.connector_test_utils import make_worker_impl
 
 
@@ -143,6 +144,32 @@ def test_dsa_prefix_hit_uses_full_allocation_and_chunk_aligned_committed_end(
     assert load_spec.dsa_committed_end == expected_committed
     assert load_spec.dsa_scratch_capacity == 4096
     assert not hasattr(request, "dsa_external_tail_chunk_start")
+
+
+@pytest.mark.parametrize(
+    ("supports_reuse", "expected"),
+    [(False, 0), (True, 2999)],
+)
+def test_kv_producer_checks_lookup_client_reuse_capability(
+    supports_reuse: bool,
+    expected: int,
+) -> None:
+    impl = _make_scheduler_impl()
+    impl.kv_role = "kv_producer"
+    impl.config.min_retrieve_tokens = 3001
+    lookup_client = MagicMock()
+    lookup_client.supports_producer_reuse.return_value = supports_reuse
+    lookup_client.lookup_cache.return_value = 3000
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+    request = SimpleNamespace(request_id="producer-reuse", num_tokens=3000)
+
+    assert impl.get_num_new_matched_tokens(request, 0) == expected
+    if supports_reuse:
+        lookup_client.lookup_cache.assert_called_once_with(
+            lookup_id=request.request_id
+        )
+    else:
+        lookup_client.lookup_cache.assert_not_called()
 
 
 def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:

@@ -3,9 +3,9 @@
 
 # Standard
 from contextlib import contextmanager
-import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+import inspect
 
 # Third Party
 import pytest
@@ -2378,6 +2378,226 @@ class TestWorkerRetrieveState:
         assert captured == ["latent", "indexer"]
         assert impl.current_layer == 1
 
+    def test_p_node_wait_fences_real_bank_without_load_retriever(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+        impl, _, engine = make_worker_connector([], use_layerwise=True)
+        impl.config.dsa_two_groups = False
+        impl.layerwise_retrievers = []
+        impl._latent_layer_names = []
+        impl._indexer_layer_names = []
+        wait = MagicMock()
+        engine.gpu_connector = SimpleNamespace(
+            supports_layerwise_prefill_transfer_window=True,
+            wait_for_layerwise_prefill_load=wait,
+        )
+
+        impl.wait_for_layer_load("model.layers.7.self_attn.attn")
+
+        wait.assert_called_once_with(layer_id=7, kv_group=0)
+
+    @pytest.mark.parametrize(
+        ("p_node", "gpu_support", "expected"),
+        [
+            ("false", True, False),
+            ("true", False, False),
+            ("true", True, True),
+        ],
+    )
+    def test_prefill_transfer_window_capability_requires_p_node_and_gpu(
+        self,
+        monkeypatch,
+        p_node,
+        gpu_support,
+        expected,
+    ):
+        monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", p_node)
+        impl, _, engine = make_worker_connector([], use_layerwise=True)
+        engine.gpu_connector = SimpleNamespace(
+            supports_layerwise_prefill_transfer_window=gpu_support,
+        )
+
+        assert impl.supports_layerwise_prefill_transfer_window is expected
+
+    def test_prefill_transfer_window_requires_layerwise_producer_capability(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+        impl, _, engine = make_worker_connector([], use_layerwise=True)
+        engine.gpu_connector = SimpleNamespace(
+            supports_layerwise_prefill_transfer_window=True,
+        )
+
+        impl.use_layerwise = False
+        assert impl.supports_layerwise_prefill_transfer_window is False
+
+        impl.use_layerwise = True
+        impl.kv_role = "kv_consumer"
+        assert impl.supports_layerwise_prefill_transfer_window is False
+
+        for role in ("kv_producer", "kv_both"):
+            impl.kv_role = role
+            assert impl.supports_layerwise_prefill_transfer_window is True
+
+    def test_p_node_wait_and_submit_split_current_and_next_layer(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+        req = ReqMeta(
+            req_id="req-1",
+            token_ids=[1, 2, 3, 4],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=4,
+                can_load=True,
+            ),
+            is_sparse_decode=False,
+            block_allocation_mode="prefill_child",
+            slot_mappings_by_bank=(
+                (
+                    torch.tensor([0, 1, 2, 3]),
+                    torch.tensor([100, 101, 102, 103]),
+                ),
+                (
+                    torch.tensor([10, 11, 12, 13]),
+                    torch.tensor([110, 111, 112, 113]),
+                ),
+            ),
+        )
+        impl, _, engine = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = True
+        impl._latent_layer_names = [
+            "model.layers.4.self_attn.attn",
+            "model.layers.5.self_attn.attn",
+        ]
+        impl._indexer_layer_names = [
+            "model.layers.4.self_attn.indexer.k_cache",
+            "model.layers.5.self_attn.indexer.k_cache",
+        ]
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_requests = [req]
+        impl._layerwise_retriever_is_sparse = [False]
+        impl._layerwise_waited_groups = set()
+        impl._layerwise_required_wait_groups_cache = None
+        impl._deferred_layerwise_prefill_load_active = True
+
+        waits = []
+        engine.gpu_connector = SimpleNamespace(
+            supports_layerwise_prefill_transfer_window=True,
+            wait_for_layerwise_prefill_load=(
+                lambda layer_id, kv_group: waits.append((layer_id, kv_group))
+            ),
+        )
+        submitted = []
+
+        def _retriever(label):
+            command = yield None
+            for _ in range(2):
+                submitted.append((label, command["slot_mapping"].tolist()))
+                command = yield torch.ones(4, dtype=torch.bool)
+
+        latent = _retriever("latent")
+        indexer = _retriever("indexer")
+        next(latent)
+        next(indexer)
+        impl.layerwise_retrievers = [(latent, indexer)]
+
+        latent0 = "model.layers.4.self_attn.attn"
+        index0 = "model.layers.4.self_attn.indexer.k_cache"
+        impl.wait_for_layer_load(latent0)
+        impl.wait_for_layer_load(index0)
+
+        assert waits == [(0, 0), (0, 1)]
+        assert submitted == []
+        assert impl.current_layer == 0
+
+        with pytest.raises(RuntimeError, match="submitted out of order"):
+            impl.submit_layerwise_prefill_load(index0)
+        assert submitted == []
+        assert impl.current_layer == 0
+
+        impl.submit_layerwise_prefill_load(latent0)
+        assert submitted == [("latent", [10, 11, 12, 13])]
+        assert impl.current_layer == 0
+
+        impl.submit_layerwise_prefill_load(index0)
+        assert submitted == [
+            ("latent", [10, 11, 12, 13]),
+            ("indexer", [110, 111, 112, 113]),
+        ]
+        assert impl.current_layer == 1
+
+        latent1 = "model.layers.5.self_attn.attn"
+        index1 = "model.layers.5.self_attn.indexer.k_cache"
+        submitted_before_last = list(submitted)
+        impl.submit_layerwise_prefill_load(latent1)
+        assert submitted == submitted_before_last
+        assert impl.current_layer == 1
+
+        impl.wait_for_layer_load(latent1)
+        assert waits[-1] == (1, 0)
+        assert submitted[-1] == ("latent", [10, 11, 12, 13])
+        assert impl.current_layer == 1
+
+        impl.wait_for_layer_load(index1)
+        assert waits[-1] == (1, 1)
+        assert submitted[-1] == ("indexer", [110, 111, 112, 113])
+        assert impl.current_layer == 2
+        assert impl.layerwise_retrievers == []
+
+    def test_p_node_submit_ignores_absent_indexer_retriever(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+        req = ReqMeta(
+            req_id="req-1",
+            token_ids=[1, 2],
+            load_spec=LoadSpec(0, 2, True),
+            is_sparse_decode=False,
+            block_allocation_mode="prefill_child",
+            slot_mappings_by_bank=(
+                (torch.tensor([0, 1]), torch.tensor([100, 101])),
+                (torch.tensor([10, 11]), torch.tensor([110, 111])),
+            ),
+        )
+        impl, _, engine = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = True
+        impl._latent_layer_names = [
+            "model.layers.0.self_attn.attn",
+            "model.layers.1.self_attn.attn",
+        ]
+        impl._indexer_layer_names = [
+            "model.layers.0.self_attn.indexer.k_cache",
+            "model.layers.1.self_attn.indexer.k_cache",
+        ]
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_requests = [req]
+        impl._layerwise_retriever_is_sparse = [False]
+        impl._layerwise_waited_groups = set()
+        impl._layerwise_required_wait_groups_cache = None
+        impl._deferred_layerwise_prefill_load_active = True
+        engine.gpu_connector = SimpleNamespace(
+            supports_layerwise_prefill_transfer_window=True,
+        )
+
+        def _latent_retriever():
+            command = yield None
+            yield torch.ones(len(command["slot_mapping"]), dtype=torch.bool)
+
+        latent = _latent_retriever()
+        next(latent)
+        impl.layerwise_retrievers = [(latent, None)]
+
+        impl.submit_layerwise_prefill_load("model.layers.0.self_attn.attn")
+        assert impl.current_layer == 1
+        impl.submit_layerwise_prefill_load(
+            "model.layers.0.self_attn.indexer.k_cache"
+        )
+        assert impl.current_layer == 1
+
     def test_bind_keeps_scheduler_metadata_payload_free(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)
@@ -3177,6 +3397,62 @@ class TestWorkerRetrieveState:
         assert calls == [("sparse", False), ("dense", True)]
         impl._drain_layerwise_retrievers()
 
+    def test_p_node_dense_retrieve_enables_deferred_two_bank_get(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+        dense = make_sparse_req_meta("dense", token_count=4)
+        dense.is_sparse_decode = False
+        dense.block_allocation_mode = "prefill_child"
+        dense.slot_mappings_by_bank = (
+            (torch.arange(4),),
+            (torch.arange(4) + 10,),
+        )
+
+        impl, _, _ = make_worker_connector([dense], use_layerwise=True)
+        impl.config.dsa_two_groups = False
+        impl.num_layers = 1
+        impl._refresh_kvcaches_list()
+        impl.layerwise_retrievers = []
+        impl._layerwise_requests = []
+        impl._layerwise_retriever_is_sparse = []
+        impl._layerwise_sparse_req_ids = []
+        impl._layerwise_waited_groups = set()
+        impl._layerwise_required_wait_groups_cache = None
+        impl._stats_monitor = SimpleNamespace(
+            update_interval_vllm_hit_tokens=lambda *_args: None,
+            update_interval_prompt_tokens=lambda *_args: None,
+        )
+        retrieve_kwargs = []
+
+        class _FakeEngine:
+            enable_shared_cpu_cache = False
+            gpu_connector = SimpleNamespace(
+                supports_layerwise_prefill_transfer_window=True,
+                wait_for_layerwise_prefill_load=lambda **_kwargs: None,
+                set_layerwise_staging_concurrency=lambda *_args: None,
+            )
+
+            def retrieve_layer(self, tokens, mask, **kwargs):
+                retrieve_kwargs.append(dict(kwargs))
+
+                def _retriever():
+                    yield None
+                    yield None
+                    yield torch.ones(len(tokens), dtype=torch.bool)
+
+                return _retriever()
+
+        impl.lmcache_engine = _FakeEngine()
+
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+
+        assert len(retrieve_kwargs) == 1
+        assert retrieve_kwargs[0]["deferred_layerwise_get"] is True
+        assert retrieve_kwargs[0]["layerwise_prefill_bank_count"] == 2
+        assert impl._deferred_layerwise_prefill_load_active is True
+        impl._drain_layerwise_retrievers(finish_dense=False)
+
     def test_start_load_kv_aborts_partial_sparse_batch(self):
         requests = [
             make_sparse_req_meta("req-1", token_count=4),
@@ -3364,6 +3640,46 @@ class TestWorkerRetrieveState:
         impl._drain_layerwise_retrievers.assert_called_once_with(
             finish_dense=False
         )
+
+    def test_p_node_abort_resets_transfers_before_releasing_objects(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv(
+            "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE",
+            "true",
+        )
+        impl = _make_impl()
+        impl.use_layerwise = True
+        events = []
+        gpu_connector = SimpleNamespace(
+            supports_layerwise_prefill_transfer_window=True,
+            reset_layerwise_prefill_transfer_state=lambda **kwargs: (
+                events.append(("reset", kwargs))
+            ),
+        )
+        impl.lmcache_engine = SimpleNamespace(gpu_connector=gpu_connector)
+        request = _make_request()
+        state = WorkerRetrieveState(req_id=request.req_id)
+        impl._worker_retrieve_state[request.req_id] = state
+        impl._release_unadopted_shared_request_objects = (
+            lambda _state, _request: events.append(("release", {}))
+        )
+        impl._drop_worker_retrieve_state = (
+            lambda _req_id: events.append(("drop", {}))
+        )
+        impl._drain_layerwise_retrievers = (
+            lambda **_kwargs: events.append(("drain", {}))
+        )
+
+        impl._abort_layerwise_retrieve_step([request])
+
+        assert events == [
+            ("reset", {"synchronize": True}),
+            ("release", {}),
+            ("drop", {}),
+            ("drain", {}),
+        ]
 
     def test_store_results_remain_local_to_their_operation(self):
         impl = _make_impl()
