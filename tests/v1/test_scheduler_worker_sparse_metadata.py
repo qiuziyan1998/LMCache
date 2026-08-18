@@ -20,6 +20,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LoadSpec,
     RequestTracker,
     WorkerRetrieveState,
+    _has_live_group1_source_for_dp,
     _has_live_latent_source_for_dp,
     _live_split_source_dp_rank,
 )
@@ -471,6 +472,50 @@ def test_live_latent_source_gate_requires_exact_tp0_dp_descriptor() -> None:
         )
 
 
+def test_live_group1_source_gate_requires_complete_tp_set() -> None:
+    def descriptor(tp_rank: int, *, tokens: int = 4) -> dict:
+        return {
+            "tp_rank": tp_rank,
+            "dp_rank": 1,
+            "group_byte_totals": [0, 64],
+            "compact_layout": {
+                "group_id": 1,
+                "token_count": tokens,
+                "layers": [{"layer_id": 0}],
+                "runs": [{"token_count": tokens}],
+            },
+        }
+
+    complete = {
+        "ascend_live_split_source_v1": {
+            "descriptors": [descriptor(0), descriptor(1)]
+        }
+    }
+    assert _has_live_group1_source_for_dp(complete, 1, 4, 2)
+    assert not _has_live_group1_source_for_dp({}, 1, 4, 2)
+    assert not _has_live_group1_source_for_dp(
+        {
+            "ascend_live_split_source_v1": {
+                "descriptors": [descriptor(0)]
+            }
+        },
+        1,
+        4,
+        2,
+    )
+    assert not _has_live_group1_source_for_dp(complete, 0, 4, 2)
+    assert not _has_live_group1_source_for_dp(
+        {
+            "ascend_live_split_source_v1": {
+                "descriptors": [descriptor(0), descriptor(1, tokens=3)]
+            }
+        },
+        1,
+        4,
+        2,
+    )
+
+
 @pytest.mark.parametrize(
     ("negotiated", "mode", "expected"),
     [
@@ -544,7 +589,55 @@ def test_cold_meta_requires_two_sided_latent_activation(
 
     meta = impl._build_dsa_cold_compact_meta(request, blocks, load_spec)
 
+    assert getattr(meta, "live_split_requested", False) is (
+        mode == "p2p_preferred"
+    )
     assert meta.live_split_latent_cpu is expected
+
+
+def test_cold_meta_does_not_negotiate_live_split_without_source() -> None:
+    impl = _make_scheduler_impl()
+    impl._block_size = 2
+    impl._dsa_cold_indexer_block_ids = {}
+    impl.config.dsa_group1_load_mode = "p2p_preferred"
+    impl._vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_index=0,
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+        )
+    )
+    tokens = [1, 2, 3, 4]
+    request = SimpleNamespace(
+        request_id="req-persistent-fallback",
+        all_token_ids=tokens,
+        prompt_token_ids=tokens,
+        sampling_params=SimpleNamespace(extra_args=None),
+        mm_features=None,
+        mm_hashes=None,
+        kv_transfer_params={
+            "live_split_capabilities": (
+                "ascend_live_split_v2",
+                "ascend_live_split_compact_v1",
+            ),
+            "live_split_transfer_id": "capability-without-source",
+            "remote_block_ids": [1, 2],
+            "remote_dp_rank": 0,
+        },
+    )
+    load_spec = LoadSpec(
+        vllm_cached_tokens=0,
+        lmcache_cached_tokens=len(tokens),
+        can_load=True,
+    )
+    blocks = SimpleNamespace(
+        get_unhashed_block_ids_all_groups=lambda: [[], [10, 11]]
+    )
+
+    meta = impl._build_dsa_cold_compact_meta(request, blocks, load_spec)
+
+    assert getattr(meta, "live_split_requested", False) is False
+    assert getattr(meta, "live_split_remote_block_ids", None) is None
 
 
 def test_dp2_live_split_requires_explicit_global_source_route() -> None:

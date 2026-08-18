@@ -98,6 +98,80 @@ RETRIEVE_STATS_INTERVAL_SECONDS_ENV = (
 LayerwiseSaveKey = tuple[str, str, int, int, int]
 
 
+def _has_live_group1_source_for_dp(
+    params: Any,
+    dp_rank: int,
+    token_count: int,
+    tp_size: int,
+) -> bool:
+    """Require a complete, rank-addressable Group-1 source offer.
+
+    Capabilities describe what the peer can do; they do not prove that the
+    current request actually published source memory.  In particular, a
+    prefix-hit producer may legitimately finish without a live descriptor and
+    rely on persistent storage.  Treating that request as live allocates a
+    destination which Mooncake must later cancel and mixes the live and
+    persistent load lifecycles.
+    """
+    if (
+        not isinstance(params, dict)
+        or isinstance(dp_rank, bool)
+        or not isinstance(dp_rank, int)
+        or isinstance(token_count, bool)
+        or not isinstance(token_count, int)
+        or token_count <= 0
+        or isinstance(tp_size, bool)
+        or not isinstance(tp_size, int)
+        or tp_size <= 0
+    ):
+        return False
+    envelope = params.get("ascend_live_split_source_v1")
+    if not isinstance(envelope, dict):
+        return False
+    descriptors = envelope.get("descriptors", ())
+    if not isinstance(descriptors, (tuple, list)):
+        return False
+    source_tp_ranks: set[int] = set()
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict):
+            continue
+        tp_value = descriptor.get("tp_rank", -1)
+        dp_value = descriptor.get("dp_rank", -1)
+        if (
+            isinstance(tp_value, bool)
+            or not isinstance(tp_value, int)
+            or isinstance(dp_value, bool)
+            or not isinstance(dp_value, int)
+            or not 0 <= tp_value < tp_size
+            or dp_value != dp_rank
+        ):
+            continue
+        compact = descriptor.get("compact_layout")
+        if not isinstance(compact, dict):
+            continue
+        group_value = compact.get("group_id", -1)
+        compact_tokens = compact.get("token_count", 0)
+        totals = descriptor.get("group_byte_totals")
+        if (
+            isinstance(group_value, bool)
+            or not isinstance(group_value, int)
+            or group_value != 1
+            or isinstance(compact_tokens, bool)
+            or not isinstance(compact_tokens, int)
+            or compact_tokens != token_count
+            or not bool(compact.get("layers"))
+            or not bool(compact.get("runs"))
+            or not isinstance(totals, (tuple, list))
+            or len(totals) != 2
+            or isinstance(totals[1], bool)
+            or not isinstance(totals[1], int)
+            or totals[1] <= 0
+        ):
+            continue
+        source_tp_ranks.add(tp_value)
+    return source_tp_ranks == set(range(tp_size))
+
+
 def _has_live_latent_source_for_dp(
     params: Any,
     dp_rank: int,
@@ -9421,10 +9495,27 @@ class LMCacheConnectorV1Impl:
             params,
             self._vllm_config.parallel_config,
         )
+        try:
+            source_tp_size = int(
+                getattr(
+                    self._vllm_config.parallel_config,
+                    "tensor_parallel_size",
+                    1,
+                )
+                or 1
+            )
+        except (TypeError, ValueError):
+            source_tp_size = 0
         if (
             self._group1_p2p_preferred()
             and "ascend_live_split_v2" in capabilities
             and source_dp_rank is not None
+            and _has_live_group1_source_for_dp(
+                params,
+                source_dp_rank,
+                load_spec.lmcache_cached_tokens,
+                source_tp_size,
+            )
         ):
             remote_block_ids = params.get("remote_block_ids")
             if remote_block_ids:
