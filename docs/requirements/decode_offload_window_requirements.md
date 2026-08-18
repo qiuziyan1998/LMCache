@@ -1,4 +1,4 @@
-# Decode Offload Window 与 `committed_end` 需求文档
+# Decode Offload Window 与 `committed_end` 需求
 
 ## 1. 范围
 
@@ -369,4 +369,3 @@ synchronize 改变异步关键路径。
 - 本地 latent block 只在 scheduler 消费 published frontier 后释放。
 - 请求结束、异常和 shutdown 后不存在 block lease、MemoryObj 或 pinned memory 泄漏。
 - async save 不阻塞 decode 主计算 stream，后台失败可以被稳定上报。
-
