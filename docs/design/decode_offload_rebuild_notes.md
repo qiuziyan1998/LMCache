@@ -1,5 +1,8 @@
 # Decode Offload 设计与重建说明
 
+完整的 window、异步保存和 `committed_end` 状态机需求见
+[`decode_offload_window_requirements.md`](decode_offload_window_requirements.md)。
+
 ## Non-Negotiable Constraints
 
 - The reference patches are known to contain bugs.
