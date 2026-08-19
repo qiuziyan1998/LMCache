@@ -3750,6 +3750,8 @@ class TestWorkerRetrieveState:
         assert prepared_source.pointer_device == torch.device("cpu")
         assert prepared_source.layers[0].tensors == ()
         assert prepared_source.layers[0].memory_objs == (owner,)
+        assert kwargs["req_id"] == req.req_id
+        assert kwargs["lmcache_cached_tokens"] == 256
         assert not hasattr(req, "cached_keys")
         assert impl._worker_retrieve_state[req.req_id] is state
         impl._drain_layerwise_retrievers()
@@ -3814,6 +3816,8 @@ class TestWorkerRetrieveState:
         assert kwargs["slot_mapping"] is state.slot_mapping
         assert kwargs["ret_mask"] is ret_mask
         assert kwargs["prepared_sparse_source"].total_tokens == 512
+        assert kwargs["req_id"] == req.req_id
+        assert kwargs["lmcache_cached_tokens"] == 512
 
         impl.wait_for_layer_load("model.layers.0.self_attn.attn")
 

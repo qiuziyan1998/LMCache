@@ -5787,6 +5787,8 @@ class LMCacheConnectorV1Impl:
                 "slot_mapping": slot_mapping,
                 "sync": sync,
                 "kv_group": kv_group,
+                "req_id": request.req_id,
+                "lmcache_cached_tokens": prepared_token_count,
                 "prepared_sparse_source": prepared_source,
             }
         else:
