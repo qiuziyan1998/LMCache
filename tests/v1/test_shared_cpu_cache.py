@@ -2093,6 +2093,7 @@ def test_rank0_post_init_broadcasts_startup_error_on_storage_failure(
     engine.shared_cpu_cache_name = "/lmcache-test"
     engine.shared_cpu_cache_slab_size = None
     engine.shared_cpu_cache_generation = 0
+    engine._shared_cpu_sparse_capacity_sanity_pending = True
     engine.metadata = SimpleNamespace(
         use_mla=True,
         world_size=2,
@@ -2104,8 +2105,12 @@ def test_rank0_post_init_broadcasts_startup_error_on_storage_failure(
         get_lookup_server_worker_ids=lambda use_mla, world_size: [],
     )
     broadcasts = []
+    capacity_reports = []
     engine.broadcast_object_fn = lambda payload, src: broadcasts.append(
         (payload, src)
+    )
+    engine._report_shared_cpu_sparse_capacity_sanity = lambda: (
+        capacity_reports.append("reported")
     )
 
     def fail_storage_manager(*args, **kwargs):
@@ -2119,6 +2124,8 @@ def test_rank0_post_init_broadcasts_startup_error_on_storage_failure(
     with pytest.raises(RuntimeError, match="stale shm segment"):
         engine.post_init()
 
+    assert capacity_reports == ["reported"]
+    assert engine._shared_cpu_sparse_capacity_sanity_pending is False
     assert len(broadcasts) == 1
     envelope, src = broadcasts[0]
     assert src == 0

@@ -294,7 +294,11 @@ class LMCacheEngine:
                 self.fmt = MemoryFormat.KV_T2D
         if metadata.use_mla:
             self.fmt = MemoryFormat.KV_MLA_LATENT_FMT
-        self._report_shared_cpu_sparse_capacity_sanity()
+        # DSA index KV-group shapes are registered by the vLLM adapter after
+        # the engine is constructed.  Run the capacity check from post_init,
+        # once all KV groups are available, but still before StorageManager
+        # allocates the shared-memory slab.
+        self._shared_cpu_sparse_capacity_sanity_pending = True
 
         # NOTE(ApostaC): we haven't support lookup-cache yet
         self.lookup_cache: dict[CacheEngineKey, Any] = {}
@@ -4410,6 +4414,13 @@ class LMCacheEngine:
             lookup_server_worker_ids = self.config.get_lookup_server_worker_ids(
                 self.metadata.use_mla, self.metadata.world_size
             )
+            if getattr(
+                self,
+                "_shared_cpu_sparse_capacity_sanity_pending",
+                False,
+            ):
+                self._report_shared_cpu_sparse_capacity_sanity()
+                self._shared_cpu_sparse_capacity_sanity_pending = False
             self._preflight_shared_cpu_shm_capacity()
             shared_passive_rank = (
                 self.enable_shared_cpu_cache
