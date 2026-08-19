@@ -6692,6 +6692,13 @@ class LMCacheConnectorV1Impl:
                 continue
             if getattr(load_spec, "dsa_cold_compact_load", False):
                 continue
+            if not load_spec.can_load and getattr(
+                load_spec, "dsa_cold_compact_resume", False
+            ):
+                raise RuntimeError(
+                    "Cold compact resume requires a prepared worker load: "
+                    f"req_id={request.req_id}"
+                )
             has_load_spec = True
             vllm_hit_tokens += load_spec.vllm_cached_tokens
             prompt_tokens += request.retrieve_token_count()
@@ -6941,6 +6948,16 @@ class LMCacheConnectorV1Impl:
                         shared_cpu_enabled=shared_cpu_enabled,
                         shared_cpu_preflight_state=shared_cpu_preflight_state,
                     )
+                    if latent_prepared is None and getattr(
+                        request.load_spec,
+                        "dsa_cold_compact_resume",
+                        False,
+                    ):
+                        raise RuntimeError(
+                            "Cold compact resume lost its prepared Group-0 "
+                            f"source: req_id={request.req_id}, "
+                            f"tokens={token_count}"
+                        )
                     cold_perf_active = bool(
                         request_perf_started and latent_prepared is None
                     )
@@ -10030,6 +10047,11 @@ class LMCacheConnectorV1Impl:
                 if load_spec is None:
                     raise RuntimeError("Cold compact resume lost its LoadSpec")
                 delattr(load_spec, "dsa_cold_compact_load")
+                # The scheduler calls update_state_after_alloc(..., 0) when it
+                # promotes a completed asynchronous load. That callback clears
+                # can_load for ordinary requests, but a cold resume still needs
+                # the prepared per-layer Group-0 transfer on its first forward.
+                load_spec.can_load = True
                 load_spec.dsa_cold_compact_resume = True
             num_tokens_to_compute = (
                 request.num_computed_tokens

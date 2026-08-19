@@ -1248,23 +1248,49 @@ class TestDisaggSpecOwnership:
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
     def test_cold_compact_resume_marker_is_one_shot(self) -> None:
         impl = _make_scheduler_impl()
+        impl._manager = SimpleNamespace(lookup_client=MagicMock())
         req_id = "cold-resume"
         prompt_len = 8193
         request = SimpleNamespace(
+            request_id=req_id,
             req_id=req_id,
             prompt_token_ids=list(range(prompt_len)),
             block_ids=list(range(513)),
+            num_tokens=prompt_len,
             num_computed_tokens=prompt_len - 1,
             sampling_params=SimpleNamespace(extra_args=None),
         )
-        impl._dsa_cold_loaded_req_ids = {req_id}
         impl.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=0,
             lmcache_cached_tokens=prompt_len,
-            can_load=True,
+            can_load=False,
             dsa_committed_end=prompt_len - 1,
         )
-        setattr(impl.load_specs[req_id], "dsa_cold_compact_load", True)
+        impl.load_specs[req_id].dsa_cold_compact_load = True
+        cold_meta = SimpleNamespace(req_id=req_id)
+        impl._build_dsa_cold_compact_meta = MagicMock(return_value=cold_meta)
+
+        # The first allocation callback admits the asynchronous full-prefix
+        # load and emits its no-forward worker metadata.
+        impl.update_state_after_alloc(request, prompt_len - 1, object())
+        assert impl.load_specs[req_id].can_load is True
+        initial = impl.build_connector_meta(
+            StubSchedulerOutput(
+                finished_req_ids=set(),
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=StubCachedRequestData([], [], []),
+                num_scheduled_tokens={},
+            )
+        )
+        assert initial.dsa_cold_compact_load_pending is True
+        assert initial.requests == [cold_meta]
+
+        # A completed async load is scheduled a second time with no newly
+        # allocated external tokens. This is the real transition that used to
+        # clear can_load immediately before the first sparse resume.
+        impl._dsa_cold_loaded_req_ids = {req_id}
+        impl.update_state_after_alloc(request, 0)
+        assert impl.load_specs[req_id].can_load is False
 
         first = impl.build_connector_meta(
             StubSchedulerOutput(
@@ -1276,6 +1302,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         ).requests[0]
 
         assert first.is_sparse_decode
+        assert first.load_spec.can_load is True
         assert first.load_spec.dsa_committed_end == prompt_len - 1
         assert first.load_spec.dsa_cold_compact_resume is True
         assert not hasattr(first.load_spec, "dsa_cold_compact_load")

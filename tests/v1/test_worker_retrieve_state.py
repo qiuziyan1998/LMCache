@@ -3683,6 +3683,7 @@ class TestWorkerRetrieveState:
 
     def test_sparse_decode_start_uses_minimal_prepared_kwargs(self):
         req = make_sparse_req_meta("req-1", token_count=256)
+        req.load_spec.dsa_cold_compact_resume = True
         owner = object()
         state = WorkerRetrieveState(
             cached_keys=[["layer-key"]],
@@ -3755,6 +3756,33 @@ class TestWorkerRetrieveState:
         assert not hasattr(req, "cached_keys")
         assert impl._worker_retrieve_state[req.req_id] is state
         impl._drain_layerwise_retrievers()
+
+    def test_cold_compact_resume_requires_prepared_group0_source(self) -> None:
+        request = make_sparse_req_meta("cold-resume", token_count=4)
+        request.load_spec.dsa_cold_compact_resume = True
+        impl, _, engine = make_worker_connector(
+            [request], use_layerwise=True
+        )
+        impl.config.dsa_two_groups = False
+        impl.num_layers = 1
+        impl._refresh_kvcaches_list()
+        impl.layerwise_retrievers = []
+        impl._layerwise_requests = []
+        impl._layerwise_retriever_is_sparse = []
+        impl._layerwise_sparse_req_ids = []
+        impl._stats_monitor = SimpleNamespace(
+            update_interval_vllm_hit_tokens=lambda *_args: None,
+            update_interval_prompt_tokens=lambda *_args: None,
+        )
+        engine.enable_shared_cpu_cache = False
+
+        with pytest.raises(
+            RuntimeError,
+            match="Cold compact resume lost its prepared Group-0 source",
+        ):
+            impl.start_load_kv(
+                SimpleNamespace(attn_metadata=SimpleNamespace())
+            )
 
     def test_sparse_warm_ref_reuses_worker_metadata(self):
         req = make_sparse_req_meta("req-1", token_count=256)
@@ -3998,6 +4026,23 @@ class TestWorkerRetrieveState:
         staging.assert_called_once_with(2)
         assert calls == [("sparse", False), ("dense", True)]
         impl._drain_layerwise_retrievers()
+
+    def test_cold_compact_resume_rejects_non_loadable_metadata(self) -> None:
+        request = make_sparse_req_meta(
+            "cold-resume",
+            can_load=False,
+            token_count=4,
+        )
+        request.load_spec.dsa_cold_compact_resume = True
+        impl, _, _ = make_worker_connector([request], use_layerwise=True)
+
+        with pytest.raises(
+            RuntimeError,
+            match="Cold compact resume requires a prepared worker load",
+        ):
+            impl.start_load_kv(
+                SimpleNamespace(attn_metadata=SimpleNamespace())
+            )
 
     def test_dense_two_group_load_rejects_missing_indexer_mapping(self):
         dense = make_sparse_req_meta("dense", token_count=4)
