@@ -639,6 +639,38 @@ class StorageManager:
                 return [False] * len(keys)
         return backend.batched_external_pages_exist(keys)
 
+    def submit_remote_fill_direct_push(
+        self,
+        *,
+        remote_session: str,
+        source_plan: Any,
+        destination_descriptors: tuple[Any, ...],
+        activation: Any,
+    ) -> Future:
+        """Submit one armed remote fill through the active RemoteBackend."""
+        backend = self.storage_backends.get("RemoteBackend")
+        if not isinstance(backend, RemoteBackend):
+            raise RuntimeError("Remote fill requires RemoteBackend")
+        with self._bypass_lock:
+            if "RemoteBackend" in self._bypassed_backends:
+                raise RuntimeError("RemoteBackend is bypassed")
+        return backend.submit_remote_fill_direct_push(
+            remote_session=remote_session,
+            source_plan=source_plan,
+            destination_descriptors=destination_descriptors,
+            activation=activation,
+        )
+
+    def get_remote_fill_destination_session(self) -> str | None:
+        """Return TP0's registered native destination session, if enabled."""
+        backend = self.storage_backends.get("RemoteBackend")
+        if not isinstance(backend, RemoteBackend):
+            return None
+        with self._bypass_lock:
+            if "RemoteBackend" in self._bypassed_backends:
+                return None
+        return backend.get_remote_fill_destination_session()
+
     def get(
         self,
         key: CacheEngineKey,
@@ -1279,6 +1311,136 @@ class StorageManager:
                 break
             remaining = remaining[hits:]
         return total, mapping
+
+    def batched_contains_two_group_layer_pages(
+        self,
+        group0_keys: Sequence[LayerCacheEngineKey],
+        group1_keys: Sequence[LayerCacheEngineKey],
+        search_range: Optional[List[str]] = None,
+        pin: bool = False,
+    ) -> tuple[int, dict[str, list[CacheEngineKey]]]:
+        """Locate a contiguous prefix of complete two-group physical pages.
+
+        Args:
+            group0_keys: Group 0 representative layer keys in logical order.
+            group1_keys: Aligned Group 1 representative layer keys.
+            search_range: Optional ordered backend filter.
+            pin: Atomically pin complete pairs in pin-capable backends.
+
+        Returns:
+            The number of complete page pairs and their backend mapping. Each
+            mapping value is interleaved ``g0, g1`` by logical page.
+
+        Raises:
+            ValueError: If the key sequences are not aligned two-group page
+                representatives.
+
+        Notes:
+            A backend can contribute only whole pairs. An isolated Group 0 or
+            Group 1 hit never advances the prefix and is never retained. The
+            LocalCPU backend performs lookup and pair pinning under its single
+            cache lock; persistent backends are rechecked on the exact even
+            prefix before any backend-specific pin is recorded.
+        """
+        if len(group0_keys) != len(group1_keys):
+            raise ValueError("Two-group page lookup requires aligned key counts")
+        for group0, group1 in zip(group0_keys, group1_keys, strict=True):
+            if (
+                group0.kv_group != 0
+                or group1.kv_group != 1
+                or group0.layer_id != group1.layer_id
+                or group0.chunk_hash != group1.chunk_hash
+                or group0.model_name != group1.model_name
+                or group0.world_size != group1.world_size
+                or group0.worker_id != group1.worker_id
+            ):
+                raise ValueError(
+                    "Two-group page lookup requires identical logical page pairs"
+                )
+
+        total_pairs = 0
+        mapping: dict[str, list[CacheEngineKey]] = {}
+        pinned: list[tuple[StorageBackendInterface, list[CacheEngineKey]]] = []
+
+        def rollback() -> None:
+            for backend, keys in reversed(pinned):
+                batched_unpin = getattr(backend, "batched_unpin", None)
+                if callable(batched_unpin):
+                    batched_unpin(keys)
+                else:
+                    for key in keys:
+                        backend.unpin(key)
+
+        try:
+            for name, backend in self.get_active_storage_backends(
+                search_range=search_range
+            ):
+                if total_pairs == len(group0_keys):
+                    break
+                remaining0 = group0_keys[total_pairs:]
+                remaining1 = group1_keys[total_pairs:]
+                if name == "LocalCPUBackend":
+                    physical0 = [key.without_layer() for key in remaining0]
+                    physical1 = [key.without_layer() for key in remaining1]
+                    pair_hits = backend.batched_contains_two_group_prefix(
+                        physical0,
+                        physical1,
+                        pin=pin,
+                    )
+                    if not 0 <= pair_hits <= len(remaining0):
+                        raise RuntimeError(
+                            "LocalCPU returned an invalid two-group page prefix"
+                        )
+                    backend_keys = [
+                        key
+                        for pair in zip(
+                            physical0[:pair_hits],
+                            physical1[:pair_hits],
+                            strict=True,
+                        )
+                        for key in pair
+                    ]
+                else:
+                    contains = getattr(backend, "batched_contains_layer_pages", None)
+                    if not callable(contains):
+                        continue
+                    interleaved = [
+                        key
+                        for pair in zip(remaining0, remaining1, strict=True)
+                        for key in pair
+                    ]
+                    raw_hits = int(contains(interleaved, False))
+                    if not 0 <= raw_hits <= len(interleaved):
+                        raise RuntimeError(
+                            f"{name} returned an invalid layer-page prefix"
+                        )
+                    pair_hits = raw_hits // 2
+                    backend_keys = interleaved[: 2 * pair_hits]
+                    if pin and backend_keys:
+                        retained = int(contains(backend_keys, True))
+                        if retained != len(backend_keys):
+                            if retained > 0:
+                                partial = backend_keys[:retained]
+                                batched_unpin = getattr(backend, "batched_unpin", None)
+                                if callable(batched_unpin):
+                                    batched_unpin(partial)
+                                else:
+                                    for key in partial:
+                                        backend.unpin(key)
+                            return total_pairs, mapping
+
+                if pair_hits <= 0:
+                    continue
+                mapping[name] = backend_keys
+                if pin:
+                    pinned.append((backend, backend_keys))
+                total_pairs += pair_hits
+        except Exception:
+            if pin:
+                rollback()
+            raise
+
+        return total_pairs, mapping
 
     def get_block_mapping(
         self, chunk_infos: List[Tuple[CacheEngineKey, int, int]]

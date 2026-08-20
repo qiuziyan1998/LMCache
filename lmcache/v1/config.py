@@ -228,6 +228,182 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     "pd_proxy_port": {"type": Optional[int], "default": None, "env_converter": int},
     # Transfer-related configurations
     "transfer_channel": {"type": Optional[str], "default": None, "env_converter": str},
+    # Direct remote LocalCPU fill (default-off; native activation is hardware-gated)
+    "enable_remote_lmcache_store": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "remote_fill_transport_mode": {
+        "type": str,
+        "default": "global_te_push",
+        "env_converter": str,
+    },
+    "remote_fill_publish_mode": {
+        "type": str,
+        "default": "final_only",
+        "env_converter": str,
+    },
+    "remote_fill_require_both_groups": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
+    "remote_fill_cache_namespace": {
+        "type": str,
+        "default": "",
+        "env_converter": str,
+    },
+    "remote_fill_model_artifact_id": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
+    "remote_fill_persistent_placement": {
+        "type": str,
+        "default": "prefiller_local_preferred",
+        "env_converter": str,
+    },
+    "remote_fill_allow_evict": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "remote_fill_busy_loop_alloc": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "remote_fill_max_active_transactions": {
+        "type": int,
+        "default": 8,
+        "env_converter": int,
+    },
+    "remote_fill_max_inflight_windows_per_request": {
+        "type": int,
+        "default": 2,
+        "env_converter": int,
+    },
+    "remote_fill_max_inflight_bytes": {
+        "type": int,
+        "default": 2 * 1024**3,
+        "env_converter": int,
+    },
+    "remote_fill_max_reserved_bytes": {
+        "type": int,
+        "default": 16 * 1024**3,
+        "env_converter": int,
+    },
+    "remote_fill_max_bytes_per_request": {
+        "type": int,
+        "default": 64 * 1024**3,
+        "env_converter": int,
+    },
+    "remote_fill_min_free_bytes": {
+        "type": int,
+        "default": 8 * 1024**3,
+        "env_converter": int,
+    },
+    "remote_fill_min_free_ratio": {
+        "type": float,
+        "default": 0.05,
+        "env_converter": float,
+    },
+    "remote_fill_max_native_operations": {
+        "type": int,
+        "default": 2,
+        "env_converter": int,
+    },
+    "remote_fill_direct_worker_count": {
+        "type": int,
+        "default": 2,
+        "env_converter": int,
+    },
+    "remote_fill_window_tokens": {
+        "type": int,
+        "default": 4096,
+        "env_converter": int,
+    },
+    "remote_fill_max_control_pages_per_window": {
+        "type": int,
+        "default": 8,
+        "env_converter": int,
+    },
+    "remote_fill_max_rpc_message_bytes": {
+        "type": int,
+        "default": 64 * 1024,
+        "env_converter": int,
+    },
+    "remote_fill_open_timeout_ms": {
+        "type": int,
+        "default": 5000,
+        "env_converter": int,
+    },
+    "remote_fill_reserve_timeout_ms": {
+        "type": int,
+        "default": 5000,
+        "env_converter": int,
+    },
+    "remote_fill_arm_timeout_ms": {
+        "type": int,
+        "default": 5000,
+        "env_converter": int,
+    },
+    "remote_fill_transfer_timeout_ms": {
+        "type": int,
+        "default": 30000,
+        "env_converter": int,
+    },
+    "remote_fill_finish_timeout_ms": {
+        "type": int,
+        "default": 30000,
+        "env_converter": int,
+    },
+    "remote_fill_reservation_ttl_sec": {
+        "type": int,
+        "default": 30,
+        "env_converter": int,
+    },
+    "remote_fill_terminal_record_ttl_sec": {
+        "type": int,
+        "default": 300,
+        "env_converter": int,
+    },
+    "remote_fill_native_hard_timeout_ms": {
+        "type": int,
+        "default": 120000,
+        "env_converter": int,
+    },
+    "remote_fill_control_host": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
+    "remote_fill_control_port_start": {
+        "type": Optional[int],
+        "default": None,
+        "env_converter": int,
+    },
+    "remote_fill_descriptor_ttl_sec": {
+        "type": int,
+        "default": 10,
+        "env_converter": int,
+    },
+    "remote_fill_circuit_breaker_enabled": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
+    "remote_fill_circuit_breaker_failure_threshold": {
+        "type": int,
+        "default": 3,
+        "env_converter": int,
+    },
+    "remote_fill_circuit_breaker_cooldown_sec": {
+        "type": int,
+        "default": 60,
+        "env_converter": int,
+    },
     # Nixl-related configurations
     "nixl_backends": {
         "type": Optional[list[str]],
@@ -725,6 +901,149 @@ def _validate_config(self):
                 "shared_cpu_cache_name and shm_name refer to the same shared "
                 "slab and must not conflict."
                 + shared_cpu_config_context
+            )
+
+    if self.enable_remote_lmcache_store:
+        if self.remote_fill_transport_mode != "global_te_push":
+            raise ValueError(
+                "remote_fill_transport_mode currently supports only 'global_te_push'"
+            )
+        if self.remote_fill_publish_mode != "final_only":
+            raise ValueError(
+                "remote_fill_publish_mode currently supports only 'final_only'"
+            )
+        if self.remote_fill_persistent_placement != "prefiller_local_preferred":
+            raise ValueError(
+                "remote_fill_persistent_placement currently supports only "
+                "'prefiller_local_preferred'"
+            )
+        if not self.remote_fill_require_both_groups:
+            raise ValueError(
+                "enable_remote_lmcache_store requires "
+                "remote_fill_require_both_groups=true"
+            )
+        if self.remote_fill_allow_evict or self.remote_fill_busy_loop_alloc:
+            raise ValueError(
+                "remote fill requires nonblocking allocation with "
+                "remote_fill_allow_evict=false and "
+                "remote_fill_busy_loop_alloc=false"
+            )
+        required_remote_fill = {
+            "use_layerwise": self.use_layerwise,
+            "dsa_two_groups": self.dsa_two_groups,
+            "enable_sparse_attention": self.enable_sparse_attention,
+            "save_unfull_chunk": self.save_unfull_chunk,
+            "extra_config.save_only_first_rank": bool(
+                extra_config.get("save_only_first_rank", False)
+            ),
+            "extra_config.mooncake_page_first_multi_buffer": bool(
+                extra_config.get("mooncake_page_first_multi_buffer", False)
+            ),
+            "extra_config.mooncake_layer_merged_page_objects": bool(
+                extra_config.get("mooncake_layer_merged_page_objects", False)
+            ),
+            "extra_config.mooncake_reuse_vllm_transfer_engine": bool(
+                extra_config.get("mooncake_reuse_vllm_transfer_engine", False)
+            ),
+            "remote_url=mooncakestore://...": str(self.remote_url).startswith(
+                "mooncakestore://"
+            ),
+        }
+        missing_remote_fill = [
+            name for name, enabled in required_remote_fill.items() if not enabled
+        ]
+        if missing_remote_fill:
+            raise ValueError(
+                "enable_remote_lmcache_store requires " + ", ".join(missing_remote_fill)
+            )
+        if not self.remote_fill_cache_namespace.strip():
+            raise ValueError(
+                "enable_remote_lmcache_store requires a non-empty "
+                "remote_fill_cache_namespace"
+            )
+        artifact_id = self.remote_fill_model_artifact_id
+        if artifact_id is None or not artifact_id.strip():
+            raise ValueError(
+                "enable_remote_lmcache_store requires an immutable "
+                "remote_fill_model_artifact_id for the complete serving bundle "
+                "(weights, quantization, tokenizer, and custom model code)"
+            )
+        if (
+            self.pre_caching_hash_algorithm == "builtin"
+            and os.getenv("PYTHONHASHSEED") != "0"
+        ):
+            raise ValueError(
+                "enable_remote_lmcache_store with builtin token hashing "
+                "requires PYTHONHASHSEED=0"
+            )
+        if self.remote_fill_window_tokens <= 0 or (
+            self.remote_fill_window_tokens % self.chunk_size
+        ):
+            raise ValueError(
+                "remote_fill_window_tokens must be a positive multiple of chunk_size"
+            )
+        required_control_pages = (self.remote_fill_window_tokens // self.chunk_size) * 2
+        if self.remote_fill_max_control_pages_per_window < required_control_pages:
+            raise ValueError(
+                "remote_fill_max_control_pages_per_window is too small for one "
+                "two-group window"
+            )
+        positive_remote_fill_values = {
+            "remote_fill_max_active_transactions": (
+                self.remote_fill_max_active_transactions
+            ),
+            "remote_fill_max_inflight_windows_per_request": (
+                self.remote_fill_max_inflight_windows_per_request
+            ),
+            "remote_fill_max_inflight_bytes": self.remote_fill_max_inflight_bytes,
+            "remote_fill_max_reserved_bytes": self.remote_fill_max_reserved_bytes,
+            "remote_fill_max_bytes_per_request": (
+                self.remote_fill_max_bytes_per_request
+            ),
+            "remote_fill_max_native_operations": (
+                self.remote_fill_max_native_operations
+            ),
+            "remote_fill_direct_worker_count": self.remote_fill_direct_worker_count,
+            "remote_fill_max_rpc_message_bytes": (
+                self.remote_fill_max_rpc_message_bytes
+            ),
+            "remote_fill_open_timeout_ms": self.remote_fill_open_timeout_ms,
+            "remote_fill_reserve_timeout_ms": self.remote_fill_reserve_timeout_ms,
+            "remote_fill_arm_timeout_ms": self.remote_fill_arm_timeout_ms,
+            "remote_fill_transfer_timeout_ms": self.remote_fill_transfer_timeout_ms,
+            "remote_fill_finish_timeout_ms": self.remote_fill_finish_timeout_ms,
+            "remote_fill_reservation_ttl_sec": self.remote_fill_reservation_ttl_sec,
+            "remote_fill_terminal_record_ttl_sec": (
+                self.remote_fill_terminal_record_ttl_sec
+            ),
+            "remote_fill_native_hard_timeout_ms": (
+                self.remote_fill_native_hard_timeout_ms
+            ),
+            "remote_fill_descriptor_ttl_sec": self.remote_fill_descriptor_ttl_sec,
+        }
+        nonpositive = [
+            name for name, value in positive_remote_fill_values.items() if value <= 0
+        ]
+        if nonpositive:
+            raise ValueError(
+                "remote fill requires positive values for " + ", ".join(nonpositive)
+            )
+        if self.remote_fill_min_free_bytes < 0:
+            raise ValueError("remote_fill_min_free_bytes must be non-negative")
+        if not 0 <= self.remote_fill_min_free_ratio < 1:
+            raise ValueError("remote_fill_min_free_ratio must be in [0, 1)")
+        control_port = self.remote_fill_control_port_start
+        if control_port is not None and not 0 < control_port < 65536:
+            raise ValueError(
+                "remote_fill_control_port_start must be between 1 and 65535"
+            )
+        if self.remote_fill_circuit_breaker_failure_threshold <= 0:
+            raise ValueError(
+                "remote_fill_circuit_breaker_failure_threshold must be positive"
+            )
+        if self.remote_fill_circuit_breaker_cooldown_sec <= 0:
+            raise ValueError(
+                "remote_fill_circuit_breaker_cooldown_sec must be positive"
             )
 
     if self.enable_dsa_cold_compact_load:

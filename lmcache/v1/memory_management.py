@@ -1277,6 +1277,21 @@ class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
         """
         return True
 
+    def get_capacity_bytes(self) -> tuple[int, int]:
+        """Return an atomic ``(free_bytes, heap_bytes)`` allocator snapshot.
+
+        Returns:
+            Free and total heap capacity in bytes.
+
+        Raises:
+            NotImplementedError: If the allocator has no constant-time,
+                allocation-synchronized capacity source.
+        """
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose synchronized capacity"
+        )
+
     # TODO(chunxiaozheng): remove if after all params replaced by shapes/dtypes
     def _adapt_shapes_and_dtypes(
         self,
@@ -1582,6 +1597,12 @@ class AddressManager:
 
         self._size += size
 
+    @synchronized("_lock")
+    def get_capacity_bytes(self) -> tuple[int, int]:
+        """Return free and total address-space bytes under the allocator lock."""
+
+        return self._size - self.total_allocated_size, self._size
+
     def get_heap_size(self) -> int:
         """
         Get the total size of the address space.
@@ -1662,6 +1683,11 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
     @property
     def total_allocated_size(self) -> int:
         return self.address_manager.total_allocated_size
+
+    def get_capacity_bytes(self) -> tuple[int, int]:
+        """Return a constant-time synchronized address-space snapshot."""
+
+        return self.address_manager.get_capacity_bytes()
 
     @_lmcache_nvtx_annotate
     def allocate(
@@ -2466,6 +2492,12 @@ class HostMemoryAllocator(MemoryAllocatorInterface):
         with self.host_mem_lock:
             return self.allocator.memcheck()
 
+    def get_capacity_bytes(self) -> tuple[int, int]:
+        """Return host-pool capacity synchronized with allocate and free."""
+
+        with self.host_mem_lock:
+            return self.allocator.get_capacity_bytes()
+
     def __str__(self):
         return "HostMemoryAllocator"
 
@@ -2544,6 +2576,12 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
     def memcheck(self):
         with self.host_mem_lock:
             return self.allocator.memcheck()
+
+    def get_capacity_bytes(self) -> tuple[int, int]:
+        """Return pinned-pool capacity synchronized with allocate and free."""
+
+        with self.host_mem_lock:
+            return self.allocator.get_capacity_bytes()
 
     def close(self):
         if not self._unregistered:
@@ -2768,6 +2806,12 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
     def memcheck(self):
         with self.host_mem_lock:
             return self.pin_allocator.memcheck()
+
+    def get_capacity_bytes(self) -> tuple[int, int]:
+        """Return pinned-pool capacity synchronized with allocate and free."""
+
+        with self.host_mem_lock:
+            return self.pin_allocator.get_capacity_bytes()
 
     def close(self):
         if not self._unregistered:

@@ -11,8 +11,9 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
 
 
-MOONCAKE_PAYLOAD_LAYOUT_TAG = "lmcache.tag.payload_v2"
+MOONCAKE_PAYLOAD_LAYOUT_TAG = "lmcache.tag.payload_v3"
 MOONCAKE_VALID_TOKENS_TAG = "lmcache.tag.internal.valid_tokens"
+REMOTE_FILL_PAGE_ABI_VERSION = "lmcache-layer-page-v3"
 
 
 def mooncake_valid_tokens(key: CacheEngineKey, chunk_size: int) -> int:
@@ -63,9 +64,7 @@ def mooncake_payload_layout(
     dtype = metadata.kv_dtype
     extra_config = config.extra_config or {}
     model_config_hash = ""
-    model_config_path = os.path.join(
-        metadata.model_name, "config.json"
-    )
+    model_config_path = os.path.join(metadata.model_name, "config.json")
     try:
         with open(model_config_path, encoding="utf-8") as model_config:
             canonical_model_config = json.dumps(
@@ -85,17 +84,48 @@ def mooncake_payload_layout(
         raw_token_dims = tuple(int(value) for value in raw_token_dims)
     else:
         raw_token_dims = str(raw_token_dims)
+    normalized_dims: dict[str, int] = {}
+    if isinstance(raw_token_dims, tuple):
+        if raw_token_dims and isinstance(raw_token_dims[0], tuple):
+            normalized_dims = {str(key): int(value) for key, value in raw_token_dims}
+        else:
+            normalized_dims = {
+                str(index): int(value) for index, value in enumerate(raw_token_dims)
+            }
     descriptor = {
-        "version": 2,
+        "version": 3,
+        "deployment_namespace": str(getattr(config, "remote_fill_cache_namespace", "")),
+        "model_artifact_id": str(
+            getattr(config, "remote_fill_model_artifact_id", "") or ""
+        ),
+        # The deployment-supplied artifact is the immutable serving-bundle ID:
+        # weights, quantization output, tokenizer, and custom model code.  The
+        # page ABI remains code-owned so a storage-layout change also changes
+        # every canonical page key without another operator knob.
+        "model_artifact_scope": "serving-bundle-v1",
+        "page_abi_version": REMOTE_FILL_PAGE_ABI_VERSION,
         "chunk_size": chunk_size,
         "kv_shape": kv_shape,
         "dtype": str(dtype),
-        "model_config": model_config_hash,
+        "model_config_digest": model_config_hash,
+        "cache_bearing_layers": extra_config.get("mooncake_cache_bearing_layers", ""),
         "use_mla": metadata.use_mla,
         "use_layerwise": config.use_layerwise,
         "dsa_two_groups": config.dsa_two_groups,
         "save_chunk_meta": resolve_save_chunk_meta(config),
         "raw_token_dims": raw_token_dims,
+        "group0_raw_token_dim": normalized_dims.get("0", 0),
+        "group1_raw_token_dim": normalized_dims.get("1", 0),
+        "group1_schema_version": str(
+            extra_config.get("mooncake_group1_schema_version", "")
+        ),
+        "mtp_layout_version": str(extra_config.get("mooncake_mtp_layout_version", "")),
+        "page_first_multi_buffer": bool(
+            extra_config.get("mooncake_page_first_multi_buffer", False)
+        ),
+        "layer_merged_pages": bool(
+            extra_config.get("mooncake_layer_merged_page_objects", False)
+        ),
     }
     encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
     return hashlib.blake2b(encoded.encode(), digest_size=8).hexdigest(), descriptor

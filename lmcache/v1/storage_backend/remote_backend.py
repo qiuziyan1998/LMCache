@@ -437,6 +437,33 @@ class RemoteBackend(StorageBackendInterface):
             normalized = [key.with_new_worker_id(0) for key in normalized]
         return self.connection.batched_external_pages_exist(normalized)
 
+    def submit_remote_fill_direct_push(
+        self,
+        *,
+        remote_session: str,
+        source_plan: Any,
+        destination_descriptors: tuple[Any, ...],
+        activation: Any,
+    ) -> Future:
+        """Submit one armed native direct push on the storage event loop."""
+        if self.connection is None:
+            raise RuntimeError("Remote connection is unavailable")
+        return asyncio.run_coroutine_threadsafe(
+            self.connection.push_external_pages(
+                remote_session=remote_session,
+                source_plan=source_plan,
+                destination_descriptors=destination_descriptors,
+                activation=activation,
+            ),
+            self.loop,
+        )
+
+    def get_remote_fill_destination_session(self) -> str | None:
+        """Return the active connector's native destination session."""
+        if self.connection is None:
+            return None
+        return self.connection.get_remote_fill_destination_session()
+
     @_lmcache_nvtx_annotate
     def get_blocking(
         self,

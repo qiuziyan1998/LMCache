@@ -145,6 +145,20 @@ class TestLocalCPUBackend:
             is None
         )
 
+    def test_allocator_capacity_is_constant_time_allocator_snapshot(self):
+        """Capacity uses allocator counters and reflects allocate/free changes."""
+
+        allocator = TensorMemoryAllocator(torch.zeros(16384, dtype=torch.uint8))
+        backend = object.__new__(LocalCPUBackend)
+        backend.memory_allocator = allocator
+
+        assert backend.get_allocator_capacity_bytes() == (16384, 16384)
+        memory_obj = allocator.allocate(torch.Size([1]), torch.uint8)
+        assert memory_obj is not None
+        assert backend.get_allocator_capacity_bytes() == (12288, 16384)
+        allocator.free(memory_obj)
+        assert backend.get_allocator_capacity_bytes() == (16384, 16384)
+
     def test_layer_page_uses_explicit_page_key(self):
         config = create_test_config(use_layerwise=True)
         config.enable_shared_cpu_cache = True

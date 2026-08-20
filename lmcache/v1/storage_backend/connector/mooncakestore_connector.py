@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import asyncio
 from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Any, Callable, List, Optional, cast, no_type_check
-import asyncio
 import json
 import os
+from threading import Lock
+from time import perf_counter
+from typing import Any, Callable, List, Optional, cast, no_type_check
 
 # Third Party
 import torch
@@ -34,14 +37,23 @@ from lmcache.v1.mooncake_layout import (
     mooncake_valid_tokens,
 )
 from lmcache.v1.protocol import RemoteMetadata
+from lmcache.v1.remote_fill.protocol import DestinationPageDescriptor
+from lmcache.v1.remote_fill.native import (
+    DIRECT_PUSH_H0_QUALIFICATION_V1,
+    DirectPushSourcePlan,
+    NativeDirectPushActivation,
+    NativeDirectPushAmbiguousError,
+    NativeDirectPushPreSubmitError,
+    NativeDirectPushResult,
+    NativeDirectPushTerminalError,
+)
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.system_detection import NUMADetector
 
 logger = init_logger(__name__)
 
-
-async def _drain_native_task(task: asyncio.Task[Any]) -> None:
+async def _drain_native_task(task: asyncio.Future[Any]) -> None:
     """Keep native transfer buffers alive through coroutine cancellation."""
     while not task.done():
         try:
@@ -54,14 +66,308 @@ async def _drain_native_task(task: asyncio.Task[Any]) -> None:
         task.exception()
 
 
-def _shared_vllm_mooncake_transport() -> tuple[Any, str, Any]:
+def _shared_vllm_mooncake_transport() -> tuple[Any, str, Any, Any]:
     """Borrow vLLM-Ascend's process-wide Mooncake engine and registry."""
     global_te = import_module(
         "vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine"
     ).global_te
     hostname = import_module("vllm.utils.network_utils").get_ip()
     engine = global_te.get_transfer_engine(hostname, device_name=None)
-    return global_te, f"{hostname}:{engine.get_rpc_port()}", engine.get_engine()
+    return (
+        global_te,
+        f"{hostname}:{engine.get_rpc_port()}",
+        engine.get_engine(),
+        engine,
+    )
+
+
+def _direct_push_owner_ranges(owners: tuple[Any, ...]) -> list[tuple[int, int]]:
+    """Return unique source-storage registrations for retained owners."""
+    ranges = {
+        (
+            int(owner.untyped_storage().data_ptr()),
+            int(owner.untyped_storage().nbytes()),
+        )
+        for owner in owners
+    }
+    if not ranges or any(ptr <= 0 or size <= 0 for ptr, size in ranges):
+        raise ValueError("Direct push requires valid retained source owners")
+    return sorted(ranges)
+
+
+def _validate_direct_push_activation(
+    activation: NativeDirectPushActivation | None,
+) -> NativeDirectPushActivation:
+    """Fail closed unless H0 qualification and ARM acknowledgement are explicit."""
+    if activation is None:
+        raise RuntimeError("Native direct push is hard-disabled until Gate H0 passes")
+    if activation.h0_qualification != DIRECT_PUSH_H0_QUALIFICATION_V1:
+        raise RuntimeError("Native direct push Gate H0 qualification is invalid")
+    if not activation.arm_acknowledged:
+        raise RuntimeError("Native direct push requires ARM_WINDOW acknowledgement")
+    if not activation.native_transfer_attempt_id:
+        raise ValueError("Native direct push requires a transfer attempt identifier")
+    return activation
+
+
+class MooncakeDirectPushTransport:
+    """Bounded asynchronous wrapper over Mooncake's native sync-write API.
+
+    The wrapper owns a worker pool and operation semaphore that are independent
+    from persistent Mooncake puts. Source owners remain reachable until the
+    original native call reaches a terminal return, even after a timeout.
+    """
+
+    def __init__(
+        self,
+        register_source_owners: Callable[[tuple[Any, ...]], None],
+        transfer_engine: Any,
+        *,
+        worker_count: int,
+        max_operations: int,
+        timeout_seconds: float,
+    ) -> None:
+        """Create a bounded, initially idle direct-push transport.
+
+        Args:
+            register_source_owners: Connector-owned idempotent registration
+                callback shared with persistent Mooncake transfers.
+            transfer_engine: Borrowed native Mooncake TransferEngine.
+            worker_count: Number of dedicated direct-push worker threads.
+            max_operations: Maximum native calls that may remain in flight.
+            timeout_seconds: Deadline before completion becomes ambiguous.
+
+        Raises:
+            ValueError: If a resource bound is not positive.
+        """
+        if worker_count <= 0 or max_operations <= 0 or timeout_seconds <= 0:
+            raise ValueError("Direct push resource bounds must be positive")
+        self._register_source_owners = register_source_owners
+        self._transfer_engine = transfer_engine
+        self._timeout_seconds = timeout_seconds
+        self._executor = ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="lmcache-remote-fill",
+        )
+        self._operation_limit = asyncio.Semaphore(max_operations)
+        self._task_lock = asyncio.Lock()
+        self._inflight: set[asyncio.Future[NativeDirectPushResult]] = set()
+        self._closed = False
+
+    async def push_external_pages(
+        self,
+        *,
+        remote_session: str,
+        source_plan: DirectPushSourcePlan,
+        destination_descriptors: tuple[DestinationPageDescriptor, ...],
+        activation: NativeDirectPushActivation | None,
+    ) -> NativeDirectPushResult:
+        """Push exact source page runs into trusted remote destinations.
+
+        Args:
+            remote_session: Mooncake destination session ``host:rpc_port``.
+            source_plan: P-local pointers, sizes, owners, and producer fences.
+            destination_descriptors: HMAC-verified and unexpired descriptors.
+            activation: Explicit Gate H0 and ``ARM_WINDOW`` proof.
+
+        Returns:
+            Aggregate terminal native transfer result with exact byte counts.
+
+        Raises:
+            RuntimeError: If the helper is unqualified, unarmed, or closed.
+            ValueError: If source and destination coverage or bytes differ.
+            NativeDirectPushTerminalError: If native code is nonzero.
+            NativeDirectPushAmbiguousError: If the native call misses its
+                deadline; the exception retains the original terminal future.
+        """
+        activation = _validate_direct_push_activation(activation)
+        if not remote_session:
+            raise ValueError("Native direct push requires a remote session")
+        if not source_plan.producer_events or any(
+            not callable(getattr(event, "synchronize", None))
+            for event in source_plan.producer_events
+        ):
+            raise ValueError("Native direct push requires real producer events")
+        vectors = self._build_vectors(
+            remote_session,
+            source_plan,
+            destination_descriptors,
+            activation.native_transfer_attempt_id,
+        )
+        owner_ranges = _direct_push_owner_ranges(source_plan.owners)
+        self._validate_source_ranges(vectors[0], vectors[2], owner_ranges)
+
+        loop = asyncio.get_running_loop()
+
+        def run_native() -> NativeDirectPushResult:
+            try:
+                source_device = next(
+                    (
+                        owner.device
+                        for owner in source_plan.owners
+                        if getattr(getattr(owner, "device", None), "type", None)
+                        == "npu"
+                    ),
+                    None,
+                )
+                if source_device is not None:
+                    torch.npu.set_device(source_device)
+                seen_events: set[int] = set()
+                for event in source_plan.producer_events:
+                    if id(event) in seen_events:
+                        continue
+                    seen_events.add(id(event))
+                    event.synchronize()
+                self._register_source_owners(source_plan.owners)
+            except Exception as exc:
+                raise NativeDirectPushPreSubmitError(
+                    "Native direct push failed before submission"
+                ) from exc
+            started = perf_counter()
+            native_return = self._transfer_engine.batch_transfer_sync_write(
+                remote_session,
+                list(vectors[0]),
+                list(vectors[1]),
+                list(vectors[2]),
+            )
+            if not isinstance(native_return, int) or isinstance(native_return, bool):
+                raise RuntimeError(
+                    "Mooncake native direct push returned an ambiguous status"
+                )
+            return NativeDirectPushResult(
+                native_transfer_attempt_id=activation.native_transfer_attempt_id,
+                return_code=native_return,
+                vector_count=len(vectors[0]),
+                transferred_bytes=sum(vectors[2]),
+                elapsed_ms=(perf_counter() - started) * 1000,
+            )
+
+        async with self._task_lock:
+            if self._closed:
+                raise RuntimeError("Native direct push transport is closed")
+            await self._operation_limit.acquire()
+            if self._closed:
+                self._operation_limit.release()
+                raise RuntimeError("Native direct push transport is closed")
+            try:
+                future = loop.run_in_executor(self._executor, run_native)
+            except BaseException:
+                self._operation_limit.release()
+                raise
+            self._inflight.add(future)
+
+        def release_operation(done: asyncio.Future[NativeDirectPushResult]) -> None:
+            self._inflight.discard(done)
+            self._operation_limit.release()
+
+        future.add_done_callback(release_operation)
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(future), timeout=self._timeout_seconds
+            )
+        except asyncio.CancelledError:
+            await _drain_native_task(future)
+            raise
+        except asyncio.TimeoutError as exc:
+            raise NativeDirectPushAmbiguousError(
+                activation.native_transfer_attempt_id,
+                future,
+            ) from exc
+        except NativeDirectPushPreSubmitError:
+            raise
+        except Exception as exc:
+            raise NativeDirectPushAmbiguousError(
+                activation.native_transfer_attempt_id,
+                future,
+            ) from exc
+        if result.return_code != 0:
+            raise NativeDirectPushTerminalError(result)
+        return result
+
+    async def close(self) -> None:
+        """Drain native calls and close the dedicated worker pool."""
+        self._closed = True
+        async with self._task_lock:
+            inflight = tuple(self._inflight)
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
+        self._executor.shutdown(wait=True, cancel_futures=False)
+
+    @staticmethod
+    def _build_vectors(
+        remote_session: str,
+        source_plan: DirectPushSourcePlan,
+        destination_descriptors: tuple[DestinationPageDescriptor, ...],
+        native_transfer_attempt_id: str,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        if not source_plan.pages or not destination_descriptors:
+            raise ValueError("Native direct push requires nonempty pages")
+        destinations: dict[tuple[str, int], DestinationPageDescriptor] = {}
+        for descriptor in destination_descriptors:
+            identity = (descriptor.canonical_key, descriptor.kv_group)
+            if identity in destinations:
+                raise ValueError("Native direct push destination is duplicated")
+            if descriptor.remote_session != remote_session:
+                raise ValueError("Native direct push remote session changed")
+            if (
+                descriptor.native_transfer_attempt_id
+                != native_transfer_attempt_id
+            ):
+                raise ValueError("Native direct push attempt identifier changed")
+            if descriptor.destination_ptr <= 0 or descriptor.destination_length <= 0:
+                raise ValueError("Native direct push destination is invalid")
+            destinations[identity] = descriptor
+
+        sources: set[tuple[str, int]] = set()
+        source_ptrs: list[int] = []
+        destination_ptrs: list[int] = []
+        lengths: list[int] = []
+        for page in source_plan.pages:
+            identity = (page.canonical_key, page.kv_group)
+            if identity in sources:
+                raise ValueError("Native direct push source page is duplicated")
+            sources.add(identity)
+            descriptor = destinations.get(identity)
+            if descriptor is None:
+                raise ValueError("Native direct push destination page is missing")
+            if not page.source_ptrs or len(page.source_ptrs) != len(
+                page.source_lengths
+            ):
+                raise ValueError("Native direct push source vectors are invalid")
+            offset = 0
+            for source_ptr, length in zip(
+                page.source_ptrs, page.source_lengths, strict=True
+            ):
+                if source_ptr <= 0 or length <= 0:
+                    raise ValueError("Native direct push source extent is invalid")
+                source_ptrs.append(source_ptr)
+                destination_ptrs.append(descriptor.destination_ptr + offset)
+                lengths.append(length)
+                offset += length
+            if offset != descriptor.destination_length:
+                raise ValueError("Native direct push page byte count differs")
+        if sources != set(destinations):
+            raise ValueError("Native direct push page coverage differs")
+        return tuple(source_ptrs), tuple(destination_ptrs), tuple(lengths)
+
+    @staticmethod
+    def _validate_source_ranges(
+        source_ptrs: tuple[int, ...],
+        lengths: tuple[int, ...],
+        owner_ranges: list[tuple[int, int]],
+    ) -> None:
+        starts = [ptr for ptr, _ in owner_ranges]
+        prefix_ends: list[int] = []
+        for ptr, size in owner_ranges:
+            prefix_ends.append(
+                max(prefix_ends[-1] if prefix_ends else 0, ptr + size)
+            )
+        for ptr, length in zip(source_ptrs, lengths, strict=True):
+            index = bisect_right(starts, ptr) - 1
+            if index < 0 or ptr + length > prefix_ends[index]:
+                raise ValueError(
+                    "Native direct push source lies outside retained owners"
+                )
 
 
 @dataclass
@@ -221,14 +527,22 @@ class MooncakestoreConnector(RemoteConnector):
                     "mooncake_reuse_vllm_transfer_engine must be a boolean"
                 )
             self._shared_global_te = None
+            self._shared_transfer_engine = None
+            self._shared_local_segment = None
             if reuse_vllm_engine:
                 if self.config.protocol != "ascend":
                     raise ValueError(
                         "mooncake_reuse_vllm_transfer_engine requires protocol=ascend"
                     )
-                self._shared_global_te, local_segment, native_engine = (
+                (
+                    self._shared_global_te,
+                    local_segment,
+                    native_engine,
+                    self._shared_transfer_engine,
+                ) = (
                     _shared_vllm_mooncake_transport()
                 )
+                self._shared_local_segment = local_segment
 
             # Check if storage_root_dir exists and set environment variable
             if (
@@ -350,8 +664,21 @@ class MooncakestoreConnector(RemoteConnector):
         self.registered_buffer_size = 0
         self._external_buffers: dict[int, int] = {}
         self._shared_external_buffers: dict[int, int] = {}
+        self._shared_external_registration_lock = Lock()
         self._external_put_lock = asyncio.Lock()
         self._inflight_put_tasks: set[asyncio.Task[Any]] = set()
+        self._direct_push_transport: MooncakeDirectPushTransport | None = None
+        self._direct_push_transport_init_lock = Lock()
+        self._direct_push_worker_count = int(
+            getattr(lmcache_config, "remote_fill_direct_worker_count", 2)
+        )
+        self._direct_push_max_operations = int(
+            getattr(lmcache_config, "remote_fill_max_native_operations", 2)
+        )
+        self._direct_push_timeout_seconds = (
+            int(getattr(lmcache_config, "remote_fill_transfer_timeout_ms", 30000))
+            / 1000
+        )
         # Initialize ReplicateConfig
         self._replicate_config_cls = ReplicateConfig
         self.replica_config = ReplicateConfig()
@@ -681,7 +1008,6 @@ class MooncakestoreConnector(RemoteConnector):
     def _register_external_owners(self, owners: tuple[Any, ...]) -> None:
         """Register tensor storages once in this Mooncake transport context."""
         active: dict[int, int] = {}
-        shared: dict[int, int] = {}
         cpu_ptr = getattr(self, "registered_buffer_ptr", None)
         cpu_size = int(getattr(self, "registered_buffer_size", 0))
         for owner in owners:
@@ -693,27 +1019,13 @@ class MooncakestoreConnector(RemoteConnector):
                 and size <= cpu_size
             ):
                 continue
-            target = (
-                shared
-                if getattr(self, "_shared_global_te", None) is not None
+            if (
+                getattr(self, "_shared_global_te", None) is not None
                 and getattr(getattr(owner, "device", None), "type", None) == "npu"
-                else active
-            )
-            target[ptr] = size
-        shared_global_te = getattr(self, "_shared_global_te", None)
-        if shared:
-            # Stable NPU KV regions stay registered for the process lifetime;
-            # CPU staging remains store-scoped below.
-            registered = getattr(self, "_shared_external_buffers", {})
-            pending = {
-                ptr: size
-                for ptr, size in shared.items()
-                if registered.get(ptr) != size
-            }
-            if pending:
-                shared_global_te.register_buffer(list(pending), list(pending.values()))
-                registered.update(pending)
-            self._shared_external_buffers = registered
+            ):
+                continue
+            active[ptr] = size
+        self._ensure_shared_external_owners_registered(owners)
         for ptr in self._external_buffers.keys() - active.keys():
             self.store.unregister_buffer(ptr)
             self._external_buffers.pop(ptr, None)
@@ -729,6 +1041,52 @@ class MooncakestoreConnector(RemoteConnector):
                     f"size={size} status={status}"
                 )
             self._external_buffers[ptr] = size
+
+    def _ensure_shared_external_owners_registered(
+        self,
+        owners: tuple[Any, ...],
+    ) -> None:
+        """Register shared GlobalTE source storages exactly once.
+
+        Persistent storage and direct remote fill may run concurrently. Both
+        paths call this connector-owned helper so they cannot race independent
+        registration registries for the same stable NPU allocation.
+        """
+
+        shared_global_te = getattr(self, "_shared_global_te", None)
+        if shared_global_te is None:
+            return
+        shared = {
+            int(owner.untyped_storage().data_ptr()): int(
+                owner.untyped_storage().nbytes()
+            )
+            for owner in owners
+            if getattr(getattr(owner, "device", None), "type", None) == "npu"
+        }
+        if not shared:
+            return
+        lock = self._shared_external_registration_lock
+        with lock:
+            registered = self._shared_external_buffers
+            mismatched = {
+                ptr: (registered[ptr], size)
+                for ptr, size in shared.items()
+                if ptr in registered and registered[ptr] != size
+            }
+            if mismatched:
+                raise RuntimeError(
+                    "GlobalTE source storage changed size after registration: "
+                    f"{mismatched}"
+                )
+            pending = {
+                ptr: size for ptr, size in shared.items() if ptr not in registered
+            }
+            if pending:
+                shared_global_te.register_buffer(
+                    list(pending),
+                    list(pending.values()),
+                )
+                registered.update(pending)
 
     def _page_keys_for(self, keys: List[CacheEngineKey]) -> list[Optional[str]]:
         """Resolve page keys from canonical chunk or representative layer keys."""
@@ -2227,6 +2585,66 @@ class MooncakestoreConnector(RemoteConnector):
                 status="ok",
             )
 
+    def get_remote_fill_destination_session(self) -> str | None:
+        """Return the registered GlobalTE session used for direct writes."""
+        return self._shared_local_segment
+
+    async def push_external_pages(
+        self,
+        *,
+        remote_session: str,
+        source_plan: DirectPushSourcePlan,
+        destination_descriptors: tuple[DestinationPageDescriptor, ...],
+        activation: NativeDirectPushActivation | None,
+    ) -> NativeDirectPushResult:
+        """Push P-local NPU page runs directly into decoder LocalCPU pages.
+
+        Args:
+            remote_session: Trusted decoder TransferEngine session.
+            source_plan: P-local pointers, owners, and producer events.
+            destination_descriptors: Already validated remote capabilities.
+            activation: Explicit H0 qualification and ARM acknowledgement.
+
+        Returns:
+            Aggregate terminal result for the original native submission.
+
+        Raises:
+            RuntimeError: If H0/ARM proof or shared GlobalTE is unavailable.
+            ValueError: If exact page coverage and byte validation fails.
+            NativeDirectPushTerminalError: For nonzero native return status.
+            NativeDirectPushAmbiguousError: When terminal state is unknown at
+                the configured transfer deadline.
+
+        Notes:
+            This API is inert unless its caller supplies an explicitly
+            qualified activation token. It never acquires the persistent
+            connector's external-put lock.
+        """
+        _validate_direct_push_activation(activation)
+        if self._shared_global_te is None or self._shared_transfer_engine is None:
+            raise RuntimeError(
+                "Native direct push requires the borrowed process-wide GlobalTE"
+            )
+        transport = self._direct_push_transport
+        if transport is None:
+            with self._direct_push_transport_init_lock:
+                transport = self._direct_push_transport
+                if transport is None:
+                    transport = MooncakeDirectPushTransport(
+                        self._ensure_shared_external_owners_registered,
+                        self._shared_transfer_engine,
+                        worker_count=self._direct_push_worker_count,
+                        max_operations=self._direct_push_max_operations,
+                        timeout_seconds=self._direct_push_timeout_seconds,
+                    )
+                    self._direct_push_transport = transport
+        return await transport.push_external_pages(
+            remote_session=remote_session,
+            source_plan=source_plan,
+            destination_descriptors=destination_descriptors,
+            activation=activation,
+        )
+
     def batched_external_pages_exist(
         self, keys: List[CacheEngineKey]
     ) -> List[bool]:
@@ -2493,6 +2911,9 @@ class MooncakestoreConnector(RemoteConnector):
         pass
 
     async def close(self):
+        direct_push_transport = getattr(self, "_direct_push_transport", None)
+        if direct_push_transport is not None:
+            await direct_push_transport.close()
         if self._inflight_put_tasks:
             await asyncio.gather(
                 *tuple(self._inflight_put_tasks), return_exceptions=True

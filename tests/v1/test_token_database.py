@@ -11,6 +11,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.mooncake_layout import (
     mooncake_legacy_key,
     mooncake_page_key,
+    mooncake_payload_layout,
     mooncake_valid_tokens,
 )
 from lmcache.v1.token_database import ChunkedTokenDatabase, SegmentTokenDatabase
@@ -87,7 +88,7 @@ def test_mooncake_page_keys_include_payload_layout_signature(monkeypatch):
 
     key = next(iter(db.process_tokens(tokens=generate_tokens(256, "cpu"))))[2]
 
-    assert dict(key.tags or ())["payload_v2"] == db.mooncake_payload_layout
+    assert dict(key.tags or ())["payload_v3"] == db.mooncake_payload_layout
 
     monkeypatch.setenv("LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK", "2048")
     monkeypatch.setenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "2")
@@ -106,6 +107,39 @@ def test_mooncake_page_keys_include_payload_layout_signature(monkeypatch):
         ChunkedTokenDatabase(cfg, dumb_metadata()).mooncake_payload_layout
         != db.mooncake_payload_layout
     )
+
+
+def test_payload_v3_identity_includes_remote_fill_abi() -> None:
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=1024, backend="cpu")
+    cfg.remote_fill_cache_namespace = "deployment-a"
+    cfg.remote_fill_model_artifact_id = "weights-build-a"
+    cfg.dsa_two_groups = True
+    cfg.extra_config = {
+        "mooncake_page_first_multi_buffer": True,
+        "mooncake_layer_merged_page_objects": True,
+        "mooncake_dsa_raw_token_dims": {0: 576, 1: 128},
+        "mooncake_cache_bearing_layers": 79,
+        "mooncake_group1_schema_version": "dsa-index-v2",
+        "mooncake_mtp_layout_version": "mtp-1",
+    }
+
+    metadata = dumb_metadata(kv_shape=(32, 2, 1024, 8, 128))
+    signature, descriptor = mooncake_payload_layout(cfg, metadata)
+
+    assert descriptor["version"] == 3
+    assert descriptor["deployment_namespace"] == "deployment-a"
+    assert descriptor["model_artifact_id"] == "weights-build-a"
+    assert descriptor["model_artifact_scope"] == "serving-bundle-v1"
+    assert descriptor["page_abi_version"] == "lmcache-layer-page-v3"
+    assert descriptor["group0_raw_token_dim"] == 576
+    assert descriptor["group1_raw_token_dim"] == 128
+    assert descriptor["cache_bearing_layers"] == 79
+    assert descriptor["group1_schema_version"] == "dsa-index-v2"
+    assert descriptor["mtp_layout_version"] == "mtp-1"
+
+    cfg.remote_fill_model_artifact_id = "weights-build-b"
+    other_signature, _ = mooncake_payload_layout(cfg, metadata)
+    assert other_signature != signature
 
 
 @pytest.mark.parametrize("chunk_size", [256, 512, 1024])

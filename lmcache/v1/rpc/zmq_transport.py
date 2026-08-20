@@ -31,7 +31,9 @@ from lmcache.v1.rpc_utils import (
 
 logger = init_logger(__name__)
 
-SocketParams = namedtuple("SocketParams", ["socket_path", "rank"])
+SocketParams = namedtuple(
+    "SocketParams", ["socket_path", "rank", "protocol"], defaults=["ipc"]
+)
 
 
 def _utc_timestamp() -> str:
@@ -77,7 +79,7 @@ class ZmqReqRepClientTransport(RpcClientTransport):
         socket = get_zmq_socket(
             self.ctx,
             params.socket_path,
-            "ipc",
+            params.protocol,
             zmq.REQ,
             "connect",
         )
@@ -189,11 +191,10 @@ class ZmqReqRepClientTransport(RpcClientTransport):
                 socket.close(linger=0)
             except Exception as e:
                 logger.warning("Error closing socket: %s", e)
-        try:
-            if self.ctx:
-                self.ctx.term()
-        except Exception as e:
-            logger.warning("Error terminating ZMQ context: %s", e)
+        self.sockets.clear()
+        # get_zmq_context() returns the process-wide singleton.  This transport
+        # owns its sockets, but not that shared context; terminating it here
+        # would invalidate unrelated and subsequently-created RPC clients.
 
 
 class ZmqRouterServerTransport(RpcServerTransport):
@@ -207,18 +208,27 @@ class ZmqRouterServerTransport(RpcServerTransport):
         self,
         socket_path: str,
         recv_timeout_ms: int = 1000,
+        protocol: str = "ipc",
+        max_frame_bytes: int | None = None,
+        max_frame_count: int | None = None,
     ):
+        if max_frame_bytes is not None and max_frame_bytes <= 0:
+            raise ValueError("max_frame_bytes must be positive when configured")
+        if max_frame_count is not None and max_frame_count <= 0:
+            raise ValueError("max_frame_count must be positive when configured")
         self.decoder = msgspec.msgpack.Decoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         self.socket = get_zmq_socket(
             self.ctx,
             socket_path,
-            "ipc",
+            protocol,
             zmq.ROUTER,  # type: ignore[attr-defined]
             "bind",
         )
         self.socket.setsockopt(zmq.RCVTIMEO, recv_timeout_ms)
         self.socket_path = socket_path
+        self.max_frame_bytes = max_frame_bytes
+        self.max_frame_count = max_frame_count
 
     def recv_request(
         self,
@@ -235,13 +245,34 @@ class ZmqRouterServerTransport(RpcServerTransport):
         except zmq.Again:
             return None
 
+        if not frames:
+            logger.warning("Malformed request received: missing routing identity.")
+            return None
         identity = frames[0].bytes
+        if len(frames) < 2 or frames[1].bytes != b"":
+            logger.warning("Malformed request received: invalid REQ delimiter.")
+            return (identity, [])
         # frames[1] is the empty delimiter from REQ socket
         raw_frames = frames[2:]
         if len(raw_frames) < 3:
             logger.warning("Malformed request received: not enough frames.")
-            return None
-        data_frames = [self.decoder.decode(f) for f in raw_frames]
+            return (identity, [])
+        if (
+            self.max_frame_count is not None
+            and len(raw_frames) > self.max_frame_count
+        ):
+            logger.warning("Malformed request received: too many frames.")
+            return (identity, [])
+        if self.max_frame_bytes is not None and any(
+            len(frame) > self.max_frame_bytes for frame in raw_frames
+        ):
+            logger.warning("Malformed request received: frame exceeds byte limit.")
+            return (identity, [])
+        try:
+            data_frames = [self.decoder.decode(f) for f in raw_frames]
+        except (msgspec.DecodeError, msgspec.ValidationError):
+            logger.warning("Malformed request received: invalid msgpack frame.")
+            return (identity, [])
         return (identity, data_frames)
 
     def send_response(

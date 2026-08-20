@@ -252,6 +252,26 @@ class InstrumentedRemoteConnector(RemoteConnector):
         self._stats_monitor.update_interval_remote_time_to_get(elapsed * 1000)
         self._stats_monitor.update_interval_remote_read_metrics(total_size)
 
+    async def push_external_pages(
+        self,
+        *,
+        remote_session: str,
+        source_plan: Any,
+        destination_descriptors: tuple[Any, ...],
+        activation: Any,
+    ) -> Any:
+        """Delegate one H0-qualified remote direct push."""
+        return await self._connector.push_external_pages(
+            remote_session=remote_session,
+            source_plan=source_plan,
+            destination_descriptors=destination_descriptors,
+            activation=activation,
+        )
+
+    def get_remote_fill_destination_session(self) -> str | None:
+        """Delegate the pointer-free native destination session."""
+        return self._connector.get_remote_fill_destination_session()
+
     def batched_external_pages_exist(
         self, keys: List[CacheEngineKey]
     ) -> List[bool]:

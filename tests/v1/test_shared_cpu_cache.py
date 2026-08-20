@@ -614,6 +614,103 @@ def test_layer_page_batch_plan_lazily_expands_legacy_suffix():
     assert resolved["planned_page_chunks"] == 2
 
 
+def test_remote_fill_plan_is_forwarded_to_rank0_actual_retrieval():
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        chunk_size=4,
+        enable_shared_cpu_cache=True,
+        use_layerwise=True,
+        remote_url="mooncakestore://metadata/",
+        extra_config={
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+            "save_only_first_rank": True,
+        },
+    )
+    engine.num_layers = 2
+    engine.metadata = SimpleNamespace(worker_id=0)
+    engine.storage_manager = SimpleNamespace()
+    engine.gpu_connector = object()
+    engine.shared_cpu_cache_strict = False
+    engine.stats_monitor = SimpleNamespace(on_retrieve_request=lambda _tokens: 1)
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _group: True
+    engine._is_passive = lambda: False
+    keys = [replace(_make_key(), chunk_hash=chunk) for chunk in (1, 2, 3)]
+    engine._dense_retrieve_token_results = lambda *_args: iter(
+        [(0, 4, keys[0]), (4, 8, keys[1]), (8, 10, keys[2])]
+    )
+    retained_plan = [
+        ("RemoteBackend", True),
+        ("RemoteBackend", True),
+        ("RemoteBackend", False),
+    ]
+    engine._remote_fill_retrieve_plan = (
+        lambda _req_id, _candidates, _kv_group: retained_plan
+    )
+    engine._shared_page_first_location_plan = lambda _keys: pytest.fail(
+        "RemoteFill must not build a new opportunistic location plan"
+    )
+    engine._find_shared_rank0_chunk_location = lambda _key: pytest.fail(
+        "RemoteFill must not re-probe per-layer locations"
+    )
+    resolved = {}
+
+    def retrieve(**kwargs):
+        resolved.update(kwargs)
+        yield kwargs["ret_mask"]
+
+    engine._retrieve_layer_shared_rank0 = retrieve
+
+    list(engine.retrieve_layer(list(range(10)), req_id="req-remote-fill"))
+
+    assert resolved["remote_fill_plan"] == retained_plan
+    assert resolved["planned_page_chunks"] == 2
+    assert resolved["chunk_locations_layer_major"] == [
+        ["RemoteBackend"] * 3,
+        ["RemoteBackend"] * 3,
+    ]
+
+
+def test_malformed_remote_fill_actual_plan_fails_closed_and_unpins():
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        chunk_size=4,
+        enable_shared_cpu_cache=True,
+        use_layerwise=True,
+        remote_url="mooncakestore://metadata/",
+        extra_config={
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+            "save_only_first_rank": True,
+        },
+    )
+    engine.num_layers = 2
+    engine.metadata = SimpleNamespace(worker_id=0)
+    engine.storage_manager = SimpleNamespace()
+    engine.gpu_connector = object()
+    engine.shared_cpu_cache_strict = False
+    engine.stats_monitor = SimpleNamespace(on_retrieve_request=lambda _tokens: 1)
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _group: True
+    engine._is_passive = lambda: False
+    keys = [replace(_make_key(), chunk_hash=chunk) for chunk in (1, 2)]
+    engine._dense_retrieve_token_results = lambda *_args: iter(
+        [(0, 4, keys[0]), (4, 8, keys[1])]
+    )
+    engine._remote_fill_retrieve_plan = lambda *_args: [
+        ("RemoteBackend", False),
+        ("RemoteBackend", True),
+    ]
+    released = []
+    engine.lookup_unpin = lambda req_id: released.append(req_id)
+
+    with pytest.raises(ValueError, match="not a page prefix"):
+        list(engine.retrieve_layer(list(range(8)), req_id="req-malformed"))
+
+    assert released == ["req-malformed"]
+
+
 @pytest.mark.parametrize(
     "local_hit,remote_hits,retrieval_backends,supports_batch",
     [

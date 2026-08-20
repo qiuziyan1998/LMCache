@@ -8,6 +8,7 @@ from typing import (
     Callable,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     Union,
@@ -76,6 +77,45 @@ class LocalCPUPrefixGetResult:
             memory_obj = self.take_local(index)
             if memory_obj is not None:
                 memory_obj.ref_count_down()
+
+
+@dataclass(frozen=True)
+class LayerPageBatchPutResult:
+    """Result of an immutable layer-page batch admission.
+
+    Attributes:
+        inserted_keys: Keys newly admitted by this call, in input order.
+        existing_keys: Keys whose previously committed entries won, in input
+            order.
+    """
+
+    inserted_keys: tuple[CacheEngineKey, ...]
+    existing_keys: tuple[CacheEngineKey, ...]
+
+
+@dataclass(frozen=True)
+class ExternalTwoGroupCommitResult:
+    """Result of an atomic external two-group prefix publication.
+
+    Attributes:
+        committed: Whether complete required coverage was published.
+        inserted_keys: Required keys newly admitted by this call.
+        existing_keys: Required keys won by an earlier committed entry.
+        redundant_pages: Ready pages not admitted and safe for the caller to
+            release according to its reservation lifecycle.
+        missing_keys: Required keys with neither a committed entry nor a ready
+            reservation. This is empty whenever ``committed`` is true.
+    """
+
+    committed: bool
+    inserted_keys: tuple[CacheEngineKey, ...]
+    existing_keys: tuple[CacheEngineKey, ...]
+    redundant_pages: tuple[LayerPageMemoryObj, ...]
+    missing_keys: tuple[CacheEngineKey, ...] = ()
+
+
+class LayerPageAdmissionRollbackError(RuntimeError):
+    """Admission failed and rollback could not restore ownership safely."""
 
 
 class LocalCPUBackend(AllocatorBackendInterface):
@@ -204,6 +244,60 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 LayerPageMemoryObj.pin_many([page for _, page in pages])
                 self.keys_in_request.extend(page_key for page_key, _ in pages)
         return len(pages)
+
+    def batched_contains_two_group_prefix(
+        self,
+        group0_keys: Sequence[CacheEngineKey],
+        group1_keys: Sequence[CacheEngineKey],
+        *,
+        pin: bool = False,
+    ) -> int:
+        """Return the contiguous prefix present in both page keyspaces.
+
+        Args:
+            group0_keys: Canonical Group 0 physical-page keys.
+            group1_keys: Canonical Group 1 physical-page keys aligned by
+                logical page with ``group0_keys``.
+            pin: Atomically pin both groups for every prefix page when true.
+
+        Returns:
+            The number of complete two-group page pairs in the contiguous
+            prefix. If the batch pin primitive declines the operation, returns
+            zero without recording request keys.
+
+        Raises:
+            ValueError: If the two key sequences have different lengths.
+
+        Notes:
+            Lookup, the first-hole decision, pinning, and request-key tracking
+            occur under one LocalCPU cache lock. A later complete pair cannot
+            extend the result past an earlier hole.
+        """
+        self._validate_two_group_page_keys(
+            group0_keys,
+            group1_keys,
+            context="Two-group lookup",
+        )
+
+        pages: list[LayerPageMemoryObj] = []
+        page_keys: list[CacheEngineKey] = []
+        with self.cpu_lock:
+            for group0_key, group1_key in zip(group0_keys, group1_keys, strict=True):
+                group0_page = self.hot_cache.get(group0_key)
+                group1_page = self.hot_cache.get(group1_key)
+                if not isinstance(group0_page, LayerPageMemoryObj) or not isinstance(
+                    group1_page, LayerPageMemoryObj
+                ):
+                    break
+                pages.extend((group0_page, group1_page))
+                page_keys.extend((group0_key, group1_key))
+
+            if pin and not LayerPageMemoryObj.pin_many(pages):
+                return 0
+            if pin:
+                self.keys_in_request.extend(page_keys)
+
+        return len(pages) // 2
 
     def batched_unpin(self, keys: Sequence[CacheEngineKey]) -> None:
         """Unpin each stored key occurrence."""
@@ -345,6 +439,165 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     )
             if stored_keys:
                 self.cache_policy.update_on_put_many(stored_keys)
+
+    def batched_submit_layer_pages_if_absent(
+        self,
+        keys: Sequence[CacheEngineKey],
+        pages: Sequence[LayerPageMemoryObj],
+    ) -> LayerPageBatchPutResult:
+        """Atomically admit immutable physical pages without overwriting keys.
+
+        Args:
+            keys: Distinct canonical, layer-independent physical-page keys.
+            pages: Distinct, valid allocator-owned pages aligned with ``keys``.
+
+        Returns:
+            A result separating newly inserted keys from keys already present.
+            Existing cache entries always win and are never compared or
+            replaced. If LocalCPU storage is disabled, both result tuples are
+            empty and page ownership is unchanged.
+
+        Raises:
+            ValueError: If counts differ, a key or page object is repeated, a
+                key is layer-specific, or a page is not a valid
+                ``LayerPageMemoryObj``.
+            Exception: Re-raises an unexpected cache or policy exception after
+                rolling back mappings and cache-owned page references. Raises
+                ``RuntimeError`` instead if rollback itself cannot restore
+                policy state or page ownership safely.
+
+        Notes:
+            Validation happens before the cache lock. Coverage validation,
+            reference acquisition, insertion, and policy updates share one
+            lock, so readers observe either the complete admitted batch or its
+            complete predecessor. Controller notifications are best effort and
+            are emitted only after the cache commit becomes visible.
+        """
+        self._validate_layer_page_batch(keys, pages)
+        if not self.use_hot:
+            return LayerPageBatchPutResult((), ())
+
+        with self.cpu_lock:
+            pending: list[tuple[CacheEngineKey, LayerPageMemoryObj]] = []
+            existing_keys: list[CacheEngineKey] = []
+            for key, page in zip(keys, pages, strict=True):
+                if key in self.hot_cache:
+                    existing_keys.append(key)
+                else:
+                    pending.append((key, page))
+            result = self._admit_layer_pages_locked(pending, existing_keys)
+
+        self._notify_layer_page_admissions(result.inserted_keys)
+        return result
+
+    def commit_external_two_group_prefix_if_absent(
+        self,
+        required_group0_keys: Sequence[CacheEngineKey],
+        required_group1_keys: Sequence[CacheEngineKey],
+        ready_reservations: Mapping[CacheEngineKey, LayerPageMemoryObj],
+    ) -> ExternalTwoGroupCommitResult:
+        """Atomically publish complete externally filled two-group coverage.
+
+        Args:
+            required_group0_keys: Canonical Group 0 keys in logical page order.
+            required_group1_keys: Canonical Group 1 keys aligned by logical
+                page with ``required_group0_keys``.
+            ready_reservations: Terminal-success reservation pages keyed by
+                canonical required key. Reservations may also be supplied for
+                keys that won an insertion race.
+
+        Returns:
+            An immutable result describing whether the complete prefix was
+            committed, newly inserted and pre-existing keys, redundant ready
+            pages, and any missing required keys. A failed coverage check never
+            inserts a page; all supplied ready pages are then redundant.
+
+        Raises:
+            ValueError: If groups are misaligned, keys are noncanonical,
+                duplicated, assigned to the wrong group, reservation keys are
+                outside the required prefix, or reservation pages are invalid
+                or aliased.
+            Exception: Re-raises an unexpected cache or policy exception after
+                rolling back mappings and cache-owned references. Raises
+                ``RuntimeError`` if rollback itself cannot safely restore
+                state.
+
+        Notes:
+            Input validation occurs before the cache lock. Under one lock, the
+            first pass proves every required key has an existing winner or a
+            ready page; only then does the shared admission path insert all
+            absent pages and update policy state. Notifications occur after
+            the lock. The caller retains its reservation references for
+            admitted pages and remains responsible for releasing them.
+        """
+        self._validate_two_group_page_keys(
+            required_group0_keys,
+            required_group1_keys,
+            context="External two-group commit",
+        )
+
+        required_keys = [
+            key
+            for pair in zip(
+                required_group0_keys, required_group1_keys, strict=True
+            )
+            for key in pair
+        ]
+        ready = dict(ready_reservations)
+        ready_keys = list(ready)
+        ready_pages = list(ready.values())
+        self._validate_layer_page_batch(ready_keys, ready_pages)
+        required_key_set = set(required_keys)
+        if any(key not in required_key_set for key in ready_keys):
+            raise ValueError(
+                "External two-group reservations must belong to the required prefix"
+            )
+
+        if not self.use_hot:
+            return ExternalTwoGroupCommitResult(
+                committed=False,
+                inserted_keys=(),
+                existing_keys=(),
+                redundant_pages=tuple(ready_pages),
+                missing_keys=tuple(required_keys),
+            )
+
+        with self.cpu_lock:
+            pending: list[tuple[CacheEngineKey, LayerPageMemoryObj]] = []
+            existing_keys: list[CacheEngineKey] = []
+            missing_keys: list[CacheEngineKey] = []
+            redundant_pages: list[LayerPageMemoryObj] = []
+            for key in required_keys:
+                if key in self.hot_cache:
+                    existing_keys.append(key)
+                    ready_page = ready.get(key)
+                    if ready_page is not None:
+                        redundant_pages.append(ready_page)
+                    continue
+                ready_page = ready.get(key)
+                if ready_page is None:
+                    missing_keys.append(key)
+                else:
+                    pending.append((key, ready_page))
+
+            if missing_keys:
+                return ExternalTwoGroupCommitResult(
+                    committed=False,
+                    inserted_keys=(),
+                    existing_keys=tuple(existing_keys),
+                    redundant_pages=tuple(ready_pages),
+                    missing_keys=tuple(missing_keys),
+                )
+
+            put_result = self._admit_layer_pages_locked(pending, existing_keys)
+
+        self._notify_layer_page_admissions(put_result.inserted_keys)
+        return ExternalTwoGroupCommitResult(
+            committed=True,
+            inserted_keys=put_result.inserted_keys,
+            existing_keys=put_result.existing_keys,
+            redundant_pages=tuple(redundant_pages),
+        )
 
     def batched_get_layer_page_prefix(
         self, keys: Sequence[CacheEngineKey]
@@ -1170,8 +1423,157 @@ class LocalCPUBackend(AllocatorBackendInterface):
     def get_memory_allocator(self):
         return self.memory_allocator
 
+    def get_allocator_capacity_bytes(self) -> tuple[int, int]:
+        """Return free and total allocator bytes without scanning cache keys.
+
+        Returns:
+            A constant-time ``(free_bytes, heap_bytes)`` snapshot synchronized
+            with allocator allocation and free operations.
+
+        Raises:
+            NotImplementedError: If the configured allocator cannot provide a
+                synchronized constant-time snapshot.
+            RuntimeError: If an allocator violates the capacity contract.
+        """
+
+        free_bytes, heap_bytes = self.memory_allocator.get_capacity_bytes()
+        if (
+            not isinstance(free_bytes, int)
+            or not isinstance(heap_bytes, int)
+            or free_bytes < 0
+            or heap_bytes <= 0
+            or free_bytes > heap_bytes
+        ):
+            raise RuntimeError("allocator returned invalid capacity bytes")
+        return free_bytes, heap_bytes
+
     def close(self) -> None:
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.memory_allocator.close()
         self.clear()
+
+    @staticmethod
+    def _validate_canonical_page_keys(
+        keys: Sequence[CacheEngineKey],
+    ) -> None:
+        if any(type(key) is not CacheEngineKey for key in keys):
+            raise ValueError(
+                "Layer-page admission requires canonical layer-independent keys"
+            )
+        if len(set(keys)) != len(keys):
+            raise ValueError("Layer-page admission requires unique keys")
+
+    @classmethod
+    def _validate_two_group_page_keys(
+        cls,
+        group0_keys: Sequence[CacheEngineKey],
+        group1_keys: Sequence[CacheEngineKey],
+        *,
+        context: str,
+    ) -> None:
+        """Validate aligned canonical page identities for the two DSA groups."""
+        if len(group0_keys) != len(group1_keys):
+            raise ValueError(f"{context} requires aligned key counts")
+        cls._validate_canonical_page_keys([*group0_keys, *group1_keys])
+        if any(key.kv_group != 0 for key in group0_keys) or any(
+            key.kv_group != 1 for key in group1_keys
+        ):
+            raise ValueError(f"{context} requires Group 0/1 keys")
+
+        def shared_tags(key: CacheEngineKey) -> tuple:
+            return tuple(tag for tag in (key.tags or ()) if tag[0] != "dsa_idx")
+
+        for group0_key, group1_key in zip(group0_keys, group1_keys, strict=True):
+            group0_identity = (
+                group0_key.model_name,
+                group0_key.world_size,
+                group0_key.worker_id,
+                group0_key.chunk_hash,
+                shared_tags(group0_key),
+            )
+            group1_identity = (
+                group1_key.model_name,
+                group1_key.world_size,
+                group1_key.worker_id,
+                group1_key.chunk_hash,
+                shared_tags(group1_key),
+            )
+            if group0_identity != group1_identity:
+                raise ValueError(f"{context} requires identical logical page pairs")
+
+    @classmethod
+    def _validate_layer_page_batch(
+        cls,
+        keys: Sequence[CacheEngineKey],
+        pages: Sequence[LayerPageMemoryObj],
+    ) -> None:
+        if len(keys) != len(pages):
+            raise ValueError("Layer-page admission requires aligned key counts")
+        cls._validate_canonical_page_keys(keys)
+        if any(not isinstance(page, LayerPageMemoryObj) for page in pages):
+            raise ValueError("Layer-page admission requires layer-page objects")
+        if len({id(page) for page in pages}) != len(pages):
+            raise ValueError("Layer-page admission requires unique pages")
+        if any(not page.is_valid() for page in pages):
+            raise ValueError("Layer-page admission cannot store invalid pages")
+
+    def _admit_layer_pages_locked(
+        self,
+        pending: Sequence[tuple[CacheEngineKey, LayerPageMemoryObj]],
+        existing_keys: Sequence[CacheEngineKey],
+    ) -> LayerPageBatchPutResult:
+        inserted_keys: list[CacheEngineKey] = []
+        inserted_pages: list[LayerPageMemoryObj] = []
+        try:
+            for key, page in pending:
+                page.ref_count_up()
+                inserted_pages.append(page)
+                inserted_keys.append(key)
+                self.hot_cache[key] = page
+            if inserted_keys:
+                self.cache_policy.update_on_put_many(inserted_keys)
+        except BaseException as admission_error:
+            rollback_errors: list[BaseException] = []
+            for key, page in reversed(
+                list(zip(inserted_keys, inserted_pages, strict=True))
+            ):
+                try:
+                    if self.hot_cache.get(key) is page:
+                        self.hot_cache.pop(key)
+                except BaseException as error:
+                    rollback_errors.append(error)
+                try:
+                    self.cache_policy.update_on_force_evict(key)
+                except BaseException as error:
+                    rollback_errors.append(error)
+                try:
+                    page.ref_count_down()
+                except BaseException as error:
+                    rollback_errors.append(error)
+            if rollback_errors:
+                raise LayerPageAdmissionRollbackError(
+                    "Layer-page admission rollback could not restore state"
+                ) from admission_error
+            raise
+
+        return LayerPageBatchPutResult(
+            tuple(inserted_keys), tuple(existing_keys)
+        )
+
+    def _notify_layer_page_admissions(
+        self, inserted_keys: Sequence[CacheEngineKey]
+    ) -> None:
+        if self.batched_msg_sender is None:
+            return
+        for key in inserted_keys:
+            try:
+                self.batched_msg_sender.add_kv_op(
+                    op_type=OpType.ADMIT,
+                    key=key.chunk_hash,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to notify controller of admitted layer page %s",
+                    key,
+                )

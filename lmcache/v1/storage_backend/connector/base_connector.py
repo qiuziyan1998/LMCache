@@ -319,6 +319,21 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         """Retrieve page values directly into externally owned buffers."""
         raise NotImplementedError
 
+    async def push_external_pages(
+        self,
+        *,
+        remote_session: str,
+        source_plan: Any,
+        destination_descriptors: tuple[Any, ...],
+        activation: Any,
+    ) -> Any:
+        """Push registered source pages into armed remote destinations."""
+        raise NotImplementedError
+
+    def get_remote_fill_destination_session(self) -> str | None:
+        """Return this process's registered native destination session."""
+        return None
+
     def batched_external_pages_exist(
         self, keys: List[CacheEngineKey]
     ) -> List[bool]:
