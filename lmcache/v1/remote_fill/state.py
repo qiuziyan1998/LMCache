@@ -216,6 +216,10 @@ class _Transaction:
     terminal_outcome: TerminalOutcome | None = None
     source_generation: int | None = None
     windows: dict[int, _Window] = field(default_factory=dict)
+    registered_selectors: set[tuple[int, int]] = field(default_factory=set)
+    registered_keys: set[str] = field(default_factory=set)
+    inflight_window_count: int = 0
+    reserved_bytes: int = 0
     publication_ineligible: bool = False
     coverage_missing: bool = False
     terminal_at: float | None = None
@@ -423,6 +427,14 @@ class RemoteFillStateCore:
         """
 
         validate_request(request, self.limits)
+        return self.handle_validated(request)
+
+    def handle_validated(
+        self,
+        request: RemoteFillRequest,
+    ) -> RemoteFillResponse:
+        """Execute a request already validated by the byte-service boundary."""
+
         with self._lock:
             if self._closed:
                 return self._response(
@@ -525,33 +537,16 @@ class RemoteFillStateCore:
             existing = transaction.windows.get(request.window_id)
             if existing is not None:
                 return
-            prior_selectors = {
-                (page.kv_group, page.chunk_index)
-                for window in transaction.windows.values()
-                for page in window.control_pages
-            }
-            prior_keys = {
-                page.canonical_key
-                for window in transaction.windows.values()
-                for page in window.control_pages
-            }
-            if prior_selectors & {
+            if transaction.registered_selectors & {
                 (page.kv_group, page.chunk_index) for page in request.control_pages
-            } or prior_keys & {
+            } or transaction.registered_keys & {
                 page.canonical_key for page in request.control_pages
             }:
                 return
-            inflight_windows = sum(
-                window.native_state
-                in (
-                    DestinationNativeState.NOT_ARMED,
-                    DestinationNativeState.ARMED,
-                )
-                and window.state
-                not in (WindowState.RELEASED, WindowState.COMMITTED)
-                for window in transaction.windows.values()
-            )
-            if inflight_windows >= self.limits.max_inflight_windows_per_transaction:
+            if (
+                transaction.inflight_window_count
+                >= self.limits.max_inflight_windows_per_transaction
+            ):
                 return
             self._mark_direct_abandoned_locked(transaction)
 
@@ -904,6 +899,13 @@ class RemoteFillStateCore:
         if existing is not None:
             if existing.expired_unarmed:
                 transaction.windows.pop(request.window_id)
+                transaction.registered_selectors.difference_update(
+                    (page.kv_group, page.chunk_index)
+                    for page in existing.control_pages
+                )
+                transaction.registered_keys.difference_update(
+                    page.canonical_key for page in existing.control_pages
+                )
                 transaction.coverage_missing = any(
                     window.coverage_missing for window in transaction.windows.values()
                 )
@@ -923,27 +925,17 @@ class RemoteFillStateCore:
                 "transaction window capacity exhausted",
                 transaction_state=transaction.state,
             )
-        prior_selectors = {
-            (page.kv_group, page.chunk_index)
-            for window in transaction.windows.values()
-            for page in window.control_pages
-        }
         requested_selectors = {
             (page.kv_group, page.chunk_index) for page in request.control_pages
         }
-        if prior_selectors & requested_selectors:
+        if transaction.registered_selectors & requested_selectors:
             return self._response(
                 request,
                 ResultCode.WINDOW_CONFLICT,
                 "group/chunk page was already registered in another window",
             )
-        prior_keys = {
-            page.canonical_key
-            for window in transaction.windows.values()
-            for page in window.control_pages
-        }
         requested_keys = {page.canonical_key for page in request.control_pages}
-        if prior_keys & requested_keys:
+        if transaction.registered_keys & requested_keys:
             return self._response(
                 request,
                 ResultCode.WINDOW_CONFLICT,
@@ -955,16 +947,10 @@ class RemoteFillStateCore:
                 ResultCode.RESERVATION_REJECTED,
                 "control pages do not match negotiated layout",
             )
-        inflight_windows = sum(
-            window.native_state
-            in (
-                DestinationNativeState.NOT_ARMED,
-                DestinationNativeState.ARMED,
-            )
-            and window.state not in (WindowState.RELEASED, WindowState.COMMITTED)
-            for window in transaction.windows.values()
-        )
-        if inflight_windows >= self.limits.max_inflight_windows_per_transaction:
+        if (
+            transaction.inflight_window_count
+            >= self.limits.max_inflight_windows_per_transaction
+        ):
             return self._response(
                 request,
                 ResultCode.RESOURCE_EXHAUSTED,
@@ -975,13 +961,11 @@ class RemoteFillStateCore:
             if request.reserve_missing
             else 0
         )
-        transaction_bytes = sum(
-            window.total_bytes
-            for window in transaction.windows.values()
-            if window.state not in (WindowState.RELEASED, WindowState.COMMITTED)
-        )
         global_reserved_bytes = self._metrics.active_bytes
-        if transaction_bytes + requested_bytes > self.limits.max_bytes_per_transaction:
+        if (
+            transaction.reserved_bytes + requested_bytes
+            > self.limits.max_bytes_per_transaction
+        ):
             if request.reserve_missing:
                 self._mark_direct_abandoned_locked(transaction)
             return self._response(
@@ -1218,14 +1202,23 @@ class RemoteFillStateCore:
             coverage_missing=has_missing,
         )
         transaction.windows[request.window_id] = window
+        transaction.registered_selectors.update(requested_selectors)
+        transaction.registered_keys.update(requested_keys)
         if window.state not in (WindowState.RELEASED, WindowState.COMMITTED):
-            self._metrics.active_windows += 1
-            self._metrics.active_bytes += sum(
+            allocated_bytes = sum(
                 reservation.prepared.destination_length
                 for reservation in window.reservations
                 if reservation.prepared.disposition is PageDisposition.ALLOCATED
                 and not reservation.released
             )
+            self._metrics.active_windows += 1
+            self._metrics.active_bytes += allocated_bytes
+            transaction.reserved_bytes += allocated_bytes
+        if window.native_state in (
+            DestinationNativeState.NOT_ARMED,
+            DestinationNativeState.ARMED,
+        ) and window.state not in (WindowState.RELEASED, WindowState.COMMITTED):
+            transaction.inflight_window_count += 1
         if not has_missing:
             for reservation in reservations:
                 if reservation.prepared.disposition is PageDisposition.ALLOCATED:
@@ -1404,7 +1397,11 @@ class RemoteFillStateCore:
             and request.completed_bytes == window.total_bytes
         )
         if transfer_ok:
-            window.native_state = DestinationNativeState.TERMINAL_SUCCESS
+            self._set_window_native_terminal_locked(
+                transaction,
+                window,
+                DestinationNativeState.TERMINAL_SUCCESS,
+            )
             if transaction.publication_ineligible:
                 if not self._release_window_locked(transaction, window, "aborted"):
                     return self._fatal_response(request, transaction)
@@ -1421,7 +1418,11 @@ class RemoteFillStateCore:
                 transaction_state=transaction.state,
             )
 
-        window.native_state = DestinationNativeState.TERMINAL_FAILURE
+        self._set_window_native_terminal_locked(
+            transaction,
+            window,
+            DestinationNativeState.TERMINAL_FAILURE,
+        )
         self._metrics.transfer_failures += 1
         if not self._release_window_locked(transaction, window, "native failure"):
             return self._fatal_response(request, transaction)
@@ -1551,6 +1552,10 @@ class RemoteFillStateCore:
                         0,
                         self._metrics.active_bytes - window.total_bytes,
                     )
+                    transaction.reserved_bytes = max(
+                        0,
+                        transaction.reserved_bytes - window.total_bytes,
+                    )
                     self._set_window_state_locked(window, WindowState.COMMITTED)
                     for reservation in window.reservations:
                         reservation.state = WindowState.COMMITTED
@@ -1664,7 +1669,11 @@ class RemoteFillStateCore:
                     and window.armed_at is not None
                     and now - window.armed_at >= self._native_hard_timeout_sec
                 ):
-                    window.native_state = DestinationNativeState.FATAL_UNKNOWN
+                    self._set_window_native_terminal_locked(
+                        transaction,
+                        window,
+                        DestinationNativeState.FATAL_UNKNOWN,
+                    )
                     self._set_window_state_locked(window, WindowState.FATAL_RESTART)
                     for reservation in window.reservations:
                         reservation.state = WindowState.FATAL_RESTART
@@ -1715,11 +1724,23 @@ class RemoteFillStateCore:
         except Exception:
             self._mark_fatal_locked(transaction)
             return False
+        if window.native_state in (
+            DestinationNativeState.NOT_ARMED,
+            DestinationNativeState.ARMED,
+        ):
+            transaction.inflight_window_count = max(
+                0,
+                transaction.inflight_window_count - 1,
+            )
         released_bytes = sum(page.prepared.destination_length for page in pages)
         self._metrics.discarded_bytes += released_bytes
         self._metrics.active_bytes = max(
             0,
             self._metrics.active_bytes - released_bytes,
+        )
+        transaction.reserved_bytes = max(
+            0,
+            transaction.reserved_bytes - released_bytes,
         )
         for reservation in window.reservations:
             if reservation.prepared.disposition is PageDisposition.ALLOCATED:
@@ -1955,6 +1976,22 @@ class RemoteFillStateCore:
                 0,
                 self._metrics.active_windows - 1,
             )
+
+    @staticmethod
+    def _set_window_native_terminal_locked(
+        transaction: _Transaction,
+        window: _Window,
+        state: DestinationNativeState,
+    ) -> None:
+        if window.native_state in (
+            DestinationNativeState.NOT_ARMED,
+            DestinationNativeState.ARMED,
+        ):
+            transaction.inflight_window_count = max(
+                0,
+                transaction.inflight_window_count - 1,
+            )
+        window.native_state = state
 
     def _observe_response_locked(self, response: RemoteFillResponse) -> None:
         if response.code in (

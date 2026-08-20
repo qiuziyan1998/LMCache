@@ -61,6 +61,7 @@ class ZmqReqRepClientTransport(RpcClientTransport):
         self.ctx = get_zmq_context(use_asyncio=False)
         self.socket_params = socket_params
         self.timeout_ms = timeout_ms
+        self._request_lock = threading.Lock()
         self._world_size = len(socket_params)
         self.encoder = msgspec.msgpack.Encoder()
 
@@ -121,6 +122,7 @@ class ZmqReqRepClientTransport(RpcClientTransport):
     def send_and_recv_all(
         self,
         msg: list[Any],
+        timeout_ms: int | None = None,
     ) -> list[bytes]:
         """Send msg to all ranks and collect responses.
 
@@ -128,58 +130,78 @@ class ZmqReqRepClientTransport(RpcClientTransport):
         sending. On timeout or ZMQ error, recreates all
         sockets and returns an empty list.
         """
-        started_at = _utc_timestamp()
-        started = time.perf_counter()
-        encoded = [self.encoder.encode(m) for m in msg]
-        results: list[bytes] = []
-        failed_socket_idx = -1
-        sent_count = 0
-        phase = "send"
-        try:
-            for i in range(self._world_size):
-                failed_socket_idx = i
-                self.sockets[i].send_multipart(encoded, copy=False)
-                sent_count += 1
+        effective_timeout = self.timeout_ms if timeout_ms is None else timeout_ms
+        if effective_timeout <= 0:
+            raise ValueError("RPC operation timeout must be positive")
+        request_lock = getattr(self, "_request_lock", None)
+        if request_lock is None:
+            request_lock = self._request_lock = threading.Lock()
+        with request_lock:
+            for socket in self.sockets:
+                set_option = getattr(socket, "setsockopt", None)
+                if callable(set_option):
+                    set_option(zmq.RCVTIMEO, effective_timeout)
+                    set_option(zmq.SNDTIMEO, effective_timeout)
+            started_at = _utc_timestamp()
+            started = time.perf_counter()
+            encoded = [self.encoder.encode(m) for m in msg]
+            results: list[bytes] = []
+            failed_socket_idx = -1
+            sent_count = 0
+            phase = "send"
+            try:
+                for i in range(self._world_size):
+                    failed_socket_idx = i
+                    self.sockets[i].send_multipart(encoded, copy=False)
+                    sent_count += 1
 
-            phase = "recv"
-            for i in range(self._world_size):
-                failed_socket_idx = i
-                resp = self.sockets[i].recv()
-                results.append(resp)
-        except zmq.ZMQError as e:
-            params = (
-                self.socket_params[failed_socket_idx]
-                if 0 <= failed_socket_idx < self._world_size
-                else None
-            )
-            failure = "Timeout occurred" if isinstance(e, zmq.Again) else "ZMQ error"
-            logger.exception(
-                "%s for rank %s; recreating all sockets: failed_at=%s "
-                "started_at=%s elapsed_ms=%.3f phase=%s socket_index=%s "
-                "endpoint=%s timeout_ms=%s world_size=%s sent=%s received=%s "
-                "pid=%s thread=%s caller=%s error=%s",
-                failure,
-                params.rank if params is not None else "unknown",
-                _utc_timestamp(),
-                started_at,
-                (time.perf_counter() - started) * 1000,
-                phase,
-                failed_socket_idx,
-                params.socket_path if params is not None else "unknown",
-                self.timeout_ms,
-                self._world_size,
-                sent_count,
-                len(results),
-                os.getpid(),
-                threading.current_thread().name,
-                _caller_location(),
-                e,
-                stack_info=True,
-            )
-            self._recreate_all_sockets()
-            return []
+                phase = "recv"
+                for i in range(self._world_size):
+                    failed_socket_idx = i
+                    resp = self.sockets[i].recv()
+                    results.append(resp)
+            except zmq.ZMQError as e:
+                params = (
+                    self.socket_params[failed_socket_idx]
+                    if 0 <= failed_socket_idx < self._world_size
+                    else None
+                )
+                failure = (
+                    "Timeout occurred" if isinstance(e, zmq.Again) else "ZMQ error"
+                )
+                logger.exception(
+                    "%s for rank %s; recreating all sockets: failed_at=%s "
+                    "started_at=%s elapsed_ms=%.3f phase=%s socket_index=%s "
+                    "endpoint=%s timeout_ms=%s world_size=%s sent=%s received=%s "
+                    "pid=%s thread=%s caller=%s error=%s",
+                    failure,
+                    params.rank if params is not None else "unknown",
+                    _utc_timestamp(),
+                    started_at,
+                    (time.perf_counter() - started) * 1000,
+                    phase,
+                    failed_socket_idx,
+                    params.socket_path if params is not None else "unknown",
+                    effective_timeout,
+                    self._world_size,
+                    sent_count,
+                    len(results),
+                    os.getpid(),
+                    threading.current_thread().name,
+                    _caller_location(),
+                    e,
+                    stack_info=True,
+                )
+                self._recreate_all_sockets()
+                return []
+            finally:
+                for socket in self.sockets:
+                    set_option = getattr(socket, "setsockopt", None)
+                    if callable(set_option):
+                        set_option(zmq.RCVTIMEO, self.timeout_ms)
+                        set_option(zmq.SNDTIMEO, self.timeout_ms)
 
-        return results
+            return results
 
     @property
     def world_size(self) -> int:

@@ -43,7 +43,9 @@ class ByteRoundTripTransport(Protocol):
 
     limits: ProtocolLimits
 
-    def round_trip(self, encoded: bytes) -> bytes:
+    def round_trip(
+        self, encoded: bytes, *, timeout_ms: int | None = None
+    ) -> bytes:
         """Send one request and return one response."""
 
 
@@ -54,7 +56,9 @@ class ExistingRpcClientTransport(Protocol):
     def world_size(self) -> int:
         """Return the number of destination ranks."""
 
-    def send_and_recv_all(self, msg: list[Any]) -> list[bytes]:
+    def send_and_recv_all(
+        self, msg: list[Any], timeout_ms: int | None = None
+    ) -> list[bytes]:
         """Send a multi-frame message and collect raw responses."""
 
     def close(self) -> None:
@@ -104,7 +108,9 @@ class InProcessRemoteFillTransport:
         with self._lock:
             self._drop_replies[operation] += 1
 
-    def round_trip(self, encoded: bytes) -> bytes:
+    def round_trip(
+        self, encoded: bytes, *, timeout_ms: int | None = None
+    ) -> bytes:
         """Send encoded bytes to the service and return encoded response bytes.
 
         Args:
@@ -153,7 +159,9 @@ class RpcRemoteFillByteTransport:
         self._transport = transport
         self.limits = limits or ProtocolLimits()
 
-    def round_trip(self, encoded: bytes) -> bytes:
+    def round_trip(
+        self, encoded: bytes, *, timeout_ms: int | None = None
+    ) -> bytes:
         """Send the fixed three-frame envelope through existing RPC.
 
         Args:
@@ -172,7 +180,8 @@ class RpcRemoteFillByteTransport:
                 REMOTE_FILL_SERVICE_HEADER,
                 REMOTE_FILL_ENVELOPE_VERSION,
                 encoded,
-            ]
+            ],
+            timeout_ms=timeout_ms,
         )
         if len(responses) != 1 or not isinstance(responses[0], bytes):
             raise RemoteFillTransportError(
@@ -258,6 +267,7 @@ class RemoteFillClient:
         self,
         transport: ByteRoundTripTransport,
         limits: ProtocolLimits | None = None,
+        operation_timeouts_ms: dict[OperationKind, int] | None = None,
     ) -> None:
         """Create a mock-capable protocol client.
 
@@ -269,6 +279,9 @@ class RemoteFillClient:
 
         self._transport = transport
         self.limits = limits or transport.limits
+        self._operation_timeouts_ms = dict(operation_timeouts_ms or {})
+        if any(timeout <= 0 for timeout in self._operation_timeouts_ms.values()):
+            raise ValueError("remote-fill operation timeouts must be positive")
 
     def execute(self, request: RemoteFillRequest) -> RemoteFillResponse:
         """Seal, encode, execute, and decode one operation.
@@ -286,7 +299,14 @@ class RemoteFillClient:
 
         sealed = seal_request(request)
         encoded = encode_request(sealed, self.limits)
-        return decode_response(self._transport.round_trip(encoded), self.limits)
+        timeout_ms = self._operation_timeouts_ms.get(operation_kind(sealed))
+        if timeout_ms is None:
+            response = self._transport.round_trip(encoded)
+        else:
+            response = self._transport.round_trip(
+                encoded, timeout_ms=timeout_ms
+            )
+        return decode_response(response, self.limits)
 
     def close(self) -> None:
         """Close the underlying transport when it exposes a close method."""

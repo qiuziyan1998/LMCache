@@ -171,6 +171,10 @@ def _remote_fill_config(**overrides):
 
 def test_remote_fill_defaults_off_and_validates_common_contract():
     assert LMCacheEngineConfig.from_defaults().enable_remote_lmcache_store is False
+    assert (
+        LMCacheEngineConfig.from_defaults().remote_fill_control_advertise_host
+        is None
+    )
 
     config = _remote_fill_config()
     config.validate()
@@ -196,6 +200,13 @@ def test_remote_fill_builtin_hash_requires_process_seed(monkeypatch):
 
     monkeypatch.setenv("PYTHONHASHSEED", "0")
     config.validate()
+
+
+def test_remote_fill_rejects_empty_advertised_control_host():
+    config = _remote_fill_config(remote_fill_control_advertise_host="  ")
+
+    with pytest.raises(ValueError, match="control_advertise_host"):
+        config.validate()
 
 
 def test_remote_fill_rejects_undersized_control_manifest():

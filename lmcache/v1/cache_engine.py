@@ -221,6 +221,7 @@ class LMCacheEngine:
         gpu_connector: Optional[GPUConnectorInterface],
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
+        collective_all_true_fn: Optional[Callable[[bool], bool]] = None,
     ):
         logger.info(f"Creating LMCacheEngine with config: {config}")
         self.config = config
@@ -229,6 +230,7 @@ class LMCacheEngine:
         self.gpu_connector = gpu_connector
         self.broadcast_fn = broadcast_fn
         self.broadcast_object_fn = broadcast_object_fn
+        self.collective_all_true_fn = collective_all_true_fn
         # save_only_first_rank only works when use mla
         self.save_only_first_rank = (
             self.config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
@@ -1110,6 +1112,39 @@ class LMCacheEngine:
                 rank=self.metadata.worker_id,
             )
         return envelope
+
+    def _remote_fill_all_ranks_materialized(
+        self,
+        local_ready: bool,
+        *,
+        req_id: str,
+        kv_group: int,
+    ) -> bool:
+        """Return one collective materialization decision for all TP ranks."""
+
+        if self.metadata.world_size <= 1:
+            return bool(local_ready)
+        collective = getattr(self, "collective_all_true_fn", None)
+        if not callable(collective):
+            logger.error(
+                "RemoteFill shared materialization lacks a TP consensus "
+                "callback: req_id=%s kv_group=%s",
+                req_id,
+                kv_group,
+            )
+            return False
+        result = bool(collective(bool(local_ready)))
+        if cold_start_perf_enabled():
+            cold_start_perf_log(
+                logger,
+                "remote_fill_materialization_consensus",
+                req_id=req_id,
+                kv_group=kv_group,
+                rank=self.metadata.worker_id,
+                local_ready=bool(local_ready),
+                all_ranks_ready=result,
+            )
+        return result
 
     def _validate_shared_layerwise_envelope(
         self,
@@ -4342,6 +4377,11 @@ class LMCacheEngine:
                 if len(remote_fill_plan) != len(starts):
                     raise ValueError("RemoteFill retained plan length mismatch")
                 page_flags = [page for _, page in remote_fill_plan]
+                if not all(page_flags):
+                    raise ValueError(
+                        "RemoteFill LOCAL_FULL materialization requires "
+                        "physical layer pages for every retained chunk"
+                    )
                 first_legacy = next(
                     (index for index, page in enumerate(page_flags) if not page),
                     len(page_flags),
@@ -4553,6 +4593,19 @@ class LMCacheEngine:
                             batch=compact_batch,
                         )
                     )
+                    if (
+                        remote_fill_plan is not None
+                        and compact_batch is not None
+                        and not self._remote_fill_all_ranks_materialized(
+                            True,
+                            req_id=req_id,
+                            kv_group=kv_group,
+                        )
+                    ):
+                        raise _RemoteFillMaterializationError(
+                            "A passive TP rank could not materialize the "
+                            "RemoteFill shared pages"
+                        )
 
                 if perf_enabled and not consume_started:
                     consume_started = cold_start_perf_now()
@@ -4716,6 +4769,15 @@ class LMCacheEngine:
                     except Exception as exc:
                         if not remote_fill_load:
                             raise
+                        if (
+                            envelope.status == "ok"
+                            and envelope.batch is not None
+                        ):
+                            self._remote_fill_all_ranks_materialized(
+                                False,
+                                req_id=req_id,
+                                kv_group=kv_group,
+                            )
                         raise _RemoteFillMaterializationError(
                             "RemoteFill shared-handle envelope validation failed"
                         ) from exc
@@ -4749,6 +4811,7 @@ class LMCacheEngine:
                         page_view_started = (
                             cold_start_perf_now() if perf_enabled else 0.0
                         )
+                        view_error: Exception | None = None
                         try:
                             passive_page_tuple = (
                                 self._make_passive_layer_page_views(
@@ -4762,10 +4825,23 @@ class LMCacheEngine:
                         except Exception as exc:
                             if not remote_fill_load:
                                 raise
+                            view_error = exc
+                        if remote_fill_load and not (
+                            self._remote_fill_all_ranks_materialized(
+                                view_error is None,
+                                req_id=req_id,
+                                kv_group=kv_group,
+                            )
+                        ):
+                            raise _RemoteFillMaterializationError(
+                                "RemoteFill passive layer-page view "
+                                "materialization failed on at least one TP rank"
+                            ) from view_error
+                        if view_error is not None:
                             raise _RemoteFillMaterializationError(
                                 "RemoteFill passive layer-page view "
                                 "materialization failed"
-                            ) from exc
+                            ) from view_error
                         passive_pages.extend(passive_page_tuple)
                         to_release.extend(passive_pages)
                         if page_view_started:
@@ -7494,6 +7570,7 @@ class LMCacheEngineBuilder:
         gpu_connector: Optional[GPUConnectorInterface],
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
+        collective_all_true_fn: Optional[Callable[[bool], bool]] = None,
     ) -> LMCacheEngine:
         """
         Builds a new LMCacheEngine instance if it doesn't already exist for the
@@ -7520,6 +7597,7 @@ class LMCacheEngineBuilder:
                 gpu_connector,
                 broadcast_fn,
                 broadcast_object_fn,
+                collective_all_true_fn,
             )
 
             cls._instances[instance_id] = engine

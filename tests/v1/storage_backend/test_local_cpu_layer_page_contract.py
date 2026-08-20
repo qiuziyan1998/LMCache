@@ -410,6 +410,54 @@ def test_external_commit_combines_existing_and_ready_coverage(
     winner.ref_count_down()
 
 
+def test_external_commit_rejects_wrong_kind_existing_winner(
+    page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
+) -> None:
+    backend, allocate = page_backend
+    group0 = [_page_key(0, 0)]
+    group1 = [_page_key(0, 1)]
+    ready_pages = allocate(2)
+    invalid_winner = object()
+    with backend.cpu_lock:
+        backend.hot_cache[group0[0]] = invalid_winner  # type: ignore[assignment]
+
+    result = backend.commit_external_two_group_prefix_if_absent(
+        group0,
+        group1,
+        dict(zip((group0[0], group1[0]), ready_pages, strict=True)),
+    )
+
+    assert not result.committed
+    assert result.missing_keys == (group0[0],)
+    assert not backend.contains_any_exact(group1)
+    with backend.cpu_lock:
+        assert backend.hot_cache.pop(group0[0]) is invalid_winner
+
+
+def test_external_commit_rejects_static_metadata_mismatch_existing_winner(
+    page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
+) -> None:
+    backend, allocate = page_backend
+    group0 = [_page_key(0, 0)]
+    group1 = [_page_key(0, 1)]
+    existing, ready_group0, ready_group1 = allocate(3)
+    backend.batched_submit_layer_pages_if_absent(group0, [existing])
+    existing.valid_tokens = 7
+    existing.meta.valid_tokens = 7
+
+    result = backend.commit_external_two_group_prefix_if_absent(
+        group0,
+        group1,
+        {group0[0]: ready_group0, group1[0]: ready_group1},
+    )
+
+    assert not result.committed
+    assert result.missing_keys == (group0[0],)
+    assert not backend.contains_any_exact(group1)
+    existing.valid_tokens = 8
+    existing.meta.valid_tokens = 8
+
+
 def test_external_commit_is_not_partially_visible(
     page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
     monkeypatch: pytest.MonkeyPatch,

@@ -258,6 +258,11 @@ def test_connector_push_orders_event_registration_and_exact_native_vectors() -> 
     connector._shared_external_buffers = {}
     connector._shared_external_registration_lock = threading.Lock()
     plan = _source_plan(owner, calls)
+    plan = DirectPushSourcePlan(
+        plan.pages,
+        plan.owners,
+        (_ReadyEvent(calls), _ReadyEvent(calls)),
+    )
     base = owner.untyped_storage().data_ptr()
 
     async def run() -> None:
@@ -283,15 +288,77 @@ def test_connector_push_orders_event_registration_and_exact_native_vectors() -> 
         await connector._direct_push_transport.close()
 
     asyncio.run(run())
-    assert [call[0] for call in calls] == ["event", "register", "native"]
-    assert calls[1] == ("register", [base], [owner.untyped_storage().nbytes()])
-    assert calls[2] == (
+    assert [call[0] for call in calls] == [
+        "event",
+        "event",
+        "register",
+        "native",
+    ]
+    assert calls[2] == ("register", [base], [owner.untyped_storage().nbytes()])
+    assert calls[3] == (
         "native",
         "decoder:1234",
         [base, base + 8, base + 32],
         [0x5000, 0x5008, 0x6000],
         [8, 12, 16],
     )
+
+
+def test_incomplete_producer_fence_does_not_hold_native_operation_slot() -> None:
+    calls: list[tuple] = []
+    fence_entered = threading.Event()
+    fence_release = threading.Event()
+    owner = _Owner()
+
+    class _BlockingEvent:
+        @staticmethod
+        def synchronize() -> None:
+            fence_entered.set()
+            assert fence_release.wait(timeout=2)
+
+    slow_plan = _source_plan(owner, calls)
+    slow_plan = DirectPushSourcePlan(
+        slow_plan.pages,
+        slow_plan.owners,
+        (_BlockingEvent(),),
+    )
+    fast_plan = _source_plan(owner, calls)
+    transport = MooncakeDirectPushTransport(
+        _owner_registrar(_GlobalTE(calls)),
+        _Engine(calls),
+        worker_count=1,
+        max_operations=1,
+        timeout_seconds=1,
+    )
+    descriptors = (
+        _descriptor(key="page-0", group=0, ptr=0x5000, length=20),
+        _descriptor(key="page-1", group=1, ptr=0x6000, length=16),
+    )
+
+    async def run() -> None:
+        slow = asyncio.create_task(
+            transport.push_external_pages(
+                remote_session="decoder:1234",
+                source_plan=slow_plan,
+                destination_descriptors=descriptors,
+                activation=_activation(),
+            )
+        )
+        assert await asyncio.to_thread(fence_entered.wait, 1)
+        fast = await transport.push_external_pages(
+            remote_session="decoder:1234",
+            source_plan=fast_plan,
+            destination_descriptors=descriptors,
+            activation=_activation(),
+        )
+        assert fast.return_code == 0
+        assert [call[0] for call in calls].count("native") == 1
+        fence_release.set()
+        assert (await slow).return_code == 0
+        await transport.close()
+
+    asyncio.run(run())
+    assert [call[0] for call in calls].count("native") == 2
 
 
 def test_persistent_and_direct_paths_share_one_global_te_registration() -> None:

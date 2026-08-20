@@ -16,6 +16,7 @@ from lmcache.v1.remote_fill import (
     RemoteFillTransportError,
     ResultCode,
     RpcRemoteFillByteTransport,
+    OperationKind,
     decode_response,
 )
 
@@ -29,11 +30,15 @@ class FakeRpcClientTransport:
         self.last_message: list[Any] | None = None
         self.closed = False
         self.override_responses: list[bytes] | None = None
+        self.last_timeout_ms: int | None = None
 
-    def send_and_recv_all(self, msg: list[Any]) -> list[bytes]:
+    def send_and_recv_all(
+        self, msg: list[Any], timeout_ms: int | None = None
+    ) -> list[bytes]:
         """Capture the envelope and loop back its request payload."""
 
         self.last_message = msg
+        self.last_timeout_ms = timeout_ms
         if self.override_responses is not None:
             return self.override_responses
         return [self.service.handle_bytes(msg[2])]
@@ -92,6 +97,19 @@ def test_rpc_client_adapter_uses_fixed_three_frame_envelope(harness) -> None:
         REMOTE_FILL_ENVELOPE_VERSION,
     ]
     assert isinstance(rpc.last_message[2], bytes)
+
+
+def test_rpc_client_adapter_applies_operation_specific_timeout(harness) -> None:
+    rpc = FakeRpcClientTransport(harness.service)
+    client = RemoteFillClient(
+        RpcRemoteFillByteTransport(rpc),
+        operation_timeouts_ms={OperationKind.OPEN: 321},
+    )
+
+    response = client.execute(harness.requests.open())
+
+    assert response.code is ResultCode.ACCEPTED
+    assert rpc.last_timeout_ms == 321
 
 
 def test_rpc_client_adapter_requires_one_tp0_response(harness) -> None:

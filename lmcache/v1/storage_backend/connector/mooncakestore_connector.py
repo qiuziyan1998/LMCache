@@ -199,7 +199,7 @@ class MooncakeDirectPushTransport:
 
         loop = asyncio.get_running_loop()
 
-        def run_native() -> NativeDirectPushResult:
+        def prepare_source() -> None:
             try:
                 source_device = next(
                     (
@@ -223,6 +223,8 @@ class MooncakeDirectPushTransport:
                 raise NativeDirectPushPreSubmitError(
                     "Native direct push failed before submission"
                 ) from exc
+
+        def run_native() -> NativeDirectPushResult:
             started = perf_counter()
             native_return = self._transfer_engine.batch_transfer_sync_write(
                 remote_session,
@@ -241,6 +243,12 @@ class MooncakeDirectPushTransport:
                 transferred_bytes=sum(vectors[2]),
                 elapsed_ms=(perf_counter() - started) * 1000,
             )
+
+        # Producer fences can remain incomplete while chunked prefill is still
+        # running. Waiting and idempotent source registration happen before
+        # admission to the scarce native-transfer slots, so an unrelated ready
+        # request is not serialized behind model computation.
+        await asyncio.to_thread(prepare_source)
 
         async with self._task_lock:
             if self._closed:

@@ -34,6 +34,13 @@ class RemoteBackend(StorageBackendInterface):
     ):
         super().__init__(dst_device=dst_device)
         self.put_tasks: Set[CacheEngineKey] = set()
+        # Single-key callers must observe the completion of the writer that
+        # actually owns a pending key.  ``put_tasks`` remains a set because it
+        # is also the public in-flight gauge used by batched operations.
+        self._single_put_futures: dict[CacheEngineKey, Future] = {}
+        self._single_put_callbacks: dict[
+            CacheEngineKey, list[Callable[[CacheEngineKey], None]]
+        ] = {}
         self.lock = threading.Lock()
 
         assert config.remote_url is not None
@@ -264,32 +271,89 @@ class RemoteBackend(StorageBackendInterface):
         if self._mla_worker_id_as0_mode:
             return create_immediate_empty_future()
 
-        if self.exists_in_put_tasks(key):
-            return create_immediate_empty_future()
-
-        memory_obj.ref_count_up()
-
+        completion: Future = Future()
         with self.lock:
+            # Do not translate "another writer is pending" into "this put is
+            # complete".  Returning the same completion future preserves the
+            # persistent-store durability barrier for tails and repair paths.
+            pending = getattr(self, "_single_put_futures", {}).get(key)
+            if pending is not None:
+                if on_complete_callback is not None:
+                    self._single_put_callbacks.setdefault(key, []).append(
+                        on_complete_callback
+                    )
+                return pending
+            if not hasattr(self, "_single_put_futures"):
+                # Some focused tests construct RemoteBackend without running
+                # __init__; keep that supported without weakening production.
+                self._single_put_futures = {}
+                self._single_put_callbacks = {}
+            self._single_put_futures[key] = completion
+            self._single_put_callbacks[key] = (
+                [on_complete_callback] if on_complete_callback is not None else []
+            )
             self.put_tasks.add(key)
 
-        compressed_memory_obj = self.serializer.serialize(memory_obj)
-        memory_obj.ref_count_down()
+        memory_obj.ref_count_up()
+        try:
+            compressed_memory_obj = self.serializer.serialize(memory_obj)
+        except BaseException as error:
+            with self.lock:
+                if self._single_put_futures.get(key) is completion:
+                    self._single_put_futures.pop(key, None)
+                    self._single_put_callbacks.pop(key, None)
+                    self.put_tasks.discard(key)
+            if not completion.done():
+                completion.set_exception(error)
+            raise
+        finally:
+            memory_obj.ref_count_down()
 
         def put_done_callback(f: Future) -> None:
             self.put_callback(f, key)
-            if on_complete_callback is not None:
-                try:
-                    on_complete_callback(key)
-                except Exception as e:
-                    logger.warning(f"on_complete_callback failed for key {key}: {e}")
+            try:
+                result = f.result()
+            except BaseException as error:
+                if not completion.done():
+                    completion.set_exception(error)
+            else:
+                if not completion.done():
+                    completion.set_result(result)
+            with self.lock:
+                if self._single_put_futures.get(key) is completion:
+                    self._single_put_futures.pop(key, None)
+                    callbacks = self._single_put_callbacks.pop(key, ())
+                else:
+                    callbacks = ()
+            for callback in callbacks:
+                self._invoke_put_complete_callback(callback, key)
 
-        # NOTE: No need to do error handling here
-        # since the `future` is never waited
-        future = asyncio.run_coroutine_threadsafe(
-            self.connection.put(key, compressed_memory_obj), self.loop
-        )
+        # Submission failure must unwind the shared completion registration.
+        coroutine = self.connection.put(key, compressed_memory_obj)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        except BaseException as error:
+            coroutine.close()
+            with self.lock:
+                if self._single_put_futures.get(key) is completion:
+                    self._single_put_futures.pop(key, None)
+                    self._single_put_callbacks.pop(key, None)
+                    self.put_tasks.discard(key)
+            if not completion.done():
+                completion.set_exception(error)
+            raise
         future.add_done_callback(put_done_callback)
-        return future
+        return completion
+
+    @staticmethod
+    def _invoke_put_complete_callback(
+        callback: Callable[[CacheEngineKey], None],
+        key: CacheEngineKey,
+    ) -> None:
+        try:
+            callback(key)
+        except Exception as error:
+            logger.warning("on_complete_callback failed for key %s: %s", key, error)
 
     def batched_put_callback(self, future: Future, keys: List[CacheEngineKey]):
         """

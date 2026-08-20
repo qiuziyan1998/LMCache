@@ -413,8 +413,49 @@ def _make_remote_backend(requires_completion: bool) -> RemoteBackend:
     backend.serializer = _Serializer()
     backend._mla_worker_id_as0_mode = False
     backend.put_tasks = set()
+    backend._single_put_futures = {}
+    backend._single_put_callbacks = {}
     backend.lock = threading.Lock()
     return backend
+
+
+def test_duplicate_single_key_put_joins_real_pending_future(monkeypatch) -> None:
+    submitted: list[Future] = []
+
+    class _SingleConnection:
+        @staticmethod
+        async def put(key, memory_obj) -> None:
+            return None
+
+    def submit(coroutine, loop) -> Future:
+        coroutine.close()
+        future: Future = Future()
+        submitted.append(future)
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+    backend = _make_remote_backend(True)
+    backend.connection = _SingleConnection()
+    first_callback: list[CacheEngineKey] = []
+    second_callback: list[CacheEngineKey] = []
+    key = _key(7)
+
+    first = backend.submit_put_task(key, _MemoryObj(), first_callback.append)
+    second = backend.submit_put_task(key, _MemoryObj(), second_callback.append)
+
+    assert first is second
+    assert not first.done()
+    assert len(submitted) == 1
+    assert backend.exists_in_put_tasks(key)
+
+    submitted[0].set_result(None)
+
+    assert first.result() is None
+    assert first_callback == [key]
+    assert second_callback == [key]
+    assert not backend.exists_in_put_tasks(key)
+    assert backend._single_put_futures == {}
+    assert backend._single_put_callbacks == {}
 
 
 def test_layer_page_timeout_releases_late_result(monkeypatch) -> None:

@@ -379,6 +379,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": None,
         "env_converter": str,
     },
+    "remote_fill_control_advertise_host": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
     "remote_fill_control_port_start": {
         "type": Optional[int],
         "default": None,
@@ -1036,6 +1041,11 @@ def _validate_config(self):
         if control_port is not None and not 0 < control_port < 65536:
             raise ValueError(
                 "remote_fill_control_port_start must be between 1 and 65535"
+            )
+        advertise_host = self.remote_fill_control_advertise_host
+        if advertise_host is not None and not advertise_host.strip():
+            raise ValueError(
+                "remote_fill_control_advertise_host must be non-empty when set"
             )
         if self.remote_fill_circuit_breaker_failure_threshold <= 0:
             raise ValueError(

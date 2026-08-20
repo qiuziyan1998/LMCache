@@ -62,7 +62,10 @@ class RemoteFillService:
                 shared_cache_generation=self._state.shared_cache_generation,
             )
             return encode_response(bounded_error, self.limits)
-        response = self._state.handle(request)
+        # decode_request() is the single untrusted-wire validation boundary.
+        # Direct in-process users may still call state.handle(), which retains
+        # its own validation contract.
+        response = self._state.handle_validated(request)
         try:
             return encode_response(response, self.limits)
         except ProtocolValidationError:

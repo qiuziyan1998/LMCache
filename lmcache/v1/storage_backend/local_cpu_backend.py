@@ -35,7 +35,10 @@ from lmcache.v1.memory_management import (
     PagedCpuGpuMemoryAllocator,
 )
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.mooncake_layout import mooncake_layer_pages_enabled
+from lmcache.v1.mooncake_layout import (
+    mooncake_layer_pages_enabled,
+    mooncake_valid_tokens,
+)
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
@@ -568,11 +571,18 @@ class LocalCPUBackend(AllocatorBackendInterface):
             missing_keys: list[CacheEngineKey] = []
             redundant_pages: list[LayerPageMemoryObj] = []
             for key in required_keys:
-                if key in self.hot_cache:
+                existing_page = self.hot_cache.get(key)
+                if self._existing_layer_page_matches_key(key, existing_page):
                     existing_keys.append(key)
                     ready_page = ready.get(key)
                     if ready_page is not None:
                         redundant_pages.append(ready_page)
+                    continue
+                # Canonical keys are immutable. An invalid or wrong-kind
+                # winner must not be overwritten by a remote fill, but it
+                # also cannot satisfy exact two-group publication coverage.
+                if key in self.hot_cache:
+                    missing_keys.append(key)
                     continue
                 ready_page = ready.get(key)
                 if ready_page is None:
@@ -598,6 +608,42 @@ class LocalCPUBackend(AllocatorBackendInterface):
             existing_keys=put_result.existing_keys,
             redundant_pages=tuple(redundant_pages),
         )
+
+    def _existing_layer_page_matches_key(
+        self,
+        key: CacheEngineKey,
+        page: Optional[MemoryObj],
+    ) -> bool:
+        """Cheap static validation for an immutable existing-key winner."""
+
+        if not isinstance(page, LayerPageMemoryObj) or not page.is_valid():
+            return False
+        try:
+            dtypes = tuple(page.meta.dtypes or ())
+            expected_layers = (
+                int(self.metadata.kv_shape[0])
+                if self.metadata is not None
+                else page.num_layers
+            )
+            expected_format = (
+                MemoryFormat.KV_MLA_LATENT_FMT
+                if key.kv_group == 0
+                else MemoryFormat.KV_DSA_INDEX_FMT
+            )
+            return bool(
+                page.num_layers == expected_layers
+                and page.get_size() == page.layer_size * page.num_layers
+                and len(dtypes) == page.num_layers
+                and all(dtype == key.dtype for dtype in dtypes)
+                and (
+                    not bool(getattr(self.config, "dsa_two_groups", False))
+                    or page.meta.fmt == expected_format
+                )
+                and page.valid_tokens
+                == mooncake_valid_tokens(key, int(self.config.chunk_size))
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
 
     def batched_get_layer_page_prefix(
         self, keys: Sequence[CacheEngineKey]

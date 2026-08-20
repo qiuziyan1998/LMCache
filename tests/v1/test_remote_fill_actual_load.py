@@ -646,6 +646,32 @@ def test_passive_view_construction_failure_closes_consumer_and_recomputes(
     assert closed == [True]
 
 
+def test_remote_fill_materialization_consensus_uses_all_rank_result() -> None:
+    engine = _engine(_PairStorageManager())
+    votes = []
+    engine.collective_all_true_fn = lambda local_ready: (
+        votes.append(local_ready) or False
+    )
+
+    assert not engine._remote_fill_all_ranks_materialized(
+        True,
+        req_id="actual",
+        kv_group=0,
+    )
+    assert votes == [True]
+
+
+def test_remote_fill_materialization_consensus_fails_closed_without_callback(
+) -> None:
+    engine = _engine(_PairStorageManager())
+
+    assert not engine._remote_fill_all_ranks_materialized(
+        True,
+        req_id="actual",
+        kv_group=0,
+    )
+
+
 def test_storage_manager_rejects_isolated_group_and_uses_next_pair_tier() -> None:
     group0 = [
         _TokenDatabase._make_key_by_hash(0x100 + index, kv_group=0).get_first_layer()
