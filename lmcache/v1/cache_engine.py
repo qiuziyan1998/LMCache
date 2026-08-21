@@ -4624,7 +4624,12 @@ class LMCacheEngine:
                             kv_group=kv_group,
                             status="ok",
                             generation=self.shared_cpu_cache_generation,
-                            handles=handles,
+                            # The compact batch is the wire payload; the local
+                            # None placeholders exist only for adoption
+                            # bookkeeping and cannot be serialized.
+                            handles=(
+                                [] if compact_batch is not None else handles
+                            ),
                             batch=compact_batch,
                         )
                     )
