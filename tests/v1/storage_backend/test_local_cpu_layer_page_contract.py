@@ -373,6 +373,8 @@ def test_external_commit_missing_reservation_inserts_nothing(
         redundant_pages=tuple(ready_pages),
         missing_keys=(group1[1],),
     )
+    assert result.lock_wait_seconds >= 0
+    assert result.lock_hold_seconds >= 0
     assert not backend.contains_any_exact([*group0, *group1])
     assert [page.get_ref_count() for page in ready_pages] == original_ref_counts
 
@@ -403,6 +405,8 @@ def test_external_commit_combines_existing_and_ready_coverage(
         existing_keys=(group0[0],),
         redundant_pages=(duplicate_page,),
     )
+    assert result.lock_wait_seconds >= 0
+    assert result.lock_hold_seconds >= 0
     assert backend.contains_all_exact(required)
     assert winner is existing_page
     assert duplicate_page.get_ref_count() == duplicate_ref_count

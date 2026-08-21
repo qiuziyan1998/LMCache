@@ -351,7 +351,10 @@ def test_eviction_after_local_full_rechecks_and_falls_back_to_persistent() -> No
     assert "LocalCPUBackend" not in engine.lookup_pins["actual"]
 
 
-def test_local_full_hint_records_retained_paired_actual_load(caplog) -> None:
+def test_local_full_hint_records_retained_paired_actual_load(
+    caplog, monkeypatch
+) -> None:
+    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
     storage = _PairStorageManager(local_pairs=2)
     engine = _engine(storage)
 
@@ -372,6 +375,9 @@ def test_local_full_hint_records_retained_paired_actual_load(caplog) -> None:
     assert snapshot.unexpected_remote_get_total == 0
     assert '"event":"remote_fill_actual_load"' in caplog.text
     assert '"outcome":"retained_at_load"' in caplog.text
+    assert "[LMCACHE_COLD_PERF]" in caplog.text
+    assert '"req_id":"actual"' in caplog.text
+    assert '"clock_domain"' in caplog.text
 
 
 def test_local_full_hint_records_eviction_and_remote_fallback(caplog) -> None:

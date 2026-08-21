@@ -384,6 +384,35 @@ class RemoteBackend(StorageBackendInterface):
             if self._mla_worker_id_as0_mode:
                 return None
 
+            # A batched writer must be visible to concurrent same-key puts just
+            # like the single-key path. If any key already has a physical
+            # writer, use the single-key path so existing futures are joined
+            # and only genuinely new keys are submitted.
+            completion: Future = Future()
+            with self.lock:
+                has_pending = any(
+                    key in self._single_put_futures for key in keys
+                )
+                if not has_pending:
+                    for key in keys:
+                        self._single_put_futures[key] = completion
+                        self._single_put_callbacks[key] = (
+                            [on_complete_callback]
+                            if on_complete_callback is not None
+                            else []
+                        )
+                    self.put_tasks.update(keys)
+            if has_pending:
+                futures = [
+                    self.submit_put_task(
+                        key,
+                        memory_obj,
+                        on_complete_callback=on_complete_callback,
+                    )
+                    for key, memory_obj in zip(keys, memory_objs, strict=True)
+                ]
+                return futures if self.requires_put_completion() else None
+
             # First, increment reference counts for all objects
             for memory_obj in memory_objs:
                 memory_obj.ref_count_up()
@@ -392,6 +421,9 @@ class RemoteBackend(StorageBackendInterface):
             try:
                 for memory_obj in memory_objs:
                     compressed_memory_objs.append(self.serializer.serialize(memory_obj))
+            except BaseException as error:
+                self._finish_batched_completion(keys, completion, error)
+                raise
             finally:
                 # Always decrement reference counts for all objects,
                 # regardless of whether serialization succeeded or failed
@@ -399,23 +431,24 @@ class RemoteBackend(StorageBackendInterface):
                     memory_obj.ref_count_down()
 
             def batched_done_callback(f: Future) -> None:
-                self.batched_put_callback(f, list(keys))
-                # Invoke per-key callback for each key in the batch
-                if on_complete_callback is not None:
-                    for key in keys:
-                        try:
-                            on_complete_callback(key)
-                        except Exception as e:
-                            logger.warning(
-                                f"on_complete_callback failed for key {key}: {e}"
-                            )
+                try:
+                    result = f.result()
+                except BaseException as error:
+                    self._finish_batched_completion(keys, completion, error)
+                else:
+                    self._finish_batched_completion(
+                        keys, completion, None, result=result
+                    )
 
-            future = asyncio.run_coroutine_threadsafe(
-                self.connection.batched_put(keys, compressed_memory_objs),  # type: ignore
-                self.loop,
-            )
+            coroutine = self.connection.batched_put(keys, compressed_memory_objs)  # type: ignore
+            try:
+                future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+            except BaseException as error:
+                coroutine.close()
+                self._finish_batched_completion(keys, completion, error)
+                raise
             future.add_done_callback(batched_done_callback)
-            return [future] if self.requires_put_completion() else None
+            return [completion] if self.requires_put_completion() else None
         else:
             futures: List[Future] = []
             for key, memory_obj in zip(keys, memory_objs, strict=False):
@@ -427,6 +460,35 @@ class RemoteBackend(StorageBackendInterface):
                     )
                 )
             return futures if self.requires_put_completion() else None
+
+    def _finish_batched_completion(
+        self,
+        keys: Sequence[CacheEngineKey],
+        completion: Future,
+        error: BaseException | None,
+        *,
+        result: Any = None,
+    ) -> None:
+        """Publish one physical batched writer's terminal result to joiners."""
+
+        if error is None:
+            if not completion.done():
+                completion.set_result(result)
+        elif not completion.done():
+            completion.set_exception(error)
+        callbacks: list[tuple[Callable[[CacheEngineKey], None], CacheEngineKey]] = []
+        with self.lock:
+            for key in keys:
+                if self._single_put_futures.get(key) is not completion:
+                    continue
+                self._single_put_futures.pop(key, None)
+                callbacks.extend(
+                    (callback, key)
+                    for callback in self._single_put_callbacks.pop(key, ())
+                )
+                self.put_tasks.discard(key)
+        for callback, key in callbacks:
+            self._invoke_put_complete_callback(callback, key)
 
     def batched_submit_external_pages(
         self,

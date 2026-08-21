@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -108,6 +108,9 @@ class ExternalTwoGroupCommitResult:
             release according to its reservation lifecycle.
         missing_keys: Required keys with neither a committed entry nor a ready
             reservation. This is empty whenever ``committed`` is true.
+        lock_wait_seconds: Time spent waiting for the LocalCPU cache lock.
+        lock_hold_seconds: Time spent holding the lock for validation and
+            atomic admission.
     """
 
     committed: bool
@@ -115,6 +118,8 @@ class ExternalTwoGroupCommitResult:
     existing_keys: tuple[CacheEngineKey, ...]
     redundant_pages: tuple[LayerPageMemoryObj, ...]
     missing_keys: tuple[CacheEngineKey, ...] = ()
+    lock_wait_seconds: float = field(default=0.0, compare=False)
+    lock_hold_seconds: float = field(default=0.0, compare=False)
 
 
 class LayerPageAdmissionRollbackError(RuntimeError):
@@ -565,7 +570,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 missing_keys=tuple(required_keys),
             )
 
+        lock_wait_started = time.perf_counter()
         with self.cpu_lock:
+            lock_acquired = time.perf_counter()
+            lock_wait_seconds = lock_acquired - lock_wait_started
             pending: list[tuple[CacheEngineKey, LayerPageMemoryObj]] = []
             existing_keys: list[CacheEngineKey] = []
             missing_keys: list[CacheEngineKey] = []
@@ -597,9 +605,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     existing_keys=tuple(existing_keys),
                     redundant_pages=tuple(ready_pages),
                     missing_keys=tuple(missing_keys),
+                    lock_wait_seconds=lock_wait_seconds,
+                    lock_hold_seconds=time.perf_counter() - lock_acquired,
                 )
 
             put_result = self._admit_layer_pages_locked(pending, existing_keys)
+            lock_hold_seconds = time.perf_counter() - lock_acquired
 
         self._notify_layer_page_admissions(put_result.inserted_keys)
         return ExternalTwoGroupCommitResult(
@@ -607,6 +618,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             inserted_keys=put_result.inserted_keys,
             existing_keys=put_result.existing_keys,
             redundant_pages=tuple(redundant_pages),
+            lock_wait_seconds=lock_wait_seconds,
+            lock_hold_seconds=lock_hold_seconds,
         )
 
     def _existing_layer_page_matches_key(

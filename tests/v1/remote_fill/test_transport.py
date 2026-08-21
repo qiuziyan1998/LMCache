@@ -9,14 +9,22 @@ import pytest
 
 # First Party
 from lmcache.v1.remote_fill import (
+    AbortRequest,
+    ArmWindowRequest,
+    FinishRequest,
+    NegotiateRequest,
+    OpenRequest,
     REMOTE_FILL_ENVELOPE_VERSION,
     REMOTE_FILL_SERVICE_HEADER,
+    ReportTransferCompleteRequest,
     RemoteFillClient,
     RemoteFillRpcServer,
     RemoteFillTransportError,
+    ReserveWindowRequest,
     ResultCode,
     RpcRemoteFillByteTransport,
     OperationKind,
+    StatusRequest,
     decode_response,
 )
 
@@ -110,6 +118,65 @@ def test_rpc_client_adapter_applies_operation_specific_timeout(harness) -> None:
 
     assert response.code is ResultCode.ACCEPTED
     assert rpc.last_timeout_ms == 321
+
+
+@pytest.mark.parametrize(
+    ("kind", "request_type"),
+    [
+        (OperationKind.NEGOTIATE, NegotiateRequest),
+        (OperationKind.OPEN, OpenRequest),
+        (OperationKind.RESERVE_WINDOW, ReserveWindowRequest),
+        (OperationKind.ARM_WINDOW, ArmWindowRequest),
+        (
+            OperationKind.REPORT_TRANSFER_COMPLETE,
+            ReportTransferCompleteRequest,
+        ),
+        (OperationKind.FINISH, FinishRequest),
+        (OperationKind.ABORT, AbortRequest),
+        (OperationKind.STATUS, StatusRequest),
+    ],
+)
+def test_rpc_client_adapter_applies_every_operation_timeout(
+    harness, kind, request_type
+) -> None:
+    """Every control operation uses its own configured deadline."""
+
+    reserve = harness.requests.reserve()
+    requests = {
+        NegotiateRequest: harness.requests.negotiate(),
+        OpenRequest: harness.requests.open(),
+        ReserveWindowRequest: reserve,
+        ArmWindowRequest: ArmWindowRequest(
+            common=harness.requests.common(),
+            window_id=0,
+            native_transfer_attempt_id="attempt-1",
+            manifest_digest=reserve.manifest_digest,
+            destination_descriptor_digest="0" * 64,
+        ),
+        ReportTransferCompleteRequest: ReportTransferCompleteRequest(
+            common=harness.requests.common(),
+            window_id=0,
+            native_transfer_attempt_id="attempt-1",
+            native_return_code=0,
+            completed_bytes=0,
+            manifest_digest=reserve.manifest_digest,
+        ),
+        FinishRequest: harness.requests.finish(),
+        AbortRequest: AbortRequest(
+            common=harness.requests.common(), reason="qualification"
+        ),
+        StatusRequest: harness.requests.status(),
+    }
+    expected = 100 + list(OperationKind).index(kind)
+    rpc = FakeRpcClientTransport(harness.service)
+    client = RemoteFillClient(
+        RpcRemoteFillByteTransport(rpc),
+        operation_timeouts_ms={kind: expected},
+    )
+
+    client.execute(requests[request_type])
+
+    assert rpc.last_timeout_ms == expected
 
 
 def test_rpc_client_adapter_requires_one_tp0_response(harness) -> None:

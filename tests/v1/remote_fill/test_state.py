@@ -107,6 +107,67 @@ def test_lost_arm_reply_is_idempotently_retried(harness) -> None:
     )
 
 
+def test_every_lost_control_reply_is_exactly_replayable(harness) -> None:
+    """All eight operations replay the same committed result after reply loss."""
+
+    def execute_after_lost_reply(kind, request):
+        harness.transport.drop_next_reply(kind)
+        with pytest.raises(ReplyLostError):
+            harness.client.execute(request)
+        return harness.client.execute(request)
+
+    negotiate = harness.requests.negotiate(operation_id="lost-negotiate")
+    assert (
+        execute_after_lost_reply(OperationKind.NEGOTIATE, negotiate).code
+        is ResultCode.OK
+    )
+    open_request = harness.requests.open(operation_id="lost-open")
+    assert (
+        execute_after_lost_reply(OperationKind.OPEN, open_request).code
+        is ResultCode.ACCEPTED
+    )
+    reserve = harness.requests.reserve(operation_id="lost-reserve")
+    reserve_response = execute_after_lost_reply(
+        OperationKind.RESERVE_WINDOW, reserve
+    )
+    assert reserve_response.code is ResultCode.OK
+    arm = harness.requests.arm(
+        reserve, reserve_response, operation_id="lost-arm"
+    )
+    assert (
+        execute_after_lost_reply(OperationKind.ARM_WINDOW, arm).code
+        is ResultCode.OK
+    )
+    report = harness.requests.report(
+        reserve, reserve_response, operation_id="lost-report"
+    )
+    assert (
+        execute_after_lost_reply(
+            OperationKind.REPORT_TRANSFER_COMPLETE, report
+        ).code
+        is ResultCode.OK
+    )
+    status = harness.requests.status(window_id=0, operation_id="lost-status")
+    assert (
+        execute_after_lost_reply(OperationKind.STATUS, status).code
+        is ResultCode.OK
+    )
+    finish = harness.requests.finish(operation_id="lost-finish")
+    finish_response = execute_after_lost_reply(OperationKind.FINISH, finish)
+    assert finish_response.terminal_outcome is TerminalOutcome.LOCAL_FULL
+
+    harness.requests.transfer_id = "transfer-abort"
+    abort_open = harness.requests.open(operation_id="lost-abort-open")
+    assert harness.client.execute(abort_open).code is ResultCode.ACCEPTED
+    abort = AbortRequest(
+        common=harness.requests.common("lost-abort"),
+        reason="qualification",
+    )
+    abort_response = execute_after_lost_reply(OperationKind.ABORT, abort)
+    assert abort_response.code is ResultCode.TERMINAL
+    assert abort_response.terminal_outcome is TerminalOutcome.CANCELLED
+
+
 def test_concurrent_identical_reserve_allocates_once(harness) -> None:
     """The operation cache and allocator transition share one state lock."""
 

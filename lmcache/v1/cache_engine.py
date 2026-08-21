@@ -2237,12 +2237,33 @@ class LMCacheEngine:
             "destination_engine_epoch": destination_engine_epoch,
             "remote_suffix": actual_load_end > common_local_end,
         }
+        cold_start_perf_log(
+            logger,
+            "remote_fill_actual_load",
+            req_id=lookup_id,
+            outcome=outcome,
+            required_store_end=required_store_end,
+            common_local_end=common_local_end,
+            actual_load_end=actual_load_end,
+            destination_engine_epoch=destination_engine_epoch,
+            remote_suffix=actual_load_end > common_local_end,
+        )
         logger.info(
             "[LMCACHE_REMOTE_FILL] %s",
             json.dumps(fields, separators=(",", ":"), sort_keys=True),
         )
         if not retained:
             fields["event"] = "remote_fill_evicted_before_load"
+            cold_start_perf_log(
+                logger,
+                "remote_fill_evicted_before_load",
+                req_id=lookup_id,
+                required_store_end=required_store_end,
+                common_local_end=common_local_end,
+                actual_load_end=actual_load_end,
+                destination_engine_epoch=destination_engine_epoch,
+                remote_suffix=actual_load_end > common_local_end,
+            )
             logger.info(
                 "[LMCACHE_REMOTE_FILL] %s",
                 json.dumps(fields, separators=(",", ":"), sort_keys=True),

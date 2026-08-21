@@ -419,7 +419,10 @@ def _make_remote_backend(requires_completion: bool) -> RemoteBackend:
     return backend
 
 
-def test_duplicate_single_key_put_joins_real_pending_future(monkeypatch) -> None:
+@pytest.mark.parametrize("partial", [False, True])
+def test_duplicate_single_key_put_joins_real_pending_future(
+    monkeypatch, partial: bool
+) -> None:
     submitted: list[Future] = []
 
     class _SingleConnection:
@@ -438,7 +441,18 @@ def test_duplicate_single_key_put_joins_real_pending_future(monkeypatch) -> None
     backend.connection = _SingleConnection()
     first_callback: list[CacheEngineKey] = []
     second_callback: list[CacheEngineKey] = []
-    key = _key(7)
+    key = (
+        CacheEngineKey(
+            "test",
+            1,
+            0,
+            7,
+            torch.float16,
+            {MOONCAKE_VALID_TOKENS_TAG: 3},
+        )
+        if partial
+        else _key(7)
+    )
 
     first = backend.submit_put_task(key, _MemoryObj(), first_callback.append)
     second = backend.submit_put_task(key, _MemoryObj(), second_callback.append)
@@ -456,6 +470,54 @@ def test_duplicate_single_key_put_joins_real_pending_future(monkeypatch) -> None
     assert not backend.exists_in_put_tasks(key)
     assert backend._single_put_futures == {}
     assert backend._single_put_callbacks == {}
+
+
+def test_duplicate_batched_put_joins_real_physical_writer(monkeypatch) -> None:
+    submitted: list[Future] = []
+
+    class _BatchConnection(_Connection):
+        @staticmethod
+        async def put(key, memory_obj) -> None:
+            raise AssertionError("same-key join must not submit individual puts")
+
+    def submit(coroutine, loop) -> Future:
+        del loop
+        coroutine.close()
+        future: Future = Future()
+        submitted.append(future)
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+    backend = _make_remote_backend(True)
+    backend.connection = _BatchConnection(True)
+    keys = [_key(11), _key(12)]
+    first_callbacks: list[CacheEngineKey] = []
+    second_callbacks: list[CacheEngineKey] = []
+
+    first = backend.batched_submit_put_task(
+        keys,
+        [_MemoryObj(), _MemoryObj()],
+        on_complete_callback=first_callbacks.append,
+    )
+    second = backend.batched_submit_put_task(
+        keys,
+        [_MemoryObj(), _MemoryObj()],
+        on_complete_callback=second_callbacks.append,
+    )
+
+    assert first is not None and second is not None
+    assert len(submitted) == 1
+    assert all(future is first[0] for future in second)
+    assert not first[0].done()
+
+    submitted[0].set_result(None)
+
+    assert first[0].result() is None
+    assert first_callbacks == keys
+    assert second_callbacks == keys
+    assert backend._single_put_futures == {}
+    assert backend._single_put_callbacks == {}
+    assert not any(backend.exists_in_put_tasks(key) for key in keys)
 
 
 def test_layer_page_timeout_releases_late_result(monkeypatch) -> None:

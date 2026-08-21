@@ -199,7 +199,11 @@ class MooncakeDirectPushTransport:
 
         loop = asyncio.get_running_loop()
 
+        source_event_wait_ms = 0.0
+        source_registration_ms = 0.0
+
         def prepare_source() -> None:
+            nonlocal source_event_wait_ms, source_registration_ms
             try:
                 source_device = next(
                     (
@@ -212,17 +216,26 @@ class MooncakeDirectPushTransport:
                 )
                 if source_device is not None:
                     torch.npu.set_device(source_device)
+                event_wait_started = perf_counter()
                 seen_events: set[int] = set()
                 for event in source_plan.producer_events:
                     if id(event) in seen_events:
                         continue
                     seen_events.add(id(event))
                     event.synchronize()
+                source_event_wait_ms = (perf_counter() - event_wait_started) * 1000
+                registration_started = perf_counter()
                 self._register_source_owners(source_plan.owners)
+                source_registration_ms = (
+                    perf_counter() - registration_started
+                ) * 1000
             except Exception as exc:
                 raise NativeDirectPushPreSubmitError(
                     "Native direct push failed before submission"
                 ) from exc
+
+        await asyncio.to_thread(prepare_source)
+        native_slot_wait_ms = 0.0
 
         def run_native() -> NativeDirectPushResult:
             started = perf_counter()
@@ -232,6 +245,7 @@ class MooncakeDirectPushTransport:
                 list(vectors[1]),
                 list(vectors[2]),
             )
+            ended = perf_counter()
             if not isinstance(native_return, int) or isinstance(native_return, bool):
                 raise RuntimeError(
                     "Mooncake native direct push returned an ambiguous status"
@@ -241,15 +255,19 @@ class MooncakeDirectPushTransport:
                 return_code=native_return,
                 vector_count=len(vectors[0]),
                 transferred_bytes=sum(vectors[2]),
-                elapsed_ms=(perf_counter() - started) * 1000,
+                elapsed_ms=(ended - started) * 1000,
+                source_event_wait_ms=source_event_wait_ms,
+                source_registration_ms=source_registration_ms,
+                native_slot_wait_ms=native_slot_wait_ms,
+                native_started_monotonic=started,
+                native_ended_monotonic=ended,
             )
 
         # Producer fences can remain incomplete while chunked prefill is still
         # running. Waiting and idempotent source registration happen before
         # admission to the scarce native-transfer slots, so an unrelated ready
         # request is not serialized behind model computation.
-        await asyncio.to_thread(prepare_source)
-
+        native_slot_started = perf_counter()
         async with self._task_lock:
             if self._closed:
                 raise RuntimeError("Native direct push transport is closed")
@@ -257,6 +275,7 @@ class MooncakeDirectPushTransport:
             if self._closed:
                 self._operation_limit.release()
                 raise RuntimeError("Native direct push transport is closed")
+            native_slot_wait_ms = (perf_counter() - native_slot_started) * 1000
             try:
                 future = loop.run_in_executor(self._executor, run_native)
             except BaseException:

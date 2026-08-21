@@ -285,6 +285,11 @@ def test_connector_push_orders_event_registration_and_exact_native_vectors() -> 
         assert result.return_code == 0
         assert result.transferred_bytes == 36
         assert result.vector_count == 3
+        assert result.source_event_wait_ms >= 0
+        assert result.source_registration_ms >= 0
+        assert result.native_slot_wait_ms >= 0
+        assert result.native_started_monotonic > 0
+        assert result.native_ended_monotonic >= result.native_started_monotonic
         await connector._direct_push_transport.close()
 
     asyncio.run(run())
