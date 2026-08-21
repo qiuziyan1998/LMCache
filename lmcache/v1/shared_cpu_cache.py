@@ -37,6 +37,19 @@ class SharedCPUCacheValidationError(SharedCPUCacheError):
     """Raised before view creation or pointer install when metadata is unsafe."""
 
 
+def chunk_hash_to_int(chunk_hash: Union[int, bytes]) -> int:
+    """Normalize a chunk hash to its full-width integer form.
+
+    Digest-based hash algorithms (e.g. sha256_cbor in this vLLM fork) produce
+    raw digest bytes; builtin/64-bit algorithms produce ints. The shared CPU
+    cache batch wire format carries chunk hashes as integers, so digest bytes
+    are converted losslessly via a big-endian full-width interpretation.
+    """
+    if isinstance(chunk_hash, bytes):
+        return int.from_bytes(chunk_hash, "big")
+    return int(chunk_hash)
+
+
 @dataclass
 class SharedCPURequestLease:
     """Own the shared MemoryObjs retained for one live request."""

@@ -90,6 +90,7 @@ from lmcache.v1.shared_cpu_cache import (
     SharedHandleBatch,
     SharedHandleEnvelope,
     SharedSlabMapping,
+    chunk_hash_to_int,
     validate_shared_handle_batch,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
@@ -155,7 +156,9 @@ class LayerwiseStoreResult:
 class _RemoteFillChunkLookupPlan:
     start: int
     end: int
-    chunk_hash: int
+    # Raw chunk hash: int for builtin/64-bit algorithms, digest bytes for
+    # digest-based algorithms (e.g. sha256_cbor in this vLLM fork).
+    chunk_hash: Union[int, bytes]
     location: str
     page_by_group: tuple[bool, bool]
 
@@ -1348,7 +1351,8 @@ class LMCacheEngine:
             num_chunks=chunks,
             physical_sizes=physical_sizes,
             chunk_hashes=[
-                int(key.chunk_hash) for key in keys_layer_major[0][:chunks]
+                chunk_hash_to_int(key.chunk_hash)
+                for key in keys_layer_major[0][:chunks]
             ],
             offsets=[int(obj.meta.address) for obj in tail],
             page_offsets=[
@@ -1398,7 +1402,7 @@ class LMCacheEngine:
             expected_num_layers=self.num_layers,
             expected_num_chunks=batch.num_chunks,
             expected_chunk_hashes=[
-                int(key.chunk_hash)
+                chunk_hash_to_int(key.chunk_hash)
                 for key in keys_layer_major[0][: batch.num_chunks]
             ],
             slab_size=allocator.slab_size,
@@ -2023,7 +2027,7 @@ class LMCacheEngine:
                     _RemoteFillChunkLookupPlan(
                         start=start,
                         end=end,
-                        chunk_hash=int(key.chunk_hash),
+                        chunk_hash=key.chunk_hash,
                         location=location,
                         page_by_group=(True, True),
                     )
@@ -2127,7 +2131,7 @@ class LMCacheEngine:
                     _RemoteFillChunkLookupPlan(
                         start=start,
                         end=end,
-                        chunk_hash=int(key.chunk_hash),
+                        chunk_hash=key.chunk_hash,
                         location=group0[0],
                         page_by_group=(group0[2], group1[2]),
                     )
@@ -2310,7 +2314,7 @@ class LMCacheEngine:
         }
         selected: list[tuple[str, bool]] = []
         for start, end, key in candidates:
-            chunk = by_chunk.get((start, end, int(key.chunk_hash)))
+            chunk = by_chunk.get((start, end, key.chunk_hash))
             if chunk is None:
                 raise _RemoteFillMaterializationError(
                     "Remote-fill actual-load candidates do not match the "
