@@ -990,6 +990,14 @@ def _validate_config(self):
             raise ValueError(
                 "remote fill requires positive values for " + ", ".join(nonpositive)
             )
+        minimum_pin_timeout = (
+            float(self.remote_fill_native_hard_timeout_ms) / 1000.0 + 60.0
+        )
+        if float(self.pin_timeout_sec) <= minimum_pin_timeout:
+            raise ValueError(
+                "remote fill requires pin_timeout_sec to exceed the native hard "
+                "timeout by more than 60 seconds"
+            )
         if self.remote_fill_min_free_bytes < 0:
             raise ValueError("remote_fill_min_free_bytes must be non-negative")
         if not 0 <= self.remote_fill_min_free_ratio < 1:

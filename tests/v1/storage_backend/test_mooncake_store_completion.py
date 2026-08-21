@@ -22,6 +22,7 @@ from lmcache.v1.mooncake_layout import (
     MOONCAKE_VALID_TOKENS_TAG,
     mooncake_page_key,
 )
+from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
 from lmcache.v1.storage_backend.connector import (
     mooncakestore_connector as mooncake_connector,
 )
@@ -924,7 +925,7 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
     )
     connector._metadata_for_raw_key = lambda key: (None, None, None, 1)
     owner = torch.empty(16, dtype=torch.uint8)
-    event = _Event()
+    events = (_Event(), _Event())
 
     asyncio.run(
         connector.batched_put_external_pages(
@@ -932,12 +933,12 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
             [[owner.data_ptr()]],
             [[owner.numel()]],
             (owner,),
-            event,
+            events,
             "request",
         )
     )
 
-    assert event.waited
+    assert all(event.waited for event in events)
     put = next(call for call in calls if call[0] == "put")
     assert put[1] == [mooncake_page_key(_key(7), 2)]
     assert put[2:] == ([[owner.data_ptr()]], [[owner.numel()]])
@@ -948,7 +949,7 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
             [[owner.data_ptr()]],
             [[8]],
             (owner,),
-            event,
+            events,
             "request",
         )
     )
@@ -962,7 +963,7 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
                 [[owner.data_ptr()]],
                 [[owner.numel() - 1]],
                 (owner,),
-                event,
+                events,
                 "request",
             )
         )
@@ -1200,6 +1201,56 @@ def test_mooncake_cancelled_direct_page_put_drains_native_transfer() -> None:
             await task
 
     asyncio.run(cancel_put())
+
+
+def test_mooncake_direct_page_put_has_native_hard_deadline() -> None:
+    release = threading.Event()
+
+    class _Store:
+        @staticmethod
+        def register_buffer(ptr, size):
+            return 0
+
+        @staticmethod
+        def batch_put_from_multi_buffers(keys, ptrs, sizes, replica):
+            assert release.wait(5)
+            return [0] * len(keys)
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector._external_put_lock = asyncio.Lock()
+    connector._external_buffers = {}
+    connector._inflight_put_tasks = set()
+    connector.store = _Store()
+    connector.replica_config = object()
+    connector.config = SimpleNamespace(
+        transfer_timeout=0.01,
+        remote_fill_native_hard_timeout_ms=20,
+    )
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (None, None, None, 1)
+    owner = torch.empty(16, dtype=torch.uint8)
+    timer = threading.Timer(0.1, release.set)
+    timer.start()
+    try:
+        with pytest.raises(NativeExternalPageTransferUnknownError):
+            asyncio.run(
+                connector.batched_put_external_pages(
+                    [_key(13)],
+                    [[owner.data_ptr()]],
+                    [[16]],
+                    (owner,),
+                    None,
+                    "request",
+                )
+            )
+    finally:
+        release.set()
+        timer.join()
 
 
 def test_instrumented_connector_delegates_direct_pages() -> None:

@@ -529,7 +529,7 @@ class RemoteBackend(StorageBackendInterface):
         buffer_ptrs: List[List[int]],
         buffer_sizes: List[List[int]],
         owners: tuple[Any, ...],
-        ready_event: Any,
+        producer_events: tuple[Any, ...] | Any,
         req_id: str,
     ) -> Future:
         """Submit registered external buffers to the remote connector."""
@@ -544,7 +544,7 @@ class RemoteBackend(StorageBackendInterface):
                 buffer_ptrs,
                 buffer_sizes,
                 owners,
-                ready_event,
+                producer_events,
                 req_id,
             ),
             self.loop,
@@ -614,6 +614,15 @@ class RemoteBackend(StorageBackendInterface):
                 destination_descriptors=destination_descriptors,
                 activation=activation,
             ),
+            self.loop,
+        )
+
+    def prepare_remote_fill_source(self, source_plan: Any) -> Future:
+        """Prepare direct-push source owners on the storage event loop."""
+        if self.connection is None:
+            raise RuntimeError("Remote connection is unavailable")
+        return asyncio.run_coroutine_threadsafe(
+            self.connection.prepare_remote_fill_source(source_plan),
             self.loop,
         )
 

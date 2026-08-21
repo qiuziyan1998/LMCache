@@ -207,6 +207,16 @@ def test_remote_fill_derives_control_manifest_bound() -> None:
     assert config.remote_fill_max_control_pages_per_window == 8
 
 
+def test_remote_fill_pin_timeout_outlives_native_unknown_window() -> None:
+    config = _remote_fill_config(
+        remote_fill_native_hard_timeout_ms=120000,
+        pin_timeout_sec=180,
+    )
+
+    with pytest.raises(ValueError, match="pin_timeout_sec"):
+        config.validate()
+
+
 def test_remote_fill_builtin_hash_is_resolved_to_deterministic_hash(monkeypatch):
     monkeypatch.delenv("PYTHONHASHSEED", raising=False)
     config = _remote_fill_config(pre_caching_hash_algorithm="builtin")

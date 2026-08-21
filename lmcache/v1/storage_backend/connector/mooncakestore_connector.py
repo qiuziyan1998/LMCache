@@ -46,6 +46,8 @@ from lmcache.v1.remote_fill.native import (
     NativeDirectPushPreSubmitError,
     NativeDirectPushResult,
     NativeDirectPushTerminalError,
+    NativeExternalPageTransferUnknownError,
+    PreparedDirectPushSource,
 )
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -64,6 +66,26 @@ async def _drain_native_task(task: asyncio.Future[Any]) -> None:
             break
     if not task.cancelled():
         task.exception()
+
+
+async def _wait_external_native_until_hard_deadline(
+    task: asyncio.Future[Any],
+    *,
+    deadline: float,
+    operation: str,
+) -> Any:
+    """Wait for an uncancellable external DMA without exceeding its hard bound."""
+
+    remaining = max(0.0, deadline - perf_counter())
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+    except asyncio.TimeoutError as error:
+        logger.critical(
+            "Mooncake external-page %s exceeded its native hard deadline; "
+            "memory remains retained and paired restart is required",
+            operation,
+        )
+        raise NativeExternalPageTransferUnknownError(operation, task) from error
 
 
 def _shared_vllm_mooncake_transport() -> tuple[Any, str, Any, Any]:
@@ -158,7 +180,7 @@ class MooncakeDirectPushTransport:
         self,
         *,
         remote_session: str,
-        source_plan: DirectPushSourcePlan,
+        source_plan: DirectPushSourcePlan | PreparedDirectPushSource,
         destination_descriptors: tuple[DestinationPageDescriptor, ...],
         activation: NativeDirectPushActivation | None,
     ) -> NativeDirectPushResult:
@@ -183,25 +205,43 @@ class MooncakeDirectPushTransport:
         activation = _validate_direct_push_activation(activation)
         if not remote_session:
             raise ValueError("Native direct push requires a remote session")
-        if not source_plan.producer_events or any(
+        prepared_source = (
+            source_plan if isinstance(source_plan, PreparedDirectPushSource) else None
+        )
+        raw_source_plan = (
+            prepared_source.source_plan
+            if prepared_source is not None
+            else source_plan
+        )
+        if not raw_source_plan.producer_events or any(
             not callable(getattr(event, "synchronize", None))
-            for event in source_plan.producer_events
+            for event in raw_source_plan.producer_events
         ):
             raise ValueError("Native direct push requires real producer events")
         vectors = self._build_vectors(
             remote_session,
-            source_plan,
+            raw_source_plan,
             destination_descriptors,
             activation.native_transfer_attempt_id,
         )
-        owner_ranges = _direct_push_owner_ranges(source_plan.owners)
+        owner_ranges = _direct_push_owner_ranges(raw_source_plan.owners)
         self._validate_source_ranges(vectors[0], vectors[2], owner_ranges)
 
         loop = asyncio.get_running_loop()
 
-        source_event_wait_ms = 0.0
-        source_fences_ready_monotonic = 0.0
-        source_registration_ms = 0.0
+        source_event_wait_ms = (
+            prepared_source.source_event_wait_ms if prepared_source is not None else 0.0
+        )
+        source_fences_ready_monotonic = (
+            prepared_source.source_fences_ready_monotonic
+            if prepared_source is not None
+            else 0.0
+        )
+        source_registration_ms = (
+            prepared_source.source_registration_ms
+            if prepared_source is not None
+            else 0.0
+        )
 
         def prepare_source() -> None:
             nonlocal source_event_wait_ms, source_fences_ready_monotonic
@@ -210,7 +250,7 @@ class MooncakeDirectPushTransport:
                 source_device = next(
                     (
                         owner.device
-                        for owner in source_plan.owners
+                        for owner in raw_source_plan.owners
                         if getattr(getattr(owner, "device", None), "type", None)
                         == "npu"
                     ),
@@ -220,7 +260,7 @@ class MooncakeDirectPushTransport:
                     torch.npu.set_device(source_device)
                 event_wait_started = perf_counter()
                 seen_events: set[int] = set()
-                for event in source_plan.producer_events:
+                for event in raw_source_plan.producer_events:
                     if id(event) in seen_events:
                         continue
                     seen_events.add(id(event))
@@ -228,7 +268,7 @@ class MooncakeDirectPushTransport:
                 source_fences_ready_monotonic = perf_counter()
                 source_event_wait_ms = (perf_counter() - event_wait_started) * 1000
                 registration_started = perf_counter()
-                self._register_source_owners(source_plan.owners)
+                self._register_source_owners(raw_source_plan.owners)
                 source_registration_ms = (
                     perf_counter() - registration_started
                 ) * 1000
@@ -237,7 +277,8 @@ class MooncakeDirectPushTransport:
                     "Native direct push failed before submission"
                 ) from exc
 
-        await asyncio.to_thread(prepare_source)
+        if prepared_source is None:
+            await asyncio.to_thread(prepare_source)
         native_slot_wait_ms = 0.0
 
         def run_native() -> NativeDirectPushResult:
@@ -2404,10 +2445,13 @@ class MooncakestoreConnector(RemoteConnector):
         buffer_ptrs: List[List[int]],
         buffer_sizes: List[List[int]],
         owners: tuple[Any, ...],
-        ready_event: Any,
+        producer_events: tuple[Any, ...] | Any,
         req_id: str,
     ) -> None:
         """Write registered accelerator buffers with page or legacy keys."""
+        native_unknown = getattr(self, "_external_native_unknown_error", None)
+        if native_unknown is not None:
+            raise native_unknown
         if self.save_chunk_meta or not self._page_first_multi_buffer:
             raise RuntimeError("Direct page store requires metadata-free page mode")
         if not keys:
@@ -2431,8 +2475,17 @@ class MooncakestoreConnector(RemoteConnector):
             if owners and owners[0].device.type == "npu":
                 torch.npu.set_device(owners[0].device)
             wait_started = cold_start_perf_now() if started is not None else None
-            if ready_event is not None:
-                ready_event.synchronize()
+            normalized_events = (
+                producer_events
+                if isinstance(producer_events, tuple)
+                else (() if producer_events is None else (producer_events,))
+            )
+            seen_events: set[int] = set()
+            for producer_event in normalized_events:
+                if id(producer_event) in seen_events:
+                    continue
+                seen_events.add(id(producer_event))
+                producer_event.synchronize()
             wait_ms = (
                 (cold_start_perf_now() - wait_started) * 1000
                 if wait_started is not None
@@ -2451,6 +2504,17 @@ class MooncakestoreConnector(RemoteConnector):
             return placement, wait_ms, transfer_ms
 
         async with self._external_put_lock:
+            hard_deadline = perf_counter() + max(
+                float(self.config.transfer_timeout),
+                float(
+                    getattr(
+                        self.config,
+                        "remote_fill_native_hard_timeout_ms",
+                        float(self.config.transfer_timeout) * 1000.0,
+                    )
+                )
+                / 1000.0,
+            )
             task = asyncio.create_task(asyncio.to_thread(put))
             self._inflight_put_tasks.add(task)
             task.add_done_callback(self._inflight_put_tasks.discard)
@@ -2459,7 +2523,15 @@ class MooncakestoreConnector(RemoteConnector):
                     asyncio.shield(task), timeout=self.config.transfer_timeout
                 )
             except asyncio.CancelledError:
-                await _drain_native_task(task)
+                try:
+                    await _wait_external_native_until_hard_deadline(
+                        task,
+                        deadline=hard_deadline,
+                        operation="put",
+                    )
+                except NativeExternalPageTransferUnknownError as unknown:
+                    self._external_native_unknown_error = unknown
+                    raise
                 raise
             except asyncio.TimeoutError:
                 logger.error(
@@ -2468,7 +2540,16 @@ class MooncakestoreConnector(RemoteConnector):
                     self.config.transfer_timeout,
                 )
                 try:
-                    placement, wait_ms, transfer_ms = await task
+                    placement, wait_ms, transfer_ms = (
+                        await _wait_external_native_until_hard_deadline(
+                            task,
+                            deadline=hard_deadline,
+                            operation="put",
+                        )
+                    )
+                except NativeExternalPageTransferUnknownError as unknown:
+                    self._external_native_unknown_error = unknown
+                    raise
                 except BaseException as native_error:
                     raise TimeoutError(
                         "Mooncake direct page put failed after timing out"
@@ -2540,6 +2621,9 @@ class MooncakestoreConnector(RemoteConnector):
         req_id: str,
     ) -> None:
         """Read exact Mooncake pages directly into accelerator tensor storage."""
+        native_unknown = getattr(self, "_external_native_unknown_error", None)
+        if native_unknown is not None:
+            raise native_unknown
         if self.save_chunk_meta or not self._page_first_multi_buffer:
             raise RuntimeError("Direct page load requires metadata-free page mode")
         if not keys:
@@ -2571,6 +2655,17 @@ class MooncakestoreConnector(RemoteConnector):
             return statuses, transfer_ms
 
         async with self._external_put_lock:
+            hard_deadline = perf_counter() + max(
+                float(self.config.transfer_timeout),
+                float(
+                    getattr(
+                        self.config,
+                        "remote_fill_native_hard_timeout_ms",
+                        float(self.config.transfer_timeout) * 1000.0,
+                    )
+                )
+                / 1000.0,
+            )
             task = asyncio.create_task(asyncio.to_thread(get))
             self._inflight_put_tasks.add(task)
             task.add_done_callback(self._inflight_put_tasks.discard)
@@ -2582,13 +2677,28 @@ class MooncakestoreConnector(RemoteConnector):
                 # The native read is not cancellable and still owns the destination
                 # buffers. Do not let their allocator storage be reused until DMA
                 # has stopped writing into it.
-                await _drain_native_task(task)
+                try:
+                    await _wait_external_native_until_hard_deadline(
+                        task,
+                        deadline=hard_deadline,
+                        operation="get",
+                    )
+                except NativeExternalPageTransferUnknownError as unknown:
+                    self._external_native_unknown_error = unknown
+                    raise
                 raise
             except asyncio.TimeoutError:
                 # Native transfers cannot be cancelled safely while their destination
                 # tensors are live. Drain the call, then force the caller to fallback.
                 try:
-                    await task
+                    await _wait_external_native_until_hard_deadline(
+                        task,
+                        deadline=hard_deadline,
+                        operation="get",
+                    )
+                except NativeExternalPageTransferUnknownError as unknown:
+                    self._external_native_unknown_error = unknown
+                    raise
                 except BaseException as native_error:
                     raise TimeoutError(
                         "Mooncake direct page load failed after timing out"
@@ -2689,6 +2799,57 @@ class MooncakestoreConnector(RemoteConnector):
             destination_descriptors=destination_descriptors,
             activation=activation,
         )
+
+    async def prepare_remote_fill_source(
+        self, source_plan: DirectPushSourcePlan
+    ) -> PreparedDirectPushSource:
+        """Fence and register source owners before decoder memory is armed."""
+
+        if not source_plan.producer_events or any(
+            not callable(getattr(event, "synchronize", None))
+            for event in source_plan.producer_events
+        ):
+            raise ValueError("Native direct push requires real producer events")
+        owner_ranges = _direct_push_owner_ranges(source_plan.owners)
+        source_ptrs = tuple(
+            ptr for page in source_plan.pages for ptr in page.source_ptrs
+        )
+        source_lengths = tuple(
+            length for page in source_plan.pages for length in page.source_lengths
+        )
+        MooncakeDirectPushTransport._validate_source_ranges(
+            source_ptrs, source_lengths, owner_ranges
+        )
+
+        def prepare() -> PreparedDirectPushSource:
+            source_device = next(
+                (
+                    owner.device
+                    for owner in source_plan.owners
+                    if getattr(getattr(owner, "device", None), "type", None) == "npu"
+                ),
+                None,
+            )
+            if source_device is not None:
+                torch.npu.set_device(source_device)
+            wait_started = perf_counter()
+            seen_events: set[int] = set()
+            for event in source_plan.producer_events:
+                if id(event) in seen_events:
+                    continue
+                seen_events.add(id(event))
+                event.synchronize()
+            fences_ready = perf_counter()
+            registration_started = perf_counter()
+            self._ensure_shared_external_owners_registered(source_plan.owners)
+            return PreparedDirectPushSource(
+                source_plan=source_plan,
+                source_event_wait_ms=(fences_ready - wait_started) * 1000,
+                source_fences_ready_monotonic=fences_ready,
+                source_registration_ms=(perf_counter() - registration_started) * 1000,
+            )
+
+        return await asyncio.to_thread(prepare)
 
     def batched_external_pages_exist(
         self, keys: List[CacheEngineKey]
@@ -2956,6 +3117,10 @@ class MooncakestoreConnector(RemoteConnector):
         pass
 
     async def close(self):
+        if getattr(self, "_external_native_unknown_error", None) is not None:
+            raise RuntimeError(
+                "Mooncake close refused because external DMA completion is unknown"
+            )
         direct_push_transport = getattr(self, "_direct_push_transport", None)
         if direct_push_transport is not None:
             await direct_push_transport.close()

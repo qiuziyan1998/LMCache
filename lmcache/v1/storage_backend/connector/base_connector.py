@@ -302,7 +302,7 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         buffer_ptrs: List[List[int]],
         buffer_sizes: List[List[int]],
         owners: tuple[Any, ...],
-        ready_event: Any,
+        producer_events: tuple[Any, ...] | Any,
         req_id: str,
     ) -> None:
         """Persist externally owned buffers in the connector's page format."""
@@ -328,6 +328,10 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         activation: Any,
     ) -> Any:
         """Push registered source pages into armed remote destinations."""
+        raise NotImplementedError
+
+    async def prepare_remote_fill_source(self, source_plan: Any) -> Any:
+        """Fence and register direct-push sources before destination ARM."""
         raise NotImplementedError
 
     def get_remote_fill_destination_session(self) -> str | None:

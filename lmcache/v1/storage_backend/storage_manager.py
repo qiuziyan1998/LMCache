@@ -589,7 +589,7 @@ class StorageManager:
         buffer_ptrs: List[List[int]],
         buffer_sizes: List[List[int]],
         owners: tuple[Any, ...],
-        ready_event: Any,
+        producer_events: tuple[Any, ...] | Any,
         req_id: str,
     ) -> Future:
         """Forward registered external page or legacy buffers to RemoteBackend."""
@@ -604,7 +604,7 @@ class StorageManager:
             buffer_ptrs,
             buffer_sizes,
             owners,
-            ready_event,
+            producer_events,
             req_id,
         )
 
@@ -660,6 +660,16 @@ class StorageManager:
             destination_descriptors=destination_descriptors,
             activation=activation,
         )
+
+    def prepare_remote_fill_source(self, source_plan: Any) -> Future:
+        """Fence and register direct-push sources before destination ARM."""
+        backend = self.storage_backends.get("RemoteBackend")
+        if not isinstance(backend, RemoteBackend):
+            raise RuntimeError("Remote fill requires RemoteBackend")
+        with self._bypass_lock:
+            if "RemoteBackend" in self._bypassed_backends:
+                raise RuntimeError("RemoteBackend is bypassed")
+        return backend.prepare_remote_fill_source(source_plan)
 
     def get_remote_fill_destination_session(self) -> str | None:
         """Return TP0's registered native destination session, if enabled."""

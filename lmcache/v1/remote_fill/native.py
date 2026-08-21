@@ -37,6 +37,16 @@ class DirectPushSourcePlan:
 
 
 @dataclass(frozen=True)
+class PreparedDirectPushSource:
+    """Producer-fenced and registered source state prepared before ARM."""
+
+    source_plan: DirectPushSourcePlan
+    source_event_wait_ms: float
+    source_fences_ready_monotonic: float
+    source_registration_ms: float
+
+
+@dataclass(frozen=True)
 class NativeDirectPushResult:
     """Terminal aggregate result of one native direct push."""
 
@@ -67,6 +77,17 @@ class NativeDirectPushTerminalError(RuntimeError):
 
 class NativeDirectPushPreSubmitError(RuntimeError):
     """Producer fencing or source registration failed before native submission."""
+
+
+class NativeExternalPageTransferUnknownError(RuntimeError):
+    """A persistent external-page DMA did not terminate by its hard deadline."""
+
+    def __init__(self, operation: str, terminal_future: asyncio.Future[Any]) -> None:
+        super().__init__(
+            f"Mooncake external-page {operation} has unknown native completion"
+        )
+        self.operation = operation
+        self.terminal_future = terminal_future
 
 
 class NativeDirectPushAmbiguousError(RuntimeError):

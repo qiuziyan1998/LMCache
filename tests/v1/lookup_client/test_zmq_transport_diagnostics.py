@@ -106,6 +106,18 @@ def test_zmq_server_returns_identity_for_malformed_request() -> None:
     assert transport.recv_request() == (b"client", [])
 
 
+def test_zmq_server_drops_timed_out_response_without_stopping() -> None:
+    transport = object.__new__(ZmqRouterServerTransport)
+    transport.socket = MagicMock()
+    transport.socket.send_multipart.side_effect = zmq.Again()
+
+    transport.send_response(b"client", b"response")
+
+    transport.socket.send_multipart.assert_called_once_with(
+        [b"client", b"", b"response"]
+    )
+
+
 def test_zmq_server_rejects_oversized_frame_before_decode() -> None:
     transport = object.__new__(ZmqRouterServerTransport)
     transport.decoder = MagicMock()

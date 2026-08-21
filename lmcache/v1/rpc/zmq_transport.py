@@ -233,11 +233,17 @@ class ZmqRouterServerTransport(RpcServerTransport):
         protocol: str = "ipc",
         max_frame_bytes: int | None = None,
         max_frame_count: int | None = None,
+        send_timeout_ms: int | None = None,
+        high_water_mark: int = 1024,
     ):
         if max_frame_bytes is not None and max_frame_bytes <= 0:
             raise ValueError("max_frame_bytes must be positive when configured")
         if max_frame_count is not None and max_frame_count <= 0:
             raise ValueError("max_frame_count must be positive when configured")
+        if send_timeout_ms is not None and send_timeout_ms <= 0:
+            raise ValueError("send_timeout_ms must be positive when configured")
+        if high_water_mark <= 0:
+            raise ValueError("high_water_mark must be positive")
         self.decoder = msgspec.msgpack.Decoder()
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         self.socket = get_zmq_socket(
@@ -248,6 +254,13 @@ class ZmqRouterServerTransport(RpcServerTransport):
             "bind",
         )
         self.socket.setsockopt(zmq.RCVTIMEO, recv_timeout_ms)
+        self.socket.setsockopt(
+            zmq.SNDTIMEO,
+            recv_timeout_ms if send_timeout_ms is None else send_timeout_ms,
+        )
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.setsockopt(zmq.SNDHWM, high_water_mark)
+        self.socket.setsockopt(zmq.RCVHWM, high_water_mark)
         self.socket_path = socket_path
         self.max_frame_bytes = max_frame_bytes
         self.max_frame_count = max_frame_count
@@ -303,7 +316,13 @@ class ZmqRouterServerTransport(RpcServerTransport):
         response: bytes,
     ) -> None:
         """Send response back via ROUTER socket."""
-        self.socket.send_multipart([identity, b"", response])
+        try:
+            self.socket.send_multipart([identity, b"", response])
+        except zmq.Again:
+            # The state transition and its idempotent result are already
+            # recorded.  Treat this as a lost reply so the client can retry or
+            # resolve the operation through STATUS; never stall maintenance.
+            logger.warning("Dropping an RPC response after the bounded send timeout")
 
     def close(self) -> None:
         self.socket.close(linger=0)
