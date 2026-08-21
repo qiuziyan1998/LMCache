@@ -13,6 +13,7 @@ from lmcache.v1.mooncake_layout import (
     mooncake_page_key,
     mooncake_payload_layout,
     mooncake_valid_tokens,
+    resolve_mooncake_dsa_raw_token_dims,
 )
 from lmcache.v1.token_database import ChunkedTokenDatabase, SegmentTokenDatabase
 
@@ -140,6 +141,32 @@ def test_payload_v3_identity_includes_remote_fill_abi() -> None:
     cfg.remote_fill_model_artifact_id = "weights-build-b"
     other_signature, _ = mooncake_payload_layout(cfg, metadata)
     assert other_signature != signature
+
+
+def test_payload_v3_infers_dsa_dimensions_from_model_config(tmp_path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        '{"kv_lora_rank":512,"qk_rope_head_dim":64,"dsa_head_dim":128}',
+        encoding="utf-8",
+    )
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=1024, backend="cpu")
+    cfg.dsa_two_groups = True
+    cfg.extra_config = {
+        "mooncake_page_first_multi_buffer": True,
+        "mooncake_layer_merged_page_objects": True,
+    }
+    metadata = dumb_metadata_with_model_name(str(model_dir))
+    metadata.use_mla = True
+
+    dimensions, source = resolve_mooncake_dsa_raw_token_dims(cfg, metadata)
+    _, descriptor = mooncake_payload_layout(cfg, metadata)
+
+    assert dimensions == {0: 576, 1: 128}
+    assert source.startswith("model config inference:")
+    assert descriptor["raw_token_dims"] == (("0", 576), ("1", 128))
+    assert descriptor["group0_raw_token_dim"] == 576
+    assert descriptor["group1_raw_token_dim"] == 128
 
 
 def test_payload_v3_automatically_fingerprints_serving_bundle(

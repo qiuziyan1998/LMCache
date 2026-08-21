@@ -32,6 +32,146 @@ _AUTO_IDENTITY_EXTENSIONS = {
 _AUTO_IDENTITY_SAMPLE_BYTES = 64 * 1024
 
 
+def _parse_dsa_raw_token_dims(value: Any) -> dict[int, int]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = dict(item.split(":", 1) for item in value.split(",") if item)
+    else:
+        parsed = value
+    if isinstance(parsed, dict):
+        return {int(key): int(dimension) for key, dimension in parsed.items()}
+    if isinstance(parsed, (list, tuple)) and len(parsed) >= 2:
+        return {0: int(parsed[0]), 1: int(parsed[1])}
+    raise ValueError(
+        "mooncake_dsa_raw_token_dims must be a dict, list, or "
+        "'0:latent,1:indexer' string"
+    )
+
+
+def _first_int_from_nested(config_dict: dict[str, Any], names: set[str]) -> int | None:
+    stack: list[Any] = [config_dict]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                if key in names and isinstance(value, int):
+                    return value
+                if isinstance(value, (dict, list, tuple)):
+                    stack.append(value)
+        elif isinstance(current, (list, tuple)):
+            stack.extend(current)
+    return None
+
+
+def _load_model_config_for_dsa_dims(
+    metadata: LMCacheMetadata,
+) -> tuple[dict[str, Any], str]:
+    model_name = getattr(metadata, "model_name", "")
+    if not model_name:
+        return {}, "metadata.model_name unavailable"
+    config_path = os.path.join(model_name, "config.json")
+    if not os.path.isfile(config_path):
+        return {}, f"{config_path} unavailable"
+    try:
+        with open(config_path, encoding="utf-8") as stream:
+            loaded = json.load(stream)
+    except Exception as exc:
+        return {}, f"{config_path} load failed: {exc}"
+    if not isinstance(loaded, dict):
+        return {}, f"{config_path} is not a JSON object"
+    return loaded, config_path
+
+
+def _infer_dsa_raw_token_dims(
+    config: LMCacheEngineConfig,
+    metadata: LMCacheMetadata,
+) -> tuple[dict[int, int], str]:
+    if not config.dsa_two_groups:
+        return {}, "dsa_two_groups disabled"
+
+    inferred: dict[int, int] = {}
+    shapes = metadata.get_shapes()
+    if metadata.use_mla and shapes:
+        for kv_group, shape in enumerate(shapes[:2]):
+            if len(shape) >= 1:
+                inferred[kv_group] = int(shape[-1])
+
+    model_config, source = _load_model_config_for_dsa_dims(metadata)
+    if not model_config:
+        return inferred, source if inferred else "no inferable local metadata"
+
+    kv_lora_rank = _first_int_from_nested(
+        model_config,
+        {"kv_lora_rank", "k_head_dim", "k_hidden_dims"},
+    )
+    qk_rope_head_dim = _first_int_from_nested(
+        model_config,
+        {"qk_rope_head_dim", "rope_head_dim", "v_head_dim"},
+    )
+    dsa_head_dim = _first_int_from_nested(
+        model_config,
+        {
+            "dsa_head_dim",
+            "dsa_hidden_dim",
+            "dsa_hidden_dims",
+            "index_head_dim",
+            "indexer_head_dim",
+        },
+    )
+    if dsa_head_dim is None:
+        dsa_head_dim = _first_int_from_nested(
+            model_config,
+            {"head_dim", "hidden_size_per_attention_head"},
+        )
+    if kv_lora_rank is not None and qk_rope_head_dim is not None:
+        inferred[0] = kv_lora_rank + qk_rope_head_dim
+    if dsa_head_dim is not None:
+        inferred[1] = dsa_head_dim
+    return inferred, source
+
+
+def resolve_mooncake_dsa_raw_token_dims(
+    config: LMCacheEngineConfig,
+    metadata: LMCacheMetadata,
+) -> tuple[dict[int, int], str]:
+    """Resolve the immutable per-token widths for both DSA cache groups.
+
+    Explicit configuration remains an override for unusual model layouts. The
+    normal path derives dimensions from model metadata at startup so Mooncake
+    persistence and RemoteFill negotiate one identical payload identity.
+
+    Args:
+        config: Resolved LMCache engine configuration.
+        metadata: Model and cache topology metadata.
+
+    Returns:
+        A mapping from cache group to raw elements per token and a diagnostic
+        description of the source used for the mapping.
+    """
+
+    if not config.dsa_two_groups:
+        return {}, "dsa_two_groups disabled"
+
+    override = (config.extra_config or {}).get("mooncake_dsa_raw_token_dims")
+    if override is not None:
+        return (
+            _parse_dsa_raw_token_dims(override),
+            "extra_config.mooncake_dsa_raw_token_dims",
+        )
+
+    inferred, source = _infer_dsa_raw_token_dims(config, metadata)
+    if inferred.get(0, 0) > 0 and inferred.get(1, 0) > 0:
+        return inferred, f"model config inference: {source}"
+
+    model_name = getattr(metadata, "model_name", "")
+    world_size = getattr(metadata, "world_size", None)
+    if "GLM-5.1-w4a8" in model_name and world_size == 8:
+        return {0: 576, 1: 128}, "hardcoded GLM-5.1-w4a8 TP8"
+    return {}, "no raw DSA dims rule matched"
+
+
 def _update_sampled_file_identity(digest: Any, path: Path) -> None:
     """Add bounded content evidence for one serving-bundle file."""
 
@@ -171,23 +311,15 @@ def mooncake_payload_layout(
             ).hexdigest()
     except (OSError, TypeError, ValueError):
         pass
-    raw_token_dims = extra_config.get("mooncake_dsa_raw_token_dims", "")
-    if isinstance(raw_token_dims, dict):
-        raw_token_dims = tuple(
-            sorted((str(key), int(value)) for key, value in raw_token_dims.items())
-        )
-    elif isinstance(raw_token_dims, (list, tuple)):
-        raw_token_dims = tuple(int(value) for value in raw_token_dims)
-    else:
-        raw_token_dims = str(raw_token_dims)
-    normalized_dims: dict[str, int] = {}
-    if isinstance(raw_token_dims, tuple):
-        if raw_token_dims and isinstance(raw_token_dims[0], tuple):
-            normalized_dims = {str(key): int(value) for key, value in raw_token_dims}
-        else:
-            normalized_dims = {
-                str(index): int(value) for index, value in enumerate(raw_token_dims)
-            }
+    resolved_dims, _dims_source = resolve_mooncake_dsa_raw_token_dims(
+        config, metadata
+    )
+    normalized_dims = {
+        str(key): int(dimension) for key, dimension in resolved_dims.items()
+    }
+    raw_token_dims: str | tuple[tuple[str, int], ...] = (
+        tuple(sorted(normalized_dims.items())) if normalized_dims else ""
+    )
     deployment_namespace, model_artifact_id = resolve_remote_fill_identity(
         config, metadata
     )

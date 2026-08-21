@@ -35,6 +35,7 @@ from lmcache.v1.mooncake_layout import (
     mooncake_layer_pages_enabled,
     mooncake_page_key,
     mooncake_valid_tokens,
+    resolve_mooncake_dsa_raw_token_dims,
 )
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.remote_fill.protocol import DestinationPageDescriptor
@@ -780,140 +781,11 @@ class MooncakestoreConnector(RemoteConnector):
         logger.info("MooncakeConnector initialized successfully.")
 
     @staticmethod
-    def _parse_dsa_raw_token_dims(value: Any) -> dict[int, int]:
-        if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-            except json.JSONDecodeError:
-                parsed = dict(item.split(":", 1) for item in value.split(",") if item)
-        else:
-            parsed = value
-        if isinstance(parsed, dict):
-            return {int(k): int(v) for k, v in parsed.items()}
-        if isinstance(parsed, (list, tuple)) and len(parsed) >= 2:
-            return {0: int(parsed[0]), 1: int(parsed[1])}
-        raise ValueError(
-            "mooncake_dsa_raw_token_dims must be a dict, list, or "
-            "'0:latent,1:indexer' string"
-        )
-
-    @staticmethod
-    def _first_int_from_nested(
-        config_dict: dict[str, Any], names: set[str]
-    ) -> int | None:
-        stack: list[Any] = [config_dict]
-        while stack:
-            current = stack.pop()
-            if isinstance(current, dict):
-                for key, value in current.items():
-                    if key in names and isinstance(value, int):
-                        return value
-                    if isinstance(value, (dict, list, tuple)):
-                        stack.append(value)
-            elif isinstance(current, (list, tuple)):
-                stack.extend(current)
-        return None
-
-    @staticmethod
-    def _load_model_config_for_dsa_dims(metadata) -> tuple[dict[str, Any], str]:
-        model_name = getattr(metadata, "model_name", "")
-        if not model_name:
-            return {}, "metadata.model_name unavailable"
-        config_path = os.path.join(model_name, "config.json")
-        if not os.path.isfile(config_path):
-            return {}, f"{config_path} unavailable"
-        try:
-            with open(config_path, encoding="utf-8") as fin:
-                loaded = json.load(fin)
-        except Exception as exc:
-            return {}, f"{config_path} load failed: {exc}"
-        if not isinstance(loaded, dict):
-            return {}, f"{config_path} is not a JSON object"
-        return loaded, config_path
-
-    @staticmethod
-    def _has_complete_dsa_raw_token_dims(dims: dict[int, int]) -> bool:
-        return dims.get(0, 0) > 0 and dims.get(1, 0) > 0
-
-    @classmethod
-    def _infer_dsa_raw_token_dims(
-        cls,
-        config: LMCacheEngineConfig,
-        metadata,
-    ) -> tuple[dict[int, int], str]:
-        if not getattr(config, "dsa_two_groups", False):
-            return {}, "dsa_two_groups disabled"
-
-        inferred: dict[int, int] = {}
-
-        shapes = getattr(metadata, "get_shapes", lambda: [])()
-        if getattr(metadata, "use_mla", False) and shapes:
-            shape0 = shapes[0]
-            if len(shape0) >= 1:
-                inferred[0] = int(shape0[-1])
-
-        model_config, source = cls._load_model_config_for_dsa_dims(metadata)
-        if not model_config:
-            return inferred, source if inferred else "no inferable local metadata"
-
-        kv_lora_rank = cls._first_int_from_nested(
-            model_config,
-            {"kv_lora_rank", "k_head_dim", "k_hidden_dims"},
-        )
-        qk_rope_head_dim = cls._first_int_from_nested(
-            model_config,
-            {"qk_rope_head_dim", "rope_head_dim", "v_head_dim"},
-        )
-        dsa_head_dim = cls._first_int_from_nested(
-            model_config,
-            {
-                "dsa_head_dim",
-                "dsa_hidden_dim",
-                "dsa_hidden_dims",
-                "index_head_dim",
-                "indexer_head_dim",
-            },
-        )
-        if dsa_head_dim is None:
-            dsa_head_dim = cls._first_int_from_nested(
-                model_config,
-                {"head_dim", "hidden_size_per_attention_head"},
-            )
-        if kv_lora_rank is not None and qk_rope_head_dim is not None:
-            inferred[0] = kv_lora_rank + qk_rope_head_dim
-        if dsa_head_dim is not None:
-            inferred[1] = dsa_head_dim
-        return inferred, source
-
-    @classmethod
     def _resolve_dsa_raw_token_dims(
-        cls,
         config: LMCacheEngineConfig,
         metadata,
     ) -> tuple[dict[int, int], str]:
-        if not getattr(config, "dsa_two_groups", False):
-            return {}, "dsa_two_groups disabled"
-
-        extra = config.extra_config or {}
-        override = extra.get("mooncake_dsa_raw_token_dims")
-        if override is not None:
-            return (
-                cls._parse_dsa_raw_token_dims(override),
-                "extra_config.mooncake_dsa_raw_token_dims",
-            )
-
-        inferred, source = cls._infer_dsa_raw_token_dims(config, metadata)
-        if cls._has_complete_dsa_raw_token_dims(inferred):
-            return inferred, f"model config inference: {source}"
-
-        model_name = getattr(metadata, "model_name", "")
-        world_size = getattr(metadata, "world_size", None)
-        if "GLM-5.1-w4a8" in model_name and world_size == 8:
-            # Last-resort shortcut for the current GLM DSA two-group layout:
-            # kv_group=0 latent payload is (k=512 + v=64) bf16 elements/token;
-            # kv_group=1 indexer payload is 128 bf16 elements/token.
-            return {0: 576, 1: 128}, "hardcoded GLM-5.1-w4a8 TP8"
-        return {}, "no raw DSA dims rule matched"
+        return resolve_mooncake_dsa_raw_token_dims(config, metadata)
 
     def _metadata_for_raw_key(
         self,

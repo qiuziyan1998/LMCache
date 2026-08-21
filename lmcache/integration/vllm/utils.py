@@ -128,6 +128,11 @@ def lmcache_get_or_create_config() -> LMCacheEngineConfig:
                             "Using local configuration only.",
                             remote_config_url,
                         )
+                # Constructors deliberately only parse values. Validate once
+                # after file, environment, and remote overrides are final so
+                # derived invariants are installed before TokenDatabase uses
+                # them to build cross-process cache identities.
+                _config_instance.validate()
     return _config_instance
 
 
