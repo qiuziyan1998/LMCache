@@ -293,14 +293,14 @@ def test_groups_from_different_persistent_tiers_do_not_form_a_hit() -> None:
     }
 
 
-def test_group1_lookup_error_releases_already_pinned_group0() -> None:
+def test_group1_lookup_error_releases_group0_and_recomputes(caplog) -> None:
     storage = _PairStorageManager()
     storage.page_results = {0: "RemoteBackend"}
     storage.page_errors = {1: RuntimeError("group1 lookup failed")}
     engine = _engine(storage)
 
-    with pytest.raises(RuntimeError, match="group1 lookup failed"):
-        engine.lookup(list(range(8)), lookup_id="req", pin=True)
+    with caplog.at_level(logging.ERROR):
+        assert engine.lookup(list(range(8)), lookup_id="req", pin=True) == 0
 
     assert "req" not in engine._remote_fill_lookup_plans
     assert engine.lookup_pins["req"] == {}
@@ -308,6 +308,8 @@ def test_group1_lookup_error_releases_already_pinned_group0() -> None:
     keys, locations = storage.unpinned[0]
     assert [key.kv_group for key in keys] == [0]
     assert locations == ["RemoteBackend"]
+    assert '"code":"RF-D-002"' in caplog.text
+    assert '"action":"RECOMPUTE"' in caplog.text
 
 
 def test_page_and_legacy_groups_share_one_persistent_chunk_plan() -> None:
@@ -402,6 +404,31 @@ def test_local_full_hint_records_eviction_and_remote_fallback(caplog) -> None:
     assert '"event":"remote_fill_actual_load"' in caplog.text
     assert '"event":"remote_fill_evicted_before_load"' in caplog.text
     assert '"remote_suffix":true' in caplog.text
+
+
+def test_local_full_hint_without_any_prefix_is_visible_and_recomputes(
+    caplog,
+) -> None:
+    storage = _PairStorageManager(local_pairs=0, remote_pairs=0)
+    engine = _engine(storage)
+
+    with caplog.at_level(logging.WARNING):
+        assert (
+            engine.lookup(
+                list(range(8)),
+                lookup_id="actual",
+                pin=True,
+                request_configs=_local_full_hint(),
+            )
+            == 0
+        )
+
+    snapshot = engine.remote_fill_actual_load_metrics_snapshot()
+    assert snapshot.retained_at_load_total == 0
+    assert snapshot.evicted_before_load_total == 1
+    assert snapshot.unexpected_remote_get_total == 0
+    assert '"code":"RF-D-001"' in caplog.text
+    assert '"action":"PERSISTENT_FALLBACK_OR_RECOMPUTE"' in caplog.text
 
 
 def test_rank0_materialization_failure_releases_pair_pins_and_recomputes() -> None:

@@ -79,6 +79,7 @@ from lmcache.v1.mooncake_layout import (
     mooncake_valid_tokens,
 )
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.remote_fill_diagnostics import log_remote_fill_validation_failure
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
     first_last_layer_keys,
@@ -2180,17 +2181,26 @@ class LMCacheEngine:
         required_store_end, destination_engine_epoch = hint
         plan = self._remote_fill_lookup_plans.get(lookup_id)
         if plan is None:
-            return
+            log_remote_fill_validation_failure(
+                logger,
+                code="RF-D-001",
+                stage="actual_load_admission",
+                action="PERSISTENT_FALLBACK_OR_RECOMPUTE",
+                req_id=lookup_id,
+                reason="LOCAL_FULL hint has no retained paired prefix",
+                severity="warning",
+            )
 
         common_local_end = 0
         unexpected_remote = False
-        for chunk in plan.chunks:
-            if chunk.start >= required_store_end:
-                break
-            if chunk.location != "LocalCPUBackend":
-                unexpected_remote = True
-                break
-            common_local_end = min(chunk.end, required_store_end)
+        if plan is not None:
+            for chunk in plan.chunks:
+                if chunk.start >= required_store_end:
+                    break
+                if chunk.location != "LocalCPUBackend":
+                    unexpected_remote = True
+                    break
+                common_local_end = min(chunk.end, required_store_end)
 
         retained = common_local_end >= required_store_end
         outcome = "retained_at_load" if retained else "evicted_before_load"
@@ -5968,20 +5978,21 @@ class LMCacheEngine:
                 for result in passive_retriever:
                     yielded_steps += 1
                     yield result
-            except _RemoteFillMaterializationError:
+            except _RemoteFillMaterializationError as exc:
                 if (
                     yielded_steps >= self.num_layers + 2
                     or not self._remote_fill_pair_lookup_enabled()
                     or self._remote_fill_local_full_hint(request_configs) is None
                 ):
                     raise
-                logger.warning(
-                    "RemoteFill passive-view load failed; returning an empty "
-                    "retrieval mask so the configured invalid-block policy "
-                    "recomputes the request: req_id=%s, kv_group=%s",
-                    req_id,
-                    kv_group,
-                    exc_info=True,
+                log_remote_fill_validation_failure(
+                    logger,
+                    code="RF-D-004",
+                    stage="passive_materialization",
+                    action="RECOMPUTE",
+                    req_id=req_id,
+                    reason=f"kv_group={kv_group}",
+                    error=exc,
                 )
                 yield from self._remote_fill_recompute_result(
                     ret_mask=ret_mask,
@@ -6027,14 +6038,14 @@ class LMCacheEngine:
                         details={"error": str(exc)},
                     )
                 )
-                logger.warning(
-                    "RemoteFill retained lookup plan failed validation; "
-                    "released paired lookup pins and returned an empty "
-                    "retrieval mask so the configured invalid-block policy "
-                    "recomputes the request: req_id=%s, kv_group=%s",
-                    req_id,
-                    kv_group,
-                    exc_info=True,
+                log_remote_fill_validation_failure(
+                    logger,
+                    code="RF-D-003",
+                    stage="retained_plan_validation",
+                    action="RECOMPUTE",
+                    req_id=req_id,
+                    reason=f"kv_group={kv_group}",
+                    error=exc,
                 )
                 yield from self._remote_fill_recompute_result(
                     ret_mask=ret_mask,
@@ -6238,21 +6249,21 @@ class LMCacheEngine:
                 for result in rank0_retriever:
                     yielded_steps += 1
                     yield result
-            except _RemoteFillMaterializationError:
+            except _RemoteFillMaterializationError as exc:
                 if (
                     remote_fill_plan is None
                     or yielded_steps >= self.num_layers + 2
                 ):
                     raise
                 self.lookup_unpin(req_id)
-                logger.warning(
-                    "RemoteFill retained decoder load failed; released paired "
-                    "lookup pins and returned an empty retrieval mask so the "
-                    "configured invalid-block policy recomputes the request: "
-                    "req_id=%s, kv_group=%s",
-                    req_id,
-                    kv_group,
-                    exc_info=True,
+                log_remote_fill_validation_failure(
+                    logger,
+                    code="RF-D-004",
+                    stage="rank0_materialization",
+                    action="RECOMPUTE",
+                    req_id=req_id,
+                    reason=f"kv_group={kv_group}",
+                    error=exc,
                 )
                 yield from self._remote_fill_recompute_result(
                     ret_mask=ret_mask,
@@ -6539,13 +6550,26 @@ class LMCacheEngine:
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
                     chunks.append((start, end, key))
-                res = self._lookup_remote_fill_two_group_prefix(
-                    chunks,
-                    search_range=search_range,
-                    lookup_id=lookup_id,
-                    pin=pin,
-                    request_configs=request_configs,
-                )
+                try:
+                    res = self._lookup_remote_fill_two_group_prefix(
+                        chunks,
+                        search_range=search_range,
+                        lookup_id=lookup_id,
+                        pin=pin,
+                        request_configs=request_configs,
+                    )
+                except Exception as exc:
+                    if lookup_id is not None:
+                        self._release_lookup_pins(lookup_id)
+                    log_remote_fill_validation_failure(
+                        logger,
+                        code="RF-D-002",
+                        stage="paired_prefix_lookup",
+                        action="RECOMPUTE",
+                        req_id=lookup_id,
+                        error=exc,
+                    )
+                    res = 0
                 if pin:
                     self._record_remote_fill_actual_load(
                         request_configs=request_configs,

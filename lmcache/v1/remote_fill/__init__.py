@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Remote direct-fill control protocol and hardware-independent state core."""
 
+# First Party
+from lmcache.v1.remote_fill_diagnostics import (
+    REMOTE_FILL_VALIDATION_MARKER,
+    log_remote_fill_validation_failure,
+)
+
 # Local
 from .codec import (
     ProtocolValidationError,
@@ -84,6 +90,7 @@ __all__ = [
     "PROTOCOL_VERSION",
     "REMOTE_FILL_ENVELOPE_VERSION",
     "REMOTE_FILL_SERVICE_HEADER",
+    "REMOTE_FILL_VALIDATION_MARKER",
     "AbortRequest",
     "AllocatedPage",
     "ArmWindowRequest",
@@ -140,6 +147,7 @@ __all__ = [
     "encode_request",
     "encode_response",
     "manifest_digest",
+    "log_remote_fill_validation_failure",
     "request_payload_digest",
     "seal_descriptor",
     "seal_request",
