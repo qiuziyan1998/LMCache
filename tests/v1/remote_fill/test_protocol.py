@@ -234,7 +234,7 @@ def test_descriptor_hmac_and_set_digest_cover_noncontiguous_pages(harness) -> No
     pointers = [descriptor.destination_ptr for descriptor in response.descriptors]
     assert len(set(pointers)) == 8
     assert all(
-        verify_descriptor(b"test deployment secret", descriptor)
+        verify_descriptor(b"test descriptor verification key", descriptor)
         for descriptor in response.descriptors
     )
     assert (
@@ -245,7 +245,7 @@ def test_descriptor_hmac_and_set_digest_cover_noncontiguous_pages(harness) -> No
         response.descriptors[0],
         destination_length=response.descriptors[0].destination_length + 1,
     )
-    assert not verify_descriptor(b"test deployment secret", changed)
+    assert not verify_descriptor(b"test descriptor verification key", changed)
 
 
 def test_response_descriptor_digest_detects_pointer_mutation(harness) -> None:

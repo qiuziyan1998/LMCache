@@ -389,7 +389,7 @@ def harness() -> Harness:
     state = RemoteFillStateCore(
         destination_engine_epoch=7,
         shared_cache_generation=11,
-        deployment_secret=b"test deployment secret",
+        descriptor_verification_key=b"test descriptor verification key",
         negotiation=negotiation,
         page_lifecycle=lifecycle,
         limits=limits,

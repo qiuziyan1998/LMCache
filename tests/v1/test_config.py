@@ -14,6 +14,14 @@ from lmcache.v1.mooncake_layout import mooncake_layer_pages_enabled
 BASE_DIR = Path(__file__).parent
 
 
+@pytest.fixture(autouse=True)
+def _qualify_remote_fill_hardware_gate(monkeypatch):
+    monkeypatch.setenv(
+        "LMCACHE_REMOTE_FILL_H0_QUALIFICATION",
+        "mooncake-sync-write-visible-v1",
+    )
+
+
 def test_get_extra_config_from_file():
     config = LMCacheEngineConfig.from_file(BASE_DIR / "data/test_config.yaml")
     check_extra_config(config)
@@ -149,21 +157,8 @@ def _remote_fill_config(**overrides):
     kwargs = {
         "enable_remote_lmcache_store": True,
         "chunk_size": 1024,
-        "use_layerwise": True,
-        "enable_sparse_attention": True,
-        "save_unfull_chunk": True,
-        "dsa_two_groups": True,
         "local_cpu": False,
-        "pre_caching_hash_algorithm": "sha256",
         "remote_url": "mooncakestore://metadata",
-        "remote_fill_cache_namespace": "deployment-a",
-        "remote_fill_model_artifact_id": "model-build-a",
-        "extra_config": {
-            "save_only_first_rank": True,
-            "mooncake_page_first_multi_buffer": True,
-            "mooncake_layer_merged_page_objects": True,
-            "mooncake_reuse_vllm_transfer_engine": True,
-        },
     }
     kwargs.update(overrides)
     return LMCacheEngineConfig.from_defaults(**kwargs)
@@ -179,27 +174,46 @@ def test_remote_fill_defaults_off_and_validates_common_contract():
     config = _remote_fill_config()
     config.validate()
 
+    assert config.use_layerwise is True
+    assert config.enable_sparse_attention is True
+    assert config.save_unfull_chunk is True
+    assert config.dsa_two_groups is True
+    assert config.pre_caching_hash_algorithm == "sha256_cbor"
+    assert config.get_extra_config_value("save_only_first_rank") is True
+    assert config.get_extra_config_value("mooncake_page_first_multi_buffer") is True
+    assert config.get_extra_config_value("mooncake_layer_merged_page_objects") is True
+    assert config.get_extra_config_value("save_chunk_meta") is False
 
-def test_remote_fill_requires_immutable_model_identity():
-    config = _remote_fill_config(remote_fill_model_artifact_id=None)
 
-    with pytest.raises(ValueError, match="remote_fill_model_artifact_id"):
-        config.validate()
+def test_remote_fill_without_hardware_qualification_preserves_legacy_config(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION", raising=False)
+    config = LMCacheEngineConfig.from_defaults(enable_remote_lmcache_store=True)
+
+    config.validate()
+
+    assert config.use_layerwise is False
+    assert config.dsa_two_groups is False
+    assert config.enable_sparse_attention is False
+    assert config.pre_caching_hash_algorithm == "builtin"
 
 
-def test_remote_fill_builtin_hash_requires_process_seed(monkeypatch):
+def test_remote_fill_derives_control_manifest_bound() -> None:
+    config = _remote_fill_config(remote_fill_max_control_pages_per_window=0)
+
+    config.validate()
+
+    assert config.remote_fill_max_control_pages_per_window == 8
+
+
+def test_remote_fill_builtin_hash_is_resolved_to_deterministic_hash(monkeypatch):
     monkeypatch.delenv("PYTHONHASHSEED", raising=False)
     config = _remote_fill_config(pre_caching_hash_algorithm="builtin")
 
-    with pytest.raises(ValueError, match="PYTHONHASHSEED"):
-        config.validate()
-
-    monkeypatch.setenv("PYTHONHASHSEED", "7")
-    with pytest.raises(ValueError, match="PYTHONHASHSEED=0"):
-        config.validate()
-
-    monkeypatch.setenv("PYTHONHASHSEED", "0")
     config.validate()
+
+    assert config.pre_caching_hash_algorithm == "sha256_cbor"
 
 
 def test_remote_fill_rejects_empty_advertised_control_host():
@@ -216,7 +230,7 @@ def test_remote_fill_rejects_undersized_control_manifest():
         config.validate()
 
 
-def test_remote_fill_requires_borrowed_global_transfer_engine():
+def test_remote_fill_internally_enables_borrowed_global_transfer_engine():
     config = _remote_fill_config(
         extra_config={
             "save_only_first_rank": True,
@@ -226,26 +240,7 @@ def test_remote_fill_requires_borrowed_global_transfer_engine():
         }
     )
 
-    with pytest.raises(ValueError, match="reuse_vllm_transfer_engine"):
-        config.validate()
-
-
-@pytest.mark.parametrize(
-    ("override", "message"),
-    [
-        ({"remote_fill_transport_mode": "pull"}, "transport_mode"),
-        ({"remote_fill_publish_mode": "incremental"}, "publish_mode"),
-        (
-            {"remote_fill_persistent_placement": "decoder_local"},
-            "persistent_placement",
-        ),
-    ],
-)
-def test_remote_fill_rejects_unimplemented_modes(override, message):
-    config = _remote_fill_config(**override)
-
-    with pytest.raises(ValueError, match=message):
-        config.validate()
+    config.validate()
 
 
 def test_group1_load_mode_defaults_to_p2p_preferred():

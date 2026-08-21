@@ -3,6 +3,7 @@
 from concurrent.futures import Future, TimeoutError
 from typing import Any, Callable, List, Optional, Sequence, Set
 import asyncio
+import os
 import threading
 import time
 
@@ -14,6 +15,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.exceptions import IrrecoverableException
 from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.remote_fill.native import DIRECT_PUSH_H0_QUALIFICATION_V1
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.connector import CreateConnector
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
@@ -232,9 +234,27 @@ class RemoteBackend(StorageBackendInterface):
 
     def requires_put_completion(self) -> bool:
         return (
-            self.connection is not None
-            and self.connection.requires_put_completion()
+            self._remote_fill_completion_required()
+            or (
+                self.connection is not None
+                and self.connection.requires_put_completion()
+            )
         )
+
+    def _remote_fill_completion_required(self) -> bool:
+        return bool(
+            self.config.enable_remote_lmcache_store
+            and os.getenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION")
+            == DIRECT_PUSH_H0_QUALIFICATION_V1
+        )
+
+    @staticmethod
+    def _connection_unavailable_future() -> Future:
+        future: Future = Future()
+        future.set_exception(
+            ConnectionError("required remote storage connection is unavailable")
+        )
+        return future
 
     def put_callback(self, future: Future, key: CacheEngineKey):
         with self.lock:
@@ -254,8 +274,9 @@ class RemoteBackend(StorageBackendInterface):
         """
         Submit a put task to store KV cache to remote storage asynchronously.
 
-        :param on_complete_callback: Optional callback invoked after the remote
-            write completes. Callback exceptions are caught and logged.
+        :param on_complete_callback: Optional terminal-notification callback.
+            It runs after success or failure; callers requiring durability must
+            inspect/wait the returned future. Callback exceptions are logged.
         """
 
         def create_immediate_empty_future() -> Future:
@@ -264,7 +285,12 @@ class RemoteBackend(StorageBackendInterface):
             return f
 
         if self.connection is None:
-            logger.warning("Connection is None in submit_put_task, returning None")
+            if self._remote_fill_completion_required():
+                logger.error(
+                    "Required remote store rejected because the connection is absent"
+                )
+                return self._connection_unavailable_future()
+            logger.warning("Connection is None in submit_put_task, returning success")
             return create_immediate_empty_future()
 
         # If MLA worker id as 0 mode is enabled, skip put tasks
@@ -372,10 +398,17 @@ class RemoteBackend(StorageBackendInterface):
         """
         Submit batched put tasks to store KV caches to remote storage.
 
-        :param on_complete_callback: Optional callback invoked once per key
-            after that key's write completes (not once per batch).
+        :param on_complete_callback: Optional terminal-notification callback
+            invoked once per key after success or failure (not once per batch).
+            Durability-sensitive callers must inspect/wait returned futures.
         """
         if self.connection is None:
+            if self._remote_fill_completion_required():
+                logger.error(
+                    "Required batched remote store rejected because the connection "
+                    "is absent"
+                )
+                return [self._connection_unavailable_future() for _ in keys]
             logger.warning(
                 "Connection is None in batched_submit_put_task, returning None"
             )

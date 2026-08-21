@@ -142,6 +142,68 @@ def test_payload_v3_identity_includes_remote_fill_abi() -> None:
     assert other_signature != signature
 
 
+def test_payload_v3_automatically_fingerprints_serving_bundle(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv(
+        "LMCACHE_REMOTE_FILL_H0_QUALIFICATION",
+        "mooncake-sync-write-visible-v1",
+    )
+    first_model = tmp_path / "model-a"
+    second_model = tmp_path / "model-b"
+    first_model.mkdir()
+    second_model.mkdir()
+    (first_model / "config.json").write_text('{"model_type":"test"}')
+    (second_model / "config.json").write_text('{"model_type":"test"}')
+    (first_model / "model.safetensors").write_bytes(b"first-weights")
+    (second_model / "model.safetensors").write_bytes(b"second-weights")
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=1024, backend="cpu")
+    cfg.enable_remote_lmcache_store = True
+
+    first_signature, first_descriptor = mooncake_payload_layout(
+        cfg, dumb_metadata_with_model_name(str(first_model))
+    )
+    repeated_signature, repeated_descriptor = mooncake_payload_layout(
+        cfg, dumb_metadata_with_model_name(str(first_model))
+    )
+    second_signature, second_descriptor = mooncake_payload_layout(
+        cfg, dumb_metadata_with_model_name(str(second_model))
+    )
+
+    assert first_signature == repeated_signature
+    assert first_descriptor["model_artifact_id"] == repeated_descriptor[
+        "model_artifact_id"
+    ]
+    assert first_descriptor["deployment_namespace"].startswith("remote-fill-")
+    assert first_descriptor["model_artifact_id"].startswith(
+        "auto-sampled-serving-bundle-v1-"
+    )
+    assert first_signature != second_signature
+    assert first_descriptor["model_artifact_id"] != second_descriptor[
+        "model_artifact_id"
+    ]
+
+
+def test_payload_v3_disabled_path_does_not_walk_serving_bundle(
+    monkeypatch,
+) -> None:
+    # Local import lets the test replace the startup-only walker itself.
+    from lmcache.v1 import mooncake_layout
+
+    monkeypatch.delenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION", raising=False)
+    monkeypatch.setattr(
+        mooncake_layout,
+        "_derive_remote_fill_artifact_id",
+        lambda *_args: pytest.fail("disabled path walked the serving bundle"),
+    )
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=1024, backend="cpu")
+
+    _, descriptor = mooncake_payload_layout(cfg, dumb_metadata())
+
+    assert descriptor["deployment_namespace"] == ""
+    assert descriptor["model_artifact_id"] == ""
+
+
 @pytest.mark.parametrize("chunk_size", [256, 512, 1024])
 @pytest.mark.parametrize("length", [1, 255, 256, 257, 511, 512, 513])
 def test_partial_page_keys_encode_only_tail_length(

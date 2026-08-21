@@ -1001,7 +1001,7 @@ def test_state_requires_positive_engine_epoch_and_limits(harness) -> None:
 
     kwargs = {
         "shared_cache_generation": 11,
-        "deployment_secret": b"secret",
+        "descriptor_verification_key": b"secret",
         "negotiation": harness.negotiation,
         "page_lifecycle": harness.lifecycle,
         "clock": harness.clock,

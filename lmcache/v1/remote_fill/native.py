@@ -46,6 +46,7 @@ class NativeDirectPushResult:
     transferred_bytes: int
     elapsed_ms: float
     source_event_wait_ms: float = 0.0
+    source_fences_ready_monotonic: float = 0.0
     source_registration_ms: float = 0.0
     native_slot_wait_ms: float = 0.0
     native_started_monotonic: float = 0.0

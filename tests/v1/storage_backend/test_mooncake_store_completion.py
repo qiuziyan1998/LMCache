@@ -406,8 +406,15 @@ def _layer_key(chunk_hash: int, layer_id: int) -> LayerCacheEngineKey:
     )
 
 
-def _make_remote_backend(requires_completion: bool) -> RemoteBackend:
+def _make_remote_backend(
+    requires_completion: bool,
+    *,
+    remote_fill_enabled: bool = False,
+) -> RemoteBackend:
     backend = object.__new__(RemoteBackend)
+    backend.config = SimpleNamespace(
+        enable_remote_lmcache_store=remote_fill_enabled,
+    )
     backend.connection = _Connection(requires_completion)
     backend.loop = object()
     backend.serializer = _Serializer()
@@ -417,6 +424,36 @@ def _make_remote_backend(requires_completion: bool) -> RemoteBackend:
     backend._single_put_callbacks = {}
     backend.lock = threading.Lock()
     return backend
+
+
+def test_remote_fill_missing_connection_fails_required_puts(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "LMCACHE_REMOTE_FILL_H0_QUALIFICATION",
+        "mooncake-sync-write-visible-v1",
+    )
+    backend = _make_remote_backend(True, remote_fill_enabled=True)
+    backend.connection = None
+
+    single = backend.submit_put_task(_key(1), _MemoryObj())
+    batch = backend.batched_submit_put_task([_key(2)], [_MemoryObj()])
+
+    with pytest.raises(ConnectionError, match="required remote storage"):
+        single.result()
+    assert batch is not None
+    with pytest.raises(ConnectionError, match="required remote storage"):
+        batch[0].result()
+
+
+def test_legacy_missing_connection_remains_best_effort(monkeypatch) -> None:
+    monkeypatch.delenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION", raising=False)
+    backend = _make_remote_backend(False, remote_fill_enabled=True)
+    backend.connection = None
+
+    single = backend.submit_put_task(_key(1), _MemoryObj())
+    batch = backend.batched_submit_put_task([_key(2)], [_MemoryObj()])
+
+    assert single.result() is None
+    assert batch is None
 
 
 @pytest.mark.parametrize("partial", [False, True])

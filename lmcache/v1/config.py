@@ -28,6 +28,8 @@ from lmcache.v1.config_base import (
 )
 
 logger = init_logger(__name__)
+_REMOTE_FILL_H0_QUALIFICATION_ENV = "LMCACHE_REMOTE_FILL_H0_QUALIFICATION"
+_REMOTE_FILL_H0_QUALIFICATION_V1 = "mooncake-sync-write-visible-v1"
 
 
 # Configuration aliases and deprecated mappings
@@ -60,6 +62,20 @@ _DEPRECATED_CONFIGS = {
         "save_indexer_only_first_rank is deprecated; use "
         "extra_config.save_only_first_rank to control both MLA latent and "
         "DSA index first-rank storage policy"
+    ),
+    "remote_fill_transport_mode": (
+        "remote_fill_transport_mode is internal and ignored"
+    ),
+    "remote_fill_publish_mode": "remote_fill_publish_mode is internal and ignored",
+    "remote_fill_require_both_groups": (
+        "remote_fill_require_both_groups is internal and ignored"
+    ),
+    "remote_fill_persistent_placement": (
+        "remote_fill_persistent_placement is internal and ignored"
+    ),
+    "remote_fill_allow_evict": "remote_fill_allow_evict is internal and ignored",
+    "remote_fill_busy_loop_alloc": (
+        "remote_fill_busy_loop_alloc is internal and ignored"
     ),
 }
 
@@ -234,21 +250,6 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
-    "remote_fill_transport_mode": {
-        "type": str,
-        "default": "global_te_push",
-        "env_converter": str,
-    },
-    "remote_fill_publish_mode": {
-        "type": str,
-        "default": "final_only",
-        "env_converter": str,
-    },
-    "remote_fill_require_both_groups": {
-        "type": bool,
-        "default": True,
-        "env_converter": _to_bool,
-    },
     "remote_fill_cache_namespace": {
         "type": str,
         "default": "",
@@ -258,21 +259,6 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "type": Optional[str],
         "default": None,
         "env_converter": str,
-    },
-    "remote_fill_persistent_placement": {
-        "type": str,
-        "default": "prefiller_local_preferred",
-        "env_converter": str,
-    },
-    "remote_fill_allow_evict": {
-        "type": bool,
-        "default": False,
-        "env_converter": _to_bool,
-    },
-    "remote_fill_busy_loop_alloc": {
-        "type": bool,
-        "default": False,
-        "env_converter": _to_bool,
     },
     "remote_fill_max_active_transactions": {
         "type": int,
@@ -326,7 +312,8 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "remote_fill_max_control_pages_per_window": {
         "type": int,
-        "default": 8,
+        # Zero derives the exact two-group bound from window/chunk size.
+        "default": 0,
         "env_converter": int,
     },
     "remote_fill_max_rpc_message_bytes": {
@@ -908,48 +895,31 @@ def _validate_config(self):
                 + shared_cpu_config_context
             )
 
-    if self.enable_remote_lmcache_store:
-        if self.remote_fill_transport_mode != "global_te_push":
-            raise ValueError(
-                "remote_fill_transport_mode currently supports only 'global_te_push'"
-            )
-        if self.remote_fill_publish_mode != "final_only":
-            raise ValueError(
-                "remote_fill_publish_mode currently supports only 'final_only'"
-            )
-        if self.remote_fill_persistent_placement != "prefiller_local_preferred":
-            raise ValueError(
-                "remote_fill_persistent_placement currently supports only "
-                "'prefiller_local_preferred'"
-            )
-        if not self.remote_fill_require_both_groups:
-            raise ValueError(
-                "enable_remote_lmcache_store requires "
-                "remote_fill_require_both_groups=true"
-            )
-        if self.remote_fill_allow_evict or self.remote_fill_busy_loop_alloc:
-            raise ValueError(
-                "remote fill requires nonblocking allocation with "
-                "remote_fill_allow_evict=false and "
-                "remote_fill_busy_loop_alloc=false"
-            )
+    remote_fill_active = bool(
+        self.enable_remote_lmcache_store
+        and os.getenv(_REMOTE_FILL_H0_QUALIFICATION_ENV)
+        == _REMOTE_FILL_H0_QUALIFICATION_V1
+    )
+    if remote_fill_active:
+        # These are invariants of the only implemented RemoteFill protocol,
+        # not deployment choices: layerwise DSA two-group pages, immutable
+        # final-only publication, non-evicting reservations, and prefiller-
+        # local persistence.  Enabling the feature selects that contract.
+        self.use_layerwise = True
+        self.dsa_two_groups = True
+        self.enable_sparse_attention = True
+        self.save_unfull_chunk = True
+        extra_config = dict(extra_config)
+        extra_config.update(
+            {
+                "save_only_first_rank": True,
+                "mooncake_page_first_multi_buffer": True,
+                "mooncake_layer_merged_page_objects": True,
+                "save_chunk_meta": False,
+            }
+        )
+        self.extra_config = extra_config
         required_remote_fill = {
-            "use_layerwise": self.use_layerwise,
-            "dsa_two_groups": self.dsa_two_groups,
-            "enable_sparse_attention": self.enable_sparse_attention,
-            "save_unfull_chunk": self.save_unfull_chunk,
-            "extra_config.save_only_first_rank": bool(
-                extra_config.get("save_only_first_rank", False)
-            ),
-            "extra_config.mooncake_page_first_multi_buffer": bool(
-                extra_config.get("mooncake_page_first_multi_buffer", False)
-            ),
-            "extra_config.mooncake_layer_merged_page_objects": bool(
-                extra_config.get("mooncake_layer_merged_page_objects", False)
-            ),
-            "extra_config.mooncake_reuse_vllm_transfer_engine": bool(
-                extra_config.get("mooncake_reuse_vllm_transfer_engine", False)
-            ),
             "remote_url=mooncakestore://...": str(self.remote_url).startswith(
                 "mooncakestore://"
             ),
@@ -961,26 +931,11 @@ def _validate_config(self):
             raise ValueError(
                 "enable_remote_lmcache_store requires " + ", ".join(missing_remote_fill)
             )
-        if not self.remote_fill_cache_namespace.strip():
-            raise ValueError(
-                "enable_remote_lmcache_store requires a non-empty "
-                "remote_fill_cache_namespace"
-            )
-        artifact_id = self.remote_fill_model_artifact_id
-        if artifact_id is None or not artifact_id.strip():
-            raise ValueError(
-                "enable_remote_lmcache_store requires an immutable "
-                "remote_fill_model_artifact_id for the complete serving bundle "
-                "(weights, quantization, tokenizer, and custom model code)"
-            )
-        if (
-            self.pre_caching_hash_algorithm == "builtin"
-            and os.getenv("PYTHONHASHSEED") != "0"
-        ):
-            raise ValueError(
-                "enable_remote_lmcache_store with builtin token hashing "
-                "requires PYTHONHASHSEED=0"
-            )
+        if self.pre_caching_hash_algorithm == "builtin":
+            # RemoteFill always crosses process/host boundaries. Select the
+            # existing deterministic vLLM hash instead of requiring operators
+            # to configure Python's process-global hash seed before startup.
+            self.pre_caching_hash_algorithm = "sha256_cbor"
         if self.remote_fill_window_tokens <= 0 or (
             self.remote_fill_window_tokens % self.chunk_size
         ):
@@ -988,7 +943,9 @@ def _validate_config(self):
                 "remote_fill_window_tokens must be a positive multiple of chunk_size"
             )
         required_control_pages = (self.remote_fill_window_tokens // self.chunk_size) * 2
-        if self.remote_fill_max_control_pages_per_window < required_control_pages:
+        if self.remote_fill_max_control_pages_per_window == 0:
+            self.remote_fill_max_control_pages_per_window = required_control_pages
+        elif self.remote_fill_max_control_pages_per_window < required_control_pages:
             raise ValueError(
                 "remote_fill_max_control_pages_per_window is too small for one "
                 "two-group window"

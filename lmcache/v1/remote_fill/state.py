@@ -303,7 +303,7 @@ class RemoteFillStateCore:
         *,
         destination_engine_epoch: int,
         shared_cache_generation: int,
-        deployment_secret: bytes,
+        descriptor_verification_key: bytes,
         negotiation: NegotiationSpec,
         page_lifecycle: PageLifecycle,
         limits: ProtocolLimits | None = None,
@@ -319,7 +319,8 @@ class RemoteFillStateCore:
         Args:
             destination_engine_epoch: Epoch changed on each decoder restart.
             shared_cache_generation: Generation of the registered shared pool.
-            deployment_secret: HMAC secret shared only within the deployment.
+            descriptor_verification_key: Decoder-incarnation key used only to
+                authenticate destination descriptors to the selected prefiller.
             negotiation: Exact static layout expected from prefiller peers.
             page_lifecycle: Decoder-owned opaque page callback.
             limits: Protocol bounds, or defaults when omitted.
@@ -338,8 +339,8 @@ class RemoteFillStateCore:
 
         if destination_engine_epoch <= 0 or shared_cache_generation < 0:
             raise ValueError("engine epoch must be positive; generation nonnegative")
-        if not deployment_secret:
-            raise ValueError("deployment_secret must not be empty")
+        if not descriptor_verification_key:
+            raise ValueError("descriptor_verification_key must not be empty")
         self._validate_negotiation_spec(negotiation)
         descriptor_ttl = (
             reservation_ttl_sec
@@ -357,7 +358,7 @@ class RemoteFillStateCore:
         self.shared_cache_generation = shared_cache_generation
         self.limits = limits or ProtocolLimits()
         self._validate_limits(self.limits)
-        self._secret = deployment_secret
+        self._descriptor_verification_key = descriptor_verification_key
         self._negotiation = negotiation
         self._lifecycle = page_lifecycle
         self._reservation_ttl_sec = reservation_ttl_sec
@@ -1131,7 +1132,7 @@ class RemoteFillStateCore:
             if prepared.disposition is PageDisposition.ALLOCATED:
                 descriptors.append(
                     seal_descriptor(
-                        self._secret,
+                        self._descriptor_verification_key,
                         DestinationPageDescriptor(
                             canonical_key=page.canonical_key,
                             chunk_index=page.chunk_index,

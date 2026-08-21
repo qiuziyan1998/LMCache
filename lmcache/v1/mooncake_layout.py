@@ -4,6 +4,9 @@
 import hashlib
 import json
 import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
 # First Party
 from lmcache.utils import CacheEngineKey
@@ -14,6 +17,99 @@ from lmcache.v1.metadata import LMCacheMetadata
 MOONCAKE_PAYLOAD_LAYOUT_TAG = "lmcache.tag.payload_v3"
 MOONCAKE_VALID_TOKENS_TAG = "lmcache.tag.internal.valid_tokens"
 REMOTE_FILL_PAGE_ABI_VERSION = "lmcache-layer-page-v3"
+REMOTE_FILL_AUTO_ARTIFACT_VERSION = "sampled-serving-bundle-v1"
+_AUTO_IDENTITY_EXTENSIONS = {
+    ".bin",
+    ".json",
+    ".model",
+    ".pt",
+    ".pth",
+    ".py",
+    ".safetensors",
+    ".tiktoken",
+    ".txt",
+}
+_AUTO_IDENTITY_SAMPLE_BYTES = 64 * 1024
+
+
+def _update_sampled_file_identity(digest: Any, path: Path) -> None:
+    """Add bounded content evidence for one serving-bundle file."""
+
+    size = path.stat().st_size
+    digest.update(str(size).encode())
+    with path.open("rb") as stream:
+        digest.update(stream.read(_AUTO_IDENTITY_SAMPLE_BYTES))
+        if size > _AUTO_IDENTITY_SAMPLE_BYTES:
+            stream.seek(max(0, size - _AUTO_IDENTITY_SAMPLE_BYTES))
+            digest.update(stream.read(_AUTO_IDENTITY_SAMPLE_BYTES))
+
+
+@lru_cache(maxsize=16)
+def _derive_remote_fill_artifact_id(
+    model_name: str,
+    served_model_name: str,
+) -> str:
+    """Derive a stable, bounded-cost serving-bundle fingerprint at startup."""
+
+    digest = hashlib.sha256()
+    digest.update(REMOTE_FILL_AUTO_ARTIFACT_VERSION.encode())
+    digest.update(served_model_name.encode())
+    model_path = Path(model_name)
+    if not model_path.is_dir():
+        digest.update(model_name.encode())
+        return f"auto-{REMOTE_FILL_AUTO_ARTIFACT_VERSION}-{digest.hexdigest()}"
+
+    candidates = sorted(
+        (
+            path
+            for path in model_path.rglob("*")
+            if path.is_file() and path.suffix.lower() in _AUTO_IDENTITY_EXTENSIONS
+        ),
+        key=lambda path: path.relative_to(model_path).as_posix(),
+    )
+    if not candidates:
+        digest.update(model_path.name.encode())
+    for path in candidates:
+        digest.update(path.relative_to(model_path).as_posix().encode())
+        _update_sampled_file_identity(digest, path)
+    return f"auto-{REMOTE_FILL_AUTO_ARTIFACT_VERSION}-{digest.hexdigest()}"
+
+
+def resolve_remote_fill_identity(
+    config: LMCacheEngineConfig,
+    metadata: LMCacheMetadata,
+) -> tuple[str, str]:
+    """Resolve optional overrides into deterministic RemoteFill identities.
+
+    The automatic artifact fingerprint samples every model, tokenizer, and
+    custom-code file at bounded cost. An explicit immutable build/revision ID
+    remains available for artifact stores that can replace unsampled content
+    in place.
+    """
+
+    artifact_id = str(config.remote_fill_model_artifact_id or "").strip()
+    namespace = str(config.remote_fill_cache_namespace or "").strip()
+    remote_fill_active = bool(
+        config.enable_remote_lmcache_store
+        and os.getenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION")
+        == "mooncake-sync-write-visible-v1"
+    )
+    if not remote_fill_active:
+        # Preserve the disabled path exactly: no bundle walk, no key namespace
+        # change, and no new startup work unless the operator explicitly set
+        # an identity for another purpose.
+        return namespace, artifact_id
+    if not artifact_id:
+        artifact_id = _derive_remote_fill_artifact_id(
+            str(metadata.model_name),
+            str(metadata.served_model_name or metadata.model_name),
+        )
+    if not namespace:
+        namespace_digest = hashlib.sha256(
+            f"{artifact_id}\0{REMOTE_FILL_PAGE_ABI_VERSION}".encode()
+        ).hexdigest()[:24]
+        namespace = f"remote-fill-{namespace_digest}"
+    return namespace, artifact_id
 
 
 def mooncake_valid_tokens(key: CacheEngineKey, chunk_size: int) -> int:
@@ -92,12 +188,13 @@ def mooncake_payload_layout(
             normalized_dims = {
                 str(index): int(value) for index, value in enumerate(raw_token_dims)
             }
+    deployment_namespace, model_artifact_id = resolve_remote_fill_identity(
+        config, metadata
+    )
     descriptor = {
         "version": 3,
-        "deployment_namespace": str(getattr(config, "remote_fill_cache_namespace", "")),
-        "model_artifact_id": str(
-            getattr(config, "remote_fill_model_artifact_id", "") or ""
-        ),
+        "deployment_namespace": deployment_namespace,
+        "model_artifact_id": model_artifact_id,
         # The deployment-supplied artifact is the immutable serving-bundle ID:
         # weights, quantization output, tokenizer, and custom model code.  The
         # page ABI remains code-owned so a storage-layout change also changes

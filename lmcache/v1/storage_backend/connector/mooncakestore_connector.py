@@ -200,10 +200,12 @@ class MooncakeDirectPushTransport:
         loop = asyncio.get_running_loop()
 
         source_event_wait_ms = 0.0
+        source_fences_ready_monotonic = 0.0
         source_registration_ms = 0.0
 
         def prepare_source() -> None:
-            nonlocal source_event_wait_ms, source_registration_ms
+            nonlocal source_event_wait_ms, source_fences_ready_monotonic
+            nonlocal source_registration_ms
             try:
                 source_device = next(
                     (
@@ -223,6 +225,7 @@ class MooncakeDirectPushTransport:
                         continue
                     seen_events.add(id(event))
                     event.synchronize()
+                source_fences_ready_monotonic = perf_counter()
                 source_event_wait_ms = (perf_counter() - event_wait_started) * 1000
                 registration_started = perf_counter()
                 self._register_source_owners(source_plan.owners)
@@ -257,6 +260,7 @@ class MooncakeDirectPushTransport:
                 transferred_bytes=sum(vectors[2]),
                 elapsed_ms=(ended - started) * 1000,
                 source_event_wait_ms=source_event_wait_ms,
+                source_fences_ready_monotonic=source_fences_ready_monotonic,
                 source_registration_ms=source_registration_ms,
                 native_slot_wait_ms=native_slot_wait_ms,
                 native_started_monotonic=started,
@@ -454,7 +458,15 @@ class MooncakeStoreConfig:
         if extra_config is None:
             raise ValueError("The extra config is not set.")
         # Read Mooncake-specific knob
-        prefer_local_alloc = extra_config.get("mooncake_prefer_local_alloc", False)
+        prefer_local_alloc = bool(
+            extra_config.get("mooncake_prefer_local_alloc", False)
+            or (
+                config.enable_remote_lmcache_store
+                and config.pd_role != "receiver"
+                and os.getenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION")
+                == DIRECT_PUSH_H0_QUALIFICATION_V1
+            )
+        )
 
         return MooncakeStoreConfig(
             local_hostname=extra_config["local_hostname"],
@@ -542,11 +554,17 @@ class MooncakestoreConnector(RemoteConnector):
                 self.config.device_name = dev_name
             logger.info("Mooncake Configuration loaded. config: %s", self.config)
 
-            reuse_vllm_engine = (
-                False
-                if lmcache_config is None
-                else lmcache_config.get_extra_config_value(
-                    "mooncake_reuse_vllm_transfer_engine", False
+            reuse_vllm_engine = bool(
+                lmcache_config is not None
+                and (
+                    (
+                        lmcache_config.enable_remote_lmcache_store
+                        and os.getenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION")
+                        == DIRECT_PUSH_H0_QUALIFICATION_V1
+                    )
+                    or lmcache_config.get_extra_config_value(
+                        "mooncake_reuse_vllm_transfer_engine", False
+                    )
                 )
             )
             if not isinstance(reuse_vllm_engine, bool):
