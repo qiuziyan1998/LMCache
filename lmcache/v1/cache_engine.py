@@ -4385,6 +4385,18 @@ class LMCacheEngine:
 
         phase = kwargs.get("shared_cpu_phase", "dense_prefix")
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
+        # Mirror the passive side's derivation exactly: the TP materialization
+        # consensus must be entered by every rank or by none. A prefiller
+        # prefix-hit retrieve carries a remote_fill_plan without the decoder's
+        # LOCAL_FULL hint, so its passive ranks never enter the consensus and
+        # an unconditional rank0 entry deadlocks the collective.
+        remote_fill_load = bool(
+            self._remote_fill_pair_lookup_enabled()
+            and self._remote_fill_local_full_hint(
+                kwargs.get("request_configs")
+            )
+            is not None
+        )
         if not keys_layer_major:
             for layer_id in range(self.num_layers):
                 self._broadcast_shared_envelope(
@@ -4634,7 +4646,8 @@ class LMCacheEngine:
                         )
                     )
                     if (
-                        remote_fill_plan is not None
+                        remote_fill_load
+                        and remote_fill_plan is not None
                         and compact_batch is not None
                         and not self._remote_fill_all_ranks_materialized(
                             True,
