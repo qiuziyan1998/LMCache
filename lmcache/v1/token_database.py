@@ -23,7 +23,11 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
-from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.config import (
+    LMCacheEngineConfig,
+    _REMOTE_FILL_H0_QUALIFICATION_ENV,
+    _REMOTE_FILL_H0_QUALIFICATION_V1,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
     MOONCAKE_PAYLOAD_LAYOUT_TAG,
@@ -72,6 +76,8 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         if (
             config is not None
             and config.enable_remote_lmcache_store
+            and os.getenv(_REMOTE_FILL_H0_QUALIFICATION_ENV)
+            == _REMOTE_FILL_H0_QUALIFICATION_V1
             and hash_algorithm != "builtin"
             and self.hash_func is hash
         ):
