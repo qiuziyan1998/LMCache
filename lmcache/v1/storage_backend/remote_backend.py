@@ -3,7 +3,6 @@
 from concurrent.futures import Future, TimeoutError
 from typing import Any, Callable, List, Optional, Sequence, Set
 import asyncio
-import os
 import threading
 import time
 
@@ -15,7 +14,6 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.exceptions import IrrecoverableException
 from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.remote_fill.native import DIRECT_PUSH_H0_QUALIFICATION_V1
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.connector import CreateConnector
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
@@ -242,11 +240,7 @@ class RemoteBackend(StorageBackendInterface):
         )
 
     def _remote_fill_completion_required(self) -> bool:
-        return bool(
-            self.config.enable_remote_lmcache_store
-            and os.getenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION")
-            == DIRECT_PUSH_H0_QUALIFICATION_V1
-        )
+        return bool(self.config.enable_remote_lmcache_store)
 
     @staticmethod
     def _connection_unavailable_future() -> Future:

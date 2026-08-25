@@ -229,11 +229,7 @@ def resolve_remote_fill_identity(
 
     artifact_id = str(config.remote_fill_model_artifact_id or "").strip()
     namespace = str(config.remote_fill_cache_namespace or "").strip()
-    remote_fill_active = bool(
-        config.enable_remote_lmcache_store
-        and os.getenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION")
-        == "mooncake-sync-write-visible-v1"
-    )
+    remote_fill_active = bool(config.enable_remote_lmcache_store)
     if not remote_fill_active:
         # Preserve the disabled path exactly: no bundle walk, no key namespace
         # change, and no new startup work unless the operator explicitly set

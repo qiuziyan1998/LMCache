@@ -213,7 +213,7 @@ def test_instrumented_connector_forwards_remote_fill_direct_push() -> None:
     assert mooncake.get_remote_fill_destination_session() == "decoder:5678"
 
 
-def test_native_direct_push_is_hard_disabled_without_h0_token() -> None:
+def test_native_direct_push_requires_explicit_activation() -> None:
     calls: list[tuple] = []
     owner = _Owner()
     transport = MooncakeDirectPushTransport(
@@ -225,7 +225,7 @@ def test_native_direct_push_is_hard_disabled_without_h0_token() -> None:
     )
 
     async def run() -> None:
-        with pytest.raises(RuntimeError, match="hard-disabled"):
+        with pytest.raises(RuntimeError, match="explicit activation"):
             await transport.push_external_pages(
                 remote_session="decoder:1234",
                 source_plan=_source_plan(owner, calls),
@@ -234,6 +234,67 @@ def test_native_direct_push_is_hard_disabled_without_h0_token() -> None:
                     _descriptor(key="page-1", group=1, ptr=0x6000, length=16),
                 ),
                 activation=None,
+            )
+        await transport.close()
+
+    asyncio.run(run())
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    (
+        "qualification",
+        "arm_acknowledged",
+        "attempt",
+        "exception",
+        "message",
+    ),
+    [
+        ("invalid", True, "attempt-1", RuntimeError, "compatibility contract"),
+        (
+            DIRECT_PUSH_H0_QUALIFICATION_V1,
+            False,
+            "attempt-1",
+            RuntimeError,
+            "ARM_WINDOW",
+        ),
+        (
+            DIRECT_PUSH_H0_QUALIFICATION_V1,
+            True,
+            "",
+            ValueError,
+            "attempt identifier",
+        ),
+    ],
+)
+def test_native_direct_push_rejects_invalid_activation_proof(
+    qualification: str,
+    arm_acknowledged: bool,
+    attempt: str,
+    exception: type[Exception],
+    message: str,
+) -> None:
+    calls: list[tuple] = []
+    transport = MooncakeDirectPushTransport(
+        _owner_registrar(_GlobalTE(calls)),
+        _Engine(calls),
+        worker_count=1,
+        max_operations=1,
+        timeout_seconds=1,
+    )
+    activation = NativeDirectPushActivation(
+        h0_qualification=qualification,
+        native_transfer_attempt_id=attempt,
+        arm_acknowledged=arm_acknowledged,
+    )
+
+    async def run() -> None:
+        with pytest.raises(exception, match=message):
+            await transport.push_external_pages(
+                remote_session="decoder:1234",
+                source_plan=object(),
+                destination_descriptors=(),
+                activation=activation,
             )
         await transport.close()
 

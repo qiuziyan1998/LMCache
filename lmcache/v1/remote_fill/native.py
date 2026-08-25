@@ -10,8 +10,10 @@ DIRECT_PUSH_H0_QUALIFICATION_V1 = "mooncake-sync-write-visible-v1"
 
 @dataclass(frozen=True)
 class NativeDirectPushActivation:
-    """Explicit H0 qualification and ARM proof for one native submission."""
+    """Compatibility contract and ARM proof for one native submission."""
 
+    # Kept for constructor compatibility; runtime activation is controlled by
+    # enable_remote_lmcache_store and the request-scoped ARM acknowledgement.
     h0_qualification: str
     native_transfer_attempt_id: str
     arm_acknowledged: bool

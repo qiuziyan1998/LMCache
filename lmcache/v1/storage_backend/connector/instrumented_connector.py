@@ -260,7 +260,7 @@ class InstrumentedRemoteConnector(RemoteConnector):
         destination_descriptors: tuple[Any, ...],
         activation: Any,
     ) -> Any:
-        """Delegate one H0-qualified remote direct push."""
+        """Delegate one explicitly activated remote direct push."""
         return await self._connector.push_external_pages(
             remote_session=remote_session,
             source_plan=source_plan,

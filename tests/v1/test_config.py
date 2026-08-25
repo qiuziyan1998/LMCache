@@ -14,14 +14,6 @@ from lmcache.v1.mooncake_layout import mooncake_layer_pages_enabled
 BASE_DIR = Path(__file__).parent
 
 
-@pytest.fixture(autouse=True)
-def _qualify_remote_fill_hardware_gate(monkeypatch):
-    monkeypatch.setenv(
-        "LMCACHE_REMOTE_FILL_H0_QUALIFICATION",
-        "mooncake-sync-write-visible-v1",
-    )
-
-
 def test_get_extra_config_from_file():
     config = LMCacheEngineConfig.from_file(BASE_DIR / "data/test_config.yaml")
     check_extra_config(config)
@@ -183,20 +175,22 @@ def test_remote_fill_defaults_off_and_validates_common_contract():
     assert config.get_extra_config_value("mooncake_page_first_multi_buffer") is True
     assert config.get_extra_config_value("mooncake_layer_merged_page_objects") is True
     assert config.get_extra_config_value("save_chunk_meta") is False
+    assert config.remote_fill_submission_mode == "per_chunk"
 
 
-def test_remote_fill_without_hardware_qualification_preserves_legacy_config(
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION", raising=False)
-    config = LMCacheEngineConfig.from_defaults(enable_remote_lmcache_store=True)
+def test_remote_fill_rejects_unknown_submission_mode() -> None:
+    config = _remote_fill_config(remote_fill_submission_mode="unknown")
+
+    with pytest.raises(ValueError, match="remote_fill_submission_mode"):
+        config.validate()
+
+
+def test_remote_fill_accepts_final_deferred_rollback_mode() -> None:
+    config = _remote_fill_config(remote_fill_submission_mode="final_deferred")
 
     config.validate()
 
-    assert config.use_layerwise is False
-    assert config.dsa_two_groups is False
-    assert config.enable_sparse_attention is False
-    assert config.pre_caching_hash_algorithm == "builtin"
+    assert config.remote_fill_submission_mode == "final_deferred"
 
 
 def test_remote_fill_derives_control_manifest_bound() -> None:

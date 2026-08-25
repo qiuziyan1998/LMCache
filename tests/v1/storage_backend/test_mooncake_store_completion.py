@@ -39,6 +39,8 @@ def _make_mooncake_connector(
     monkeypatch: pytest.MonkeyPatch,
     extra_config: dict,
     calls: list,
+    *,
+    remote_fill_enabled: bool = False,
 ) -> tuple[MooncakestoreConnector, asyncio.AbstractEventLoop]:
     class _Store:
         def setup(self, *args):
@@ -71,6 +73,7 @@ def _make_mooncake_connector(
     )
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=8,
+        enable_remote_lmcache_store=remote_fill_enabled,
         extra_config={
             "local_hostname": "configured-host",
             "metadata_server": "metadata",
@@ -98,7 +101,16 @@ def _make_mooncake_connector(
     return MooncakestoreConnector("", 0, "", loop, local_cpu, config), loop
 
 
-def test_mooncake_reuses_vllm_engine_and_registration_registry(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("remote_fill_enabled", "extra_config"),
+    [
+        (False, {"mooncake_reuse_vllm_transfer_engine": True}),
+        (True, {}),
+    ],
+)
+def test_mooncake_reuses_vllm_engine_and_registration_registry(
+    monkeypatch, remote_fill_enabled: bool, extra_config: dict
+) -> None:
     calls = []
 
     class _Engine:
@@ -136,8 +148,9 @@ def test_mooncake_reuses_vllm_engine_and_registration_registry(monkeypatch) -> N
 
     connector, loop = _make_mooncake_connector(
         monkeypatch,
-        {"mooncake_reuse_vllm_transfer_engine": True},
+        extra_config,
         calls,
+        remote_fill_enabled=remote_fill_enabled,
     )
     tensor = torch.empty(16, dtype=torch.uint8)
     owner = SimpleNamespace(
@@ -428,10 +441,6 @@ def _make_remote_backend(
 
 
 def test_remote_fill_missing_connection_fails_required_puts(monkeypatch) -> None:
-    monkeypatch.setenv(
-        "LMCACHE_REMOTE_FILL_H0_QUALIFICATION",
-        "mooncake-sync-write-visible-v1",
-    )
     backend = _make_remote_backend(True, remote_fill_enabled=True)
     backend.connection = None
 
@@ -445,9 +454,8 @@ def test_remote_fill_missing_connection_fails_required_puts(monkeypatch) -> None
         batch[0].result()
 
 
-def test_legacy_missing_connection_remains_best_effort(monkeypatch) -> None:
-    monkeypatch.delenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION", raising=False)
-    backend = _make_remote_backend(False, remote_fill_enabled=True)
+def test_disabled_remote_fill_missing_connection_remains_best_effort() -> None:
+    backend = _make_remote_backend(False, remote_fill_enabled=False)
     backend.connection = None
 
     single = backend.submit_put_task(_key(1), _MemoryObj())

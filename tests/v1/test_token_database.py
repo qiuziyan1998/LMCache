@@ -213,10 +213,6 @@ def test_chunk_hash_contract_rejects_empty_digest(
 def test_remote_fill_rejects_builtin_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(
-        "LMCACHE_REMOTE_FILL_H0_QUALIFICATION",
-        "mooncake-sync-write-visible-v1",
-    )
     monkeypatch.setattr(
         ChunkedTokenDatabase,
         "_get_vllm_hash_func",
@@ -230,17 +226,16 @@ def test_remote_fill_rejects_builtin_fallback(
         ChunkedTokenDatabase(cfg, dumb_metadata())
 
 
-def test_inactive_remote_fill_preserves_builtin_fallback(
+def test_disabled_remote_fill_preserves_builtin_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION", raising=False)
     monkeypatch.setattr(
         ChunkedTokenDatabase,
         "_get_vllm_hash_func",
         lambda self, _algorithm: hash,
     )
     cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
-    cfg.enable_remote_lmcache_store = True
+    cfg.enable_remote_lmcache_store = False
     cfg.pre_caching_hash_algorithm = "unavailable"
 
     database = ChunkedTokenDatabase(cfg, dumb_metadata())
@@ -251,10 +246,6 @@ def test_inactive_remote_fill_preserves_builtin_fallback(
 def test_payload_v3_automatically_fingerprints_serving_bundle(
     tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv(
-        "LMCACHE_REMOTE_FILL_H0_QUALIFICATION",
-        "mooncake-sync-write-visible-v1",
-    )
     first_model = tmp_path / "model-a"
     second_model = tmp_path / "model-b"
     first_model.mkdir()
@@ -296,7 +287,6 @@ def test_payload_v3_disabled_path_does_not_walk_serving_bundle(
     # Local import lets the test replace the startup-only walker itself.
     from lmcache.v1 import mooncake_layout
 
-    monkeypatch.delenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION", raising=False)
     monkeypatch.setattr(
         mooncake_layout,
         "_derive_remote_fill_artifact_id",

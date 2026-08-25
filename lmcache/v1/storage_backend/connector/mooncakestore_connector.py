@@ -121,11 +121,11 @@ def _direct_push_owner_ranges(owners: tuple[Any, ...]) -> list[tuple[int, int]]:
 def _validate_direct_push_activation(
     activation: NativeDirectPushActivation | None,
 ) -> NativeDirectPushActivation:
-    """Fail closed unless H0 qualification and ARM acknowledgement are explicit."""
+    """Fail closed unless the compatibility contract and ARM proof are valid."""
     if activation is None:
-        raise RuntimeError("Native direct push is hard-disabled until Gate H0 passes")
+        raise RuntimeError("Native direct push requires explicit activation")
     if activation.h0_qualification != DIRECT_PUSH_H0_QUALIFICATION_V1:
-        raise RuntimeError("Native direct push Gate H0 qualification is invalid")
+        raise RuntimeError("Native direct push compatibility contract is invalid")
     if not activation.arm_acknowledged:
         raise RuntimeError("Native direct push requires ARM_WINDOW acknowledgement")
     if not activation.native_transfer_attempt_id:
@@ -191,7 +191,7 @@ class MooncakeDirectPushTransport:
             remote_session: Mooncake destination session ``host:rpc_port``.
             source_plan: P-local pointers, sizes, owners, and producer fences.
             destination_descriptors: HMAC-verified and unexpired descriptors.
-            activation: Explicit Gate H0 and ``ARM_WINDOW`` proof.
+            activation: Compatibility contract and ``ARM_WINDOW`` proof.
 
         Returns:
             Aggregate terminal native transfer result with exact byte counts.
@@ -505,8 +505,6 @@ class MooncakeStoreConfig:
             or (
                 config.enable_remote_lmcache_store
                 and config.pd_role != "receiver"
-                and os.getenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION")
-                == DIRECT_PUSH_H0_QUALIFICATION_V1
             )
         )
 
@@ -599,11 +597,7 @@ class MooncakestoreConnector(RemoteConnector):
             reuse_vllm_engine = bool(
                 lmcache_config is not None
                 and (
-                    (
-                        lmcache_config.enable_remote_lmcache_store
-                        and os.getenv("LMCACHE_REMOTE_FILL_H0_QUALIFICATION")
-                        == DIRECT_PUSH_H0_QUALIFICATION_V1
-                    )
+                    lmcache_config.enable_remote_lmcache_store
                     or lmcache_config.get_extra_config_value(
                         "mooncake_reuse_vllm_transfer_engine", False
                     )
@@ -2630,13 +2624,13 @@ class MooncakestoreConnector(RemoteConnector):
             remote_session: Trusted decoder TransferEngine session.
             source_plan: P-local pointers, owners, and producer events.
             destination_descriptors: Already validated remote capabilities.
-            activation: Explicit H0 qualification and ARM acknowledgement.
+            activation: Compatibility contract and ARM acknowledgement.
 
         Returns:
             Aggregate terminal result for the original native submission.
 
         Raises:
-            RuntimeError: If H0/ARM proof or shared GlobalTE is unavailable.
+            RuntimeError: If activation/ARM proof or shared GlobalTE is unavailable.
             ValueError: If exact page coverage and byte validation fails.
             NativeDirectPushTerminalError: For nonzero native return status.
             NativeDirectPushAmbiguousError: When terminal state is unknown at

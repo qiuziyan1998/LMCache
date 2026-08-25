@@ -28,8 +28,7 @@ from lmcache.v1.config_base import (
 )
 
 logger = init_logger(__name__)
-_REMOTE_FILL_H0_QUALIFICATION_ENV = "LMCACHE_REMOTE_FILL_H0_QUALIFICATION"
-_REMOTE_FILL_H0_QUALIFICATION_V1 = "mooncake-sync-write-visible-v1"
+_REMOTE_FILL_SUBMISSION_MODES = frozenset(("final_deferred", "per_chunk"))
 
 
 # Configuration aliases and deprecated mappings
@@ -244,11 +243,16 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     "pd_proxy_port": {"type": Optional[int], "default": None, "env_converter": int},
     # Transfer-related configurations
     "transfer_channel": {"type": Optional[str], "default": None, "env_converter": str},
-    # Direct remote LocalCPU fill (default-off; native activation is hardware-gated)
+    # Direct remote LocalCPU fill (default-off; native work remains request-ARM gated)
     "enable_remote_lmcache_store": {
         "type": bool,
         "default": False,
         "env_converter": _to_bool,
+    },
+    "remote_fill_submission_mode": {
+        "type": str,
+        "default": "per_chunk",
+        "env_converter": str,
     },
     "remote_fill_cache_namespace": {
         "type": str,
@@ -895,11 +899,13 @@ def _validate_config(self):
                 + shared_cpu_config_context
             )
 
-    remote_fill_active = bool(
-        self.enable_remote_lmcache_store
-        and os.getenv(_REMOTE_FILL_H0_QUALIFICATION_ENV)
-        == _REMOTE_FILL_H0_QUALIFICATION_V1
-    )
+    if self.remote_fill_submission_mode not in _REMOTE_FILL_SUBMISSION_MODES:
+        raise ValueError(
+            "remote_fill_submission_mode must be one of "
+            f"{sorted(_REMOTE_FILL_SUBMISSION_MODES)}, got "
+            f"{self.remote_fill_submission_mode!r}"
+        )
+    remote_fill_active = bool(self.enable_remote_lmcache_store)
     if remote_fill_active:
         # These are invariants of the only implemented RemoteFill protocol,
         # not deployment choices: layerwise DSA two-group pages, immutable
