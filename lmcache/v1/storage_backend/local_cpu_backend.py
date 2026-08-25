@@ -2,6 +2,7 @@
 # Standard
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+import sys
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -15,6 +16,7 @@ from typing import (
 )
 import threading
 import time
+from weakref import ReferenceType, ref
 
 # Third Party
 import torch
@@ -25,6 +27,7 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
+from lmcache.v1.cold_start_perf import cold_start_perf_enabled
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     LayerPageMemoryObj,
@@ -49,6 +52,9 @@ if TYPE_CHECKING:
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+_MAX_EXTERNAL_RETENTION_TRACES = 16
+_MAX_EXTERNAL_RETENTION_MUTATIONS = 128
 
 
 @dataclass
@@ -111,6 +117,8 @@ class ExternalTwoGroupCommitResult:
         lock_wait_seconds: Time spent waiting for the LocalCPU cache lock.
         lock_hold_seconds: Time spent holding the lock for validation and
             atomic admission.
+        retention_trace_id: Opt-in diagnostic trace armed atomically with a
+            successful commit. ``None`` when cold-start diagnostics are off.
     """
 
     committed: bool
@@ -120,6 +128,31 @@ class ExternalTwoGroupCommitResult:
     missing_keys: tuple[CacheEngineKey, ...] = ()
     lock_wait_seconds: float = field(default=0.0, compare=False)
     lock_hold_seconds: float = field(default=0.0, compare=False)
+    retention_trace_id: Optional[int] = field(default=None, compare=False)
+
+
+@dataclass(frozen=True)
+class _ExternalRetentionMutation:
+    monotonic_ns: int
+    cause: str
+    operation: str
+    pair_index: int
+    kv_group: int
+    old_type: str
+    new_type: str
+    removed_committed_page: bool
+    callsite: str
+
+
+@dataclass
+class _ExternalTwoGroupRetentionTrace:
+    trace_id: int
+    started_ns: int
+    required_keys: tuple[CacheEngineKey, ...]
+    positions: dict[CacheEngineKey, tuple[int, int]]
+    committed_pages: dict[CacheEngineKey, ReferenceType[MemoryObj]]
+    mutations: list[_ExternalRetentionMutation] = field(default_factory=list)
+    dropped_mutations: int = 0
 
 
 class LayerPageAdmissionRollbackError(RuntimeError):
@@ -162,6 +195,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
         self.cpu_lock = threading.Lock()
+
+        # Cold-start diagnostics are armed only by a successful external
+        # two-group commit while LMCACHE_COLD_START_PERF is enabled. Keeping an
+        # empty list in ordinary operation makes every mutation hook a single
+        # predictable branch, with no logging or cache inspection.
+        self._external_retention_trace_sequence = 0
+        self._external_retention_traces: list[_ExternalTwoGroupRetentionTrace] = []
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
@@ -259,6 +299,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         group1_keys: Sequence[CacheEngineKey],
         *,
         pin: bool = False,
+        diagnostics: Optional[dict[str, object]] = None,
     ) -> int:
         """Return the contiguous prefix present in both page keyspaces.
 
@@ -267,6 +308,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
             group1_keys: Canonical Group 1 physical-page keys aligned by
                 logical page with ``group0_keys``.
             pin: Atomically pin both groups for every prefix page when true.
+            diagnostics: Optional request-local mapping populated from the
+                already-held cache lock. This never probes the allocator or
+                emits a log from the mutation path.
 
         Returns:
             The number of complete two-group page pairs in the contiguous
@@ -304,6 +348,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 return 0
             if pin:
                 self.keys_in_request.extend(page_keys)
+            if diagnostics is not None:
+                diagnostics.update(
+                    self._consume_external_retention_trace_locked(
+                        group0_keys,
+                        group1_keys,
+                        local_pairs=len(pages) // 2,
+                    )
+                )
 
         return len(pages) // 2
 
@@ -347,6 +399,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
             memory_obj.ref_count_up()
             self.hot_cache[key] = memory_obj
+            self._record_external_retention_mutation_locked(
+                key,
+                cause="ordinary_put",
+                operation="admit",
+                old_obj=None,
+                new_obj=memory_obj,
+            )
 
             self.cache_policy.update_on_put(key)
 
@@ -390,6 +449,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     continue
                 memory_obj.ref_count_up()
                 self.hot_cache[key] = memory_obj
+                self._record_external_retention_mutation_locked(
+                    key,
+                    cause="ordinary_batched_put",
+                    operation="admit",
+                    old_obj=None,
+                    new_obj=memory_obj,
+                )
                 stored_keys.append(key)
             if stored_keys:
                 self.cache_policy.update_on_put_many(stored_keys)
@@ -433,6 +499,17 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     continue
                 page.ref_count_up()
                 self.hot_cache[key] = page
+                self._record_external_retention_mutation_locked(
+                    key,
+                    cause=(
+                        "layer_page_replace"
+                        if existing is not None
+                        else "layer_page_put"
+                    ),
+                    operation="replace" if existing is not None else "admit",
+                    old_obj=existing,
+                    new_obj=page,
+                )
                 stored_keys.append(key)
                 if existing is not None:
                     # Other request owners retain their own references. Only
@@ -555,6 +632,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         ready_keys = list(ready)
         ready_pages = list(ready.values())
         self._validate_layer_page_batch(ready_keys, ready_pages)
+        trace_enabled = cold_start_perf_enabled()
         required_key_set = set(required_keys)
         if any(key not in required_key_set for key in ready_keys):
             raise ValueError(
@@ -610,6 +688,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 )
 
             put_result = self._admit_layer_pages_locked(pending, existing_keys)
+            retention_trace_id = self._arm_external_retention_trace_locked(
+                required_keys,
+                enabled=trace_enabled,
+            )
             lock_hold_seconds = time.perf_counter() - lock_acquired
 
         self._notify_layer_page_admissions(put_result.inserted_keys)
@@ -620,6 +702,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             redundant_pages=tuple(redundant_pages),
             lock_wait_seconds=lock_wait_seconds,
             lock_hold_seconds=lock_hold_seconds,
+            retention_trace_id=retention_trace_id,
         )
 
     def _existing_layer_page_matches_key(
@@ -845,7 +928,15 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 self.cpu_lock.release()
             return False
 
-        memory_obj = self.hot_cache.pop(key)
+        memory_obj = self.hot_cache[key]
+        self.hot_cache.pop(key)
+        self._record_external_retention_mutation_locked(
+            key,
+            cause="explicit_remove" if force else "allocation_evict",
+            operation="remove",
+            old_obj=memory_obj,
+            new_obj=None,
+        )
         memory_obj.ref_count_down()
 
         if force:
@@ -1278,9 +1369,17 @@ class LocalCPUBackend(AllocatorBackendInterface):
                             # is not supported.
                             old_mem_objs = []
                             for key in evict_key_all_layer:
-                                old_mem_objs.append(self.hot_cache[key])
+                                old_mem_obj = self.hot_cache[key]
                                 self.cache_policy.update_on_force_evict(key)
                                 self.hot_cache.pop(key, None)
+                                self._record_external_retention_mutation_locked(
+                                    key,
+                                    cause="batched_allocate_evict",
+                                    operation="remove",
+                                    old_obj=old_mem_obj,
+                                    new_obj=None,
+                                )
+                                old_mem_objs.append(old_mem_obj)
 
                             for old_mem_obj in old_mem_objs:
                                 old_mem_obj.ref_count_down()
@@ -1371,7 +1470,17 @@ class LocalCPUBackend(AllocatorBackendInterface):
                             if item in self.hot_cache
                         ]
                     )
-                    objects = [self.hot_cache.pop(item) for item in keys]
+                    objects = []
+                    for item in keys:
+                        memory_obj = self.hot_cache.pop(item)
+                        self._record_external_retention_mutation_locked(
+                            item,
+                            cause="layer_page_allocate_evict",
+                            operation="remove",
+                            old_obj=memory_obj,
+                            new_obj=None,
+                        )
+                        objects.append(memory_obj)
                     for item in keys:
                         self.cache_policy.update_on_force_evict(item)
                 else:
@@ -1590,6 +1699,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 inserted_pages.append(page)
                 inserted_keys.append(key)
                 self.hot_cache[key] = page
+                self._record_external_retention_mutation_locked(
+                    key,
+                    cause="layer_page_admit_if_absent",
+                    operation="admit",
+                    old_obj=None,
+                    new_obj=page,
+                )
             if inserted_keys:
                 self.cache_policy.update_on_put_many(inserted_keys)
         except BaseException as admission_error:
@@ -1600,6 +1716,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 try:
                     if self.hot_cache.get(key) is page:
                         self.hot_cache.pop(key)
+                        self._record_external_retention_mutation_locked(
+                            key,
+                            cause="layer_page_admission_rollback",
+                            operation="remove",
+                            old_obj=page,
+                            new_obj=None,
+                        )
                 except BaseException as error:
                     rollback_errors.append(error)
                 try:
@@ -1619,6 +1742,225 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return LayerPageBatchPutResult(
             tuple(inserted_keys), tuple(existing_keys)
         )
+
+    def _arm_external_retention_trace_locked(
+        self,
+        required_keys: Sequence[CacheEngineKey],
+        *,
+        enabled: bool,
+    ) -> Optional[int]:
+        """Arm bounded host-only diagnostics while the commit lock is held."""
+
+        if not enabled:
+            return None
+        self._external_retention_trace_sequence += 1
+        trace_id = self._external_retention_trace_sequence
+        required = tuple(required_keys)
+        positions = {
+            key: (pair_index, key.kv_group)
+            for pair_index, pair in enumerate(
+                zip(required[::2], required[1::2], strict=True)
+            )
+            for key in pair
+        }
+        trace = _ExternalTwoGroupRetentionTrace(
+            trace_id=trace_id,
+            started_ns=time.monotonic_ns(),
+            required_keys=required,
+            positions=positions,
+            committed_pages={key: ref(self.hot_cache[key]) for key in required},
+        )
+        if len(self._external_retention_traces) >= _MAX_EXTERNAL_RETENTION_TRACES:
+            self._external_retention_traces.pop(0)
+        self._external_retention_traces.append(trace)
+        return trace_id
+
+    def _record_external_retention_mutation_locked(
+        self,
+        key: CacheEngineKey,
+        *,
+        cause: str,
+        operation: str,
+        old_obj: Optional[MemoryObj],
+        new_obj: Optional[MemoryObj],
+    ) -> None:
+        """Record a watched mapping mutation without I/O or extra locking."""
+
+        if not self._external_retention_traces:
+            return
+        watched = [
+            trace for trace in self._external_retention_traces if key in trace.positions
+        ]
+        if not watched:
+            return
+        now_ns = time.monotonic_ns()
+        callsite = self._external_retention_callsite()
+        for trace in watched:
+            position = trace.positions[key]
+            if len(trace.mutations) >= _MAX_EXTERNAL_RETENTION_MUTATIONS:
+                trace.dropped_mutations += 1
+                continue
+            pair_index, kv_group = position
+            trace.mutations.append(
+                _ExternalRetentionMutation(
+                    monotonic_ns=now_ns,
+                    cause=cause,
+                    operation=operation,
+                    pair_index=pair_index,
+                    kv_group=kv_group,
+                    old_type=type(old_obj).__name__
+                    if old_obj is not None
+                    else "absent",
+                    new_type=type(new_obj).__name__
+                    if new_obj is not None
+                    else "absent",
+                    removed_committed_page=(
+                        old_obj is not None
+                        and (committed_page := trace.committed_pages.get(key))
+                        is not None
+                        and committed_page() is old_obj
+                        and operation in {"remove", "replace"}
+                    ),
+                    callsite=callsite,
+                )
+            )
+
+    @staticmethod
+    def _external_retention_callsite() -> str:
+        """Return a short host-Python call chain for a watched explicit remove."""
+
+        names: list[str] = []
+        try:
+            frame = sys._getframe(3)
+        except ValueError:
+            return ""
+        for _ in range(3):
+            if frame is None:
+                break
+            names.append(f"{frame.f_code.co_name}:{frame.f_lineno}")
+            frame = frame.f_back
+        return "<-".join(names)
+
+    def _consume_external_retention_trace_locked(
+        self,
+        group0_keys: Sequence[CacheEngineKey],
+        group1_keys: Sequence[CacheEngineKey],
+        *,
+        local_pairs: int,
+    ) -> dict[str, object]:
+        """Summarize one trace at the exact lookup observation point."""
+
+        required = tuple(
+            key for pair in zip(group0_keys, group1_keys, strict=True) for key in pair
+        )
+        candidates = [
+            trace
+            for trace in self._external_retention_traces
+            if trace.required_keys == required
+        ]
+        trace = candidates[0] if candidates else None
+        if trace is not None:
+            self._external_retention_traces.remove(trace)
+
+        fields: dict[str, object] = {
+            "retention_trace_status": "matched" if trace is not None else "not_found",
+            "retention_trace_candidates": len(candidates),
+        }
+        first_hole = local_pairs if local_pairs < len(group0_keys) else None
+        if first_hole is None:
+            fields["local_first_hole_pair"] = None
+        else:
+            group0_key = group0_keys[first_hole]
+            group1_key = group1_keys[first_hole]
+            fields.update(
+                local_first_hole_pair=first_hole,
+                local_first_hole_group0_state=self._external_retention_page_state(
+                    group0_key, trace
+                ),
+                local_first_hole_group1_state=self._external_retention_page_state(
+                    group1_key, trace
+                ),
+            )
+
+        if trace is None:
+            if first_hole is not None:
+                fields["retention_root_cause"] = "untracked_first_hole"
+            return fields
+
+        now_ns = time.monotonic_ns()
+        cause_counts: dict[str, int] = {}
+        for mutation in trace.mutations:
+            cause_counts[mutation.cause] = cause_counts.get(mutation.cause, 0) + 1
+        fields.update(
+            retention_trace_id=trace.trace_id,
+            retention_trace_age_ms=round((now_ns - trace.started_ns) / 1_000_000, 3),
+            retention_mutation_count=len(trace.mutations),
+            retention_mutation_dropped=trace.dropped_mutations,
+            retention_mutation_causes=cause_counts,
+        )
+
+        if first_hole is None:
+            fields["retention_root_cause"] = "none"
+            return fields
+        if trace.dropped_mutations:
+            fields["retention_root_cause"] = "mutation_journal_overflow"
+            return fields
+
+        bad_keys = [
+            key
+            for key in (group0_keys[first_hole], group1_keys[first_hole])
+            if not isinstance(self.hot_cache.get(key), LayerPageMemoryObj)
+        ]
+        last_by_key = {
+            key: next(
+                (
+                    mutation
+                    for mutation in reversed(trace.mutations)
+                    if (mutation.pair_index, mutation.kv_group) == trace.positions[key]
+                ),
+                None,
+            )
+            for key in bad_keys
+        }
+        roots = [mutation for mutation in last_by_key.values() if mutation is not None]
+        if not roots:
+            fields["retention_root_cause"] = "untracked_first_hole"
+            return fields
+        root = min(roots, key=lambda mutation: mutation.monotonic_ns)
+        fields.update(
+            retention_root_cause=root.cause,
+            retention_root_operation=root.operation,
+            retention_root_pair=root.pair_index,
+            retention_root_group=root.kv_group,
+            retention_root_elapsed_ms=round(
+                (root.monotonic_ns - trace.started_ns) / 1_000_000,
+                3,
+            ),
+            retention_root_old_type=root.old_type,
+            retention_root_new_type=root.new_type,
+            retention_root_removed_committed_page=root.removed_committed_page,
+        )
+        if root.callsite:
+            fields["retention_root_callsite"] = root.callsite
+        return fields
+
+    def _external_retention_page_state(
+        self,
+        key: CacheEngineKey,
+        trace: Optional[_ExternalTwoGroupRetentionTrace],
+    ) -> str:
+        """Describe one watched mapping without allocating or probing storage."""
+
+        page = self.hot_cache.get(key)
+        if page is None:
+            return "absent"
+        if not isinstance(page, LayerPageMemoryObj):
+            return f"wrong_type:{type(page).__name__}"
+        if trace is not None:
+            committed_page = trace.committed_pages.get(key)
+            if committed_page is not None and committed_page() is page:
+                return "committed_page"
+        return "replacement_page"
 
     def _notify_layer_page_admissions(
         self, inserted_keys: Sequence[CacheEngineKey]

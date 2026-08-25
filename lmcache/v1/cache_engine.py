@@ -2057,6 +2057,7 @@ class LMCacheEngine:
                         group_keys[1],
                         ["LocalCPUBackend"],
                         pin,
+                        diagnostics=diagnostics,
                     )
                 )
                 append_mapping(local_mapping)

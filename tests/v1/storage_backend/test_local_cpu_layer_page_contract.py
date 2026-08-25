@@ -414,6 +414,120 @@ def test_external_commit_combines_existing_and_ready_coverage(
     winner.ref_count_down()
 
 
+def test_external_commit_retention_trace_identifies_explicit_remove(
+    page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
+    backend, allocate = page_backend
+    group0 = [_page_key(0, 0)]
+    group1 = [_page_key(0, 1)]
+    pages = allocate(2)
+
+    result = backend.commit_external_two_group_prefix_if_absent(
+        group0,
+        group1,
+        {group0[0]: pages[0], group1[0]: pages[1]},
+    )
+    assert result.retention_trace_id is not None
+    assert backend.remove(group0[0])
+
+    diagnostics: dict[str, object] = {}
+    assert (
+        backend.batched_contains_two_group_prefix(
+            group0,
+            group1,
+            diagnostics=diagnostics,
+        )
+        == 0
+    )
+    assert diagnostics["retention_trace_status"] == "matched"
+    assert diagnostics["retention_trace_id"] == result.retention_trace_id
+    assert diagnostics["local_first_hole_pair"] == 0
+    assert diagnostics["local_first_hole_group0_state"] == "absent"
+    assert diagnostics["local_first_hole_group1_state"] == "committed_page"
+    assert diagnostics["retention_root_cause"] == "explicit_remove"
+    assert diagnostics["retention_root_operation"] == "remove"
+    assert diagnostics["retention_root_pair"] == 0
+    assert diagnostics["retention_root_group"] == 0
+    assert diagnostics["retention_root_removed_committed_page"] is True
+    assert "retention_root_callsite" in diagnostics
+
+
+def test_external_commit_retention_trace_identifies_layer_page_allocation_eviction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=8,
+        local_cpu=True,
+        lmcache_instance_id="layer_page_retention_trace",
+    )
+    allocator = TensorMemoryAllocator(torch.zeros(3 * 4096, dtype=torch.uint8))
+    backend = LocalCPUBackend(config=config, memory_allocator=allocator)
+    group0 = [_page_key(0, 0)]
+    group1 = [_page_key(0, 1)]
+    committed = backend.batched_allocate_layer_pages(
+        [torch.Size([8])],
+        [torch.bfloat16],
+        batch_size=2,
+        num_layers=2,
+        fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+        valid_tokens=8,
+        full_tokens=8,
+        eviction=False,
+    )
+    assert committed is not None
+    result = backend.commit_external_two_group_prefix_if_absent(
+        group0,
+        group1,
+        {group0[0]: committed[0], group1[0]: committed[1]},
+    )
+    assert result.retention_trace_id is not None
+    for page in committed:
+        page.ref_count_down()
+
+    allocated = backend.batched_allocate_layer_pages(
+        [torch.Size([8])],
+        [torch.bfloat16],
+        batch_size=2,
+        num_layers=2,
+        fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+        busy_loop=False,
+        valid_tokens=8,
+        full_tokens=8,
+        eviction=True,
+    )
+    assert allocated is not None
+    try:
+        diagnostics: dict[str, object] = {}
+        assert (
+            backend.batched_contains_two_group_prefix(
+                group0,
+                group1,
+                diagnostics=diagnostics,
+            )
+            == 0
+        )
+        assert diagnostics["retention_trace_status"] == "matched"
+        assert diagnostics["retention_root_cause"] == "layer_page_allocate_evict"
+        assert diagnostics["retention_root_removed_committed_page"] is True
+        assert "retention_root_callsite" in diagnostics
+        assert diagnostics["retention_mutation_causes"] == {
+            "layer_page_allocate_evict": 1
+        }
+    finally:
+        for key in backend.get_keys():
+            backend.remove(key)
+        for page in allocated:
+            if page.is_valid():
+                page.ref_count_down()
+        allocator.close()
+        LMCStatsMonitor.unregister_all_metrics()
+        LMCStatsMonitor.DestroyInstance()
+        PinMonitor.DestroyInstance()
+
+
 def test_external_commit_rejects_wrong_kind_existing_winner(
     page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
 ) -> None:

@@ -97,7 +97,9 @@ class _PairStorageManager:
         group1,
         search_range=None,
         pin=False,
+        diagnostics=None,
     ):
+        del diagnostics
         group0 = list(group0)
         group1 = list(group1)
         self.pair_calls.append((group0, group1, search_range, pin))

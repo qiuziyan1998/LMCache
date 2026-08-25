@@ -1328,6 +1328,7 @@ class StorageManager:
         group1_keys: Sequence[LayerCacheEngineKey],
         search_range: Optional[List[str]] = None,
         pin: bool = False,
+        diagnostics: Optional[dict[str, object]] = None,
     ) -> tuple[int, dict[str, list[CacheEngineKey]]]:
         """Locate a contiguous prefix of complete two-group physical pages.
 
@@ -1336,6 +1337,8 @@ class StorageManager:
             group1_keys: Aligned Group 1 representative layer keys.
             search_range: Optional ordered backend filter.
             pin: Atomically pin complete pairs in pin-capable backends.
+            diagnostics: Optional request-local LocalCPU retention summary.
+                It is populated under the backend's existing lookup lock.
 
         Returns:
             The number of complete page pairs and their backend mapping. Each
@@ -1392,11 +1395,19 @@ class StorageManager:
                 if name == "LocalCPUBackend":
                     physical0 = [key.without_layer() for key in remaining0]
                     physical1 = [key.without_layer() for key in remaining1]
-                    pair_hits = backend.batched_contains_two_group_prefix(
-                        physical0,
-                        physical1,
-                        pin=pin,
-                    )
+                    if diagnostics is None:
+                        pair_hits = backend.batched_contains_two_group_prefix(
+                            physical0,
+                            physical1,
+                            pin=pin,
+                        )
+                    else:
+                        pair_hits = backend.batched_contains_two_group_prefix(
+                            physical0,
+                            physical1,
+                            pin=pin,
+                            diagnostics=diagnostics,
+                        )
                     if not 0 <= pair_hits <= len(remaining0):
                         raise RuntimeError(
                             "LocalCPU returned an invalid two-group page prefix"
