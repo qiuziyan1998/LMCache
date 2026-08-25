@@ -79,6 +79,7 @@ from lmcache.v1.mooncake_layout import (
     mooncake_valid_tokens,
 )
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.remote_fill.security import content_digest
 from lmcache.v1.remote_fill_diagnostics import log_remote_fill_validation_failure
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
@@ -1971,6 +1972,7 @@ class LMCacheEngine:
         lookup_id: Optional[str],
         pin: bool,
         request_configs: Optional[dict],
+        diagnostics: Optional[dict[str, object]] = None,
     ) -> int:
         """Locate and retain a same-tier two-group prefix for actual load."""
         if not chunks:
@@ -2045,7 +2047,10 @@ class LMCacheEngine:
 
         try:
             covered = 0
+            local_pairs = 0
+            local_lookup_attempted = False
             if "LocalCPUBackend" in search_range:
+                local_lookup_attempted = True
                 local_pairs, local_mapping = (
                     self.storage_manager.batched_contains_two_group_layer_pages(
                         group_keys[0],
@@ -2057,6 +2062,40 @@ class LMCacheEngine:
                 append_mapping(local_mapping)
                 add_page_plans(0, mapping_locations(local_mapping, local_pairs))
                 covered = local_pairs
+
+            if diagnostics is not None:
+                hint = self._remote_fill_local_full_hint(request_configs)
+                if hint is not None:
+                    required_store_end, _ = hint
+                    required_pairs = sum(
+                        start < required_store_end for start, _, _ in chunks
+                    )
+                    diagnostics.update(
+                        local_lookup_attempted=local_lookup_attempted,
+                        local_pairs=min(local_pairs, required_pairs),
+                        required_pairs=required_pairs,
+                    )
+                    try:
+                        diagnostics["required_key_digest"] = content_digest(
+                            (
+                                tuple(
+                                    key.without_layer().to_string()
+                                    for key in group_keys[0][:required_pairs]
+                                ),
+                                tuple(
+                                    key.without_layer().to_string()
+                                    for key in group_keys[1][:required_pairs]
+                                ),
+                            )
+                        )
+                    except Exception:
+                        # Diagnostics must not invalidate an already-completed
+                        # paired lookup or alter its pin ownership.
+                        diagnostics["key_digest_error"] = True
+                        logger.warning(
+                            "Failed to fingerprint remote-fill lookup keys",
+                            exc_info=True,
+                        )
 
             persistent_range = [
                 location
@@ -2176,6 +2215,7 @@ class LMCacheEngine:
         request_configs: Optional[dict],
         lookup_id: Optional[str],
         actual_load_end: int,
+        diagnostics: Optional[dict[str, object]] = None,
     ) -> None:
         """Record whether a LOCAL_FULL prefix survived until actual load."""
 
@@ -2250,6 +2290,7 @@ class LMCacheEngine:
             "actual_load_end": actual_load_end,
             "destination_engine_epoch": destination_engine_epoch,
             "remote_suffix": actual_load_end > common_local_end,
+            **(diagnostics or {}),
         }
         cold_start_perf_log(
             logger,
@@ -2261,6 +2302,7 @@ class LMCacheEngine:
             actual_load_end=actual_load_end,
             destination_engine_epoch=destination_engine_epoch,
             remote_suffix=actual_load_end > common_local_end,
+            **(diagnostics or {}),
         )
         logger.info(
             "[LMCACHE_REMOTE_FILL] %s",
@@ -2277,6 +2319,7 @@ class LMCacheEngine:
                 actual_load_end=actual_load_end,
                 destination_engine_epoch=destination_engine_epoch,
                 remote_suffix=actual_load_end > common_local_end,
+                **(diagnostics or {}),
             )
             logger.info(
                 "[LMCACHE_REMOTE_FILL] %s",
@@ -6572,6 +6615,14 @@ class LMCacheEngine:
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
                     chunks.append((start, end, key))
+                remote_fill_diagnostics = (
+                    {}
+                    if pin
+                    and cold_start_perf_enabled()
+                    and self._remote_fill_local_full_hint(request_configs)
+                    is not None
+                    else None
+                )
                 try:
                     res = self._lookup_remote_fill_two_group_prefix(
                         chunks,
@@ -6579,6 +6630,7 @@ class LMCacheEngine:
                         lookup_id=lookup_id,
                         pin=pin,
                         request_configs=request_configs,
+                        diagnostics=remote_fill_diagnostics,
                     )
                 except Exception as exc:
                     if lookup_id is not None:
@@ -6597,6 +6649,7 @@ class LMCacheEngine:
                         request_configs=request_configs,
                         lookup_id=lookup_id,
                         actual_load_end=res,
+                        diagnostics=remote_fill_diagnostics,
                     )
                 return res
 

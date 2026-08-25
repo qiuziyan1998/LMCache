@@ -17,6 +17,7 @@ from lmcache.v1.cache_engine import (
     _RemoteFillMaterializationError,
 )
 from lmcache.v1.event_manager import EventStatus
+from lmcache.v1.remote_fill import content_digest
 from lmcache.v1.shared_cpu_cache import SharedHandleEnvelope
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 
@@ -382,7 +383,10 @@ def test_local_full_hint_records_retained_paired_actual_load(
     assert '"clock_domain"' in caplog.text
 
 
-def test_local_full_hint_records_eviction_and_remote_fallback(caplog) -> None:
+def test_local_full_hint_records_eviction_and_remote_fallback(
+    caplog, monkeypatch
+) -> None:
+    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
     storage = _PairStorageManager(local_pairs=0, remote_pairs=2)
     engine = _engine(storage)
 
@@ -404,6 +408,17 @@ def test_local_full_hint_records_eviction_and_remote_fallback(caplog) -> None:
     assert '"event":"remote_fill_actual_load"' in caplog.text
     assert '"event":"remote_fill_evicted_before_load"' in caplog.text
     assert '"remote_suffix":true' in caplog.text
+    group0, group1, _, _ = storage.pair_calls[0]
+    expected_digest = content_digest(
+        (
+            tuple(key.without_layer().to_string() for key in group0),
+            tuple(key.without_layer().to_string() for key in group1),
+        )
+    )
+    assert '"local_lookup_attempted":true' in caplog.text
+    assert '"local_pairs":0' in caplog.text
+    assert '"required_pairs":2' in caplog.text
+    assert f'"required_key_digest":"{expected_digest}"' in caplog.text
 
 
 def test_local_full_hint_without_any_prefix_is_visible_and_recomputes(
