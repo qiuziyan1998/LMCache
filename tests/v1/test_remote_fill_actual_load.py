@@ -341,7 +341,7 @@ def test_page_and_legacy_groups_share_one_persistent_chunk_plan() -> None:
     ]
 
 
-def test_eviction_after_local_full_rechecks_and_falls_back_to_persistent() -> None:
+def test_missing_local_prefix_rechecks_and_falls_back_to_persistent() -> None:
     storage = _PairStorageManager(local_pairs=2)
     engine = _engine(storage)
 
@@ -376,7 +376,7 @@ def test_local_full_hint_records_retained_paired_actual_load(
 
     snapshot = engine.remote_fill_actual_load_metrics_snapshot()
     assert snapshot.retained_at_load_total == 1
-    assert snapshot.evicted_before_load_total == 0
+    assert snapshot.local_prefix_missing_at_load_total == 0
     assert snapshot.unexpected_remote_get_total == 0
     assert '"event":"remote_fill_actual_load"' in caplog.text
     assert '"outcome":"retained_at_load"' in caplog.text
@@ -385,7 +385,7 @@ def test_local_full_hint_records_retained_paired_actual_load(
     assert '"clock_domain"' in caplog.text
 
 
-def test_local_full_hint_records_eviction_and_remote_fallback(
+def test_local_full_hint_records_missing_local_prefix_and_remote_fallback(
     caplog, monkeypatch
 ) -> None:
     monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
@@ -405,10 +405,12 @@ def test_local_full_hint_records_eviction_and_remote_fallback(
 
     snapshot = engine.remote_fill_actual_load_metrics_snapshot()
     assert snapshot.retained_at_load_total == 0
-    assert snapshot.evicted_before_load_total == 1
+    assert snapshot.local_prefix_missing_at_load_total == 1
     assert snapshot.unexpected_remote_get_total == 1
     assert '"event":"remote_fill_actual_load"' in caplog.text
-    assert '"event":"remote_fill_evicted_before_load"' in caplog.text
+    assert '"outcome":"local_prefix_missing_at_load"' in caplog.text
+    assert '"event":"remote_fill_local_prefix_missing_at_load"' in caplog.text
+    assert "remote_fill_evicted_before_load" not in caplog.text
     assert '"remote_suffix":true' in caplog.text
     group0, group1, _, _ = storage.pair_calls[0]
     expected_digest = content_digest(
@@ -442,7 +444,7 @@ def test_local_full_hint_without_any_prefix_is_visible_and_recomputes(
 
     snapshot = engine.remote_fill_actual_load_metrics_snapshot()
     assert snapshot.retained_at_load_total == 0
-    assert snapshot.evicted_before_load_total == 1
+    assert snapshot.local_prefix_missing_at_load_total == 1
     assert snapshot.unexpected_remote_get_total == 0
     assert '"code":"RF-D-001"' in caplog.text
     assert '"action":"PERSISTENT_FALLBACK_OR_RECOMPUTE"' in caplog.text

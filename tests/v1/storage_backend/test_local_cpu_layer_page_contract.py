@@ -414,6 +414,27 @@ def test_external_commit_combines_existing_and_ready_coverage(
     winner.ref_count_down()
 
 
+def test_missing_prefix_without_trace_is_not_misattributed(
+    page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
+) -> None:
+    backend, _ = page_backend
+    group0 = [_page_key(0, 0)]
+    group1 = [_page_key(0, 1)]
+    diagnostics: dict[str, object] = {}
+
+    assert (
+        backend.batched_contains_two_group_prefix(
+            group0,
+            group1,
+            diagnostics=diagnostics,
+        )
+        == 0
+    )
+    assert diagnostics["retention_trace_status"] == "no_exact_key_match"
+    assert diagnostics["retention_attribution_status"] == "trace_not_matched"
+    assert "retention_attributed_cause" not in diagnostics
+
+
 def test_external_commit_retention_trace_identifies_explicit_remove(
     page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
     monkeypatch: pytest.MonkeyPatch,
@@ -446,12 +467,13 @@ def test_external_commit_retention_trace_identifies_explicit_remove(
     assert diagnostics["local_first_hole_pair"] == 0
     assert diagnostics["local_first_hole_group0_state"] == "absent"
     assert diagnostics["local_first_hole_group1_state"] == "committed_page"
-    assert diagnostics["retention_root_cause"] == "explicit_remove"
-    assert diagnostics["retention_root_operation"] == "remove"
-    assert diagnostics["retention_root_pair"] == 0
-    assert diagnostics["retention_root_group"] == 0
-    assert diagnostics["retention_root_removed_committed_page"] is True
-    assert "retention_root_callsite" in diagnostics
+    assert diagnostics["retention_attribution_status"] == "attributed"
+    assert diagnostics["retention_attributed_cause"] == "explicit_remove"
+    assert diagnostics["retention_attributed_operation"] == "remove"
+    assert diagnostics["retention_attributed_pair"] == 0
+    assert diagnostics["retention_attributed_group"] == 0
+    assert diagnostics["retention_attributed_removed_committed_page"] is True
+    assert "retention_attributed_callsite" in diagnostics
 
 
 def test_external_commit_retention_trace_identifies_layer_page_allocation_eviction(
@@ -510,9 +532,10 @@ def test_external_commit_retention_trace_identifies_layer_page_allocation_evicti
             == 0
         )
         assert diagnostics["retention_trace_status"] == "matched"
-        assert diagnostics["retention_root_cause"] == "layer_page_allocate_evict"
-        assert diagnostics["retention_root_removed_committed_page"] is True
-        assert "retention_root_callsite" in diagnostics
+        assert diagnostics["retention_attribution_status"] == "attributed"
+        assert diagnostics["retention_attributed_cause"] == "layer_page_allocate_evict"
+        assert diagnostics["retention_attributed_removed_committed_page"] is True
+        assert "retention_attributed_callsite" in diagnostics
         assert diagnostics["retention_mutation_causes"] == {
             "layer_page_allocate_evict": 1
         }

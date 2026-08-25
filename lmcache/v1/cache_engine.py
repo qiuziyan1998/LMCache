@@ -178,14 +178,14 @@ class RemoteFillActualLoadMetricsSnapshot:
     """Fixed-cardinality LOCAL_FULL actual-load outcome counters."""
 
     retained_at_load_total: int
-    evicted_before_load_total: int
+    local_prefix_missing_at_load_total: int
     unexpected_remote_get_total: int
 
 
 @dataclass(slots=True)
 class _RemoteFillActualLoadCounters:
     retained_at_load: int = 0
-    evicted_before_load: int = 0
+    local_prefix_missing_at_load: int = 0
     unexpected_remote_get: int = 0
 
 
@@ -2248,7 +2248,9 @@ class LMCacheEngine:
                 common_local_end = min(chunk.end, required_store_end)
 
         retained = common_local_end >= required_store_end
-        outcome = "retained_at_load" if retained else "evicted_before_load"
+        outcome = (
+            "retained_at_load" if retained else "local_prefix_missing_at_load"
+        )
         lock = getattr(self, "_remote_fill_actual_load_lock", None)
         counters = getattr(self, "_remote_fill_actual_load_counters", None)
         if lock is None or counters is None:
@@ -2263,7 +2265,7 @@ class LMCacheEngine:
             if retained:
                 counters.retained_at_load += 1
             else:
-                counters.evicted_before_load += 1
+                counters.local_prefix_missing_at_load += 1
             if unexpected_remote:
                 counters.unexpected_remote_get += 1
 
@@ -2310,10 +2312,10 @@ class LMCacheEngine:
             json.dumps(fields, separators=(",", ":"), sort_keys=True),
         )
         if not retained:
-            fields["event"] = "remote_fill_evicted_before_load"
+            fields["event"] = "remote_fill_local_prefix_missing_at_load"
             cold_start_perf_log(
                 logger,
-                "remote_fill_evicted_before_load",
+                "remote_fill_local_prefix_missing_at_load",
                 req_id=lookup_id,
                 required_store_end=required_store_end,
                 common_local_end=common_local_end,
@@ -2339,7 +2341,9 @@ class LMCacheEngine:
         with lock:
             return RemoteFillActualLoadMetricsSnapshot(
                 retained_at_load_total=counters.retained_at_load,
-                evicted_before_load_total=counters.evicted_before_load,
+                local_prefix_missing_at_load_total=(
+                    counters.local_prefix_missing_at_load
+                ),
                 unexpected_remote_get_total=counters.unexpected_remote_get,
             )
 

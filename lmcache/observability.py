@@ -1034,14 +1034,10 @@ class PrometheusLogger:
             ),
             labelnames=labelnames,
         )
-        self.counter_remote_fill_local_full_evicted_before_load = (
-            self._create_counter(
-                name="lmcache:remote_fill_local_full_evicted_before_load_total",
-                documentation=(
-                    "LOCAL_FULL handoffs missing LocalCPU pages at actual load"
-                ),
-                labelnames=labelnames,
-            )
+        self.counter_remote_fill_local_prefix_missing_at_load = self._create_counter(
+            name="lmcache:remote_fill_local_prefix_missing_at_load_total",
+            documentation="LOCAL_FULL handoffs missing LocalCPU pages at actual load",
+            labelnames=labelnames,
         )
         self.counter_remote_fill_unexpected_remote_get = self._create_counter(
             name="lmcache:remote_fill_unexpected_remote_get_total",
@@ -1681,8 +1677,8 @@ class PrometheusLogger:
             "retained_at_load": (
                 self.counter_remote_fill_local_full_retained_at_load
             ),
-            "evicted_before_load": (
-                self.counter_remote_fill_local_full_evicted_before_load
+            "local_prefix_missing_at_load": (
+                self.counter_remote_fill_local_prefix_missing_at_load
             ),
             "unexpected_remote_get": self.counter_remote_fill_unexpected_remote_get,
         }

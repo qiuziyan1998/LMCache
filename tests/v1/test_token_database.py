@@ -169,6 +169,63 @@ def test_payload_v3_infers_dsa_dimensions_from_model_config(tmp_path) -> None:
     assert descriptor["group1_raw_token_dim"] == 128
 
 
+@pytest.mark.parametrize(
+    ("hash_func", "expected_type", "expected_bytes"),
+    (
+        (hash, int, None),
+        (lambda _value: b"\x00" * 32, bytes, 32),
+        (lambda _value: b"\x00" * 16, bytes, 16),
+    ),
+)
+def test_chunk_hash_contract_uses_actual_hash_output(
+    monkeypatch: pytest.MonkeyPatch,
+    hash_func,
+    expected_type: type[int] | type[bytes],
+    expected_bytes: int | None,
+) -> None:
+    monkeypatch.setattr(
+        ChunkedTokenDatabase,
+        "_get_vllm_hash_func",
+        lambda self, _algorithm: hash_func,
+    )
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
+
+    database = ChunkedTokenDatabase(cfg, dumb_metadata())
+
+    assert database.chunk_hash_type is expected_type
+    assert database.chunk_hash_bytes == expected_bytes
+
+
+def test_chunk_hash_contract_rejects_empty_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ChunkedTokenDatabase,
+        "_get_vllm_hash_func",
+        lambda self, _algorithm: lambda _value: b"",
+    )
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
+
+    with pytest.raises(TypeError, match="empty byte digest"):
+        ChunkedTokenDatabase(cfg, dumb_metadata())
+
+
+def test_remote_fill_rejects_builtin_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ChunkedTokenDatabase,
+        "_get_vllm_hash_func",
+        lambda self, _algorithm: hash,
+    )
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
+    cfg.enable_remote_lmcache_store = True
+    cfg.pre_caching_hash_algorithm = "unavailable"
+
+    with pytest.raises(ValueError, match="refusing builtin-hash fallback"):
+        ChunkedTokenDatabase(cfg, dumb_metadata())
+
+
 def test_payload_v3_automatically_fingerprints_serving_bundle(
     tmp_path, monkeypatch
 ) -> None:

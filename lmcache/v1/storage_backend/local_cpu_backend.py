@@ -1863,7 +1863,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
             self._external_retention_traces.remove(trace)
 
         fields: dict[str, object] = {
-            "retention_trace_status": "matched" if trace is not None else "not_found",
+            "retention_trace_status": (
+                "matched" if trace is not None else "no_exact_key_match"
+            ),
             "retention_trace_candidates": len(candidates),
         }
         first_hole = local_pairs if local_pairs < len(group0_keys) else None
@@ -1884,7 +1886,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         if trace is None:
             if first_hole is not None:
-                fields["retention_root_cause"] = "untracked_first_hole"
+                fields["retention_attribution_status"] = "trace_not_matched"
+            else:
+                fields["retention_attribution_status"] = "not_needed"
             return fields
 
         now_ns = time.monotonic_ns()
@@ -1900,10 +1904,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
         )
 
         if first_hole is None:
-            fields["retention_root_cause"] = "none"
+            fields["retention_attribution_status"] = "not_needed"
             return fields
         if trace.dropped_mutations:
-            fields["retention_root_cause"] = "mutation_journal_overflow"
+            fields["retention_attribution_status"] = "journal_overflow"
             return fields
 
         bad_keys = [
@@ -1924,24 +1928,25 @@ class LocalCPUBackend(AllocatorBackendInterface):
         }
         roots = [mutation for mutation in last_by_key.values() if mutation is not None]
         if not roots:
-            fields["retention_root_cause"] = "untracked_first_hole"
+            fields["retention_attribution_status"] = "no_matching_mutation"
             return fields
         root = min(roots, key=lambda mutation: mutation.monotonic_ns)
         fields.update(
-            retention_root_cause=root.cause,
-            retention_root_operation=root.operation,
-            retention_root_pair=root.pair_index,
-            retention_root_group=root.kv_group,
-            retention_root_elapsed_ms=round(
+            retention_attribution_status="attributed",
+            retention_attributed_cause=root.cause,
+            retention_attributed_operation=root.operation,
+            retention_attributed_pair=root.pair_index,
+            retention_attributed_group=root.kv_group,
+            retention_attributed_elapsed_ms=round(
                 (root.monotonic_ns - trace.started_ns) / 1_000_000,
                 3,
             ),
-            retention_root_old_type=root.old_type,
-            retention_root_new_type=root.new_type,
-            retention_root_removed_committed_page=root.removed_committed_page,
+            retention_attributed_old_type=root.old_type,
+            retention_attributed_new_type=root.new_type,
+            retention_attributed_removed_committed_page=root.removed_committed_page,
         )
         if root.callsite:
-            fields["retention_root_callsite"] = root.callsite
+            fields["retention_attributed_callsite"] = root.callsite
         return fields
 
     def _external_retention_page_state(

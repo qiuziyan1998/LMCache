@@ -69,6 +69,16 @@ class TokenDatabase(metaclass=abc.ABCMeta):
 
         # Get hash function with vLLM version compatibility
         self.hash_func = self._get_vllm_hash_func(hash_algorithm)
+        if (
+            config is not None
+            and config.enable_remote_lmcache_store
+            and hash_algorithm != "builtin"
+            and self.hash_func is hash
+        ):
+            raise ValueError(
+                f"RemoteFill hash algorithm {hash_algorithm!r} is unavailable; "
+                "refusing builtin-hash fallback"
+            )
 
         # Initialize NONE_HASH (vLLM >= PR#20511)
         # NOTE: For centralized cache sharing, ensure PYTHONHASHSEED is
@@ -89,6 +99,11 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         except (ImportError, AttributeError):
             NONE_HASH = 0
             logger.info("Using default NONE_HASH=0 (vLLM not available)")
+
+        (
+            self.chunk_hash_type,
+            self.chunk_hash_bytes,
+        ) = self._probe_chunk_hash_contract()
 
         self.metadata = metadata
         self.mooncake_payload_layout = None
@@ -120,6 +135,37 @@ class TokenDatabase(metaclass=abc.ABCMeta):
                 config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
                 and metadata.use_mla
             )
+
+    def _probe_chunk_hash_contract(
+        self,
+    ) -> tuple[type[int] | type[bytes], int | None]:
+        """Return the actual output representation of the loaded hash function.
+
+        vLLM changed deterministic prefix hashes from integers to raw bytes
+        while retaining compatibility aliases for older algorithm names.  The
+        configured name therefore cannot determine the in-memory key type.
+        Probe the already-loaded CPU hash function once during initialization
+        so protocol consumers can reconstruct cache keys exactly.
+
+        Returns:
+            The concrete output type and, for byte digests, their fixed width.
+
+        Raises:
+            TypeError: If the loaded hash function returns an unsupported type
+                or an empty byte digest.
+        """
+
+        probe = self.hash_func((NONE_HASH, (), ()))
+        if type(probe) is int:
+            return int, None
+        if type(probe) is bytes:
+            if not probe:
+                raise TypeError("token hash function returned an empty byte digest")
+            return bytes, len(probe)
+        raise TypeError(
+            "token hash function must return int or bytes, got "
+            f"{type(probe).__name__}"
+        )
 
     def _get_vllm_hash_func(self, hash_algorithm: str):
         """Get hash function from vLLM with version compatibility.
