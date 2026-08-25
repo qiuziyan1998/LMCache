@@ -2372,6 +2372,35 @@ class LMCacheEngine:
             selected.append((chunk.location, chunk.page_by_group[kv_group]))
         return selected
 
+    def _remote_fill_retained_local_page_plan(
+        self,
+        req_id: str,
+        kv_group: int,
+        required_end: int,
+    ) -> Optional[tuple[list[tuple[int, int, Any]], list[str]]]:
+        """Return an exact retained LocalCPU page plan for actual load."""
+        plan = getattr(self, "_remote_fill_lookup_plans", {}).get(req_id)
+        if plan is None or kv_group not in (0, 1):
+            return None
+        chunks = [chunk for chunk in plan.chunks if chunk.start < required_end]
+        if not chunks or chunks[-1].end < required_end:
+            raise _RemoteFillMaterializationError(
+                "Remote-fill retained plan does not cover the required frontier"
+            )
+        if any(
+            chunk.location != "LocalCPUBackend"
+            or not chunk.page_by_group[kv_group]
+            for chunk in chunks
+        ):
+            return None
+        return (
+            [
+                (int(chunk.start), int(chunk.end), chunk.chunk_hash)
+                for chunk in chunks
+            ],
+            [chunk.location for chunk in chunks],
+        )
+
     def _remote_fill_recompute_result(
         self,
         *,

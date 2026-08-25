@@ -241,6 +241,9 @@ def test_complete_local_two_group_prefix_is_pinned_as_pairs() -> None:
     assert {
         chunk.location for chunk in engine._remote_fill_lookup_plans["req"].chunks
     } == {"LocalCPUBackend"}
+    chunk_plan = engine._remote_fill_retained_local_page_plan("req", 0, 8)
+    assert chunk_plan is not None
+    assert chunk_plan[0] == [(0, 4, 0x100), (4, 8, 0x101)]
 
     engine.lookup_unpin("req")
     assert "req" not in engine._remote_fill_lookup_plans
@@ -339,6 +342,9 @@ def test_page_and_legacy_groups_share_one_persistent_chunk_plan() -> None:
     assert engine._remote_fill_retrieve_plan("req", first_candidate, 1) == [
         ("RemoteBackend", False)
     ]
+    assert engine._remote_fill_retained_local_page_plan("req", 0, 4) is None
+    with pytest.raises(RuntimeError, match="required frontier"):
+        engine._remote_fill_retained_local_page_plan("req", 0, 5)
 
 
 def test_missing_local_prefix_rechecks_and_falls_back_to_persistent() -> None:
