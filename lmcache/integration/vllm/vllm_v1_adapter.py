@@ -6216,19 +6216,41 @@ class LMCacheConnectorV1Impl:
             jobs=2,
         )
 
+    def _resolve_dsa_cold_tp_admission(
+        self, plan: dict[str, Any], local_materialized: bool
+    ) -> bool:
+        tp_admission = plan.get("dense_tp_admission")
+        if tp_admission is None:
+            return bool(local_materialized)
+        if tp_admission.done():
+            return bool(tp_admission.result())
+        request = plan["request"]
+        try:
+            local_admission = plan.get("dense_local_admission")
+            local_ready = bool(
+                local_materialized
+                and local_admission is not None
+                and local_admission.result()
+            )
+            result = bool(
+                self.lmcache_engine.remote_fill_all_ranks_ready(
+                    local_ready,
+                    req_id=request.req_id,
+                    kv_group=0,
+                    phase="materialization",
+                )
+            )
+        except BaseException as exc:
+            tp_admission.set_exception(exc)
+            raise
+        tp_admission.set_result(result)
+        return result
+
     def _reject_dsa_cold_tp_admission(self, plan: dict[str, Any]) -> None:
         tp_admission = plan.get("dense_tp_admission")
         if tp_admission is None or tp_admission.done():
             return
-        request = plan["request"]
-        tp_admission.set_result(
-            self.lmcache_engine.remote_fill_all_ranks_ready(
-                False,
-                req_id=request.req_id,
-                kv_group=0,
-                phase="materialization",
-            )
-        )
+        self._resolve_dsa_cold_tp_admission(plan, False)
 
     def _try_prepare_dsa_live_split(self, request: ReqMeta) -> bool:
         """Reserve cold groups until live import succeeds or falls back."""
@@ -7025,6 +7047,10 @@ class LMCacheConnectorV1Impl:
                     or int(latent_result.sum().item()) != token_count
                 ):
                     raise RuntimeError("Cold compact latent retrieve was incomplete")
+                if dense_bootstrap_required and not (
+                    self._resolve_dsa_cold_tp_admission(plan, True)
+                ):
+                    raise RuntimeError("dense bootstrap TP materialization failed")
                 retrieve_location = retrieve_kwargs.get(
                     "cached_retrieve_location"
                 )
@@ -7122,12 +7148,16 @@ class LMCacheConnectorV1Impl:
             except BaseException as error:
                 indexer_error = error
             tp_admission = plan.get("dense_tp_admission")
+            tp_admitted = False
+            if tp_admission is not None and tp_admission.done():
+                try:
+                    tp_admitted = bool(tp_admission.result())
+                except BaseException:
+                    pass
             if (
                 dense_bootstrap_required
                 and not host_submission_voted
-                and tp_admission is not None
-                and tp_admission.done()
-                and bool(tp_admission.result())
+                and tp_admitted
             ):
                 self.lmcache_engine.remote_fill_all_ranks_ready(
                     False,

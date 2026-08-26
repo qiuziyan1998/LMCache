@@ -2059,6 +2059,98 @@ class TestWorkerRetrieveState:
         assert state.dense_load_source_owners == (owner,)
         assert plan["indexer_source_owners"] == ()
 
+    def test_cold_compact_resolves_admission_after_override_materializes(self):
+        impl = _make_impl()
+        impl.num_layers = 1
+        impl._num_layers_for_group = lambda _group: 1
+        ticket = object()
+        vote = MagicMock(return_value=True)
+
+        def latent_retriever():
+            yield torch.ones(1, dtype=torch.bool)
+            yield torch.ones(1, dtype=torch.bool)
+
+        impl.lmcache_engine = SimpleNamespace(
+            gpu_connector=SimpleNamespace(
+                dense_bootstrap_load_submitted=lambda value: value is ticket,
+            ),
+            retrieve_layer_head_token_wise=MagicMock(
+                side_effect=lambda *args, **kwargs: latent_retriever()
+            ),
+            remote_fill_all_ranks_ready=vote,
+        )
+        impl._sparse_retrieve_kwargs = MagicMock(return_value=({}, None, None))
+        impl._record_dsa_cold_dense_load_readiness = (
+            lambda state, readiness, *_args, **_kwargs: setattr(
+                state, "dense_load_ticket", readiness
+            )
+        )
+        impl._refresh_prepared_sparse_sources = lambda state, _tokens: (
+            state.prepared_sparse_sources.__setitem__(0, object())
+        )
+        request = SimpleNamespace(
+            req_id="req-1",
+            load_spec=SimpleNamespace(lmcache_cached_tokens=1),
+        )
+        local_admission, tp_admission = Future(), Future()
+        local_admission.set_result(True)
+        plan = {
+            "request": request,
+            "token_count": 1,
+            "tokens": [1],
+            "token_mask": torch.ones(1, dtype=torch.bool),
+            "latent_kvcaches": [],
+            "planned_at": 0.0,
+            "plan_started": 0.0,
+            "latent_shared_ready": Future(),
+            "dense_local_admission": local_admission,
+            "dense_tp_admission": tp_admission,
+            "dense_bootstrap_required": True,
+        }
+        dependency = Future()
+        dependency.set_result((None, ticket, 0.0, 0.0))
+
+        result = impl._run_dsa_cold_compact_load(plan, None, dependency)
+
+        assert result.dense_load_ticket is ticket
+        assert tp_admission.result() is True
+        assert vote.call_args_list == [
+            call(True, req_id="req-1", kv_group=0, phase="materialization"),
+            call(True, req_id="req-1", kv_group=1, phase="host_submission"),
+        ]
+
+    def test_existing_engine_admission_does_not_vote_twice(self):
+        impl = _make_impl()
+        vote = MagicMock()
+        impl.lmcache_engine = SimpleNamespace(remote_fill_all_ranks_ready=vote)
+        tp_admission = Future()
+        tp_admission.set_result(True)
+
+        assert impl._resolve_dsa_cold_tp_admission(
+            {"dense_tp_admission": tp_admission}, True
+        )
+        vote.assert_not_called()
+
+    def test_materialization_vote_error_completes_adapter_admission(self):
+        impl = _make_impl()
+        error = RuntimeError("collective failed")
+        impl.lmcache_engine = SimpleNamespace(
+            remote_fill_all_ranks_ready=MagicMock(side_effect=error)
+        )
+        local_admission, tp_admission = Future(), Future()
+        local_admission.set_result(True)
+        plan = {
+            "request": SimpleNamespace(req_id="req-1"),
+            "dense_local_admission": local_admission,
+            "dense_tp_admission": tp_admission,
+        }
+
+        with pytest.raises(RuntimeError, match="collective failed"):
+            impl._resolve_dsa_cold_tp_admission(plan, True)
+
+        assert tp_admission.exception() is error
+        impl._reject_dsa_cold_tp_admission(plan)
+
     def test_cold_compact_late_group0_failure_votes_host_submission_false(self):
         impl = _make_impl()
         impl.num_layers = 1
