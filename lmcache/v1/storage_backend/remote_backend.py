@@ -34,6 +34,13 @@ class RemoteBackend(StorageBackendInterface):
     ):
         super().__init__(dst_device=dst_device)
         self.put_tasks: Set[CacheEngineKey] = set()
+        # Single-key callers must observe the completion of the writer that
+        # actually owns a pending key.  ``put_tasks`` remains a set because it
+        # is also the public in-flight gauge used by batched operations.
+        self._single_put_futures: dict[CacheEngineKey, Future] = {}
+        self._single_put_callbacks: dict[
+            CacheEngineKey, list[Callable[[CacheEngineKey], None]]
+        ] = {}
         self.lock = threading.Lock()
 
         assert config.remote_url is not None
@@ -225,9 +232,23 @@ class RemoteBackend(StorageBackendInterface):
 
     def requires_put_completion(self) -> bool:
         return (
-            self.connection is not None
-            and self.connection.requires_put_completion()
+            self._remote_fill_completion_required()
+            or (
+                self.connection is not None
+                and self.connection.requires_put_completion()
+            )
         )
+
+    def _remote_fill_completion_required(self) -> bool:
+        return bool(self.config.enable_remote_lmcache_store)
+
+    @staticmethod
+    def _connection_unavailable_future() -> Future:
+        future: Future = Future()
+        future.set_exception(
+            ConnectionError("required remote storage connection is unavailable")
+        )
+        return future
 
     def put_callback(self, future: Future, key: CacheEngineKey):
         with self.lock:
@@ -247,8 +268,9 @@ class RemoteBackend(StorageBackendInterface):
         """
         Submit a put task to store KV cache to remote storage asynchronously.
 
-        :param on_complete_callback: Optional callback invoked after the remote
-            write completes. Callback exceptions are caught and logged.
+        :param on_complete_callback: Optional terminal-notification callback.
+            It runs after success or failure; callers requiring durability must
+            inspect/wait the returned future. Callback exceptions are logged.
         """
 
         def create_immediate_empty_future() -> Future:
@@ -257,39 +279,101 @@ class RemoteBackend(StorageBackendInterface):
             return f
 
         if self.connection is None:
-            logger.warning("Connection is None in submit_put_task, returning None")
+            if self._remote_fill_completion_required():
+                logger.error(
+                    "Required remote store rejected because the connection is absent"
+                )
+                return self._connection_unavailable_future()
+            logger.warning("Connection is None in submit_put_task, returning success")
             return create_immediate_empty_future()
 
         # If MLA worker id as 0 mode is enabled, skip put tasks
         if self._mla_worker_id_as0_mode:
             return create_immediate_empty_future()
 
-        if self.exists_in_put_tasks(key):
-            return create_immediate_empty_future()
-
-        memory_obj.ref_count_up()
-
+        completion: Future = Future()
         with self.lock:
+            # Do not translate "another writer is pending" into "this put is
+            # complete".  Returning the same completion future preserves the
+            # persistent-store durability barrier for tails and repair paths.
+            pending = getattr(self, "_single_put_futures", {}).get(key)
+            if pending is not None:
+                if on_complete_callback is not None:
+                    self._single_put_callbacks.setdefault(key, []).append(
+                        on_complete_callback
+                    )
+                return pending
+            if not hasattr(self, "_single_put_futures"):
+                # Some focused tests construct RemoteBackend without running
+                # __init__; keep that supported without weakening production.
+                self._single_put_futures = {}
+                self._single_put_callbacks = {}
+            self._single_put_futures[key] = completion
+            self._single_put_callbacks[key] = (
+                [on_complete_callback] if on_complete_callback is not None else []
+            )
             self.put_tasks.add(key)
 
-        compressed_memory_obj = self.serializer.serialize(memory_obj)
-        memory_obj.ref_count_down()
+        memory_obj.ref_count_up()
+        try:
+            compressed_memory_obj = self.serializer.serialize(memory_obj)
+        except BaseException as error:
+            with self.lock:
+                if self._single_put_futures.get(key) is completion:
+                    self._single_put_futures.pop(key, None)
+                    self._single_put_callbacks.pop(key, None)
+                    self.put_tasks.discard(key)
+            if not completion.done():
+                completion.set_exception(error)
+            raise
+        finally:
+            memory_obj.ref_count_down()
 
         def put_done_callback(f: Future) -> None:
             self.put_callback(f, key)
-            if on_complete_callback is not None:
-                try:
-                    on_complete_callback(key)
-                except Exception as e:
-                    logger.warning(f"on_complete_callback failed for key {key}: {e}")
+            try:
+                result = f.result()
+            except BaseException as error:
+                if not completion.done():
+                    completion.set_exception(error)
+            else:
+                if not completion.done():
+                    completion.set_result(result)
+            with self.lock:
+                if self._single_put_futures.get(key) is completion:
+                    self._single_put_futures.pop(key, None)
+                    callbacks = self._single_put_callbacks.pop(key, ())
+                else:
+                    callbacks = ()
+            for callback in callbacks:
+                self._invoke_put_complete_callback(callback, key)
 
-        # NOTE: No need to do error handling here
-        # since the `future` is never waited
-        future = asyncio.run_coroutine_threadsafe(
-            self.connection.put(key, compressed_memory_obj), self.loop
-        )
+        # Submission failure must unwind the shared completion registration.
+        coroutine = self.connection.put(key, compressed_memory_obj)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        except BaseException as error:
+            coroutine.close()
+            with self.lock:
+                if self._single_put_futures.get(key) is completion:
+                    self._single_put_futures.pop(key, None)
+                    self._single_put_callbacks.pop(key, None)
+                    self.put_tasks.discard(key)
+            if not completion.done():
+                completion.set_exception(error)
+            raise
         future.add_done_callback(put_done_callback)
-        return future
+        return completion
+
+    @staticmethod
+    def _invoke_put_complete_callback(
+        callback: Callable[[CacheEngineKey], None],
+        key: CacheEngineKey,
+    ) -> None:
+        try:
+            callback(key)
+        except Exception as error:
+            logger.warning("on_complete_callback failed for key %s: %s", key, error)
 
     def batched_put_callback(self, future: Future, keys: List[CacheEngineKey]):
         """
@@ -308,10 +392,17 @@ class RemoteBackend(StorageBackendInterface):
         """
         Submit batched put tasks to store KV caches to remote storage.
 
-        :param on_complete_callback: Optional callback invoked once per key
-            after that key's write completes (not once per batch).
+        :param on_complete_callback: Optional terminal-notification callback
+            invoked once per key after success or failure (not once per batch).
+            Durability-sensitive callers must inspect/wait returned futures.
         """
         if self.connection is None:
+            if self._remote_fill_completion_required():
+                logger.error(
+                    "Required batched remote store rejected because the connection "
+                    "is absent"
+                )
+                return [self._connection_unavailable_future() for _ in keys]
             logger.warning(
                 "Connection is None in batched_submit_put_task, returning None"
             )
@@ -319,6 +410,35 @@ class RemoteBackend(StorageBackendInterface):
         if self.connection.support_batched_put():
             if self._mla_worker_id_as0_mode:
                 return None
+
+            # A batched writer must be visible to concurrent same-key puts just
+            # like the single-key path. If any key already has a physical
+            # writer, use the single-key path so existing futures are joined
+            # and only genuinely new keys are submitted.
+            completion: Future = Future()
+            with self.lock:
+                has_pending = any(
+                    key in self._single_put_futures for key in keys
+                )
+                if not has_pending:
+                    for key in keys:
+                        self._single_put_futures[key] = completion
+                        self._single_put_callbacks[key] = (
+                            [on_complete_callback]
+                            if on_complete_callback is not None
+                            else []
+                        )
+                    self.put_tasks.update(keys)
+            if has_pending:
+                futures = [
+                    self.submit_put_task(
+                        key,
+                        memory_obj,
+                        on_complete_callback=on_complete_callback,
+                    )
+                    for key, memory_obj in zip(keys, memory_objs, strict=True)
+                ]
+                return futures if self.requires_put_completion() else None
 
             # First, increment reference counts for all objects
             for memory_obj in memory_objs:
@@ -328,6 +448,9 @@ class RemoteBackend(StorageBackendInterface):
             try:
                 for memory_obj in memory_objs:
                     compressed_memory_objs.append(self.serializer.serialize(memory_obj))
+            except BaseException as error:
+                self._finish_batched_completion(keys, completion, error)
+                raise
             finally:
                 # Always decrement reference counts for all objects,
                 # regardless of whether serialization succeeded or failed
@@ -335,23 +458,24 @@ class RemoteBackend(StorageBackendInterface):
                     memory_obj.ref_count_down()
 
             def batched_done_callback(f: Future) -> None:
-                self.batched_put_callback(f, list(keys))
-                # Invoke per-key callback for each key in the batch
-                if on_complete_callback is not None:
-                    for key in keys:
-                        try:
-                            on_complete_callback(key)
-                        except Exception as e:
-                            logger.warning(
-                                f"on_complete_callback failed for key {key}: {e}"
-                            )
+                try:
+                    result = f.result()
+                except BaseException as error:
+                    self._finish_batched_completion(keys, completion, error)
+                else:
+                    self._finish_batched_completion(
+                        keys, completion, None, result=result
+                    )
 
-            future = asyncio.run_coroutine_threadsafe(
-                self.connection.batched_put(keys, compressed_memory_objs),  # type: ignore
-                self.loop,
-            )
+            coroutine = self.connection.batched_put(keys, compressed_memory_objs)  # type: ignore
+            try:
+                future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+            except BaseException as error:
+                coroutine.close()
+                self._finish_batched_completion(keys, completion, error)
+                raise
             future.add_done_callback(batched_done_callback)
-            return [future] if self.requires_put_completion() else None
+            return [completion] if self.requires_put_completion() else None
         else:
             futures: List[Future] = []
             for key, memory_obj in zip(keys, memory_objs, strict=False):
@@ -364,13 +488,42 @@ class RemoteBackend(StorageBackendInterface):
                 )
             return futures if self.requires_put_completion() else None
 
+    def _finish_batched_completion(
+        self,
+        keys: Sequence[CacheEngineKey],
+        completion: Future,
+        error: BaseException | None,
+        *,
+        result: Any = None,
+    ) -> None:
+        """Publish one physical batched writer's terminal result to joiners."""
+
+        if error is None:
+            if not completion.done():
+                completion.set_result(result)
+        elif not completion.done():
+            completion.set_exception(error)
+        callbacks: list[tuple[Callable[[CacheEngineKey], None], CacheEngineKey]] = []
+        with self.lock:
+            for key in keys:
+                if self._single_put_futures.get(key) is not completion:
+                    continue
+                self._single_put_futures.pop(key, None)
+                callbacks.extend(
+                    (callback, key)
+                    for callback in self._single_put_callbacks.pop(key, ())
+                )
+                self.put_tasks.discard(key)
+        for callback, key in callbacks:
+            self._invoke_put_complete_callback(callback, key)
+
     def batched_submit_external_pages(
         self,
         keys: Sequence[CacheEngineKey],
         buffer_ptrs: List[List[int]],
         buffer_sizes: List[List[int]],
         owners: tuple[Any, ...],
-        ready_event: Any,
+        producer_events: tuple[Any, ...] | Any,
         req_id: str,
     ) -> Future:
         """Submit registered external buffers to the remote connector."""
@@ -385,7 +538,7 @@ class RemoteBackend(StorageBackendInterface):
                 buffer_ptrs,
                 buffer_sizes,
                 owners,
-                ready_event,
+                producer_events,
                 req_id,
             ),
             self.loop,
@@ -436,6 +589,42 @@ class RemoteBackend(StorageBackendInterface):
         if self._mla_worker_id_as0_mode:
             normalized = [key.with_new_worker_id(0) for key in normalized]
         return self.connection.batched_external_pages_exist(normalized)
+
+    def submit_remote_fill_direct_push(
+        self,
+        *,
+        remote_session: str,
+        source_plan: Any,
+        destination_descriptors: tuple[Any, ...],
+        activation: Any,
+    ) -> Future:
+        """Submit one armed native direct push on the storage event loop."""
+        if self.connection is None:
+            raise RuntimeError("Remote connection is unavailable")
+        return asyncio.run_coroutine_threadsafe(
+            self.connection.push_external_pages(
+                remote_session=remote_session,
+                source_plan=source_plan,
+                destination_descriptors=destination_descriptors,
+                activation=activation,
+            ),
+            self.loop,
+        )
+
+    def prepare_remote_fill_source(self, source_plan: Any) -> Future:
+        """Prepare direct-push source owners on the storage event loop."""
+        if self.connection is None:
+            raise RuntimeError("Remote connection is unavailable")
+        return asyncio.run_coroutine_threadsafe(
+            self.connection.prepare_remote_fill_source(source_plan),
+            self.loop,
+        )
+
+    def get_remote_fill_destination_session(self) -> str | None:
+        """Return the active connector's native destination session."""
+        if self.connection is None:
+            return None
+        return self.connection.get_remote_fill_destination_session()
 
     @_lmcache_nvtx_annotate
     def get_blocking(

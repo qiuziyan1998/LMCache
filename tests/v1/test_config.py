@@ -145,6 +145,108 @@ def test_npu_content_diagnostics_defaults_off_and_can_be_enabled(monkeypatch):
     assert LMCacheEngineConfig.from_env().enable_npu_content_diagnostics is True
 
 
+def _remote_fill_config(**overrides):
+    kwargs = {
+        "enable_remote_lmcache_store": True,
+        "chunk_size": 1024,
+        "local_cpu": False,
+        "remote_url": "mooncakestore://metadata",
+    }
+    kwargs.update(overrides)
+    return LMCacheEngineConfig.from_defaults(**kwargs)
+
+
+def test_remote_fill_defaults_off_and_validates_common_contract():
+    assert LMCacheEngineConfig.from_defaults().enable_remote_lmcache_store is False
+    assert (
+        LMCacheEngineConfig.from_defaults().remote_fill_control_advertise_host
+        is None
+    )
+
+    config = _remote_fill_config()
+    config.validate()
+
+    assert config.use_layerwise is True
+    assert config.enable_sparse_attention is True
+    assert config.save_unfull_chunk is True
+    assert config.dsa_two_groups is True
+    assert config.pre_caching_hash_algorithm == "sha256_cbor"
+    assert config.get_extra_config_value("save_only_first_rank") is True
+    assert config.get_extra_config_value("mooncake_page_first_multi_buffer") is True
+    assert config.get_extra_config_value("mooncake_layer_merged_page_objects") is True
+    assert config.get_extra_config_value("save_chunk_meta") is False
+    assert config.remote_fill_submission_mode == "per_chunk"
+
+
+def test_remote_fill_rejects_unknown_submission_mode() -> None:
+    config = _remote_fill_config(remote_fill_submission_mode="unknown")
+
+    with pytest.raises(ValueError, match="remote_fill_submission_mode"):
+        config.validate()
+
+
+def test_remote_fill_accepts_final_deferred_rollback_mode() -> None:
+    config = _remote_fill_config(remote_fill_submission_mode="final_deferred")
+
+    config.validate()
+
+    assert config.remote_fill_submission_mode == "final_deferred"
+
+
+def test_remote_fill_derives_control_manifest_bound() -> None:
+    config = _remote_fill_config(remote_fill_max_control_pages_per_window=0)
+
+    config.validate()
+
+    assert config.remote_fill_max_control_pages_per_window == 8
+
+
+def test_remote_fill_pin_timeout_outlives_native_unknown_window() -> None:
+    config = _remote_fill_config(
+        remote_fill_native_hard_timeout_ms=120000,
+        pin_timeout_sec=180,
+    )
+
+    with pytest.raises(ValueError, match="pin_timeout_sec"):
+        config.validate()
+
+
+def test_remote_fill_builtin_hash_is_resolved_to_deterministic_hash(monkeypatch):
+    monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+    config = _remote_fill_config(pre_caching_hash_algorithm="builtin")
+
+    config.validate()
+
+    assert config.pre_caching_hash_algorithm == "sha256_cbor"
+
+
+def test_remote_fill_rejects_empty_advertised_control_host():
+    config = _remote_fill_config(remote_fill_control_advertise_host="  ")
+
+    with pytest.raises(ValueError, match="control_advertise_host"):
+        config.validate()
+
+
+def test_remote_fill_rejects_undersized_control_manifest():
+    config = _remote_fill_config(remote_fill_max_control_pages_per_window=7)
+
+    with pytest.raises(ValueError, match="max_control_pages"):
+        config.validate()
+
+
+def test_remote_fill_internally_enables_borrowed_global_transfer_engine():
+    config = _remote_fill_config(
+        extra_config={
+            "save_only_first_rank": True,
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+            "mooncake_reuse_vllm_transfer_engine": False,
+        }
+    )
+
+    config.validate()
+
+
 def test_group1_load_mode_defaults_to_p2p_preferred():
     config = LMCacheEngineConfig.from_defaults()
 

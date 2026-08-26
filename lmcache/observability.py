@@ -1027,6 +1027,25 @@ class PrometheusLogger:
             documentation="Total number of failed eviction in local cpu backend",
             labelnames=labelnames,
         )
+        self.counter_remote_fill_local_full_retained_at_load = self._create_counter(
+            name="lmcache:remote_fill_local_full_retained_at_load_total",
+            documentation=(
+                "LOCAL_FULL handoffs whose paired LocalCPU prefix remained resident"
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_remote_fill_local_prefix_missing_at_load = self._create_counter(
+            name="lmcache:remote_fill_local_prefix_missing_at_load_total",
+            documentation="LOCAL_FULL handoffs missing LocalCPU pages at actual load",
+            labelnames=labelnames,
+        )
+        self.counter_remote_fill_unexpected_remote_get = self._create_counter(
+            name="lmcache:remote_fill_unexpected_remote_get_total",
+            documentation=(
+                "Remote fallback selected inside a forwarded LOCAL_FULL range"
+            ),
+            labelnames=labelnames,
+        )
 
         self.counter_forced_unpin_count = self._create_counter(
             name="lmcache:forced_unpin_count",
@@ -1650,6 +1669,24 @@ class PrometheusLogger:
         if data < 0:
             return
         counter.labels(**self.labels).inc(data)
+
+    def log_remote_fill_actual_load(self, outcome: str) -> None:
+        """Increment one fixed-cardinality actual-load outcome counter."""
+
+        counters = {
+            "retained_at_load": (
+                self.counter_remote_fill_local_full_retained_at_load
+            ),
+            "local_prefix_missing_at_load": (
+                self.counter_remote_fill_local_prefix_missing_at_load
+            ),
+            "unexpected_remote_get": self.counter_remote_fill_unexpected_remote_get,
+        }
+        try:
+            counter = counters[outcome]
+        except KeyError as exc:
+            raise ValueError("unknown remote-fill actual-load outcome") from exc
+        self._log_counter(counter, 1)
 
     def _log_histogram(self, histogram, data: Union[List[int], List[float]]) -> None:
         # Convenience function for logging to histogram.

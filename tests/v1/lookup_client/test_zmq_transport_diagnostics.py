@@ -3,7 +3,7 @@
 
 # Standard
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 import queue
 import threading
 
@@ -15,7 +15,11 @@ import zmq
 from lmcache.v1.lookup_client import lmcache_lookup_client
 from lmcache.v1.lookup_client.lmcache_lookup_client import LMCacheLookupClient
 from lmcache.v1.rpc import zmq_transport
-from lmcache.v1.rpc.zmq_transport import SocketParams, ZmqReqRepClientTransport
+from lmcache.v1.rpc.zmq_transport import (
+    SocketParams,
+    ZmqReqRepClientTransport,
+    ZmqRouterServerTransport,
+)
 
 
 class _RecvTimeoutSocket:
@@ -24,6 +28,14 @@ class _RecvTimeoutSocket:
 
     def recv(self) -> bytes:
         raise zmq.Again()
+
+
+class _RouterSocket:
+    def __init__(self, frames) -> None:
+        self.frames = frames
+
+    def recv_multipart(self, copy=False):
+        return self.frames
 
 
 def _call_transport(transport: ZmqReqRepClientTransport) -> list[bytes]:
@@ -56,6 +68,146 @@ def test_zmq_timeout_log_contains_transport_and_caller_context(monkeypatch) -> N
     assert "caller=" in message and "_call_transport" in message
     assert kwargs["stack_info"] is True
     transport._recreate_all_sockets.assert_called_once_with()
+
+
+def test_zmq_client_transport_accepts_explicit_tcp_endpoint(monkeypatch) -> None:
+    socket = MagicMock()
+    create_socket = MagicMock(return_value=socket)
+    monkeypatch.setattr(zmq_transport, "get_zmq_socket", create_socket)
+    transport = object.__new__(ZmqReqRepClientTransport)
+    transport.ctx = object()
+    transport.timeout_ms = 1000
+
+    result = transport._create_socket(
+        SocketParams("10.0.0.8:19001", 0, "tcp")
+    )
+
+    assert result is socket
+    create_socket.assert_called_once_with(
+        transport.ctx,
+        "10.0.0.8:19001",
+        "tcp",
+        zmq.REQ,
+        "connect",
+    )
+    assert socket.setsockopt.call_args_list == [
+        call(zmq.RCVTIMEO, 1000),
+        call(zmq.SNDTIMEO, 1000),
+    ]
+
+
+def test_zmq_server_returns_identity_for_malformed_request() -> None:
+    transport = object.__new__(ZmqRouterServerTransport)
+    transport.decoder = msgspec.msgpack.Decoder()
+    transport.max_frame_bytes = 1024
+    transport.max_frame_count = 3
+    transport.socket = _RouterSocket([zmq.Frame(b"client"), zmq.Frame(b"")])
+
+    assert transport.recv_request() == (b"client", [])
+
+
+def test_zmq_server_drops_timed_out_response_without_stopping() -> None:
+    transport = object.__new__(ZmqRouterServerTransport)
+    transport.socket = MagicMock()
+    transport.socket.send_multipart.side_effect = zmq.Again()
+
+    transport.send_response(b"client", b"response")
+
+    transport.socket.send_multipart.assert_called_once_with(
+        [b"client", b"", b"response"]
+    )
+
+
+def test_zmq_server_rejects_oversized_frame_before_decode() -> None:
+    transport = object.__new__(ZmqRouterServerTransport)
+    transport.decoder = MagicMock()
+    transport.max_frame_bytes = 8
+    transport.max_frame_count = 3
+    transport.socket = _RouterSocket(
+        [
+            zmq.Frame(b"client"),
+            zmq.Frame(b""),
+            zmq.Frame(b"x" * 9),
+            zmq.Frame(b"1"),
+            zmq.Frame(b"2"),
+        ]
+    )
+
+    assert transport.recv_request() == (b"client", [])
+    transport.decoder.decode.assert_not_called()
+
+
+def test_zmq_server_contains_invalid_outer_msgpack() -> None:
+    transport = object.__new__(ZmqRouterServerTransport)
+    transport.decoder = msgspec.msgpack.Decoder()
+    transport.max_frame_bytes = 1024
+    transport.max_frame_count = 3
+    transport.socket = _RouterSocket(
+        [
+            zmq.Frame(b"client"),
+            zmq.Frame(b""),
+            zmq.Frame(b"\xc1"),
+            zmq.Frame(msgspec.msgpack.encode(1)),
+            zmq.Frame(msgspec.msgpack.encode(b"request")),
+        ]
+    )
+
+    assert transport.recv_request() == (b"client", [])
+
+
+def test_zmq_server_rejects_excess_frames_before_decode() -> None:
+    transport = object.__new__(ZmqRouterServerTransport)
+    transport.decoder = MagicMock()
+    transport.max_frame_bytes = 1024
+    transport.max_frame_count = 3
+    transport.socket = _RouterSocket(
+        [
+            zmq.Frame(b"client"),
+            zmq.Frame(b""),
+            zmq.Frame(b"1"),
+            zmq.Frame(b"2"),
+            zmq.Frame(b"3"),
+            zmq.Frame(b"4"),
+        ]
+    )
+
+    assert transport.recv_request() == (b"client", [])
+    transport.decoder.decode.assert_not_called()
+
+
+def test_closing_client_does_not_terminate_shared_context(monkeypatch) -> None:
+    context = MagicMock()
+    first_socket = MagicMock()
+    second_socket = MagicMock()
+    second_socket.recv.return_value = b"response"
+    sockets = iter((first_socket, second_socket))
+
+    monkeypatch.setattr(
+        zmq_transport,
+        "get_zmq_context",
+        MagicMock(return_value=context),
+    )
+    monkeypatch.setattr(
+        zmq_transport,
+        "get_zmq_socket",
+        MagicMock(side_effect=lambda *_args: next(sockets)),
+    )
+
+    params = [SocketParams("127.0.0.1:19001", 0, "tcp")]
+    first = ZmqReqRepClientTransport(params, timeout_ms=1000)
+    second = ZmqReqRepClientTransport(params, timeout_ms=1000)
+
+    first.close()
+
+    first_socket.close.assert_called_once_with(linger=0)
+    context.term.assert_not_called()
+    second_socket.close.assert_not_called()
+    assert second.send_and_recv_all(["service", "version", b"request"]) == [
+        b"response"
+    ]
+
+    second.close()
+    context.term.assert_not_called()
 
 
 class _TokenDatabase:

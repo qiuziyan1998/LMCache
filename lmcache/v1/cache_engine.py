@@ -3,6 +3,7 @@
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 # Standard
 import asyncio
 import gc
+import json
 import math
 import multiprocessing
 import os
@@ -34,7 +36,11 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
+from lmcache.observability import (
+    LMCacheStatsLogger,
+    LMCStatsMonitor,
+    PrometheusLogger,
+)
 from lmcache.usage_context import InitializeUsageContext
 from lmcache.utils import (
     CacheEngineKey,
@@ -74,6 +80,8 @@ from lmcache.v1.mooncake_layout import (
     mooncake_valid_tokens,
 )
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.remote_fill.security import content_digest
+from lmcache.v1.remote_fill_diagnostics import log_remote_fill_validation_failure
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
     first_last_layer_keys,
@@ -84,6 +92,7 @@ from lmcache.v1.shared_cpu_cache import (
     SharedHandleBatch,
     SharedHandleEnvelope,
     SharedSlabMapping,
+    chunk_hash_to_int,
     validate_shared_handle_batch,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
@@ -146,6 +155,42 @@ class LayerwiseStoreResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _RemoteFillChunkLookupPlan:
+    start: int
+    end: int
+    # Raw chunk hash: int for builtin/64-bit algorithms, digest bytes for
+    # digest-based algorithms (e.g. sha256_cbor in this vLLM fork).
+    chunk_hash: Union[int, bytes]
+    location: str
+    page_by_group: tuple[bool, bool]
+
+
+@dataclass(frozen=True, slots=True)
+class _RemoteFillLookupPlan:
+    chunks: tuple[_RemoteFillChunkLookupPlan, ...]
+
+
+class _RemoteFillMaterializationError(RuntimeError):
+    """A retained RemoteFill plan cannot be safely materialized for loading."""
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteFillActualLoadMetricsSnapshot:
+    """Fixed-cardinality LOCAL_FULL actual-load outcome counters."""
+
+    retained_at_load_total: int
+    local_prefix_missing_at_load_total: int
+    unexpected_remote_get_total: int
+
+
+@dataclass(slots=True)
+class _RemoteFillActualLoadCounters:
+    retained_at_load: int = 0
+    local_prefix_missing_at_load: int = 0
+    unexpected_remote_get: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class _SharedRank0ObjectContext:
     parent_allocator: MemoryAllocatorInterface
     slab_size: int
@@ -182,6 +227,7 @@ class LMCacheEngine:
         gpu_connector: Optional[GPUConnectorInterface],
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
+        collective_all_true_fn: Optional[Callable[[bool], bool]] = None,
     ):
         logger.info(f"Creating LMCacheEngine with config: {config}")
         self.config = config
@@ -190,6 +236,7 @@ class LMCacheEngine:
         self.gpu_connector = gpu_connector
         self.broadcast_fn = broadcast_fn
         self.broadcast_object_fn = broadcast_object_fn
+        self.collective_all_true_fn = collective_all_true_fn
         # save_only_first_rank only works when use mla
         self.save_only_first_rank = (
             self.config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
@@ -318,6 +365,9 @@ class LMCacheEngine:
         self.lookup_pins: dict[str, dict[str, list]] = defaultdict(
             lambda: defaultdict(list)
         )
+        self._remote_fill_lookup_plans: dict[str, _RemoteFillLookupPlan] = {}
+        self._remote_fill_actual_load_lock = Lock()
+        self._remote_fill_actual_load_counters = _RemoteFillActualLoadCounters()
 
         InitializeUsageContext(config, metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -1191,6 +1241,39 @@ class LMCacheEngine:
                     waiters.pop(expected)
                 condition.notify_all()
 
+    def _remote_fill_all_ranks_materialized(
+        self,
+        local_ready: bool,
+        *,
+        req_id: str,
+        kv_group: int,
+    ) -> bool:
+        """Return one collective materialization decision for all TP ranks."""
+
+        if self.metadata.world_size <= 1:
+            return bool(local_ready)
+        collective = getattr(self, "collective_all_true_fn", None)
+        if not callable(collective):
+            logger.error(
+                "RemoteFill shared materialization lacks a TP consensus "
+                "callback: req_id=%s kv_group=%s",
+                req_id,
+                kv_group,
+            )
+            return False
+        result = bool(collective(bool(local_ready)))
+        if cold_start_perf_enabled():
+            cold_start_perf_log(
+                logger,
+                "remote_fill_materialization_consensus",
+                req_id=req_id,
+                kv_group=kv_group,
+                rank=self.metadata.worker_id,
+                local_ready=bool(local_ready),
+                all_ranks_ready=result,
+            )
+        return result
+
     def _validate_shared_layerwise_envelope(
         self,
         envelope: SharedHandleEnvelope,
@@ -1392,7 +1475,8 @@ class LMCacheEngine:
             num_chunks=chunks,
             physical_sizes=physical_sizes,
             chunk_hashes=[
-                int(key.chunk_hash) for key in keys_layer_major[0][:chunks]
+                chunk_hash_to_int(key.chunk_hash)
+                for key in keys_layer_major[0][:chunks]
             ],
             offsets=[int(obj.meta.address) for obj in tail],
             page_offsets=[
@@ -1442,7 +1526,7 @@ class LMCacheEngine:
             expected_num_layers=self.num_layers,
             expected_num_chunks=batch.num_chunks,
             expected_chunk_hashes=[
-                int(key.chunk_hash)
+                chunk_hash_to_int(key.chunk_hash)
                 for key in keys_layer_major[0][: batch.num_chunks]
             ],
             slab_size=allocator.slab_size,
@@ -1992,6 +2076,481 @@ class LMCacheEngine:
                 base_key, int(self.config.chunk_size)
             ),
         )
+
+    def _remote_fill_pair_lookup_enabled(self) -> bool:
+        return bool(
+            getattr(self.config, "enable_remote_lmcache_store", False)
+            and getattr(self.config, "dsa_two_groups", False)
+            and getattr(self, "use_layerwise", False)
+            and mooncake_layer_pages_enabled(self.config)
+            and self._should_use_shared_layerwise_retrieve(0)
+            and self._should_use_shared_layerwise_retrieve(1)
+        )
+
+    def _lookup_remote_fill_two_group_prefix(
+        self,
+        chunks: list[tuple[int, int, CacheEngineKey]],
+        *,
+        search_range: list[str],
+        lookup_id: Optional[str],
+        pin: bool,
+        request_configs: Optional[dict],
+        diagnostics: Optional[dict[str, object]] = None,
+    ) -> int:
+        """Locate and retain a same-tier two-group prefix for actual load."""
+        if not chunks:
+            return 0
+        if pin:
+            assert lookup_id is not None, "lookup_id is required when pin is True"
+        assert self.storage_manager is not None
+
+        group_keys = {
+            group: [
+                self._lookup_key_for_kv_group(
+                    key,
+                    kv_group=group,
+                    request_configs=request_configs,
+                ).get_first_layer()
+                for _, _, key in chunks
+            ]
+            for group in (0, 1)
+        }
+        retained: dict[str, list[CacheEngineKey]] = defaultdict(list)
+        plan: list[_RemoteFillChunkLookupPlan] = []
+
+        def release(mapping: dict[str, list[CacheEngineKey]]) -> None:
+            if not pin:
+                return
+            for location, keys in mapping.items():
+                if keys:
+                    self.storage_manager.batched_unpin(keys, [location])
+
+        def append_mapping(mapping: dict[str, list[CacheEngineKey]]) -> None:
+            for location, keys in mapping.items():
+                retained[location].extend(keys)
+
+        def mapping_locations(
+            mapping: dict[str, list[CacheEngineKey]], expected_pairs: int
+        ) -> list[str]:
+            locations: list[str] = []
+            for location, keys in mapping.items():
+                if len(keys) % 2:
+                    raise RuntimeError(
+                        "Two-group page lookup returned an unpaired mapping"
+                    )
+                locations.extend([location] * (len(keys) // 2))
+            if len(locations) != expected_pairs:
+                raise RuntimeError(
+                    "Two-group page lookup returned incomplete backend mapping"
+                )
+            return locations
+
+        def add_page_plans(start_index: int, locations: list[str]) -> None:
+            for offset, location in enumerate(locations):
+                start, end, key = chunks[start_index + offset]
+                plan.append(
+                    _RemoteFillChunkLookupPlan(
+                        start=start,
+                        end=end,
+                        chunk_hash=key.chunk_hash,
+                        location=location,
+                        page_by_group=(True, True),
+                    )
+                )
+
+        def finalize() -> int:
+            if pin and plan:
+                assert lookup_id is not None
+                for location, keys in retained.items():
+                    self.lookup_pins[lookup_id][location].extend(keys)
+                self._remote_fill_lookup_plans[lookup_id] = _RemoteFillLookupPlan(
+                    tuple(plan)
+                )
+            return plan[-1].end if plan else 0
+
+        try:
+            covered = 0
+            local_pairs = 0
+            local_lookup_attempted = False
+            if "LocalCPUBackend" in search_range:
+                local_lookup_attempted = True
+                local_pairs, local_mapping = (
+                    self.storage_manager.batched_contains_two_group_layer_pages(
+                        group_keys[0],
+                        group_keys[1],
+                        ["LocalCPUBackend"],
+                        pin,
+                        diagnostics=diagnostics,
+                    )
+                )
+                append_mapping(local_mapping)
+                add_page_plans(0, mapping_locations(local_mapping, local_pairs))
+                covered = local_pairs
+
+            if diagnostics is not None:
+                hint = self._remote_fill_local_full_hint(request_configs)
+                if hint is not None:
+                    required_store_end, _ = hint
+                    required_pairs = sum(
+                        start < required_store_end for start, _, _ in chunks
+                    )
+                    diagnostics.update(
+                        local_lookup_attempted=local_lookup_attempted,
+                        local_pairs=min(local_pairs, required_pairs),
+                        required_pairs=required_pairs,
+                    )
+                    try:
+                        diagnostics["required_key_digest"] = content_digest(
+                            (
+                                tuple(
+                                    key.without_layer().to_string()
+                                    for key in group_keys[0][:required_pairs]
+                                ),
+                                tuple(
+                                    key.without_layer().to_string()
+                                    for key in group_keys[1][:required_pairs]
+                                ),
+                            )
+                        )
+                    except Exception:
+                        # Diagnostics must not invalidate an already-completed
+                        # paired lookup or alter its pin ownership.
+                        diagnostics["key_digest_error"] = True
+                        logger.warning(
+                            "Failed to fingerprint remote-fill lookup keys",
+                            exc_info=True,
+                        )
+
+            persistent_range = [
+                location
+                for location in search_range
+                if location != "LocalCPUBackend"
+            ]
+            if covered == len(chunks) or not persistent_range:
+                return finalize()
+
+            page_pairs, page_mapping = (
+                self.storage_manager.batched_contains_two_group_layer_pages(
+                    group_keys[0][covered:],
+                    group_keys[1][covered:],
+                    persistent_range,
+                    pin,
+                )
+            )
+            append_mapping(page_mapping)
+            add_page_plans(
+                covered,
+                mapping_locations(page_mapping, page_pairs),
+            )
+            covered += page_pairs
+
+            def locate_group(
+                chunk_index: int,
+                kv_group: int,
+            ) -> tuple[str, dict[str, list[CacheEngineKey]], bool] | None:
+                page_key = group_keys[kv_group][chunk_index]
+                hits, mapping = self.storage_manager.batched_contains_layer_pages(
+                    [page_key],
+                    persistent_range,
+                    pin,
+                )
+                if hits == 1 and len(mapping) == 1:
+                    return next(iter(mapping)), mapping, True
+                release(mapping)
+
+                layer_keys = self._lookup_key_for_kv_group(
+                    chunks[chunk_index][2],
+                    kv_group=kv_group,
+                    request_configs=request_configs,
+                ).split_layers(self.num_layers)
+                hits, mapping = self.storage_manager.batched_contains(
+                    layer_keys,
+                    persistent_range,
+                    pin,
+                )
+                if hits == len(layer_keys) and len(mapping) == 1:
+                    return next(iter(mapping)), mapping, False
+                release(mapping)
+                return None
+
+            while covered < len(chunks):
+                group0 = locate_group(covered, 0)
+                if group0 is None:
+                    break
+                try:
+                    group1 = locate_group(covered, 1)
+                except Exception:
+                    release(group0[1])
+                    raise
+                if group1 is None or group0[0] != group1[0]:
+                    release(group0[1])
+                    if group1 is not None:
+                        release(group1[1])
+                    break
+                append_mapping(group0[1])
+                append_mapping(group1[1])
+                start, end, key = chunks[covered]
+                plan.append(
+                    _RemoteFillChunkLookupPlan(
+                        start=start,
+                        end=end,
+                        chunk_hash=key.chunk_hash,
+                        location=group0[0],
+                        page_by_group=(group0[2], group1[2]),
+                    )
+                )
+                covered += 1
+            return finalize()
+        except Exception:
+            release(dict(retained))
+            raise
+
+    @staticmethod
+    def _remote_fill_local_full_hint(
+        request_configs: Optional[dict],
+    ) -> Optional[tuple[int, int]]:
+        """Return the sanitized LOCAL_FULL handoff hint, if present.
+
+        This metadata is diagnostic only.  In particular, callers must still
+        perform the ordinary paired lookup-and-pin before consulting it.
+        """
+
+        if not isinstance(request_configs, dict):
+            return None
+        hint = request_configs.get("lmcache.remote_fill_result")
+        if not isinstance(hint, dict) or hint.get("outcome") != "LOCAL_FULL":
+            return None
+        required_store_end = hint.get("required_store_end")
+        destination_engine_epoch = hint.get("destination_engine_epoch")
+        if (
+            isinstance(required_store_end, bool)
+            or not isinstance(required_store_end, int)
+            or required_store_end <= 0
+            or isinstance(destination_engine_epoch, bool)
+            or not isinstance(destination_engine_epoch, int)
+            or destination_engine_epoch <= 0
+        ):
+            return None
+        return required_store_end, destination_engine_epoch
+
+    def _record_remote_fill_actual_load(
+        self,
+        *,
+        request_configs: Optional[dict],
+        lookup_id: Optional[str],
+        actual_load_end: int,
+        diagnostics: Optional[dict[str, object]] = None,
+    ) -> None:
+        """Record whether a LOCAL_FULL prefix survived until actual load."""
+
+        hint = self._remote_fill_local_full_hint(request_configs)
+        if hint is None or lookup_id is None:
+            return
+        required_store_end, destination_engine_epoch = hint
+        plan = self._remote_fill_lookup_plans.get(lookup_id)
+        if plan is None:
+            log_remote_fill_validation_failure(
+                logger,
+                code="RF-D-001",
+                stage="actual_load_admission",
+                action="PERSISTENT_FALLBACK_OR_RECOMPUTE",
+                req_id=lookup_id,
+                reason="LOCAL_FULL hint has no retained paired prefix",
+                severity="warning",
+            )
+
+        common_local_end = 0
+        unexpected_remote = False
+        if plan is not None:
+            for chunk in plan.chunks:
+                if chunk.start >= required_store_end:
+                    break
+                if chunk.location != "LocalCPUBackend":
+                    unexpected_remote = True
+                    break
+                common_local_end = min(chunk.end, required_store_end)
+
+        retained = common_local_end >= required_store_end
+        outcome = (
+            "retained_at_load" if retained else "local_prefix_missing_at_load"
+        )
+        lock = getattr(self, "_remote_fill_actual_load_lock", None)
+        counters = getattr(self, "_remote_fill_actual_load_counters", None)
+        if lock is None or counters is None:
+            # Test-only object construction may bypass LMCacheEngine.__init__.
+            self._remote_fill_actual_load_lock = Lock()
+            self._remote_fill_actual_load_counters = (
+                _RemoteFillActualLoadCounters()
+            )
+            lock = self._remote_fill_actual_load_lock
+            counters = self._remote_fill_actual_load_counters
+        with lock:
+            if retained:
+                counters.retained_at_load += 1
+            else:
+                counters.local_prefix_missing_at_load += 1
+            if unexpected_remote:
+                counters.unexpected_remote_get += 1
+
+        prometheus = PrometheusLogger.GetInstanceOrNone()
+        if prometheus is not None:
+            try:
+                prometheus.log_remote_fill_actual_load(outcome)
+                if unexpected_remote:
+                    prometheus.log_remote_fill_actual_load(
+                        "unexpected_remote_get"
+                    )
+            except Exception:
+                # Metrics must never invalidate already-acquired lookup pins.
+                logger.warning(
+                    "Failed to export remote-fill actual-load metrics",
+                    exc_info=True,
+                )
+
+        fields = {
+            "schema": 1,
+            "event": "remote_fill_actual_load",
+            "outcome": outcome,
+            "required_store_end": required_store_end,
+            "common_local_end": common_local_end,
+            "actual_load_end": actual_load_end,
+            "destination_engine_epoch": destination_engine_epoch,
+            "remote_suffix": actual_load_end > common_local_end,
+            **(diagnostics or {}),
+        }
+        cold_start_perf_log(
+            logger,
+            "remote_fill_actual_load",
+            req_id=lookup_id,
+            outcome=outcome,
+            required_store_end=required_store_end,
+            common_local_end=common_local_end,
+            actual_load_end=actual_load_end,
+            destination_engine_epoch=destination_engine_epoch,
+            remote_suffix=actual_load_end > common_local_end,
+            **(diagnostics or {}),
+        )
+        logger.info(
+            "[LMCACHE_REMOTE_FILL] %s",
+            json.dumps(fields, separators=(",", ":"), sort_keys=True),
+        )
+        if not retained:
+            fields["event"] = "remote_fill_local_prefix_missing_at_load"
+            cold_start_perf_log(
+                logger,
+                "remote_fill_local_prefix_missing_at_load",
+                req_id=lookup_id,
+                required_store_end=required_store_end,
+                common_local_end=common_local_end,
+                actual_load_end=actual_load_end,
+                destination_engine_epoch=destination_engine_epoch,
+                remote_suffix=actual_load_end > common_local_end,
+                **(diagnostics or {}),
+            )
+            logger.info(
+                "[LMCACHE_REMOTE_FILL] %s",
+                json.dumps(fields, separators=(",", ":"), sort_keys=True),
+            )
+
+    def remote_fill_actual_load_metrics_snapshot(
+        self,
+    ) -> RemoteFillActualLoadMetricsSnapshot:
+        """Return fixed-cardinality direct-fill actual-load counters."""
+
+        lock = getattr(self, "_remote_fill_actual_load_lock", None)
+        counters = getattr(self, "_remote_fill_actual_load_counters", None)
+        if lock is None or counters is None:
+            return RemoteFillActualLoadMetricsSnapshot(0, 0, 0)
+        with lock:
+            return RemoteFillActualLoadMetricsSnapshot(
+                retained_at_load_total=counters.retained_at_load,
+                local_prefix_missing_at_load_total=(
+                    counters.local_prefix_missing_at_load
+                ),
+                unexpected_remote_get_total=counters.unexpected_remote_get,
+            )
+
+    def _remote_fill_retrieve_plan(
+        self,
+        req_id: str,
+        candidates: list[tuple[int, int, CacheEngineKey]],
+        kv_group: int,
+    ) -> Optional[list[tuple[str, bool]]]:
+        plan = getattr(self, "_remote_fill_lookup_plans", {}).get(req_id)
+        if plan is None or kv_group not in (0, 1):
+            return None
+        by_chunk = {
+            (chunk.start, chunk.end, chunk.chunk_hash): chunk
+            for chunk in plan.chunks
+        }
+        selected: list[tuple[str, bool]] = []
+        for start, end, key in candidates:
+            chunk = by_chunk.get((start, end, key.chunk_hash))
+            if chunk is None:
+                raise _RemoteFillMaterializationError(
+                    "Remote-fill actual-load candidates do not match the "
+                    f"retained paired lookup plan: req_id={req_id}, "
+                    f"kv_group={kv_group}, start={start}, end={end}"
+                )
+            selected.append((chunk.location, chunk.page_by_group[kv_group]))
+        return selected
+
+    def _remote_fill_retained_local_page_plan(
+        self,
+        req_id: str,
+        kv_group: int,
+        required_end: int,
+    ) -> Optional[tuple[list[tuple[int, int, Any]], list[str]]]:
+        """Return an exact retained LocalCPU page plan for actual load."""
+        plan = getattr(self, "_remote_fill_lookup_plans", {}).get(req_id)
+        if plan is None or kv_group not in (0, 1):
+            return None
+        chunks = [chunk for chunk in plan.chunks if chunk.start < required_end]
+        if not chunks or chunks[-1].end < required_end:
+            raise _RemoteFillMaterializationError(
+                "Remote-fill retained plan does not cover the required frontier"
+            )
+        if any(
+            chunk.location != "LocalCPUBackend"
+            or not chunk.page_by_group[kv_group]
+            for chunk in chunks
+        ):
+            return None
+        return (
+            [
+                (int(chunk.start), int(chunk.end), chunk.chunk_hash)
+                for chunk in chunks
+            ],
+            [chunk.location for chunk in chunks],
+        )
+
+    def _remote_fill_recompute_result(
+        self,
+        *,
+        ret_mask: torch.Tensor,
+        monitor_req_id: int,
+        yielded_steps: int,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        """Complete a failed layerwise load with the ordinary recompute signal.
+
+        Layerwise consumers expect one yield per layer, one completion yield,
+        and the final retrieval mask. Preserving that protocol while returning
+        an empty mask lets the existing vLLM invalid-block policy roll the
+        request back to recomputation instead of failing the worker.
+        """
+        ret_mask.zero_()
+        remaining_non_result_steps = max(
+            self.num_layers + 1 - yielded_steps,
+            0,
+        )
+        for _ in range(remaining_non_result_steps):
+            yield None
+        retrieved_tokens = torch.sum(ret_mask)
+        self.stats_monitor.on_retrieve_finished(
+            monitor_req_id,
+            retrieved_tokens,
+        )
+        yield ret_mask
 
     def _shared_local_cpu_backend(self):
         if self.storage_manager is None:
@@ -2977,6 +3536,7 @@ class LMCacheEngine:
         keys_layer: list[CacheEngineKey],
         chunk_locations: Optional[list[str]] = None,
         local_prefix: Optional[LocalCPUPrefixGetResult] = None,
+        enforce_planned_location: bool = False,
     ) -> list[MemoryObj]:
         """Resolve one layer into rank0 shm-backed LocalCPU MemoryObjs.
 
@@ -3026,6 +3586,9 @@ class LMCacheEngine:
                     local_prefix.take_local(chunk_index)
                     if local_prefix is not None
                     else local_cpu_backend.get_blocking(key)
+                    if not enforce_planned_location
+                    or planned_location == "LocalCPUBackend"
+                    else None
                 )
                 if hot_obj is not None:
                     if self._is_rank0_shared_mem_obj(hot_obj):
@@ -3109,7 +3672,11 @@ class LMCacheEngine:
                         resolved[pos] = fetched_obj
                         continue
 
-                    hot_obj = local_cpu_backend.get_blocking(key)
+                    hot_obj = (
+                        None
+                        if enforce_planned_location
+                        else local_cpu_backend.get_blocking(key)
+                    )
                     if hot_obj is not None and self._is_rank0_shared_mem_obj(hot_obj):
                         acquired.append(hot_obj)
                         fetched_obj.ref_count_down()
@@ -3262,6 +3829,118 @@ class LMCacheEngine:
             self._release_shared_retrieve_objs(owned, unpin=True)
             raise
 
+    def _resolve_shared_rank0_exact_layer_pages(
+        self,
+        *,
+        req_id: str,
+        phase: str,
+        kv_group: int,
+        keys_layer_major: list[list[CacheEngineKey]],
+        page_chunks: int,
+        base_page_keys: list[CacheEngineKey],
+        chunk_locations: list[str],
+    ) -> tuple[list[list[MemoryObj]], int]:
+        """Resolve a retained RemoteFill plan without reselecting its tier."""
+        chunks = len(keys_layer_major[0])
+        if (
+            len(keys_layer_major) != self.num_layers
+            or any(len(keys) != chunks for keys in keys_layer_major)
+            or len(base_page_keys) < page_chunks
+            or len(chunk_locations) != chunks
+            or not 0 <= page_chunks <= chunks
+        ):
+            raise ValueError("RemoteFill exact layer-page plan is malformed")
+
+        pages: list[MemoryObj] = []
+        owned: list[MemoryObj] = []
+        pinned: list[MemoryObj] = []
+        try:
+            offset = 0
+            while offset < page_chunks:
+                location = chunk_locations[offset]
+                run_end = offset + 1
+                while (
+                    run_end < page_chunks
+                    and chunk_locations[run_end] == location
+                ):
+                    run_end += 1
+                run_keys = base_page_keys[offset:run_end]
+                if location == "LocalCPUBackend":
+                    fetched, count = (
+                        self._shared_local_cpu_backend().batched_get_layer_page_prefix(
+                            run_keys
+                        )
+                    )
+                    if count != len(run_keys):
+                        owned.extend(fetched)
+                        raise ValueError(
+                            "Pinned RemoteFill LocalCPU page plan became unavailable"
+                        )
+                else:
+                    assert self.storage_manager is not None
+                    backend = self.storage_manager.storage_backends.get(location)
+                    retrieve = getattr(backend, "batched_get_layer_pages", None)
+                    if not callable(retrieve):
+                        raise RuntimeError(
+                            f"RemoteFill backend {location!r} cannot retrieve pages"
+                        )
+                    fetched = retrieve(run_keys)
+                if len(fetched) != len(run_keys):
+                    owned.extend(fetched)
+                    raise ValueError(
+                        "RemoteFill exact layer-page result count is inconsistent"
+                    )
+                pages.extend(fetched)
+                owned.extend(fetched)
+                offset = run_end
+
+            tail: list[list[MemoryObj]] = []
+            tail_locations = chunk_locations[page_chunks:]
+            for layer_id, layer_keys in enumerate(keys_layer_major):
+                layer = self._resolve_shared_rank0_layer_mem_objs(
+                    req_id=req_id,
+                    phase=phase,
+                    layer_id=layer_id,
+                    kv_group=kv_group,
+                    keys_layer=layer_keys[page_chunks:],
+                    chunk_locations=tail_locations,
+                    enforce_planned_location=True,
+                )
+                tail.append(layer)
+                owned.extend(layer)
+                pinned.extend(layer)
+
+            invalid_page = any(
+                not isinstance(page, LayerPageMemoryObj)
+                or page.num_layers != self.num_layers
+                or page.get_shape()
+                != self._expected_shared_cpu_chunk_metadata(
+                    kv_group=kv_group,
+                    num_tokens=mooncake_valid_tokens(
+                        base_page_keys[index], self.config.chunk_size
+                    ),
+                )[0]
+                for index, page in enumerate(pages)
+            )
+            if invalid_page or not LayerPageMemoryObj.pin_many(pages):
+                raise ValueError("Invalid or unpinnable RemoteFill layer page")
+            pinned.extend(pages)
+            for chunk_index, page in enumerate(pages):
+                self._validate_rank0_shared_mem_obj(
+                    page,
+                    req_id=req_id,
+                    phase=phase,
+                    layer_id=0,
+                    kv_group=kv_group,
+                    chunk_index=chunk_index,
+                )
+            return [list(pages) + layer for layer in tail], page_chunks
+        except Exception:
+            for obj in reversed(pinned):
+                obj.unpin()
+            self._release_shared_retrieve_objs(owned, unpin=False)
+            raise
+
     def _resolve_shared_rank0_layer_pages(
         self,
         *,
@@ -3271,6 +3950,7 @@ class LMCacheEngine:
         keys_layer_major: list[list[CacheEngineKey]],
         page_chunks: int,
         base_page_keys: Optional[list[CacheEngineKey]] = None,
+        exact_chunk_locations: Optional[list[str]] = None,
     ) -> tuple[list[list[MemoryObj]], int]:
         """Resolve merged pages and expand layer keys only for a legacy suffix."""
         if not 0 < page_chunks <= len(keys_layer_major[0]):
@@ -3286,6 +3966,16 @@ class LMCacheEngine:
         )
         if len(page_keys) != page_chunks:
             raise ValueError("Layer-page retrieval requires one base key per page")
+        if exact_chunk_locations is not None:
+            return self._resolve_shared_rank0_exact_layer_pages(
+                req_id=req_id,
+                phase=phase,
+                kv_group=kv_group,
+                keys_layer_major=keys_layer_major,
+                page_chunks=page_chunks,
+                base_page_keys=page_keys,
+                chunk_locations=exact_chunk_locations,
+            )
 
         local = self._shared_local_cpu_backend()
         pages, local_count = local.batched_get_layer_page_prefix(page_keys)
@@ -3888,12 +4578,25 @@ class LMCacheEngine:
         kv_group: int,
         kwargs: dict[str, Any],
         planned_page_chunks: int = 0,
+        remote_fill_plan: Optional[list[tuple[str, bool]]] = None,
     ) -> Generator[Optional[torch.Tensor], None, None]:
         assert self.storage_manager is not None
         assert self.gpu_connector is not None
 
         phase = kwargs.get("shared_cpu_phase", "dense_prefix")
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
+        # Mirror the passive side's derivation exactly: the TP materialization
+        # consensus must be entered by every rank or by none. A prefiller
+        # prefix-hit retrieve carries a remote_fill_plan without the decoder's
+        # LOCAL_FULL hint, so its passive ranks never enter the consensus and
+        # an unconditional rank0 entry deadlocks the collective.
+        remote_fill_load = bool(
+            self._remote_fill_pair_lookup_enabled()
+            and self._remote_fill_local_full_hint(
+                kwargs.get("request_configs")
+            )
+            is not None
+        )
         if not keys_layer_major:
             for layer_id in range(self.num_layers):
                 self._broadcast_shared_envelope(
@@ -3915,6 +4618,45 @@ class LMCacheEngine:
             yield ret_mask
             return
 
+        exact_locations: Optional[list[str]] = None
+        if remote_fill_plan is not None:
+            try:
+                if len(remote_fill_plan) != len(starts):
+                    raise ValueError("RemoteFill retained plan length mismatch")
+                page_flags = [page for _, page in remote_fill_plan]
+                if not all(page_flags):
+                    raise ValueError(
+                        "RemoteFill LOCAL_FULL materialization requires "
+                        "physical layer pages for every retained chunk"
+                    )
+                first_legacy = next(
+                    (index for index, page in enumerate(page_flags) if not page),
+                    len(page_flags),
+                )
+                if (
+                    any(page_flags[first_legacy:])
+                    or first_legacy != planned_page_chunks
+                ):
+                    raise ValueError(
+                        "RemoteFill layer-page representation is not a page prefix"
+                    )
+            except Exception as exc:
+                self._broadcast_shared_envelope(
+                    self._shared_layerwise_error_envelope(
+                        req_id=req_id,
+                        phase=phase,
+                        request_ordinal=request_ordinal,
+                        layer_id=0,
+                        kv_group=kv_group,
+                        message="RemoteFill retained plan validation failed.",
+                        details={"error": str(exc)},
+                    )
+                )
+                raise _RemoteFillMaterializationError(
+                    "RemoteFill retained plan validation failed"
+                ) from exc
+            exact_locations = [location for location, _ in remote_fill_plan]
+
         assert_layerwise_gpu_connector(self.gpu_connector)
         mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
         next(mem_obj_consumer)
@@ -3925,7 +4667,8 @@ class LMCacheEngine:
         page_first_resolve = (
             mooncake_page_layout_enabled(getattr(self, "config", None))
             and (
-                location in {"LocalCPUBackend", "RemoteBackend"}
+                remote_fill_plan is not None
+                or location in {"LocalCPUBackend", "RemoteBackend"}
                 or self._is_shared_page_first_location_plan(
                     chunk_locations_layer_major
                 )
@@ -3939,6 +4682,7 @@ class LMCacheEngine:
         consume_started = consumer_send_s = consumer_finish_s = 0.0
         try:
             for layer_id in range(self.num_layers):
+                envelope_required = compact_batch is None
                 try:
                     if page_first_resolve:
                         if pre_resolved_layers is None:
@@ -3962,6 +4706,7 @@ class LMCacheEngine:
                                             else key
                                             for key in keys_layer_major[0]
                                         ],
+                                        exact_chunk_locations=exact_locations,
                                     )
                                 )
                                 layer_pages = tuple(
@@ -3970,6 +4715,18 @@ class LMCacheEngine:
                                         :layer_page_chunks
                                     ]
                                     if isinstance(page, LayerPageMemoryObj)
+                                )
+                            elif exact_locations is not None:
+                                pre_resolved_layers, _ = (
+                                    self._resolve_shared_rank0_exact_layer_pages(
+                                        req_id=req_id,
+                                        phase=phase,
+                                        kv_group=kv_group,
+                                        keys_layer_major=keys_layer_major,
+                                        page_chunks=0,
+                                        base_page_keys=[],
+                                        chunk_locations=exact_locations,
+                                    )
                                 )
                             else:
                                 pre_resolved_layers = (
@@ -3994,20 +4751,6 @@ class LMCacheEngine:
                                 raise ValueError(
                                     "Layer pages require compact shared publication"
                                 )
-                            if compact_batch is not None:
-                                self._broadcast_shared_envelope(
-                                    SharedHandleEnvelope(
-                                        request_id=req_id,
-                                        phase=phase,
-                                        request_ordinal=request_ordinal,
-                                        layer_id=0,
-                                        kv_group=kv_group,
-                                        status="ok",
-                                        generation=self.shared_cpu_cache_generation,
-                                        handles=[],
-                                        batch=compact_batch,
-                                    )
-                                )
                         mem_objs_layer = pre_resolved_layers[layer_id]
                     else:
                         mem_objs_layer = self._resolve_shared_rank0_layer_mem_objs(
@@ -4019,6 +4762,8 @@ class LMCacheEngine:
                             chunk_locations=chunk_locations_layer_major[layer_id],
                         )
                 except Exception as exc:
+                    if not envelope_required:
+                        raise
                     message = (
                         "Shared CPU cache rank0 materialization failed before "
                         "handle publication."
@@ -4037,26 +4782,51 @@ class LMCacheEngine:
                             },
                         )
                     )
-                    raise
+                    if remote_fill_plan is None:
+                        raise
+                    raise _RemoteFillMaterializationError(message) from exc
                 if pre_resolved_layers is None:
                     to_release.extend(mem_objs_layer)
                 resolved_layers.append(mem_objs_layer)
 
-                handles = (
-                    [None] * len(mem_objs_layer)
-                    if compact_batch is not None
-                    else self._make_shared_handles_for_layer(
-                        req_id=req_id,
-                        phase=phase,
-                        keys_layer=keys_layer_major[layer_id],
-                        mem_objs_layer=mem_objs_layer,
-                        layer_id=layer_id,
-                        kv_group=kv_group,
-                        validate_memory_objs=False,
+                try:
+                    handles = (
+                        [None] * len(mem_objs_layer)
+                        if compact_batch is not None
+                        else self._make_shared_handles_for_layer(
+                            req_id=req_id,
+                            phase=phase,
+                            keys_layer=keys_layer_major[layer_id],
+                            mem_objs_layer=mem_objs_layer,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                            validate_memory_objs=False,
+                        )
                     )
-                )
+                except Exception as exc:
+                    if remote_fill_plan is None or not envelope_required:
+                        raise
+                    message = (
+                        "Shared CPU cache rank0 handle materialization failed "
+                        "before publication."
+                    )
+                    self._broadcast_shared_envelope(
+                        self._shared_layerwise_error_envelope(
+                            req_id=req_id,
+                            phase=phase,
+                            request_ordinal=request_ordinal,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                            message=message,
+                            details={
+                                "error": str(exc),
+                                "location": location,
+                            },
+                        )
+                    )
+                    raise _RemoteFillMaterializationError(message) from exc
                 handles_by_layer.append(handles)
-                if compact_batch is None:
+                if envelope_required:
                     self._broadcast_shared_envelope(
                         SharedHandleEnvelope(
                             request_id=req_id,
@@ -4066,9 +4836,29 @@ class LMCacheEngine:
                             kv_group=kv_group,
                             status="ok",
                             generation=self.shared_cpu_cache_generation,
-                            handles=handles,
+                            # The compact batch is the wire payload; the local
+                            # None placeholders exist only for adoption
+                            # bookkeeping and cannot be serialized.
+                            handles=(
+                                [] if compact_batch is not None else handles
+                            ),
+                            batch=compact_batch,
                         )
                     )
+                    if (
+                        remote_fill_load
+                        and remote_fill_plan is not None
+                        and compact_batch is not None
+                        and not self._remote_fill_all_ranks_materialized(
+                            True,
+                            req_id=req_id,
+                            kv_group=kv_group,
+                        )
+                    ):
+                        raise _RemoteFillMaterializationError(
+                            "A passive TP rank could not materialize the "
+                            "RemoteFill shared pages"
+                        )
 
                 if perf_enabled and not consume_started:
                     consume_started = cold_start_perf_now()
@@ -4194,6 +4984,13 @@ class LMCacheEngine:
 
         phase = kwargs.get("shared_cpu_phase", "dense_prefix")
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
+        remote_fill_load = bool(
+            self._remote_fill_pair_lookup_enabled()
+            and self._remote_fill_local_full_hint(
+                kwargs.get("request_configs")
+            )
+            is not None
+        )
         assert_layerwise_gpu_connector(self.gpu_connector)
         mem_obj_consumer = None
         to_release: list[MemoryObj] = []
@@ -4219,14 +5016,30 @@ class LMCacheEngine:
                     )
                     if perf_enabled and not consume_started:
                         consume_started = cold_start_perf_now()
-                    self._validate_shared_layerwise_envelope(
-                        envelope,
-                        req_id=req_id,
-                        phase=phase,
-                        request_ordinal=request_ordinal,
-                        layer_id=layer_id,
-                        kv_group=kv_group,
-                    )
+                    try:
+                        self._validate_shared_layerwise_envelope(
+                            envelope,
+                            req_id=req_id,
+                            phase=phase,
+                            request_ordinal=request_ordinal,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                        )
+                    except Exception as exc:
+                        if not remote_fill_load:
+                            raise
+                        if (
+                            envelope.status == "ok"
+                            and envelope.batch is not None
+                        ):
+                            self._remote_fill_all_ranks_materialized(
+                                False,
+                                req_id=req_id,
+                                kv_group=kv_group,
+                            )
+                        raise _RemoteFillMaterializationError(
+                            "RemoteFill shared-handle envelope validation failed"
+                        ) from exc
                     if envelope.status in ("miss", "skipped"):
                         if layer_id == 0:
                             yield torch.sum(ret_mask)
@@ -4257,13 +5070,37 @@ class LMCacheEngine:
                         page_view_started = (
                             cold_start_perf_now() if perf_enabled else 0.0
                         )
-                        passive_page_tuple = self._make_passive_layer_page_views(
-                            compact_batch,
-                            starts=starts_all,
-                            ends=ends_all,
-                            keys_layer_major=keys_layer_major,
-                            kv_group=kv_group,
-                        )
+                        view_error: Exception | None = None
+                        try:
+                            passive_page_tuple = (
+                                self._make_passive_layer_page_views(
+                                    compact_batch,
+                                    starts=starts_all,
+                                    ends=ends_all,
+                                    keys_layer_major=keys_layer_major,
+                                    kv_group=kv_group,
+                                )
+                            )
+                        except Exception as exc:
+                            if not remote_fill_load:
+                                raise
+                            view_error = exc
+                        if remote_fill_load and not (
+                            self._remote_fill_all_ranks_materialized(
+                                view_error is None,
+                                req_id=req_id,
+                                kv_group=kv_group,
+                            )
+                        ):
+                            raise _RemoteFillMaterializationError(
+                                "RemoteFill passive layer-page view "
+                                "materialization failed on at least one TP rank"
+                            ) from view_error
+                        if view_error is not None:
+                            raise _RemoteFillMaterializationError(
+                                "RemoteFill passive layer-page view "
+                                "materialization failed"
+                            ) from view_error
                         passive_pages.extend(passive_page_tuple)
                         to_release.extend(passive_pages)
                         if page_view_started:
@@ -4273,11 +5110,16 @@ class LMCacheEngine:
                     and envelope is not None
                     and len(envelope.handles) != expected_handle_count
                 ):
-                    raise ValueError(
+                    error = ValueError(
                         "Shared CPU cache passive received inconsistent handle "
                         f"count at layer {layer_id}: {len(envelope.handles)} != "
                         f"{expected_handle_count}"
                     )
+                    if not remote_fill_load:
+                        raise error
+                    raise _RemoteFillMaterializationError(
+                        "RemoteFill passive handle count is inconsistent"
+                    ) from error
 
                 mem_objs_layer: list[MemoryObj] = list(passive_pages)
                 layer_handles = (
@@ -4301,32 +5143,39 @@ class LMCacheEngine:
                         int(starts_all[chunk_index]),
                         int(ends_all[chunk_index]),
                     )
-                    mem_obj = (
-                        self.shared_cpu_cache_passive_allocator.create_batch_view(
-                            compact_batch,
-                            layer_id=layer_id,
-                            chunk_index=chunk_index,
-                            shape=expected_shape,
-                            dtype=expected_dtype,
-                            fmt=expected_fmt,
-                            cached_positions=positions,
+                    try:
+                        mem_obj = (
+                            self.shared_cpu_cache_passive_allocator.create_batch_view(
+                                compact_batch,
+                                layer_id=layer_id,
+                                chunk_index=chunk_index,
+                                shape=expected_shape,
+                                dtype=expected_dtype,
+                                fmt=expected_fmt,
+                                cached_positions=positions,
+                            )
+                            if compact_batch is not None
+                            else self.shared_cpu_cache_passive_allocator.create_view(
+                                handle,
+                                expected_request_id=req_id,
+                                expected_phase=phase,
+                                expected_layer_id=layer_id,
+                                expected_kv_group=kv_group,
+                                expected_chunk_index=chunk_index,
+                                expected_key=keys_layer_major[layer_id][chunk_index],
+                                expected_shape=expected_shape,
+                                expected_dtype=expected_dtype,
+                                expected_fmt=expected_fmt,
+                                expected_cached_positions=positions,
+                                expected_producer_rank=self.metadata.first_rank,
+                            )
                         )
-                        if compact_batch is not None
-                        else self.shared_cpu_cache_passive_allocator.create_view(
-                            handle,
-                            expected_request_id=req_id,
-                            expected_phase=phase,
-                            expected_layer_id=layer_id,
-                            expected_kv_group=kv_group,
-                            expected_chunk_index=chunk_index,
-                            expected_key=keys_layer_major[layer_id][chunk_index],
-                            expected_shape=expected_shape,
-                            expected_dtype=expected_dtype,
-                            expected_fmt=expected_fmt,
-                            expected_cached_positions=positions,
-                            expected_producer_rank=self.metadata.first_rank,
-                        )
-                    )
+                    except Exception as exc:
+                        if not remote_fill_load:
+                            raise
+                        raise _RemoteFillMaterializationError(
+                            "RemoteFill passive shared view materialization failed"
+                        ) from exc
                     mem_objs_layer.append(mem_obj)
                     to_release.append(mem_obj)
                 if view_started:
@@ -5344,18 +6193,46 @@ class LMCacheEngine:
                 ends.append(end)
                 keys.append(key.split_layers(self.num_layers))
 
-            yield from self._retrieve_layer_shared_passive(
-                starts_all=starts,
-                ends_all=ends,
-                keys_layer_major=[list(row) for row in zip(*keys, strict=False)]
-                if keys
-                else [],
-                ret_mask=ret_mask,
-                monitor_req_id=monitor_req_id,
-                req_id=req_id,
-                kv_group=kv_group,
-                kwargs=kwargs,
-            )
+            yielded_steps = 0
+            try:
+                passive_retriever = self._retrieve_layer_shared_passive(
+                    starts_all=starts,
+                    ends_all=ends,
+                    keys_layer_major=[
+                        list(row) for row in zip(*keys, strict=False)
+                    ]
+                    if keys
+                    else [],
+                    ret_mask=ret_mask,
+                    monitor_req_id=monitor_req_id,
+                    req_id=req_id,
+                    kv_group=kv_group,
+                    kwargs=kwargs,
+                )
+                for result in passive_retriever:
+                    yielded_steps += 1
+                    yield result
+            except _RemoteFillMaterializationError as exc:
+                if (
+                    yielded_steps >= self.num_layers + 2
+                    or not self._remote_fill_pair_lookup_enabled()
+                    or self._remote_fill_local_full_hint(request_configs) is None
+                ):
+                    raise
+                log_remote_fill_validation_failure(
+                    logger,
+                    code="RF-D-004",
+                    stage="passive_materialization",
+                    action="RECOMPUTE",
+                    req_id=req_id,
+                    reason=f"kv_group={kv_group}",
+                    error=exc,
+                )
+                yield from self._remote_fill_recompute_result(
+                    ret_mask=ret_mask,
+                    monitor_req_id=monitor_req_id,
+                    yielded_steps=yielded_steps,
+                )
             return
 
         if shared_layerwise_retrieve:
@@ -5371,9 +6248,50 @@ class LMCacheEngine:
                 tokens, mask, request_configs, kv_group, kwargs
             )
             candidates = list(token_results)
+            try:
+                remote_fill_plan = self._remote_fill_retrieve_plan(
+                    req_id,
+                    candidates,
+                    kv_group,
+                )
+            except _RemoteFillMaterializationError as exc:
+                self.lookup_unpin(req_id)
+                if self._remote_fill_local_full_hint(request_configs) is None:
+                    raise
+                self._broadcast_shared_envelope(
+                    self._shared_layerwise_error_envelope(
+                        req_id=req_id,
+                        phase=phase,
+                        request_ordinal=request_ordinal,
+                        layer_id=0,
+                        kv_group=kv_group,
+                        message=(
+                            "RemoteFill retained lookup plan could not be "
+                            "materialized; recomputing the request."
+                        ),
+                        details={"error": str(exc)},
+                    )
+                )
+                log_remote_fill_validation_failure(
+                    logger,
+                    code="RF-D-003",
+                    stage="retained_plan_validation",
+                    action="RECOMPUTE",
+                    req_id=req_id,
+                    reason=f"kv_group={kv_group}",
+                    error=exc,
+                )
+                yield from self._remote_fill_recompute_result(
+                    ret_mask=ret_mask,
+                    monitor_req_id=monitor_req_id,
+                    yielded_steps=0,
+                )
+                return
             batch_plan = None
             tail_plan: Optional[list[str]] = None
-            if mooncake_page_layout_enabled(self.config):
+            layer_pages = False
+            page_candidates: list[tuple[int, int, CacheEngineKey]] = []
+            if remote_fill_plan is None and mooncake_page_layout_enabled(self.config):
                 layer_pages = mooncake_layer_pages_enabled(self.config)
                 page_candidates = (
                     candidates[
@@ -5422,17 +6340,37 @@ class LMCacheEngine:
                             tail_locations.append(tail_location)
                         else:
                             tail_plan = tail_locations
-            for start, end, key in candidates:
+            for candidate_index, (start, end, key) in enumerate(candidates):
                 missing_layer = False
-                planned = batch_plan is not None and len(keys) < len(batch_plan)
+                remote_fill_chunk = (
+                    remote_fill_plan[candidate_index]
+                    if remote_fill_plan is not None
+                    else None
+                )
+                remote_fill_page_planned = bool(
+                    remote_fill_chunk is not None and remote_fill_chunk[1]
+                )
+                ordinary_page_planned = bool(
+                    remote_fill_chunk is None
+                    and batch_plan is not None
+                    and len(keys) < len(batch_plan)
+                )
                 keys_multi_layer = (
                     [key] * self.num_layers
-                    if planned and layer_pages
+                    if remote_fill_page_planned
+                    or (ordinary_page_planned and layer_pages)
                     else key.split_layers(self.num_layers)
                 )
+                planned_location = (
+                    remote_fill_chunk[0]
+                    if remote_fill_chunk is not None
+                    else batch_plan[len(keys)]
+                    if ordinary_page_planned and batch_plan is not None
+                    else None
+                )
                 locations_multi_layer: list[str] = (
-                    [batch_plan[len(keys)]] * len(keys_multi_layer)
-                    if planned
+                    [planned_location] * len(keys_multi_layer)
+                    if planned_location is not None
                     else tail_plan
                     if tail_plan is not None
                     and len(keys) == len(page_candidates)
@@ -5490,6 +6428,37 @@ class LMCacheEngine:
                 if unique_locations
                 else None
             )
+            planned_page_chunks = (
+                sum(page for _, page in remote_fill_plan)
+                if remote_fill_plan is not None
+                else len(batch_plan or [])
+            )
+            planned_locations = (
+                [location for location, _ in remote_fill_plan]
+                if remote_fill_plan is not None
+                else list(batch_plan or [])
+            )
+            planned_page_locations = (
+                [location for location, page in remote_fill_plan if page]
+                if remote_fill_plan is not None
+                else list(batch_plan or [])
+            )
+            partial_pages = (
+                sum(
+                    end - start != self.config.chunk_size
+                    for (start, end, _), (_, page) in zip(
+                        candidates,
+                        remote_fill_plan,
+                        strict=True,
+                    )
+                    if page
+                )
+                if remote_fill_plan is not None
+                else sum(
+                    end - start != self.config.chunk_size
+                    for start, end, _ in candidates[:planned_page_chunks]
+                )
+            )
             cold_start_perf_log(
                 logger,
                 "shared_location_plan",
@@ -5499,25 +6468,20 @@ class LMCacheEngine:
                 phase=phase,
                 kv_group=kv_group,
                 chunks=len(keys),
-                objects=len(batch_plan or [])
-                + max(0, len(keys) - len(batch_plan or [])) * self.num_layers,
+                objects=planned_page_chunks
+                + max(0, len(keys) - planned_page_chunks) * self.num_layers,
                 logical_objects=sum(map(len, keys)),
-                physical_pages=(
-                    min(len(keys), len(batch_plan or []))
-                    if mooncake_layer_pages_enabled(self.config)
-                    else 0
-                ),
-                partial_pages=sum(
-                    end - start != self.config.chunk_size
-                    for start, end, _ in candidates[: len(batch_plan or [])]
-                ),
-                local_pages=(batch_plan or []).count("LocalCPUBackend"),
-                remote_pages=(batch_plan or []).count("RemoteBackend"),
-                unresolved_pages=max(0, len(candidates) - len(batch_plan or [])),
-                logical_layers_avoided=len(batch_plan or [])
+                physical_pages=planned_page_chunks,
+                partial_pages=partial_pages,
+                local_pages=planned_page_locations.count("LocalCPUBackend"),
+                remote_pages=planned_page_locations.count("RemoteBackend"),
+                unresolved_pages=max(0, len(candidates) - len(planned_locations)),
+                logical_layers_avoided=planned_page_chunks
                 * max(0, self.num_layers - 1),
                 mode=(
-                    "page_batch"
+                    "remote_fill_plan"
+                    if remote_fill_plan is not None
+                    else "page_batch"
                     if batch_plan is not None and "RemoteBackend" in batch_plan
                     else "local_batch"
                     if batch_plan is not None
@@ -5548,19 +6512,46 @@ class LMCacheEngine:
                     f"{message} req_id={req_id}, kv_group={kv_group}, "
                     f"missing_chunks={missing_shared_chunks}"
                 )
-            yield from self._retrieve_layer_shared_rank0(
-                starts=starts,
-                ends=ends,
-                keys_layer_major=keys_layer_major,
-                chunk_locations_layer_major=chunk_locations_layer_major,
-                location=location,
-                ret_mask=ret_mask,
-                monitor_req_id=monitor_req_id,
-                req_id=req_id,
-                kv_group=kv_group,
-                kwargs=kwargs,
-                planned_page_chunks=len(batch_plan or []),
-            )
+            yielded_steps = 0
+            try:
+                rank0_retriever = self._retrieve_layer_shared_rank0(
+                    starts=starts,
+                    ends=ends,
+                    keys_layer_major=keys_layer_major,
+                    chunk_locations_layer_major=chunk_locations_layer_major,
+                    location=location,
+                    ret_mask=ret_mask,
+                    monitor_req_id=monitor_req_id,
+                    req_id=req_id,
+                    kv_group=kv_group,
+                    kwargs=kwargs,
+                    planned_page_chunks=planned_page_chunks,
+                    remote_fill_plan=remote_fill_plan,
+                )
+                for result in rank0_retriever:
+                    yielded_steps += 1
+                    yield result
+            except _RemoteFillMaterializationError as exc:
+                if (
+                    remote_fill_plan is None
+                    or yielded_steps >= self.num_layers + 2
+                ):
+                    raise
+                self.lookup_unpin(req_id)
+                log_remote_fill_validation_failure(
+                    logger,
+                    code="RF-D-004",
+                    stage="rank0_materialization",
+                    action="RECOMPUTE",
+                    req_id=req_id,
+                    reason=f"kv_group={kv_group}",
+                    error=exc,
+                )
+                yield from self._remote_fill_recompute_result(
+                    ret_mask=ret_mask,
+                    monitor_req_id=monitor_req_id,
+                    yielded_steps=yielded_steps,
+                )
             return
         for start, end, key in self._dense_retrieve_token_results(
             tokens,
@@ -5821,6 +6812,11 @@ class LMCacheEngine:
 
         if search_range is None:
             search_range = self.retrieve_locations
+        if search_range is None:
+            search_range = [
+                name
+                for name, _ in self.storage_manager.get_active_storage_backends()
+            ]
 
         res = 0
         try:
@@ -5830,6 +6826,49 @@ class LMCacheEngine:
                 offsets=offsets,
                 request_configs=request_configs,
             )
+
+            if self._remote_fill_pair_lookup_enabled():
+                chunks: list[tuple[int, int, CacheEngineKey]] = []
+                for start, end, key in chunk_info_iterator:
+                    assert isinstance(key, CacheEngineKey)
+                    chunks.append((start, end, key))
+                remote_fill_diagnostics = (
+                    {}
+                    if pin
+                    and cold_start_perf_enabled()
+                    and self._remote_fill_local_full_hint(request_configs)
+                    is not None
+                    else None
+                )
+                try:
+                    res = self._lookup_remote_fill_two_group_prefix(
+                        chunks,
+                        search_range=search_range,
+                        lookup_id=lookup_id,
+                        pin=pin,
+                        request_configs=request_configs,
+                        diagnostics=remote_fill_diagnostics,
+                    )
+                except Exception as exc:
+                    if lookup_id is not None:
+                        self._release_lookup_pins(lookup_id)
+                    log_remote_fill_validation_failure(
+                        logger,
+                        code="RF-D-002",
+                        stage="paired_prefix_lookup",
+                        action="RECOMPUTE",
+                        req_id=lookup_id,
+                        error=exc,
+                    )
+                    res = 0
+                if pin:
+                    self._record_remote_fill_actual_load(
+                        request_configs=request_configs,
+                        lookup_id=lookup_id,
+                        actual_load_end=res,
+                        diagnostics=remote_fill_diagnostics,
+                    )
+                return res
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
@@ -6162,6 +7201,7 @@ class LMCacheEngine:
         Called by the scheduler when it determines that an aborted lookup
         has finished its prefetch tasks.
         """
+        self._release_lookup_pins(lookup_id)
         try:
             # Get the completed future from event_manager
             if (
@@ -6315,17 +7355,26 @@ class LMCacheEngine:
 
     @_lmcache_nvtx_annotate
     def lookup_unpin(self, lookup_id: str) -> None:
-        if lookup_id in self.lookup_pins:
-            assert self.storage_manager is not None
-            for location, keys in self.lookup_pins.pop(lookup_id).items():
-                self.storage_manager.batched_unpin(keys, [location])
+        if self._release_lookup_pins(lookup_id):
+            return
 
-        elif (
+        if (
             self.async_loading is not None
             and self.event_manager.get_event_status(EventType.LOADING, lookup_id)
             != EventStatus.NOT_FOUND
         ):
             self.cleanup_memory_objs(lookup_id)
+
+    def _release_lookup_pins(self, lookup_id: str) -> bool:
+        """Release retained lookup pins and any paired retrieval plan."""
+        getattr(self, "_remote_fill_lookup_plans", {}).pop(lookup_id, None)
+        block_mapping = self.lookup_pins.pop(lookup_id, None)
+        if block_mapping is None:
+            return False
+        assert self.storage_manager is not None
+        for location, keys in block_mapping.items():
+            self.storage_manager.batched_unpin(keys, [location])
+        return True
 
     @_lmcache_nvtx_annotate
     def clear(
@@ -6858,6 +7907,7 @@ class LMCacheEngineBuilder:
         gpu_connector: Optional[GPUConnectorInterface],
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
+        collective_all_true_fn: Optional[Callable[[bool], bool]] = None,
     ) -> LMCacheEngine:
         """
         Builds a new LMCacheEngine instance if it doesn't already exist for the
@@ -6884,6 +7934,7 @@ class LMCacheEngineBuilder:
                 gpu_connector,
                 broadcast_fn,
                 broadcast_object_fn,
+                collective_all_true_fn,
             )
 
             cls._instances[instance_id] = engine

@@ -5,8 +5,10 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from pathlib import Path
 import json
 import os
+import socket
 import time
 from typing import Any
 
@@ -15,6 +17,18 @@ _FALSE_VALUES = {"", "0", "false", "no", "off"}
 _PERF_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
     "lmcache_cold_start_perf_context", default=None
 )
+
+
+def _clock_domain() -> tuple[str, str]:
+    host = socket.gethostname()
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        boot = str(round(time.time() - time.monotonic()))
+    return host, f"{host}:{boot}"
+
+
+_HOST, _CLOCK_DOMAIN = _clock_domain()
 
 
 def cold_start_perf_enabled() -> bool:
@@ -54,6 +68,9 @@ def cold_start_perf_log(
         "event": event,
         "pid": os.getpid(),
         "monotonic_ms": round(time.perf_counter() * 1000, 3),
+        "wall_time_ns": time.time_ns(),
+        "host": _HOST,
+        "clock_domain": _CLOCK_DOMAIN,
         **(_PERF_CONTEXT.get() or {}),
         **fields,
     }

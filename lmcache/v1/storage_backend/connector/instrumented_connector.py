@@ -216,7 +216,7 @@ class InstrumentedRemoteConnector(RemoteConnector):
         buffer_ptrs: List[List[int]],
         buffer_sizes: List[List[int]],
         owners: tuple[Any, ...],
-        ready_event: Any,
+        producer_events: tuple[Any, ...] | Any,
         req_id: str,
     ) -> None:
         """Delegate direct page buffers while retaining instrumentation."""
@@ -226,7 +226,7 @@ class InstrumentedRemoteConnector(RemoteConnector):
             buffer_ptrs,
             buffer_sizes,
             owners,
-            ready_event,
+            producer_events,
             req_id,
         )
         elapsed = time.perf_counter() - begin
@@ -251,6 +251,30 @@ class InstrumentedRemoteConnector(RemoteConnector):
         total_size = sum(map(sum, buffer_sizes))
         self._stats_monitor.update_interval_remote_time_to_get(elapsed * 1000)
         self._stats_monitor.update_interval_remote_read_metrics(total_size)
+
+    async def push_external_pages(
+        self,
+        *,
+        remote_session: str,
+        source_plan: Any,
+        destination_descriptors: tuple[Any, ...],
+        activation: Any,
+    ) -> Any:
+        """Delegate one explicitly activated remote direct push."""
+        return await self._connector.push_external_pages(
+            remote_session=remote_session,
+            source_plan=source_plan,
+            destination_descriptors=destination_descriptors,
+            activation=activation,
+        )
+
+    async def prepare_remote_fill_source(self, source_plan: Any) -> Any:
+        """Delegate source preparation without adding per-page instrumentation."""
+        return await self._connector.prepare_remote_fill_source(source_plan)
+
+    def get_remote_fill_destination_session(self) -> str | None:
+        """Delegate the pointer-free native destination session."""
+        return self._connector.get_remote_fill_destination_session()
 
     def batched_external_pages_exist(
         self, keys: List[CacheEngineKey]

@@ -22,6 +22,7 @@ from lmcache.v1.mooncake_layout import (
     MOONCAKE_VALID_TOKENS_TAG,
     mooncake_page_key,
 )
+from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
 from lmcache.v1.storage_backend.connector import (
     mooncakestore_connector as mooncake_connector,
 )
@@ -38,6 +39,8 @@ def _make_mooncake_connector(
     monkeypatch: pytest.MonkeyPatch,
     extra_config: dict,
     calls: list,
+    *,
+    remote_fill_enabled: bool = False,
 ) -> tuple[MooncakestoreConnector, asyncio.AbstractEventLoop]:
     class _Store:
         def setup(self, *args):
@@ -70,6 +73,7 @@ def _make_mooncake_connector(
     )
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=8,
+        enable_remote_lmcache_store=remote_fill_enabled,
         extra_config={
             "local_hostname": "configured-host",
             "metadata_server": "metadata",
@@ -97,7 +101,16 @@ def _make_mooncake_connector(
     return MooncakestoreConnector("", 0, "", loop, local_cpu, config), loop
 
 
-def test_mooncake_reuses_vllm_engine_and_registration_registry(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("remote_fill_enabled", "extra_config"),
+    [
+        (False, {"mooncake_reuse_vllm_transfer_engine": True}),
+        (True, {}),
+    ],
+)
+def test_mooncake_reuses_vllm_engine_and_registration_registry(
+    monkeypatch, remote_fill_enabled: bool, extra_config: dict
+) -> None:
     calls = []
 
     class _Engine:
@@ -135,8 +148,9 @@ def test_mooncake_reuses_vllm_engine_and_registration_registry(monkeypatch) -> N
 
     connector, loop = _make_mooncake_connector(
         monkeypatch,
-        {"mooncake_reuse_vllm_transfer_engine": True},
+        extra_config,
         calls,
+        remote_fill_enabled=remote_fill_enabled,
     )
     tensor = torch.empty(16, dtype=torch.uint8)
     owner = SimpleNamespace(
@@ -406,15 +420,150 @@ def _layer_key(chunk_hash: int, layer_id: int) -> LayerCacheEngineKey:
     )
 
 
-def _make_remote_backend(requires_completion: bool) -> RemoteBackend:
+def _make_remote_backend(
+    requires_completion: bool,
+    *,
+    remote_fill_enabled: bool = False,
+) -> RemoteBackend:
     backend = object.__new__(RemoteBackend)
+    backend.config = SimpleNamespace(
+        enable_remote_lmcache_store=remote_fill_enabled,
+    )
     backend.connection = _Connection(requires_completion)
     backend.loop = object()
     backend.serializer = _Serializer()
     backend._mla_worker_id_as0_mode = False
     backend.put_tasks = set()
+    backend._single_put_futures = {}
+    backend._single_put_callbacks = {}
     backend.lock = threading.Lock()
     return backend
+
+
+def test_remote_fill_missing_connection_fails_required_puts(monkeypatch) -> None:
+    backend = _make_remote_backend(True, remote_fill_enabled=True)
+    backend.connection = None
+
+    single = backend.submit_put_task(_key(1), _MemoryObj())
+    batch = backend.batched_submit_put_task([_key(2)], [_MemoryObj()])
+
+    with pytest.raises(ConnectionError, match="required remote storage"):
+        single.result()
+    assert batch is not None
+    with pytest.raises(ConnectionError, match="required remote storage"):
+        batch[0].result()
+
+
+def test_disabled_remote_fill_missing_connection_remains_best_effort() -> None:
+    backend = _make_remote_backend(False, remote_fill_enabled=False)
+    backend.connection = None
+
+    single = backend.submit_put_task(_key(1), _MemoryObj())
+    batch = backend.batched_submit_put_task([_key(2)], [_MemoryObj()])
+
+    assert single.result() is None
+    assert batch is None
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_duplicate_single_key_put_joins_real_pending_future(
+    monkeypatch, partial: bool
+) -> None:
+    submitted: list[Future] = []
+
+    class _SingleConnection:
+        @staticmethod
+        async def put(key, memory_obj) -> None:
+            return None
+
+    def submit(coroutine, loop) -> Future:
+        coroutine.close()
+        future: Future = Future()
+        submitted.append(future)
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+    backend = _make_remote_backend(True)
+    backend.connection = _SingleConnection()
+    first_callback: list[CacheEngineKey] = []
+    second_callback: list[CacheEngineKey] = []
+    key = (
+        CacheEngineKey(
+            "test",
+            1,
+            0,
+            7,
+            torch.float16,
+            {MOONCAKE_VALID_TOKENS_TAG: 3},
+        )
+        if partial
+        else _key(7)
+    )
+
+    first = backend.submit_put_task(key, _MemoryObj(), first_callback.append)
+    second = backend.submit_put_task(key, _MemoryObj(), second_callback.append)
+
+    assert first is second
+    assert not first.done()
+    assert len(submitted) == 1
+    assert backend.exists_in_put_tasks(key)
+
+    submitted[0].set_result(None)
+
+    assert first.result() is None
+    assert first_callback == [key]
+    assert second_callback == [key]
+    assert not backend.exists_in_put_tasks(key)
+    assert backend._single_put_futures == {}
+    assert backend._single_put_callbacks == {}
+
+
+def test_duplicate_batched_put_joins_real_physical_writer(monkeypatch) -> None:
+    submitted: list[Future] = []
+
+    class _BatchConnection(_Connection):
+        @staticmethod
+        async def put(key, memory_obj) -> None:
+            raise AssertionError("same-key join must not submit individual puts")
+
+    def submit(coroutine, loop) -> Future:
+        del loop
+        coroutine.close()
+        future: Future = Future()
+        submitted.append(future)
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+    backend = _make_remote_backend(True)
+    backend.connection = _BatchConnection(True)
+    keys = [_key(11), _key(12)]
+    first_callbacks: list[CacheEngineKey] = []
+    second_callbacks: list[CacheEngineKey] = []
+
+    first = backend.batched_submit_put_task(
+        keys,
+        [_MemoryObj(), _MemoryObj()],
+        on_complete_callback=first_callbacks.append,
+    )
+    second = backend.batched_submit_put_task(
+        keys,
+        [_MemoryObj(), _MemoryObj()],
+        on_complete_callback=second_callbacks.append,
+    )
+
+    assert first is not None and second is not None
+    assert len(submitted) == 1
+    assert all(future is first[0] for future in second)
+    assert not first[0].done()
+
+    submitted[0].set_result(None)
+
+    assert first[0].result() is None
+    assert first_callbacks == keys
+    assert second_callbacks == keys
+    assert backend._single_put_futures == {}
+    assert backend._single_put_callbacks == {}
+    assert not any(backend.exists_in_put_tasks(key) for key in keys)
 
 
 def test_layer_page_timeout_releases_late_result(monkeypatch) -> None:
@@ -784,7 +933,7 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
     )
     connector._metadata_for_raw_key = lambda key: (None, None, None, 1)
     owner = torch.empty(16, dtype=torch.uint8)
-    event = _Event()
+    events = (_Event(), _Event())
 
     asyncio.run(
         connector.batched_put_external_pages(
@@ -792,12 +941,12 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
             [[owner.data_ptr()]],
             [[owner.numel()]],
             (owner,),
-            event,
+            events,
             "request",
         )
     )
 
-    assert event.waited
+    assert all(event.waited for event in events)
     put = next(call for call in calls if call[0] == "put")
     assert put[1] == [mooncake_page_key(_key(7), 2)]
     assert put[2:] == ([[owner.data_ptr()]], [[owner.numel()]])
@@ -808,7 +957,7 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
             [[owner.data_ptr()]],
             [[8]],
             (owner,),
-            event,
+            events,
             "request",
         )
     )
@@ -822,7 +971,7 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
                 [[owner.data_ptr()]],
                 [[owner.numel() - 1]],
                 (owner,),
-                event,
+                events,
                 "request",
             )
         )
@@ -1060,6 +1209,56 @@ def test_mooncake_cancelled_direct_page_put_drains_native_transfer() -> None:
             await task
 
     asyncio.run(cancel_put())
+
+
+def test_mooncake_direct_page_put_has_native_hard_deadline() -> None:
+    release = threading.Event()
+
+    class _Store:
+        @staticmethod
+        def register_buffer(ptr, size):
+            return 0
+
+        @staticmethod
+        def batch_put_from_multi_buffers(keys, ptrs, sizes, replica):
+            assert release.wait(5)
+            return [0] * len(keys)
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector._external_put_lock = asyncio.Lock()
+    connector._external_buffers = {}
+    connector._inflight_put_tasks = set()
+    connector.store = _Store()
+    connector.replica_config = object()
+    connector.config = SimpleNamespace(
+        transfer_timeout=0.01,
+        remote_fill_native_hard_timeout_ms=20,
+    )
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (None, None, None, 1)
+    owner = torch.empty(16, dtype=torch.uint8)
+    timer = threading.Timer(0.1, release.set)
+    timer.start()
+    try:
+        with pytest.raises(NativeExternalPageTransferUnknownError):
+            asyncio.run(
+                connector.batched_put_external_pages(
+                    [_key(13)],
+                    [[owner.data_ptr()]],
+                    [[16]],
+                    (owner,),
+                    None,
+                    "request",
+                )
+            )
+    finally:
+        release.set()
+        timer.join()
 
 
 def test_instrumented_connector_delegates_direct_pages() -> None:

@@ -11,7 +11,9 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.mooncake_layout import (
     mooncake_legacy_key,
     mooncake_page_key,
+    mooncake_payload_layout,
     mooncake_valid_tokens,
+    resolve_mooncake_dsa_raw_token_dims,
 )
 from lmcache.v1.token_database import ChunkedTokenDatabase, SegmentTokenDatabase
 
@@ -87,7 +89,7 @@ def test_mooncake_page_keys_include_payload_layout_signature(monkeypatch):
 
     key = next(iter(db.process_tokens(tokens=generate_tokens(256, "cpu"))))[2]
 
-    assert dict(key.tags or ())["payload_v2"] == db.mooncake_payload_layout
+    assert dict(key.tags or ())["payload_v3"] == db.mooncake_payload_layout
 
     monkeypatch.setenv("LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK", "2048")
     monkeypatch.setenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "2")
@@ -106,6 +108,196 @@ def test_mooncake_page_keys_include_payload_layout_signature(monkeypatch):
         ChunkedTokenDatabase(cfg, dumb_metadata()).mooncake_payload_layout
         != db.mooncake_payload_layout
     )
+
+
+def test_payload_v3_identity_includes_remote_fill_abi() -> None:
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=1024, backend="cpu")
+    cfg.remote_fill_cache_namespace = "deployment-a"
+    cfg.remote_fill_model_artifact_id = "weights-build-a"
+    cfg.dsa_two_groups = True
+    cfg.extra_config = {
+        "mooncake_page_first_multi_buffer": True,
+        "mooncake_layer_merged_page_objects": True,
+        "mooncake_dsa_raw_token_dims": {0: 576, 1: 128},
+        "mooncake_cache_bearing_layers": 79,
+        "mooncake_group1_schema_version": "dsa-index-v2",
+        "mooncake_mtp_layout_version": "mtp-1",
+    }
+
+    metadata = dumb_metadata(kv_shape=(32, 2, 1024, 8, 128))
+    signature, descriptor = mooncake_payload_layout(cfg, metadata)
+
+    assert descriptor["version"] == 3
+    assert descriptor["deployment_namespace"] == "deployment-a"
+    assert descriptor["model_artifact_id"] == "weights-build-a"
+    assert descriptor["model_artifact_scope"] == "serving-bundle-v1"
+    assert descriptor["page_abi_version"] == "lmcache-layer-page-v3"
+    assert descriptor["group0_raw_token_dim"] == 576
+    assert descriptor["group1_raw_token_dim"] == 128
+    assert descriptor["cache_bearing_layers"] == 79
+    assert descriptor["group1_schema_version"] == "dsa-index-v2"
+    assert descriptor["mtp_layout_version"] == "mtp-1"
+
+    cfg.remote_fill_model_artifact_id = "weights-build-b"
+    other_signature, _ = mooncake_payload_layout(cfg, metadata)
+    assert other_signature != signature
+
+
+def test_payload_v3_infers_dsa_dimensions_from_model_config(tmp_path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        '{"kv_lora_rank":512,"qk_rope_head_dim":64,"dsa_head_dim":128}',
+        encoding="utf-8",
+    )
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=1024, backend="cpu")
+    cfg.dsa_two_groups = True
+    cfg.extra_config = {
+        "mooncake_page_first_multi_buffer": True,
+        "mooncake_layer_merged_page_objects": True,
+    }
+    metadata = dumb_metadata_with_model_name(str(model_dir))
+    metadata.use_mla = True
+
+    dimensions, source = resolve_mooncake_dsa_raw_token_dims(cfg, metadata)
+    _, descriptor = mooncake_payload_layout(cfg, metadata)
+
+    assert dimensions == {0: 576, 1: 128}
+    assert source.startswith("model config inference:")
+    assert descriptor["raw_token_dims"] == (("0", 576), ("1", 128))
+    assert descriptor["group0_raw_token_dim"] == 576
+    assert descriptor["group1_raw_token_dim"] == 128
+
+
+@pytest.mark.parametrize(
+    ("hash_func", "expected_type", "expected_bytes"),
+    (
+        (hash, int, None),
+        (lambda _value: b"\x00" * 32, bytes, 32),
+        (lambda _value: b"\x00" * 16, bytes, 16),
+    ),
+)
+def test_chunk_hash_contract_uses_actual_hash_output(
+    monkeypatch: pytest.MonkeyPatch,
+    hash_func,
+    expected_type: type[int] | type[bytes],
+    expected_bytes: int | None,
+) -> None:
+    monkeypatch.setattr(
+        ChunkedTokenDatabase,
+        "_get_vllm_hash_func",
+        lambda self, _algorithm: hash_func,
+    )
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
+
+    database = ChunkedTokenDatabase(cfg, dumb_metadata())
+
+    assert database.chunk_hash_type is expected_type
+    assert database.chunk_hash_bytes == expected_bytes
+
+
+def test_chunk_hash_contract_rejects_empty_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ChunkedTokenDatabase,
+        "_get_vllm_hash_func",
+        lambda self, _algorithm: lambda _value: b"",
+    )
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
+
+    with pytest.raises(TypeError, match="empty byte digest"):
+        ChunkedTokenDatabase(cfg, dumb_metadata())
+
+
+def test_remote_fill_rejects_builtin_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ChunkedTokenDatabase,
+        "_get_vllm_hash_func",
+        lambda self, _algorithm: hash,
+    )
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
+    cfg.enable_remote_lmcache_store = True
+    cfg.pre_caching_hash_algorithm = "unavailable"
+
+    with pytest.raises(ValueError, match="refusing builtin-hash fallback"):
+        ChunkedTokenDatabase(cfg, dumb_metadata())
+
+
+def test_disabled_remote_fill_preserves_builtin_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ChunkedTokenDatabase,
+        "_get_vllm_hash_func",
+        lambda self, _algorithm: hash,
+    )
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
+    cfg.enable_remote_lmcache_store = False
+    cfg.pre_caching_hash_algorithm = "unavailable"
+
+    database = ChunkedTokenDatabase(cfg, dumb_metadata())
+
+    assert database.hash_func is hash
+
+
+def test_payload_v3_automatically_fingerprints_serving_bundle(
+    tmp_path, monkeypatch
+) -> None:
+    first_model = tmp_path / "model-a"
+    second_model = tmp_path / "model-b"
+    first_model.mkdir()
+    second_model.mkdir()
+    (first_model / "config.json").write_text('{"model_type":"test"}')
+    (second_model / "config.json").write_text('{"model_type":"test"}')
+    (first_model / "model.safetensors").write_bytes(b"first-weights")
+    (second_model / "model.safetensors").write_bytes(b"second-weights")
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=1024, backend="cpu")
+    cfg.enable_remote_lmcache_store = True
+
+    first_signature, first_descriptor = mooncake_payload_layout(
+        cfg, dumb_metadata_with_model_name(str(first_model))
+    )
+    repeated_signature, repeated_descriptor = mooncake_payload_layout(
+        cfg, dumb_metadata_with_model_name(str(first_model))
+    )
+    second_signature, second_descriptor = mooncake_payload_layout(
+        cfg, dumb_metadata_with_model_name(str(second_model))
+    )
+
+    assert first_signature == repeated_signature
+    assert first_descriptor["model_artifact_id"] == repeated_descriptor[
+        "model_artifact_id"
+    ]
+    assert first_descriptor["deployment_namespace"].startswith("remote-fill-")
+    assert first_descriptor["model_artifact_id"].startswith(
+        "auto-sampled-serving-bundle-v1-"
+    )
+    assert first_signature != second_signature
+    assert first_descriptor["model_artifact_id"] != second_descriptor[
+        "model_artifact_id"
+    ]
+
+
+def test_payload_v3_disabled_path_does_not_walk_serving_bundle(
+    monkeypatch,
+) -> None:
+    # Local import lets the test replace the startup-only walker itself.
+    from lmcache.v1 import mooncake_layout
+
+    monkeypatch.setattr(
+        mooncake_layout,
+        "_derive_remote_fill_artifact_id",
+        lambda *_args: pytest.fail("disabled path walked the serving bundle"),
+    )
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=1024, backend="cpu")
+
+    _, descriptor = mooncake_payload_layout(cfg, dumb_metadata())
+
+    assert descriptor["deployment_namespace"] == ""
+    assert descriptor["model_artifact_id"] == ""
 
 
 @pytest.mark.parametrize("chunk_size", [256, 512, 1024])

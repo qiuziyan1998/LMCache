@@ -47,6 +47,9 @@ def test_cold_start_perf_structured_log(monkeypatch):
     assert payload["req_id"] == "request-1"
     assert payload["schema"] == 1
     assert payload["elapsed_ms"] >= 0
+    assert payload["wall_time_ns"] > 0
+    assert payload["host"]
+    assert payload["clock_domain"].startswith(f"{payload['host']}:")
 
 
 def test_cold_start_perf_scope_correlates_and_restores(monkeypatch):

@@ -6591,7 +6591,10 @@ class LMCacheConnectorV1Impl:
         pending_req_ids = [
             req_id
             for req_id, entry in futures.items()
-            if not entry[1].done()
+            if any(
+                not future.done()
+                for future in (entry[1], *entry[5:6])
+            )
         ]
         if pending_req_ids:
             logger.info(
@@ -6602,7 +6605,8 @@ class LMCacheConnectorV1Impl:
         failed_req_ids = []
         for req_id, entry in list(futures.items()):
             try:
-                entry[1].result()
+                for future in (entry[1], *entry[5:6]):
+                    future.result()
             except BaseException:
                 failed_req_ids.append(req_id)
         if failed_req_ids:
