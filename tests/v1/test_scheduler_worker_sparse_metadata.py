@@ -711,24 +711,45 @@ def test_dsa_cold_compact_submit_captures_current_npu_device(
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     impl._block_size = 16
     impl._dsa_cold_load_futures = {}
+    impl._run_dsa_cold_indexer_load = MagicMock()
     impl._run_dsa_cold_compact_load = MagicMock()
-    executor = SimpleNamespace(submit=MagicMock(return_value=Future()))
+    indexer_future: Future = Future()
+    latent_future: Future = Future()
+    executor = SimpleNamespace(
+        submit=MagicMock(side_effect=(indexer_future, latent_future))
+    )
     impl._get_dsa_cold_load_executor = lambda: executor
+    impl._kvcaches_for_group = lambda kv_group: [f"group-{kv_group}"]
     fake_npu = SimpleNamespace(current_device=MagicMock(return_value=5))
     monkeypatch.setattr(adapter_module.torch, "npu", fake_npu, raising=False)
     request = SimpleNamespace(
         req_id="cold-device-submit",
-        load_spec=SimpleNamespace(dsa_cold_load_generation=1),
+        token_ids=[1, 2],
+        load_spec=SimpleNamespace(
+            dsa_cold_load_generation=1,
+            lmcache_cached_tokens=2,
+        ),
         indexer_slot_mapping=[torch.tensor([160, 161])],
     )
 
     impl._submit_dsa_cold_compact_load(request)
 
-    executor.submit.assert_called_once_with(
-        impl._run_dsa_cold_compact_load,
-        request,
+    assert executor.submit.call_count == 2
+    plan = executor.submit.call_args_list[0].args[1]
+    assert executor.submit.call_args_list[0].args == (
+        impl._run_dsa_cold_indexer_load,
+        plan,
         5,
     )
+    assert executor.submit.call_args_list[1].args == (
+        impl._run_dsa_cold_compact_load,
+        plan,
+        5,
+        indexer_future,
+        None,
+    )
+    assert plan["dense_bootstrap_required"] is True
+    assert impl._dsa_cold_last_latent_future is latent_future
 
 
 def test_dsa_cold_compact_worker_restores_submitted_npu_device(
@@ -741,9 +762,11 @@ def test_dsa_cold_compact_worker_restores_submitted_npu_device(
     fake_npu = SimpleNamespace(set_device=MagicMock())
     monkeypatch.setattr(adapter_module.torch, "npu", fake_npu, raising=False)
     request = SimpleNamespace(load_spec=object())
+    plan = {"request": request}
+    indexer_future: Future = Future()
 
     with pytest.raises(RuntimeError, match="matching latent/indexer"):
-        impl._run_dsa_cold_compact_load(request, 6)
+        impl._run_dsa_cold_compact_load(plan, 6, indexer_future)
 
     fake_npu.set_device.assert_called_once_with(6)
 
@@ -760,6 +783,7 @@ def test_dsa_cold_compact_worker_retains_sources_when_stream_sync_fails() -> Non
     impl._release_unadopted_shared_request_objects = MagicMock()
     impl._release_shared_worker_retrieve_state = MagicMock()
     impl.lmcache_engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(),
         retrieve_layer_head_token_wise=MagicMock(
             side_effect=ValueError("retrieve failed")
         )
@@ -769,9 +793,21 @@ def test_dsa_cold_compact_worker_retains_sources_when_stream_sync_fails() -> Non
         load_spec=SimpleNamespace(lmcache_cached_tokens=1),
         token_ids=[1],
     )
+    plan = {
+        "request": request,
+        "tokens": [1],
+        "token_mask": torch.ones(1, dtype=torch.bool),
+        "token_count": 1,
+        "latent_kvcaches": [],
+        "planned_at": 0.0,
+        "plan_started": 0.0,
+        "latent_shared_ready": Future(),
+    }
+    indexer_future: Future = Future()
+    indexer_future.set_result((None, None, 0.0, 0.0))
 
     with pytest.raises(ValueError, match="retrieve failed") as raised:
-        impl._run_dsa_cold_compact_load(request, None)
+        impl._run_dsa_cold_compact_load(plan, None, indexer_future)
 
     assert isinstance(
         getattr(raised.value, "_lmcache_dsa_cold_state"),
@@ -795,8 +831,17 @@ def test_dsa_cold_compact_finished_signal_waits_for_future(
     state = WorkerRetrieveState(req_id="cold-future")
     state.location = "LocalCPUBackend"
     state._dsa_cold_load_completed_at = 2.0
+    indexer_future: Future = Future()
+    indexer_future.set_result(None)
     impl._dsa_cold_load_futures = {
-        "cold-future": (1, future, request, {100, 101}, 0.0)
+        "cold-future": (
+            1,
+            future,
+            request,
+            {100, 101},
+            0.0,
+            indexer_future,
+        )
     }
     impl._publish_worker_retrieve_state = MagicMock()
     impl._invalid_block_ids = set()
@@ -822,6 +867,222 @@ def test_dsa_cold_compact_finished_signal_waits_for_future(
     assert fields["scheduler_poll_ms"] == 1000.0
 
 
+def test_dsa_cold_compact_ticket_completion_gates_publication(monkeypatch) -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    latent_future: Future = Future()
+    indexer_future: Future = Future()
+    ticket = object()
+    state = WorkerRetrieveState(
+        req_id="cold-ticket",
+        dense_load_ticket=ticket,
+    )
+    state.location = "LocalCPUBackend"
+    state._dsa_cold_load_completed_at = 1.0
+    latent_future.set_result(state)
+    indexer_future.set_result((None, ticket, 0.0, 0.0))
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(
+            lmcache_cached_tokens=8192,
+            dsa_cold_load_generation=3,
+        )
+    )
+    completion = MagicMock(side_effect=(False, True))
+    impl.lmcache_engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(
+            dense_bootstrap_load_complete=completion,
+        )
+    )
+    impl._dsa_cold_load_futures = {
+        "cold-ticket": (
+            3,
+            latent_future,
+            request,
+            {100, 101},
+            0.0,
+            indexer_future,
+        )
+    }
+    impl._publish_worker_retrieve_state = MagicMock()
+    impl._invalid_block_ids = set()
+    events = []
+    monkeypatch.setattr(
+        adapter_module,
+        "cold_start_perf_log",
+        lambda _logger, event, **fields: events.append((event, fields)),
+    )
+    monkeypatch.setattr(adapter_module, "cold_start_perf_now", lambda: 3.0)
+
+    assert impl._drain_dsa_cold_load_futures() is None
+    assert "cold-ticket" in impl._dsa_cold_load_futures
+    impl._publish_worker_retrieve_state.assert_not_called()
+
+    assert impl._drain_dsa_cold_load_futures() == {"cold-ticket"}
+    impl._publish_worker_retrieve_state.assert_called_once()
+    assert completion.call_count == 2
+    event, fields = events[-1]
+    assert event == "worker_load_complete"
+    assert fields["background_host_ms"] == 1000.0
+    assert fields["host_to_device_retirement_observed_ms"] == 2000.0
+    assert fields["publish_ms"] == 0.0
+    assert "scheduler_poll_ms" not in fields
+
+
+def test_dsa_cold_compact_ticket_fatal_completion_restarts_worker() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    latent_future: Future = Future()
+    indexer_future: Future = Future()
+    ticket = object()
+    state = WorkerRetrieveState(
+        req_id="cold-ticket-fatal",
+        dense_load_ticket=ticket,
+    )
+    latent_future.set_result(state)
+    indexer_future.set_result((None, ticket, 0.0, 0.0))
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(dsa_cold_load_generation=4)
+    )
+    completion_error = RuntimeError("connector entered fatal state")
+    completion = MagicMock(side_effect=completion_error)
+    fail = MagicMock(return_value=False)
+    impl.lmcache_engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(
+            dense_bootstrap_load_complete=completion,
+            fail_dense_bootstrap_load=fail,
+        )
+    )
+    impl._dsa_cold_load_futures = {
+        "cold-ticket-fatal": (
+            4,
+            latent_future,
+            request,
+            {102, 103},
+            0.0,
+            indexer_future,
+        )
+    }
+    impl._publish_worker_retrieve_state = MagicMock()
+    impl._invalid_block_ids = set()
+
+    with pytest.raises(RuntimeError, match="requires worker restart"):
+        impl._drain_dsa_cold_load_futures()
+
+    completion.assert_called_once_with(ticket)
+    fail.assert_called_once_with(ticket, completion_error)
+    impl._publish_worker_retrieve_state.assert_not_called()
+    assert impl._invalid_block_ids == set()
+    assert "cold-ticket-fatal" in impl._dsa_cold_load_futures
+
+
+def test_dsa_cold_ticket_admission_failure_invalidates_for_recompute() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    latent_future: Future = Future()
+    indexer_future: Future = Future()
+    error = RuntimeError("admission unavailable")
+    error._lmcache_dense_ticket_clean = True
+    latent_future.set_exception(error)
+    indexer_future.set_exception(error)
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(dsa_cold_load_generation=1)
+    )
+    impl.lmcache_engine = SimpleNamespace(gpu_connector=SimpleNamespace())
+    impl._dsa_cold_load_futures = {
+        "cold-admission": (
+            1,
+            latent_future,
+            request,
+            {200, 201},
+            0.0,
+            indexer_future,
+        )
+    }
+    impl._synchronize_dsa_cold_dense_load = MagicMock()
+    impl._publish_worker_retrieve_state = MagicMock()
+    impl._invalid_block_ids = set()
+
+    assert impl._drain_dsa_cold_load_futures() == {"cold-admission"}
+
+    impl._synchronize_dsa_cold_dense_load.assert_not_called()
+    impl._publish_worker_retrieve_state.assert_not_called()
+    assert impl._invalid_block_ids == {200, 201}
+
+
+def test_dsa_cold_ticket_admission_fatal_requires_worker_restart() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    latent_future: Future = Future()
+    indexer_future: Future = Future()
+    error = RuntimeError("admission collective failed")
+    error._lmcache_dense_ticket_clean = True
+    error._lmcache_dense_bootstrap_fatal = True
+    latent_future.set_exception(error)
+    indexer_future.set_exception(error)
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(dsa_cold_load_generation=1)
+    )
+    impl.lmcache_engine = SimpleNamespace(gpu_connector=SimpleNamespace())
+    impl._dsa_cold_load_futures = {
+        "cold-admission-fatal": (
+            1,
+            latent_future,
+            request,
+            {202, 203},
+            0.0,
+            indexer_future,
+        )
+    }
+    impl._synchronize_dsa_cold_dense_load = MagicMock()
+    impl._publish_worker_retrieve_state = MagicMock()
+    impl._invalid_block_ids = set()
+
+    with pytest.raises(RuntimeError, match="requires worker restart"):
+        impl._drain_dsa_cold_load_futures()
+
+    impl._synchronize_dsa_cold_dense_load.assert_not_called()
+    impl._publish_worker_retrieve_state.assert_not_called()
+    assert impl._invalid_block_ids == {202, 203}
+
+
+def test_dsa_cold_unclean_admission_failure_still_restarts_worker() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    latent_future: Future = Future()
+    indexer_future: Future = Future()
+    ticket = object()
+    state = WorkerRetrieveState(
+        req_id="cold-admission-unsafe",
+        dense_load_ticket=ticket,
+    )
+    error = RuntimeError("admission cleanup unsafe")
+    error._lmcache_dense_bootstrap_fatal = True
+    error._lmcache_dsa_cold_state = state
+    latent_future.set_exception(error)
+    indexer_future.set_exception(error)
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(dsa_cold_load_generation=1)
+    )
+    fail = MagicMock(return_value=False)
+    impl.lmcache_engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(fail_dense_bootstrap_load=fail)
+    )
+    impl._dsa_cold_load_futures = {
+        "cold-admission-unsafe": (
+            1,
+            latent_future,
+            request,
+            {204, 205},
+            0.0,
+            indexer_future,
+        )
+    }
+    impl._publish_worker_retrieve_state = MagicMock()
+    impl._invalid_block_ids = set()
+
+    with pytest.raises(RuntimeError, match="requires worker restart"):
+        impl._drain_dsa_cold_load_futures()
+
+    fail.assert_called_once_with(ticket, error)
+    assert impl._invalid_block_ids == set()
+    assert "cold-admission-unsafe" in impl._dsa_cold_load_futures
+
+
 def test_dsa_cold_compact_generation_mismatch_releases_returned_state() -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     future = Future()
@@ -830,8 +1091,17 @@ def test_dsa_cold_compact_generation_mismatch_releases_returned_state() -> None:
     )
     state = WorkerRetrieveState(req_id="cold-stale-generation")
     future.set_result(state)
+    indexer_future: Future = Future()
+    indexer_future.set_result(None)
     impl._dsa_cold_load_futures = {
-        "cold-stale-generation": (1, future, request, {100}, 0.0)
+        "cold-stale-generation": (
+            1,
+            future,
+            request,
+            {100},
+            0.0,
+            indexer_future,
+        )
     }
     impl._worker_retrieve_state = {}
     impl._synchronize_dsa_cold_dense_load = MagicMock()
@@ -864,8 +1134,17 @@ def test_dsa_cold_compact_failed_state_releases_after_sync_retry() -> None:
     error = RuntimeError("load failed")
     setattr(error, "_lmcache_dsa_cold_state", state)
     future.set_exception(error)
+    indexer_future: Future = Future()
+    indexer_future.set_result(None)
     impl._dsa_cold_load_futures = {
-        "cold-sync-retry": (1, future, request, {100, 101}, 0.0)
+        "cold-sync-retry": (
+            1,
+            future,
+            request,
+            {100, 101},
+            0.0,
+            indexer_future,
+        )
     }
     impl._synchronize_dsa_cold_dense_load = MagicMock(
         side_effect=[RuntimeError("still active"), None]
@@ -932,8 +1211,17 @@ def test_dsa_cold_compact_abort_releases_unpublished_cpu_state() -> None:
     )
     state = WorkerRetrieveState(req_id="cold-aborted")
     future.set_result(state)
+    indexer_future: Future = Future()
+    indexer_future.set_result(None)
     impl._dsa_cold_load_futures = {
-        "cold-aborted": (1, future, request, {100, 101}, 0.0)
+        "cold-aborted": (
+            1,
+            future,
+            request,
+            {100, 101},
+            0.0,
+            indexer_future,
+        )
     }
     impl._dsa_cold_aborted_req_ids = {"cold-aborted"}
     impl.lmcache_engine = object()

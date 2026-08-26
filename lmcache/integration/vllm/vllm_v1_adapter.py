@@ -7,6 +7,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import json
 import os
+import threading
 import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
@@ -947,6 +948,50 @@ class RequestTracker:
         )
 
 
+class _DenseLoadSourceRetirement:
+    """Adapter-owned, per-owner idempotent source retirement capsule."""
+
+    def __init__(self, engine: Any) -> None:
+        self._engine = engine
+        self._lock = threading.Lock()
+        self._owners: dict[int, Any] = {}
+        self._attempted: set[int] = set()
+        self._failure: Optional[BaseException] = None
+        self._retired = False
+
+    def adopt(self, owners: Iterable[Any]) -> None:
+        with self._lock:
+            if self._retired or self._failure is not None:
+                raise RuntimeError(
+                    "cannot adopt sources after dense-load retirement"
+                )
+            for owner in owners:
+                self._owners.setdefault(id(owner), owner)
+
+    def retire_once(self) -> None:
+        with self._lock:
+            if self._retired:
+                return
+            if self._failure is not None:
+                raise self._failure
+            for owner_id, owner in tuple(self._owners.items()):
+                if owner_id in self._attempted:
+                    continue
+                # Mark before calling external ownership code. If it raises
+                # after a partial unpin/refcount mutation, retrying would risk
+                # a double release; the capsule instead retains and fails shut.
+                self._attempted.add(owner_id)
+                try:
+                    LMCacheConnectorV1Impl._release_dense_load_source_owners(
+                        (owner,), self._engine, synchronize=False
+                    )
+                except BaseException as error:
+                    self._failure = error
+                    raise
+                self._owners.pop(owner_id, None)
+            self._retired = True
+
+
 @dataclass
 class WorkerRetrieveState:
     """Request-owned worker cache payload used by retrieve operations."""
@@ -992,6 +1037,8 @@ class WorkerRetrieveState:
         repr=False,
     )
     dense_load_readiness: Optional[Any] = field(default=None, repr=False)
+    dense_load_ticket: Optional[Any] = field(default=None, repr=False)
+    dense_load_ticket_consumed: bool = field(default=False, repr=False)
     dense_load_source_owners: tuple[Any, ...] = field(
         default_factory=tuple,
         repr=False,
@@ -2289,6 +2336,23 @@ class LMCacheConnectorV1Impl:
             return self._indexer_kvcaches
         return self._latent_kvcaches
 
+    def _register_sparse_destination_kv_caches(self) -> None:
+        """Register the fixed two-group destination-cache incarnation."""
+        if not self._is_dsa_two_groups() or self.lmcache_engine is None:
+            return
+        register = getattr(
+            self.lmcache_engine.gpu_connector,
+            "register_sparse_destination_kv_caches",
+            None,
+        )
+        if callable(register):
+            register(
+                (
+                    tuple(self._kvcaches_for_group(0)),
+                    tuple(self._kvcaches_for_group(1)),
+                )
+            )
+
     def _num_layers_for_group(self, kv_group: int) -> int:
         return len(self._kvcaches_for_group(kv_group))
 
@@ -3017,6 +3081,7 @@ class LMCacheConnectorV1Impl:
 
         self._refresh_kvcaches_list()
         self._build_kv_layer_groups()
+        self._register_sparse_destination_kv_caches()
 
     ####################
     # Worker side APIs
@@ -4039,10 +4104,32 @@ class LMCacheConnectorV1Impl:
         """Drop worker bindings and release the engine-owned request lease."""
 
         req_id = state.req_id
-        LMCacheConnectorV1Impl._release_dense_load_source_owners(
-            state.dense_load_source_owners, engine
-        )
+        ticket = state.dense_load_ticket
+        if ticket is not None:
+            if engine is None:
+                raise RuntimeError(
+                    "Cannot release a dense bootstrap ticket without its engine"
+                )
+            connector = engine.gpu_connector
+            complete = getattr(
+                connector, "dense_bootstrap_load_complete", None
+            )
+            release = getattr(
+                connector, "release_dense_bootstrap_load", None
+            )
+            if not callable(complete) or not complete(ticket):
+                raise RuntimeError(
+                    "Dense bootstrap ticket is not safe to release"
+                )
+            if not callable(release) or not release(ticket):
+                raise RuntimeError("Dense bootstrap ticket release failed")
+        else:
+            LMCacheConnectorV1Impl._release_dense_load_source_owners(
+                state.dense_load_source_owners, engine
+            )
         state.dense_load_readiness = None
+        state.dense_load_ticket = None
+        state.dense_load_ticket_consumed = False
         state.dense_load_source_owners = ()
         state.prepared_sparse_sources.clear()
         for kv_group in (0, 1):
@@ -4367,6 +4454,8 @@ class LMCacheConnectorV1Impl:
             "dense_prefix_seed": state.dense_prefix_seed,
             "prepared_sparse_sources": dict(state.prepared_sparse_sources),
             "dense_load_readiness": state.dense_load_readiness,
+            "dense_load_ticket": state.dense_load_ticket,
+            "dense_load_ticket_consumed": state.dense_load_ticket_consumed,
             "dense_load_source_owners": state.dense_load_source_owners,
         }
 
@@ -5756,6 +5845,7 @@ class LMCacheConnectorV1Impl:
         shared_cpu_enabled: bool,
         shared_cpu_preflight_state: Optional[dict[str, Any]],
         metadata_only: bool = False,
+        dense_load_ticket: Optional[Any] = None,
     ) -> tuple[
         dict[str, Any],
         Optional[dict[str, Any]],
@@ -5828,6 +5918,8 @@ class LMCacheConnectorV1Impl:
         )
         if ret_mask is not None:
             retrieve_kwargs["ret_mask"] = ret_mask
+        if dense_load_ticket is not None:
+            retrieve_kwargs["dense_load_ticket"] = dense_load_ticket
         return retrieve_kwargs, shared_cpu_preflight_state, prepared_source
 
     @staticmethod
@@ -5852,6 +5944,7 @@ class LMCacheConnectorV1Impl:
         self.kv_caches = kv_caches
         self._refresh_kvcaches_list()
         self._build_kv_layer_groups()
+        self._register_sparse_destination_kv_caches()
         self._manager.post_init()
 
     def _get_dsa_cold_load_executor(self) -> ThreadPoolExecutor:
@@ -5875,14 +5968,64 @@ class LMCacheConnectorV1Impl:
             raise RuntimeError("NPU connector has no dense load-stream sync API")
         synchronize()
 
+    @staticmethod
+    def _mark_dense_bootstrap_fatal(error: BaseException) -> None:
+        error._lmcache_dense_bootstrap_fatal = True
+
+    def _release_unsubmitted_dense_bootstrap_ticket(
+        self,
+        ticket: Any,
+        error: BaseException,
+    ) -> bool:
+        """Release an OPEN ticket without synchronizing any NPU stream."""
+
+        assert self.lmcache_engine is not None
+        connector = self.lmcache_engine.gpu_connector
+        try:
+            safe = bool(connector.fail_dense_bootstrap_load(ticket, error))
+            released = safe and bool(
+                connector.release_dense_bootstrap_load(ticket)
+            )
+        except BaseException:
+            logger.critical(
+                "Failed to release a pre-submit dense bootstrap ticket",
+                exc_info=True,
+            )
+            return False
+        if released:
+            error._lmcache_dense_ticket_clean = True
+        return released
+
     def _record_dsa_cold_dense_load_readiness(
         self,
         state: WorkerRetrieveState,
         readiness: Any = None,
         additional_owners: tuple[Any, ...] = (),
+        future_wait_ms: Optional[float] = None,
     ) -> None:
         assert self.lmcache_engine is not None
         connector = self.lmcache_engine.gpu_connector
+        is_ticket = getattr(connector, "is_dense_bootstrap_ticket", None)
+        if readiness is not None and callable(is_ticket) and is_ticket(readiness):
+            # The producer retained these owners before recording the ticket
+            # event. Binding them here must stay O(1) with respect to device
+            # work and must not repeat the connector's owner walk.
+            state.dense_load_ticket = readiness
+            state.dense_load_ticket_consumed = False
+            state.dense_load_readiness = None
+            # Ticket sources belong to the adapter retirement capsule bound
+            # before submission; connector completion invokes it exactly once.
+            state.dense_load_source_owners = ()
+            if future_wait_ms is not None:
+                record_future_wait = getattr(
+                    connector, "record_dense_bootstrap_future_wait", None
+                )
+                if not callable(record_future_wait):
+                    raise RuntimeError(
+                        "NPU connector has no dense bootstrap timing API"
+                    )
+                record_future_wait(readiness, future_wait_ms)
+            return
         record = getattr(connector, "record_dense_load_readiness", None)
         if record is None:
             raise RuntimeError("NPU connector has no dense load readiness API")
@@ -5898,6 +6041,31 @@ class LMCacheConnectorV1Impl:
     def _consume_dsa_cold_dense_load_readiness(
         self, state: WorkerRetrieveState
     ) -> None:
+        ticket = state.dense_load_ticket
+        if ticket is not None:
+            assert self.lmcache_engine is not None
+            connector = self.lmcache_engine.gpu_connector
+            if not state.dense_load_ticket_consumed:
+                consume = getattr(
+                    connector, "consume_dense_bootstrap_load", None
+                )
+                if not callable(consume):
+                    raise RuntimeError(
+                        "NPU connector has no dense bootstrap consume API"
+                    )
+                consume(ticket)
+                state.dense_load_ticket_consumed = True
+            release = getattr(
+                connector, "release_dense_bootstrap_load", None
+            )
+            if not callable(release) or not release(ticket):
+                raise RuntimeError(
+                    "Dense bootstrap ticket is not safe to release"
+                )
+            state.dense_load_ticket = None
+            state.dense_load_ticket_consumed = False
+            state.dense_load_source_owners = ()
+            return
         readiness = state.dense_load_readiness
         if readiness is None:
             return
@@ -5929,7 +6097,7 @@ class LMCacheConnectorV1Impl:
                 f"active_generation={existing[0]}, generation={generation}"
             )
         indexer_slots = request.indexer_slot_mapping[0]
-        indexer_block_ids = set(
+        indexer_block_ids = frozenset(
             (indexer_slots // self._block_size).tolist()
         )
         npu_device_id = (
@@ -5937,17 +6105,23 @@ class LMCacheConnectorV1Impl:
         )
         plan_started = cold_start_perf_now()
         token_count = getattr(request.load_spec, "lmcache_cached_tokens", 0)
+        previous_latent_future = getattr(
+            self, "_dsa_cold_last_latent_future", None
+        )
         plan = {
             "request": request,
             "tokens": request.token_ids[:token_count],
             "token_mask": torch.ones(token_count, dtype=torch.bool),
             "token_count": token_count,
+            "generation": generation,
+            "destination_block_ids": tuple(sorted(indexer_block_ids)),
             "indexer_slots_cpu": request.indexer_slot_mapping[0],
             "latent_kvcaches": self._kvcaches_for_group(0),
             "indexer_kvcaches": self._kvcaches_for_group(1),
             "planned_at": cold_start_perf_now(),
             "plan_started": plan_started,
             "latent_shared_ready": Future(),
+            "dense_bootstrap_required": True,
         }
         submitted_at = cold_start_perf_now()
         cold_start_perf_log(
@@ -5962,9 +6136,6 @@ class LMCacheConnectorV1Impl:
             self._run_dsa_cold_indexer_load,
             plan,
             npu_device_id,
-        )
-        previous_latent_future = getattr(
-            self, "_dsa_cold_last_latent_future", None
         )
         latent_future = executor.submit(
             self._run_dsa_cold_compact_load,
@@ -6026,12 +6197,15 @@ class LMCacheConnectorV1Impl:
             "planned_at": cold_start_perf_now(),
             "plan_started": plan_started,
             "latent_shared_ready": Future(),
+            "dense_bootstrap_required": False,
         }
         indexer_completion: Future = Future()
         generation = request.load_spec.dsa_cold_load_generation
-        indexer_blocks = set(
+        indexer_blocks = frozenset(
             (request.indexer_slot_mapping[0] // self._block_size).tolist()
         )
+        plan["generation"] = generation
+        plan["destination_block_ids"] = tuple(sorted(indexer_blocks))
         if futures is None:
             futures = self._dsa_cold_load_futures = {}
         npu_device_id = (
@@ -6145,8 +6319,13 @@ class LMCacheConnectorV1Impl:
         # be waiting on their dependency, so queueing fallback onto the same
         # two-thread executor could deadlock.
         try:
-            result = self._run_dsa_cold_indexer_load(
-                entry["plan"], entry["npu_device_id"]
+            # Commit A intentionally leaves live-split compatibility on its
+            # existing conservative stream contract. Request-scoped ticket
+            # admission belongs only to ordinary RemoteFill-retained cold
+            # bootstrap plans.
+            self._dsa_cold_legacy_dense_load_used = True
+            result = self._run_dsa_cold_indexer_load_on_stream(
+                entry["plan"], entry["npu_device_id"], None
             )
             completion.set_result(result)
         except BaseException as exc:
@@ -6280,6 +6459,7 @@ class LMCacheConnectorV1Impl:
                         "record_dense_load_readiness",
                         None,
                     )
+                    self._dsa_cold_legacy_dense_load_used = True
                     readiness = record() if callable(record) else None
                     entry["plan"]["indexer_source_owners"] = tuple(
                         context.get("destination_owners", ())
@@ -6304,6 +6484,186 @@ class LMCacheConnectorV1Impl:
     def _run_dsa_cold_indexer_load(
         self, plan: dict[str, Any], npu_device_id: Optional[int]
     ) -> tuple[torch.Tensor, Any, float, float]:
+        """Run Group 1 under an exclusive request-scoped stream ticket."""
+        if npu_device_id is not None:
+            torch.npu.set_device(npu_device_id)
+        assert self.lmcache_engine is not None
+        connector = self.lmcache_engine.gpu_connector
+        if not plan["dense_bootstrap_required"]:
+            self._dsa_cold_legacy_dense_load_used = True
+            return self._run_dsa_cold_indexer_load_on_stream(
+                plan, npu_device_id, None
+            )
+        begin = getattr(connector, "begin_dense_bootstrap_load", None)
+        required_apis = (
+            "begin_dense_bootstrap_load",
+            "register_sparse_destination_kv_caches",
+            "is_dense_bootstrap_ticket",
+            "dense_bootstrap_load_context",
+            "mark_dense_bootstrap_submission",
+            "mark_dense_bootstrap_external_layers_complete",
+            "mark_dense_bootstrap_external_load_fatal",
+            "bind_dense_bootstrap_source_retirement",
+            "record_dense_bootstrap_future_wait",
+            "retain_dense_bootstrap_metadata",
+            "retain_dense_bootstrap_sources",
+            "finish_dense_bootstrap_load",
+            "dense_bootstrap_load_complete",
+            "consume_dense_bootstrap_load",
+            "fail_dense_bootstrap_load",
+            "release_dense_bootstrap_load",
+            "shutdown_dense_bootstrap_loads",
+        )
+        request = plan["request"]
+        indexer_slots_cpu = plan["indexer_slots_cpu"]
+        indexer_kvcaches = plan["indexer_kvcaches"]
+        validate = getattr(connector, "validate_layerwise_slot_mapping", None)
+        ticket = None
+        retirement = None
+        capacity_wait_started = cold_start_perf_now()
+        capacity_retries = 0
+        try:
+            if any(
+                not callable(getattr(connector, name, None))
+                for name in required_apis
+            ):
+                raise RuntimeError(
+                    "NPU connector has incomplete dense bootstrap APIs"
+                )
+            if callable(validate):
+                validate(indexer_slots_cpu, indexer_kvcaches, kv_group=1)
+            assert callable(begin)
+            while ticket is None:
+                ticket = begin(
+                    request_id=request.req_id,
+                    request_generation=plan["generation"],
+                    destination_block_ids=plan["destination_block_ids"],
+                    kvcaches_ref=list(indexer_kvcaches),
+                    kv_group=1,
+                    slot_mapping_dtype=torch.long,
+                    token_count=plan["token_count"],
+                )
+                if ticket is None:
+                    # Finite stream-pool pressure is normal under bursts. This
+                    # wait is confined to the cold-load executor; it never
+                    # blocks the model/active-decode thread and creates no NPU
+                    # operation or synchronization.
+                    capacity_retries += 1
+                    time.sleep(0.001)
+            retirement = _DenseLoadSourceRetirement(self.lmcache_engine)
+            connector.bind_dense_bootstrap_source_retirement(
+                ticket, retirement.retire_once
+            )
+            plan["dense_load_ticket"] = ticket
+            plan["dense_load_retirement"] = retirement
+        except BaseException as error:
+            released = ticket is None
+            if ticket is not None:
+                released = self._release_unsubmitted_dense_bootstrap_ticket(
+                    ticket, error
+                )
+            if released:
+                error._lmcache_dense_ticket_clean = True
+            else:
+                error._lmcache_dsa_cold_state = WorkerRetrieveState(
+                    req_id=request.req_id,
+                    dense_load_ticket=ticket,
+                )
+            self._mark_dense_bootstrap_fatal(error)
+            cold_start_perf_log(
+                logger,
+                "dense_bootstrap_admission_local",
+                req_id=request.req_id,
+                local_admitted=False,
+                capacity_retries=capacity_retries,
+                capacity_wait_ms=round(
+                    (cold_start_perf_now() - capacity_wait_started) * 1000, 3
+                ),
+                error=repr(error),
+            )
+            raise
+        cold_start_perf_log(
+            logger,
+            "dense_bootstrap_admission_local",
+            req_id=request.req_id,
+            local_admitted=True,
+            capacity_retries=capacity_retries,
+            capacity_wait_ms=round(
+                (cold_start_perf_now() - capacity_wait_started) * 1000, 3
+            ),
+            error=None,
+        )
+        try:
+            assert ticket is not None
+            with connector.dense_bootstrap_load_context(ticket):
+                return self._run_dsa_cold_indexer_load_on_stream(
+                    plan, npu_device_id, ticket
+                )
+        except BaseException as error:
+            assert retirement is not None
+            retrieve_state = plan.get("indexer_retrieve_state")
+            discovered_owners = (
+                self._dense_load_source_owners(retrieve_state)
+                if isinstance(retrieve_state, WorkerRetrieveState)
+                else ()
+            )
+            owners_by_id = {
+                id(owner): owner
+                for owner in (
+                    *tuple(plan.get("indexer_source_owners", ())),
+                    *tuple(plan.get("indexer_deferred_source_owners", ())),
+                    *discovered_owners,
+                )
+            }
+            source_owners = tuple(owners_by_id.values())
+            retirement.adopt(source_owners)
+            state = WorkerRetrieveState(
+                req_id=request.req_id,
+                dense_load_ticket=ticket,
+            )
+            safe = False
+            try:
+                connector.retain_dense_bootstrap_sources(ticket, source_owners)
+                safe = bool(connector.fail_dense_bootstrap_load(ticket, error))
+            except BaseException:
+                logger.critical(
+                    "Dense bootstrap failure could not fence its request stream",
+                    exc_info=True,
+                )
+            released = False
+            if safe:
+                try:
+                    released = bool(
+                        connector.release_dense_bootstrap_load(ticket)
+                    )
+                except BaseException:
+                    logger.critical(
+                        "Dense bootstrap ticket release raised after fencing",
+                        exc_info=True,
+                    )
+            if not released:
+                plan["indexer_source_owners"] = ()
+                error._lmcache_dsa_cold_state = state
+                self._mark_dense_bootstrap_fatal(error)
+                logger.critical(
+                    "Retaining dense bootstrap ticket, sources, and scheduler "
+                    "blocks because cleanup was not proven safe"
+                )
+                raise
+            plan.pop("dense_load_ticket", None)
+            plan.pop("dense_load_retirement", None)
+            plan.pop("indexer_source_owners", None)
+            plan.pop("indexer_deferred_source_owners", None)
+            plan.pop("indexer_retrieve_state", None)
+            error._lmcache_dense_ticket_clean = True
+            raise
+
+    def _run_dsa_cold_indexer_load_on_stream(
+        self,
+        plan: dict[str, Any],
+        npu_device_id: Optional[int],
+        ticket: Optional[Any],
+    ) -> tuple[torch.Tensor, Any, float, float]:
         """Load group 1 directly, or after group 0 in shared-CPU mode."""
         if npu_device_id is not None:
             torch.npu.set_device(npu_device_id)
@@ -6318,13 +6678,24 @@ class LMCacheConnectorV1Impl:
             "validate_layerwise_slot_mapping",
             None,
         )
-        if callable(validate_slots):
+        if ticket is None and callable(validate_slots):
             validate_slots(indexer_slots_cpu, indexer_kvcaches, kv_group=1)
+        retrieve_state = WorkerRetrieveState(req_id=request.req_id)
+        plan["indexer_retrieve_state"] = retrieve_state
+        connector = self.lmcache_engine.gpu_connector
+        if ticket is not None:
+            connector.retain_dense_bootstrap_metadata(
+                ticket,
+                indexer_slots_cpu,
+                plan["token_mask"],
+            )
+            connector.mark_dense_bootstrap_submission(ticket)
         indexer_slots = indexer_slots_cpu.to(
             device=self.device,
             dtype=torch.long,
         )
-        retrieve_state = WorkerRetrieveState(req_id=request.req_id)
+        if ticket is not None:
+            connector.retain_dense_bootstrap_metadata(ticket, indexer_slots)
         shared_retrieve = getattr(
             self.lmcache_engine, "_should_use_shared_layerwise_retrieve", None
         )
@@ -6344,6 +6715,7 @@ class LMCacheConnectorV1Impl:
             token_count=plan["token_count"],
             shared_cpu_enabled=shared_cpu_enabled,
             shared_cpu_preflight_state=None,
+            dense_load_ticket=ticket,
         )
         load_mode = str(
             getattr(
@@ -6374,9 +6746,25 @@ class LMCacheConnectorV1Impl:
                     retrieve_kwargs["cached_retrieve_location"] = location
                 except Exception as error:
                     owners = self._dense_load_source_owners(retrieve_state)
-                    self._release_dense_load_source_owners(
-                        owners, self.lmcache_engine
-                    )
+                    if ticket is None:
+                        self._release_dense_load_source_owners(
+                            owners, self.lmcache_engine
+                        )
+                    else:
+                        deferred = {
+                            id(owner): owner
+                            for owner in (
+                                *tuple(
+                                    plan.get(
+                                        "indexer_deferred_source_owners", ()
+                                    )
+                                ),
+                                *owners,
+                            )
+                        }
+                        plan["indexer_deferred_source_owners"] = tuple(
+                            deferred.values()
+                        )
                     retrieve_state.clear_group(1)
                     cold_start_perf_log(
                         logger,
@@ -6396,9 +6784,12 @@ class LMCacheConnectorV1Impl:
                 plan["latent_shared_ready"].result()
             except BaseException:
                 owners = self._dense_load_source_owners(retrieve_state)
-                self._release_dense_load_source_owners(
-                    owners, self.lmcache_engine
-                )
+                if ticket is None:
+                    self._release_dense_load_source_owners(
+                        owners, self.lmcache_engine
+                    )
+                else:
+                    plan["indexer_source_owners"] = owners
                 retrieve_state.clear_group(1)
                 raise
         if not shared_cpu_enabled:
@@ -6414,29 +6805,57 @@ class LMCacheConnectorV1Impl:
         try:
             try:
                 result = next(retriever)
-                for _ in range(self.num_layers):
+                for _ in range(len(indexer_kvcaches)):
                     result = retriever.send(None)
             finally:
                 retriever.close()
             source_owners = self._dense_load_source_owners(retrieve_state)
             if result is None or int(result.sum().item()) != plan["token_count"]:
                 raise RuntimeError("Cold compact indexer retrieve was incomplete")
-            record = getattr(
-                self.lmcache_engine.gpu_connector,
-                "record_dense_load_readiness",
-                None,
+            deferred_owners = tuple(
+                plan.get("indexer_deferred_source_owners", ())
             )
-            if record is None:
-                raise RuntimeError("NPU connector has no dense load readiness API")
-            readiness = record()
+            owners_by_id = {
+                id(owner): owner
+                for owner in (*deferred_owners, *source_owners)
+            }
+            source_owners = tuple(owners_by_id.values())
+            if ticket is not None:
+                retirement = plan.get("dense_load_retirement")
+                if not isinstance(retirement, _DenseLoadSourceRetirement):
+                    raise RuntimeError(
+                        "dense bootstrap source retirement capsule is missing"
+                    )
+                retirement.adopt(source_owners)
+                connector.retain_dense_bootstrap_sources(ticket, source_owners)
+                connector.finish_dense_bootstrap_load(
+                    ticket, expected_layers=len(indexer_kvcaches)
+                )
+                readiness = ticket
+            else:
+                record = getattr(
+                    connector,
+                    "record_dense_load_readiness",
+                    None,
+                )
+                if record is None:
+                    raise RuntimeError(
+                        "NPU connector has no dense load readiness API"
+                    )
+                readiness = record()
         except BaseException:
             if not source_owners:
                 source_owners = self._dense_load_source_owners(retrieve_state)
-            self._release_dense_load_source_owners(
-                source_owners, self.lmcache_engine
-            )
+            if ticket is None:
+                self._release_dense_load_source_owners(
+                    source_owners, self.lmcache_engine
+                )
+            else:
+                plan["indexer_source_owners"] = source_owners
             raise
         plan["indexer_source_owners"] = source_owners
+        plan.pop("indexer_deferred_source_owners", None)
+        plan.pop("indexer_retrieve_state", None)
         return result, readiness, cold_start_perf_now() - started, queue_ms
 
     def _run_dsa_cold_compact_load(
@@ -6521,7 +6940,7 @@ class LMCacheConnectorV1Impl:
             (
                 _,
                 indexer_readiness,
-                indexer_remote_s,
+                indexer_background_host_s,
                 indexer_queue_ms,
             ) = indexer_future.result()
             dependency_wait_ms = (
@@ -6531,7 +6950,11 @@ class LMCacheConnectorV1Impl:
                 state,
                 indexer_readiness,
                 tuple(plan.get("indexer_source_owners", ())),
+                future_wait_ms=dependency_wait_ms,
             )
+            plan.pop("dense_load_ticket", None)
+            plan.pop("dense_load_retirement", None)
+            plan.pop("indexer_source_owners", None)
 
             seal_started = cold_start_perf_now()
             state.indexer_npu_resident = True
@@ -6552,9 +6975,11 @@ class LMCacheConnectorV1Impl:
                 plan_ms=round(
                     (plan["planned_at"] - plan["plan_started"]) * 1000, 3
                 ),
-                remote_ms=round(indexer_remote_s * 1000, 3),
+                indexer_background_host_envelope_ms=round(
+                    indexer_background_host_s * 1000, 3
+                ),
                 queue_ms=round(indexer_queue_ms, 3),
-                event_wait_ms=round(dependency_wait_ms, 3),
+                indexer_future_wait_ms=round(dependency_wait_ms, 3),
                 seal_ms=round((completed_at - seal_started) * 1000, 3),
             )
             return state
@@ -6564,48 +6989,111 @@ class LMCacheConnectorV1Impl:
                 latent_shared_ready.set_exception(exc)
             # Do not release scheduler blocks or registered tensor storage while
             # the sibling native transfer can still be writing into it.
-            if not indexer_future.done():
-                try:
-                    indexer_future.result()
-                except BaseException:
-                    pass
+            indexer_error = None
+            try:
+                indexer_future.result()
+            except BaseException as error:
+                indexer_error = error
+            if indexer_error is not None and getattr(
+                indexer_error, "_lmcache_dense_bootstrap_fatal", False
+            ):
+                self._mark_dense_bootstrap_fatal(exc)
+            failed_state = getattr(exc, "_lmcache_dsa_cold_state", None)
+            if failed_state is None and indexer_error is not None:
+                failed_state = getattr(
+                    indexer_error, "_lmcache_dsa_cold_state", None
+                )
+            if isinstance(failed_state, WorkerRetrieveState):
+                if state.dense_load_ticket is None:
+                    state.dense_load_ticket = failed_state.dense_load_ticket
+                failed_owners = failed_state.dense_load_source_owners
+            else:
+                failed_owners = ()
             owners_by_id = {
                 id(owner): owner
                 for owner in (
                     *state.dense_load_source_owners,
                     *tuple(plan.get("indexer_source_owners", ())),
+                    *failed_owners,
                 )
             }
             combined_owners = tuple(owners_by_id.values())
-            try:
-                self._synchronize_dsa_cold_dense_load()
-            except BaseException:
-                # The transfer may still be writing. Preserve every owner on
-                # the surfaced state so the scheduler can retain the blocks
-                # and a later safe cleanup cannot lose the indexer future's
-                # source allocation.
-                state.dense_load_source_owners = combined_owners
-                plan["indexer_source_owners"] = ()
-                exc._lmcache_dsa_cold_state = state
-                logger.exception(
-                    "Cold compact cleanup could not synchronize the dense "
-                    "load stream; scheduler blocks must remain retained"
+            ticket = state.dense_load_ticket or plan.get("dense_load_ticket")
+            ticket_clean = bool(
+                getattr(exc, "_lmcache_dense_ticket_clean", False)
+                or (
+                    indexer_error is not None
+                    and getattr(
+                        indexer_error, "_lmcache_dense_ticket_clean", False
+                    )
                 )
-            else:
-                # The stream is already fenced. Release both adopted and
-                # not-yet-adopted indexer owners exactly once, without a
-                # redundant second device synchronization.
+            )
+            cleanup_safe = ticket_clean
+            if ticket is not None and not ticket_clean:
+                connector = self.lmcache_engine.gpu_connector
+                try:
+                    cleanup_safe = bool(
+                        connector.fail_dense_bootstrap_load(ticket, exc)
+                    )
+                except BaseException:
+                    cleanup_safe = False
+                    logger.critical(
+                        "Cold compact cleanup could not fence its dense "
+                        "bootstrap ticket",
+                        exc_info=True,
+                    )
+                if cleanup_safe:
+                    try:
+                        cleanup_safe = bool(
+                            connector.release_dense_bootstrap_load(ticket)
+                        )
+                    except BaseException:
+                        cleanup_safe = False
+                        logger.critical(
+                            "Cold compact cleanup could not release its "
+                            "fenced dense bootstrap ticket",
+                            exc_info=True,
+                        )
+            elif ticket is None and not ticket_clean:
+                try:
+                    self._synchronize_dsa_cold_dense_load()
+                    cleanup_safe = True
+                except BaseException:
+                    cleanup_safe = False
+                    logger.critical(
+                        "Cold compact cleanup could not synchronize the "
+                        "legacy dense load stream",
+                        exc_info=True,
+                    )
+            if not cleanup_safe:
+                state.dense_load_source_owners = combined_owners
+                state.dense_load_ticket = ticket
+                plan["indexer_source_owners"] = ()
+                plan.pop("dense_load_ticket", None)
+                exc._lmcache_dsa_cold_state = state
+                logger.critical(
+                    "Retaining cold compact ticket, sources, and scheduler "
+                    "blocks because cleanup was not proven safe"
+                )
+                raise
+            if ticket is not None or ticket_clean:
+                exc._lmcache_dense_ticket_clean = True
+            if ticket is None:
                 self._release_dense_load_source_owners(
                     combined_owners,
                     self.lmcache_engine,
                     synchronize=False,
                 )
-                state.dense_load_source_owners = ()
-                plan["indexer_source_owners"] = ()
-                self._release_unadopted_shared_request_objects(state, request)
-                self._release_shared_worker_retrieve_state(
-                    state, self.lmcache_engine
-                )
+            state.dense_load_source_owners = ()
+            state.dense_load_ticket = None
+            state.dense_load_ticket_consumed = False
+            plan["indexer_source_owners"] = ()
+            plan.pop("dense_load_ticket", None)
+            plan.pop("dense_load_retirement", None)
+            self._release_unadopted_shared_request_objects(state, request)
+            self._release_shared_worker_retrieve_state(
+                state, self.lmcache_engine
+            )
             raise
 
     @_lmcache_nvtx_annotate
@@ -8923,6 +9411,9 @@ class LMCacheConnectorV1Impl:
         futures = getattr(self, "_dsa_cold_load_futures", None)
         if not futures:
             return None
+        gpu_connector = getattr(
+            getattr(self, "lmcache_engine", None), "gpu_connector", None
+        )
         finished: set[str] = set()
         for req_id, entry in list(futures.items()):
             (
@@ -8950,6 +9441,27 @@ class LMCacheConnectorV1Impl:
                         f"req_id={req_id}, expected={generation}, "
                         f"actual={actual_generation}"
                     )
+                ticket = state.dense_load_ticket
+                if ticket is not None:
+                    complete = getattr(
+                        gpu_connector,
+                        "dense_bootstrap_load_complete",
+                        None,
+                    )
+                    if not callable(complete):
+                        raise RuntimeError(
+                            "NPU connector has no dense bootstrap completion API"
+                        )
+                    try:
+                        ticket_complete = bool(complete(ticket))
+                    except BaseException as error:
+                        self._mark_dense_bootstrap_fatal(error)
+                        error._lmcache_dsa_cold_state = state
+                        raise
+                    if not ticket_complete:
+                        # Keep the future entry and its scheduler destination
+                        # blocks leased while the ticket stream can still write.
+                        continue
                 completed_at = getattr(
                     state, "_dsa_cold_load_completed_at", cold_start_perf_now()
                 )
@@ -8975,6 +9487,33 @@ class LMCacheConnectorV1Impl:
                     # authoritative cleanup path.
                     state._dsa_cold_prune_protected = True
                 published_at = cold_start_perf_now()
+                if ticket is not None:
+                    timing_fields = {
+                        "background_host_ms": round(
+                            (completed_at - submitted_at) * 1000, 3
+                        ),
+                        "host_to_device_retirement_observed_ms": round(
+                            (publish_started - completed_at) * 1000, 3
+                        ),
+                        "publish_ms": round(
+                            (published_at - publish_started) * 1000, 3
+                        ),
+                    }
+                else:
+                    timing_fields = {
+                        "background_ms": round(
+                            (completed_at - submitted_at) * 1000, 3
+                        ),
+                        "scheduler_poll_ms": round(
+                            (publish_started - completed_at) * 1000, 3
+                        ),
+                        "publish_ms": round(
+                            (published_at - publish_started) * 1000, 3
+                        ),
+                        "final_unhidden_ms": round(
+                            (published_at - completed_at) * 1000, 3
+                        ),
+                    }
                 cold_start_perf_log(
                     logger,
                     "worker_load_complete",
@@ -8982,14 +9521,7 @@ class LMCacheConnectorV1Impl:
                     req_id=req_id,
                     tokens=request.load_spec.lmcache_cached_tokens,
                     mode="dsa_cold_compact",
-                    background_ms=round((completed_at - submitted_at) * 1000, 3),
-                    scheduler_poll_ms=round(
-                        (publish_started - completed_at) * 1000, 3
-                    ),
-                    publish_ms=round((published_at - publish_started) * 1000, 3),
-                    final_unhidden_ms=round(
-                        (published_at - completed_at) * 1000, 3
-                    ),
+                    **timing_fields,
                 )
                 logger.info(
                     "[DSA_COLD_COMPACT] request=%s generation=%d "
@@ -9002,16 +9534,6 @@ class LMCacheConnectorV1Impl:
                     (cold_start_perf_now() - submitted_at) * 1000,
                 )
             except BaseException as exc:
-                try:
-                    self._synchronize_dsa_cold_dense_load()
-                except BaseException:
-                    logger.critical(
-                        "Cold compact load failed and its dense load stream "
-                        "could not be synchronized; retaining request blocks: %s",
-                        req_id,
-                        exc_info=True,
-                    )
-                    continue
                 failed_state = getattr(exc, "_lmcache_dsa_cold_state", None)
                 states = getattr(self, "_worker_retrieve_state", {})
                 if (
@@ -9021,16 +9543,94 @@ class LMCacheConnectorV1Impl:
                     and states.get(req_id) is not state
                 ):
                     failed_state = state
+                ticket = (
+                    failed_state.dense_load_ticket
+                    if isinstance(failed_state, WorkerRetrieveState)
+                    else None
+                )
+                cleanup_safe = bool(
+                    getattr(exc, "_lmcache_dense_ticket_clean", False)
+                )
+                dense_bootstrap_fatal = bool(
+                    getattr(exc, "_lmcache_dense_bootstrap_fatal", False)
+                )
+
+                def restart_if_dense_bootstrap_fatal(
+                    fatal: bool = dense_bootstrap_fatal,
+                    request_id: str = req_id,
+                    error: BaseException = exc,
+                ) -> None:
+                    if not fatal:
+                        return
+                    logger.critical(
+                        "Dense bootstrap ticket lifecycle became fatal; "
+                        "retaining unsafe ownership and restarting worker: %s",
+                        request_id,
+                    )
+                    raise RuntimeError(
+                        "Dense bootstrap ticket requires worker restart"
+                    ) from error
+
+                if ticket is not None and not cleanup_safe:
+                    fail = getattr(
+                        gpu_connector, "fail_dense_bootstrap_load", None
+                    )
+                    if not callable(fail):
+                        logger.critical(
+                            "Cold compact ticket failure API is unavailable; "
+                            "retaining request blocks: %s",
+                            req_id,
+                        )
+                        restart_if_dense_bootstrap_fatal()
+                        continue
+                    try:
+                        cleanup_safe = bool(fail(ticket, exc))
+                    except BaseException:
+                        logger.critical(
+                            "Cold compact ticket could not be fenced; retaining "
+                            "request blocks: %s",
+                            req_id,
+                            exc_info=True,
+                        )
+                        restart_if_dense_bootstrap_fatal()
+                        continue
+                elif ticket is None and not cleanup_safe:
+                    try:
+                        self._synchronize_dsa_cold_dense_load()
+                        cleanup_safe = True
+                    except BaseException:
+                        logger.critical(
+                            "Cold compact legacy load stream could not be "
+                            "synchronized; retaining request blocks: %s",
+                            req_id,
+                            exc_info=True,
+                        )
+                        restart_if_dense_bootstrap_fatal()
+                        continue
+                if not cleanup_safe:
+                    restart_if_dense_bootstrap_fatal()
+                    continue
                 if failed_state is not None:
-                    self._release_unadopted_shared_request_objects(
-                        failed_state, request
-                    )
-                    self._release_shared_worker_retrieve_state(
-                        failed_state, self.lmcache_engine
-                    )
+                    try:
+                        self._release_unadopted_shared_request_objects(
+                            failed_state, request
+                        )
+                        self._release_shared_worker_retrieve_state(
+                            failed_state, self.lmcache_engine
+                        )
+                    except BaseException:
+                        logger.critical(
+                            "Cold compact ticket release was not proven safe; "
+                            "retaining request blocks: %s",
+                            req_id,
+                            exc_info=True,
+                        )
+                        restart_if_dense_bootstrap_fatal()
+                        continue
                 self._invalid_block_ids.update(indexer_block_ids)
                 if was_aborted:
                     self._release_request_lookup_pins(req_id)
+                restart_if_dense_bootstrap_fatal()
                 logger.exception(
                     "[DSA_COLD_COMPACT] request=%s generation=%d "
                     "status=failed indexer_blocks=%d elapsed_ms=%.3f",
@@ -9124,6 +9724,15 @@ class LMCacheConnectorV1Impl:
         executor = getattr(self, "_dsa_cold_load_executor", None)
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=False)
+        gpu_connector = getattr(
+            getattr(self, "lmcache_engine", None), "gpu_connector", None
+        )
+        shutdown_dense = getattr(
+            gpu_connector, "shutdown_dense_bootstrap_loads", None
+        )
+        if callable(shutdown_dense):
+            shutdown_dense()
+        if getattr(self, "_dsa_cold_legacy_dense_load_used", False):
             self._synchronize_dsa_cold_dense_load()
         self._manager.stop_services()
 
