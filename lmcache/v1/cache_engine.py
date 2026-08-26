@@ -3424,16 +3424,11 @@ class LMCacheEngine:
                             LayerPageMemoryObj,
                         )
                     ):
-                        if missed_layers:
-                            return None
                         continue
                     for layer_id, key in enumerate(
                         chunk if isinstance(chunk, list) else [chunk]
                     ):
-                        if key in hot_cache:
-                            if layer_id in missed_layers:
-                                return None
-                        else:
+                        if key not in hot_cache:
                             missed_layers.add(layer_id)
                             local_chunks = min(local_chunks, chunk_index)
         if local_chunks == len(keys_by_chunk):
