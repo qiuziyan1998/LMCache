@@ -6002,7 +6002,7 @@ class LMCacheConnectorV1Impl:
             self._dsa_cold_load_executor = executor
         return executor
 
-    def _synchronize_dsa_cold_dense_load(self) -> None:
+    def _synchronize_dsa_cold_dense_load(self, stream: Any = None) -> None:
         assert self.lmcache_engine is not None
         synchronize = getattr(
             self.lmcache_engine.gpu_connector,
@@ -6011,7 +6011,21 @@ class LMCacheConnectorV1Impl:
         )
         if synchronize is None:
             raise RuntimeError("NPU connector has no dense load-stream sync API")
-        synchronize()
+        if stream is None:
+            synchronize()
+        else:
+            synchronize(stream)
+
+    def _synchronize_dsa_cold_dense_readiness(self, readiness: Any) -> None:
+        assert self.lmcache_engine is not None
+        synchronize = getattr(
+            self.lmcache_engine.gpu_connector,
+            "synchronize_dense_load_readiness",
+            None,
+        )
+        if synchronize is None:
+            raise RuntimeError("NPU connector has no dense load readiness sync API")
+        synchronize(readiness)
 
     def _record_dsa_cold_dense_load_readiness(
         self,
@@ -6443,8 +6457,26 @@ class LMCacheConnectorV1Impl:
         self, plan: dict[str, Any], npu_device_id: Optional[int]
     ) -> tuple[torch.Tensor, Any, float, float]:
         """Load group 1 directly, or after group 0 in shared-CPU mode."""
+        perf_breakdown = {} if cold_start_perf_enabled() else None
+        if perf_breakdown is not None:
+            plan["indexer_perf"] = perf_breakdown
+
+        def stage_start() -> float:
+            return cold_start_perf_now() if perf_breakdown is not None else 0.0
+
+        def finish_stage(name: str, stage_started: float) -> None:
+            if perf_breakdown is not None:
+                perf_breakdown[name] = round(
+                    (cold_start_perf_now() - stage_started) * 1000, 3
+                )
+
+        producer_setup_started = stage_start()
         if npu_device_id is not None:
             torch.npu.set_device(npu_device_id)
+        producer_stream = (
+            torch.npu.current_stream() if npu_device_id is not None else None
+        )
+        finish_stage("producer_setup_ms", producer_setup_started)
         assert self.lmcache_engine is not None
         started = cold_start_perf_now()
         queue_ms = (started - plan["planned_at"]) * 1000
@@ -6456,12 +6488,16 @@ class LMCacheConnectorV1Impl:
             "validate_layerwise_slot_mapping",
             None,
         )
+        slot_validate_started = stage_start()
         if callable(validate_slots):
             validate_slots(indexer_slots_cpu, indexer_kvcaches, kv_group=1)
+        finish_stage("slot_validate_ms", slot_validate_started)
+        slot_submit_started = stage_start()
         indexer_slots = indexer_slots_cpu.to(
             device=self.device,
             dtype=torch.long,
         )
+        finish_stage("slot_mapping_submit_ms", slot_submit_started)
         retrieve_state = WorkerRetrieveState(req_id=request.req_id)
         shared_retrieve = getattr(
             self.lmcache_engine, "_should_use_shared_layerwise_retrieve", None
@@ -6469,6 +6505,7 @@ class LMCacheConnectorV1Impl:
         shared_cpu_enabled = bool(
             callable(shared_retrieve) and shared_retrieve(1)
         )
+        retrieve_kwargs_started = stage_start()
         retrieve_kwargs, _, _ = self._sparse_retrieve_kwargs(
             request,
             retrieve_state,
@@ -6483,6 +6520,9 @@ class LMCacheConnectorV1Impl:
             shared_cpu_enabled=shared_cpu_enabled,
             shared_cpu_preflight_state=None,
         )
+        finish_stage("retrieve_kwargs_ms", retrieve_kwargs_started)
+        if perf_breakdown is not None:
+            retrieve_kwargs["_cold_perf_breakdown"] = perf_breakdown
         load_mode = str(
             getattr(
                 getattr(self, "config", None),
@@ -6495,6 +6535,7 @@ class LMCacheConnectorV1Impl:
                 self.lmcache_engine, "prefetch_shared_layer_pages", None
             )
             if callable(prefetch):
+                prefetch_perf_started = stage_start()
                 prefetch_started = cold_start_perf_now()
                 cold_start_perf_log(
                     logger,
@@ -6529,7 +6570,9 @@ class LMCacheConnectorV1Impl:
                         request.req_id,
                         error,
                     )
+                finish_stage("prefetch_ms", prefetch_perf_started)
         if shared_cpu_enabled:
+            latent_gate_started = stage_start()
             try:
                 plan["latent_shared_ready"].result()
             except BaseException:
@@ -6539,26 +6582,33 @@ class LMCacheConnectorV1Impl:
                 )
                 retrieve_state.clear_group(1)
                 raise
+            finish_stage("latent_gate_wait_ms", latent_gate_started)
         if not shared_cpu_enabled:
             retrieve_kwargs["direct_external_pages"] = True
             retrieve_kwargs["_defer_direct_load_readiness"] = True
+        generator_started = stage_start()
         retriever = self.lmcache_engine.retrieve_layer_head_token_wise(
             plan["tokens"],
             plan["token_mask"],
             **retrieve_kwargs,
         )
+        finish_stage("generator_create_ms", generator_started)
         result = None
         source_owners: tuple[Any, ...] = ()
         try:
+            layer_submit_started = stage_start()
             try:
                 result = next(retriever)
                 for _ in range(self.num_layers):
                     result = retriever.send(None)
             finally:
                 retriever.close()
+            finish_stage("layer_submit_host_ms", layer_submit_started)
+            result_check_started = stage_start()
             source_owners = self._dense_load_source_owners(retrieve_state)
             if result is None or int(result.sum().item()) != plan["token_count"]:
                 raise RuntimeError("Cold compact indexer retrieve was incomplete")
+            finish_stage("result_check_ms", result_check_started)
             record = getattr(
                 self.lmcache_engine.gpu_connector,
                 "record_dense_load_readiness",
@@ -6566,12 +6616,19 @@ class LMCacheConnectorV1Impl:
             )
             if record is None:
                 raise RuntimeError("NPU connector has no dense load readiness API")
-            readiness = record()
+            readiness_started = stage_start()
+            readiness = (
+                record() if producer_stream is None else record(producer_stream)
+            )
+            finish_stage("readiness_record_ms", readiness_started)
         except BaseException:
             if not source_owners:
                 source_owners = self._dense_load_source_owners(retrieve_state)
+            self._synchronize_dsa_cold_dense_load(producer_stream)
             self._release_dense_load_source_owners(
-                source_owners, self.lmcache_engine
+                source_owners,
+                self.lmcache_engine,
+                synchronize=False,
             )
             raise
         plan["indexer_source_owners"] = source_owners
@@ -6647,6 +6704,7 @@ class LMCacheConnectorV1Impl:
         token_mask = plan["token_mask"]
         state = live_state or WorkerRetrieveState(req_id=request.req_id)
         started = cold_start_perf_now()
+        indexer_readiness = None
         try:
             if previous_latent_future is not None:
                 try:
@@ -6738,17 +6796,19 @@ class LMCacheConnectorV1Impl:
                 queue_ms=round(indexer_queue_ms, 3),
                 event_wait_ms=round(dependency_wait_ms, 3),
                 seal_ms=round((completed_at - seal_started) * 1000, 3),
+                **plan.get("indexer_perf", {}),
             )
             return state
         except BaseException as exc:
             latent_shared_ready = plan["latent_shared_ready"]
             if not latent_shared_ready.done():
                 latent_shared_ready.set_exception(exc)
-            # Do not release scheduler blocks or registered tensor storage while
-            # the sibling native transfer can still be writing into it.
-            if not indexer_future.done():
+            # Resolve the sibling result even when Group 0 failed before its
+            # normal dependency wait. A successful result carries the exact
+            # producer-stream fence; a failed result fenced its stream locally.
+            if indexer_readiness is None:
                 try:
-                    indexer_future.result()
+                    _, indexer_readiness, _, _ = indexer_future.result()
                 except BaseException:
                     pass
             owners_by_id = {
@@ -6760,7 +6820,8 @@ class LMCacheConnectorV1Impl:
             }
             combined_owners = tuple(owners_by_id.values())
             try:
-                self._synchronize_dsa_cold_dense_load()
+                if indexer_readiness is not None:
+                    self._synchronize_dsa_cold_dense_readiness(indexer_readiness)
             except BaseException:
                 # The transfer may still be writing. Preserve every owner on
                 # the surfaced state so the scheduler can retain the blocks

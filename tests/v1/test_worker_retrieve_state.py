@@ -74,12 +74,19 @@ def test_cold_compact_drain_waits_for_both_dependencies() -> None:
     assert "request" in impl._dsa_cold_load_futures
 
 
-def test_cold_compact_indexer_uses_direct_sparse_retrieve_path() -> None:
+def test_cold_compact_indexer_uses_direct_sparse_retrieve_path(monkeypatch) -> None:
+    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
     impl = _make_impl()
     impl.num_layers = 2
     impl.device = "cpu"
     owner = object()
     readiness = object()
+    producer_stream = object()
+    npu = SimpleNamespace(
+        set_device=MagicMock(),
+        current_stream=MagicMock(return_value=producer_stream),
+    )
+    monkeypatch.setattr(adapter_mod.torch, "npu", npu, raising=False)
 
     def sparse_kwargs(_request, state, _bound_state, **_kwargs):
         state.cached_memory_objs_indexer = [[owner], [owner]]
@@ -89,15 +96,15 @@ def test_cold_compact_indexer_uses_direct_sparse_retrieve_path() -> None:
         assert kwargs["marker"] == "sparse"
         assert kwargs["direct_external_pages"] is True
         assert kwargs["_defer_direct_load_readiness"] is True
+        assert kwargs["_cold_perf_breakdown"] is plan["indexer_perf"]
         yield None
         yield torch.ones(4, dtype=torch.bool)
         yield torch.ones(4, dtype=torch.bool)
 
     impl._sparse_retrieve_kwargs = MagicMock(side_effect=sparse_kwargs)
+    record = MagicMock(return_value=readiness)
     impl.lmcache_engine = SimpleNamespace(
-        gpu_connector=SimpleNamespace(
-            record_dense_load_readiness=lambda: readiness,
-        ),
+        gpu_connector=SimpleNamespace(record_dense_load_readiness=record),
         retrieve_layer=MagicMock(
             side_effect=AssertionError("generic retrieve path is CPU staged")
         ),
@@ -121,11 +128,15 @@ def test_cold_compact_indexer_uses_direct_sparse_retrieve_path() -> None:
         "planned_at": adapter_mod.cold_start_perf_now(),
     }
 
-    result = impl._run_dsa_cold_indexer_load(plan, None)
+    result = impl._run_dsa_cold_indexer_load(plan, 3)
 
     assert torch.equal(result[0], torch.ones(4, dtype=torch.bool))
     assert result[1] is readiness
     assert plan["indexer_source_owners"] == (owner,)
+    assert plan["indexer_perf"]["layer_submit_host_ms"] >= 0
+    assert plan["indexer_perf"]["readiness_record_ms"] >= 0
+    npu.set_device.assert_called_once_with(3)
+    record.assert_called_once_with(producer_stream)
     impl.lmcache_engine.retrieve_layer.assert_not_called()
     impl.lmcache_engine.retrieve_layer_head_token_wise.assert_called_once()
 
@@ -348,7 +359,11 @@ def test_cold_compact_group1_prefetch_failure_releases_and_falls_back() -> None:
 
 
 @pytest.mark.parametrize("failure", ("incomplete", "transfer"))
-def test_failed_cold_indexer_releases_transient_memory_owner(failure) -> None:
+def test_failed_cold_indexer_releases_transient_memory_owner(
+    failure, monkeypatch
+) -> None:
+    calls = []
+
     class Owner:
         def __init__(self):
             self.released = 0
@@ -357,14 +372,22 @@ def test_failed_cold_indexer_releases_transient_memory_owner(failure) -> None:
             return True
 
         def ref_count_down(self):
+            calls.append("release")
             self.released += 1
 
     impl = _make_impl()
     impl.num_layers = 1
     impl.device = "cpu"
     owner = Owner()
+    producer_stream = object()
+    npu = SimpleNamespace(
+        set_device=MagicMock(),
+        current_stream=MagicMock(return_value=producer_stream),
+    )
+    monkeypatch.setattr(adapter_mod.torch, "npu", npu, raising=False)
+    synchronize = MagicMock(side_effect=lambda _stream: calls.append("sync"))
     connector = SimpleNamespace(
-        synchronize_dense_load_stream=MagicMock(),
+        synchronize_dense_load_stream=synchronize,
         record_dense_load_readiness=MagicMock(),
     )
 
@@ -397,10 +420,11 @@ def test_failed_cold_indexer_releases_transient_memory_owner(failure) -> None:
 
     expected = "transfer failed|indexer retrieve was incomplete"
     with pytest.raises(RuntimeError, match=expected):
-        impl._run_dsa_cold_indexer_load(plan, None)
+        impl._run_dsa_cold_indexer_load(plan, 3)
 
-    connector.synchronize_dense_load_stream.assert_called_once_with()
+    synchronize.assert_called_once_with(producer_stream)
     connector.record_dense_load_readiness.assert_not_called()
+    assert calls == ["sync", "release"]
     assert owner.released == 1
     assert "indexer_source_owners" not in plan
 
@@ -1602,7 +1626,7 @@ class TestWorkerRetrieveState:
         impl._num_layers_for_group = lambda _group: 1
         impl.lmcache_engine = SimpleNamespace(
             gpu_connector=SimpleNamespace(
-                synchronize_dense_load_stream=synchronize,
+                synchronize_dense_load_readiness=synchronize,
             )
         )
         impl._record_dsa_cold_dense_load_readiness = MagicMock(
@@ -1636,7 +1660,7 @@ class TestWorkerRetrieveState:
                 live_state=state,
             )
 
-        synchronize.assert_called_once_with()
+        synchronize.assert_called_once_with(dependency.result()[1])
         assert owner.unpinned == 1
         assert owner.released == 1
         assert plan["indexer_source_owners"] == ()
@@ -1649,7 +1673,7 @@ class TestWorkerRetrieveState:
         impl._num_layers_for_group = lambda _group: 1
         impl.lmcache_engine = SimpleNamespace(
             gpu_connector=SimpleNamespace(
-                synchronize_dense_load_stream=MagicMock(
+                synchronize_dense_load_readiness=MagicMock(
                     side_effect=RuntimeError("sync failed")
                 ),
             )
