@@ -99,10 +99,28 @@ def test_sparse_destination_registration_uses_fixed_two_group_caches() -> None:
         )
     )
     impl._kvcaches_for_group = lambda group: latent if group == 0 else indexer
+    impl.supports_dsa_cold_compact_load = lambda: True
 
     impl._register_sparse_destination_kv_caches()
 
-    register.assert_called_once_with((tuple(latent), tuple(indexer)))
+    register.assert_called_once_with(
+        (tuple(latent), tuple(indexer)), slot_mapping_dtype=torch.long
+    )
+
+
+def test_sparse_destination_registration_skips_disabled_cold_compact() -> None:
+    impl = _make_impl()
+    register = MagicMock()
+    impl.lmcache_engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(
+            register_sparse_destination_kv_caches=register
+        )
+    )
+    impl.supports_dsa_cold_compact_load = lambda: False
+
+    impl._register_sparse_destination_kv_caches()
+
+    register.assert_not_called()
 
 
 def test_cold_compact_drain_waits_for_both_dependencies() -> None:

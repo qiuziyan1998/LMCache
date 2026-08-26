@@ -2338,7 +2338,7 @@ class LMCacheConnectorV1Impl:
 
     def _register_sparse_destination_kv_caches(self) -> None:
         """Register the fixed two-group destination-cache incarnation."""
-        if not self._is_dsa_two_groups() or self.lmcache_engine is None:
+        if not self.supports_dsa_cold_compact_load() or self.lmcache_engine is None:
             return
         register = getattr(
             self.lmcache_engine.gpu_connector,
@@ -2350,7 +2350,8 @@ class LMCacheConnectorV1Impl:
                 (
                     tuple(self._kvcaches_for_group(0)),
                     tuple(self._kvcaches_for_group(1)),
-                )
+                ),
+                slot_mapping_dtype=torch.long,
             )
 
     def _num_layers_for_group(self, kv_group: int) -> int:
