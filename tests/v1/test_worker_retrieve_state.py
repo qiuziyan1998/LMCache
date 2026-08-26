@@ -48,6 +48,9 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     impl._cold_perf_dense_load_completed = {}
     impl.kv_role = "kv_both"
     impl._late_finished_sending = set()
+    impl._pending_dense_load_req_ids = set()
+    impl._finished_dense_load_req_ids = set()
+    impl._dsa_cold_managed_req_ids = set()
     return impl
 
 
@@ -137,6 +140,37 @@ def test_cold_compact_drain_waits_for_both_dependencies() -> None:
     assert "request" in impl._dsa_cold_load_futures
 
 
+def test_finished_cold_request_waits_for_device_safe_ticket() -> None:
+    impl = _make_impl()
+    ticket = object()
+    state = WorkerRetrieveState(
+        req_id="request",
+        dense_load_ticket=ticket,
+        indexer_npu_materialization_pending=True,
+    )
+    impl._worker_retrieve_state["request"] = state
+    impl._pending_dense_load_req_ids.add("request")
+    impl._dsa_cold_managed_req_ids.add("request")
+    complete = MagicMock(side_effect=(False, True))
+    release = MagicMock(return_value=True)
+    impl.lmcache_engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(
+            dense_bootstrap_load_complete=complete,
+            release_dense_bootstrap_load=release,
+        ),
+        release_shared_cpu_sparse_request=MagicMock(),
+    )
+
+    impl._retire_completed_dense_load_tickets()
+    assert impl._finalize_worker_requests_after_store({"request"}) == set()
+    assert "request" in impl._worker_retrieve_state
+
+    impl._retire_completed_dense_load_tickets()
+    assert impl._finalize_worker_requests_after_store(set()) == {"request"}
+    assert "request" not in impl._worker_retrieve_state
+    release.assert_called_once_with(ticket)
+
+
 def test_cold_compact_indexer_uses_direct_sparse_retrieve_path() -> None:
     impl = _make_impl()
     impl.num_layers = 2
@@ -195,12 +229,12 @@ def test_cold_compact_indexer_uses_direct_sparse_retrieve_path() -> None:
 
 
 @pytest.mark.parametrize(
-    ("admitted", "capacity_retry"),
-    ((True, False), (True, True), (False, False)),
+    ("local_admitted", "tp_admitted"),
+    ((True, True), (False, False), (True, False)),
 )
 def test_cold_compact_indexer_ticket_orders_every_npu_operation(
-    admitted: bool,
-    capacity_retry: bool,
+    local_admitted: bool,
+    tp_admitted: bool,
 ) -> None:
     impl = _make_impl()
     impl.num_layers = 2
@@ -231,10 +265,8 @@ def test_cold_compact_indexer_ticket_orders_every_npu_operation(
         nonlocal begin_calls
         begin_calls += 1
         order.append(("begin", kwargs))
-        if not admitted:
+        if not local_admitted:
             raise RuntimeError("connector unavailable")
-        if capacity_retry and begin_calls == 1:
-            return None
         return ticket
 
     def sparse_kwargs(_request, state, _bound_state, **kwargs):
@@ -251,7 +283,7 @@ def test_cold_compact_indexer_ticket_orders_every_npu_operation(
 
     def retrieve(_tokens, _mask, **kwargs):
         assert kwargs.get("dense_load_ticket") is (
-            ticket if admitted else None
+            ticket if local_admitted and tp_admitted else None
         )
         yield None
         for layer in range(2):
@@ -284,6 +316,7 @@ def test_cold_compact_indexer_ticket_orders_every_npu_operation(
         finish_dense_bootstrap_load=lambda value, expected_layers: order.append(
             ("finish", value, expected_layers)
         ),
+        dense_bootstrap_load_submitted=MagicMock(return_value=True),
         dense_bootstrap_load_complete=MagicMock(return_value=True),
         consume_dense_bootstrap_load=MagicMock(),
         fail_dense_bootstrap_load=MagicMock(return_value=True),
@@ -309,23 +342,30 @@ def test_cold_compact_indexer_ticket_orders_every_npu_operation(
         "planned_at": adapter_mod.cold_start_perf_now(),
         "dense_bootstrap_required": True,
         "latent_shared_ready": Future(),
+        "dense_local_admission": Future(),
+        "dense_tp_admission": Future(),
     }
+    plan["dense_tp_admission"].set_result(tp_admitted)
 
-    if admitted:
+    if local_admitted and tp_admitted:
         result = impl._run_dsa_cold_indexer_load(plan, None)
     else:
-        with pytest.raises(RuntimeError, match="connector unavailable") as raised:
+        message = (
+            "connector unavailable"
+            if not local_admitted
+            else "TP admission failed"
+        )
+        with pytest.raises(RuntimeError, match=message) as raised:
             impl._run_dsa_cold_indexer_load(plan, None)
-        assert raised.value._lmcache_dense_bootstrap_fatal is True
         assert raised.value._lmcache_dense_ticket_clean is True
         result = None
 
     begin_kwargs = next(value[1] for value in order if value[0] == "begin")
-    assert begin_calls == (2 if capacity_retry else 1)
+    assert begin_calls == 1
     assert begin_kwargs["slot_mapping_dtype"] is torch.long
     assert begin_kwargs["token_count"] == 4
     validate_slots.assert_called_once()
-    if admitted:
+    if local_admitted and tp_admitted:
         to_index = next(
             i for i, value in enumerate(order) if value[0] == "to"
         )
@@ -349,8 +389,12 @@ def test_cold_compact_indexer_ticket_orders_every_npu_operation(
         assert "context_enter" not in order
         assert not any(value[0] == "to" for value in order)
         assert not getattr(impl, "_dsa_cold_legacy_dense_load_used", False)
-        connector.fail_dense_bootstrap_load.assert_not_called()
-        connector.release_dense_bootstrap_load.assert_not_called()
+        if local_admitted:
+            connector.fail_dense_bootstrap_load.assert_called_once()
+            connector.release_dense_bootstrap_load.assert_called_once_with(ticket)
+        else:
+            connector.fail_dense_bootstrap_load.assert_not_called()
+            connector.release_dense_bootstrap_load.assert_not_called()
 
 
 def test_cold_compact_shared_indexer_waits_for_latent_publication() -> None:
@@ -1773,15 +1817,17 @@ class TestWorkerRetrieveState:
         assert state.dense_load_source_owners == (direct_owner, owner_a)
         assert state.dense_load_readiness is None
 
-    def test_dense_load_ticket_is_consumed_and_detached_exactly_once(self):
+    def test_dense_load_ticket_waits_once_and_detaches_after_completion(self):
         order = []
         ticket = object()
+        complete = MagicMock(side_effect=(False, True))
 
         connector = SimpleNamespace(
             is_dense_bootstrap_ticket=lambda value: value is ticket,
             consume_dense_bootstrap_load=lambda value: order.append(
                 ("consume", value)
             ),
+            dense_bootstrap_load_complete=complete,
             release_dense_bootstrap_load=lambda value: (
                 order.append(("ticket_release", value)) or True
             ),
@@ -1796,6 +1842,9 @@ class TestWorkerRetrieveState:
             state, ticket, additional_owners=(object(),)
         )
         impl._consume_dsa_cold_dense_load_readiness(state)
+
+        assert order == [("consume", ticket)]
+        assert state.dense_load_ticket is ticket
         impl._consume_dsa_cold_dense_load_readiness(state)
 
         assert order == [
@@ -1804,6 +1853,7 @@ class TestWorkerRetrieveState:
         ]
         assert state.dense_load_ticket is None
         assert state.dense_load_source_owners == ()
+        assert complete.call_count == 2
 
     def test_dense_load_ticket_release_failure_retains_owner_and_ticket(self):
         ticket = object()
@@ -1814,6 +1864,7 @@ class TestWorkerRetrieveState:
         )
         connector = SimpleNamespace(
             consume_dense_bootstrap_load=MagicMock(),
+            dense_bootstrap_load_complete=MagicMock(return_value=True),
             release_dense_bootstrap_load=MagicMock(return_value=False),
         )
         impl = _make_impl()
@@ -2007,6 +2058,59 @@ class TestWorkerRetrieveState:
         assert raised.value._lmcache_dsa_cold_state is state
         assert state.dense_load_source_owners == (owner,)
         assert plan["indexer_source_owners"] == ()
+
+    def test_cold_compact_late_group0_failure_votes_host_submission_false(self):
+        impl = _make_impl()
+        impl.num_layers = 1
+        impl.device = "cpu"
+        impl._num_layers_for_group = lambda _group: 1
+        impl._synchronize_dsa_cold_dense_load = MagicMock()
+        impl._release_unadopted_shared_request_objects = MagicMock()
+        impl._release_shared_worker_retrieve_state = MagicMock()
+        vote = MagicMock(return_value=False)
+
+        def latent_retriever():
+            while True:
+                yield torch.zeros(1, dtype=torch.bool)
+
+        impl.lmcache_engine = SimpleNamespace(
+            gpu_connector=SimpleNamespace(),
+            retrieve_layer_head_token_wise=MagicMock(
+                side_effect=lambda *args, **kwargs: latent_retriever()
+            ),
+            remote_fill_all_ranks_ready=vote,
+        )
+        impl._sparse_retrieve_kwargs = MagicMock(return_value=({}, None, None))
+        request = SimpleNamespace(
+            req_id="req-1",
+            load_spec=SimpleNamespace(lmcache_cached_tokens=1),
+        )
+        tp_admission = Future()
+        tp_admission.set_result(True)
+        plan = {
+            "request": request,
+            "token_count": 1,
+            "tokens": [1],
+            "token_mask": torch.ones(1, dtype=torch.bool),
+            "latent_kvcaches": [],
+            "planned_at": 0.0,
+            "plan_started": 0.0,
+            "latent_shared_ready": Future(),
+            "dense_bootstrap_required": True,
+            "dense_tp_admission": tp_admission,
+        }
+        dependency = Future()
+        dependency.set_result((None, object(), 0.0, 0.0))
+
+        with pytest.raises(RuntimeError, match="latent retrieve was incomplete"):
+            impl._run_dsa_cold_compact_load(plan, None, dependency)
+
+        vote.assert_called_once_with(
+            False,
+            req_id="req-1",
+            kv_group=1,
+            phase="host_submission",
+        )
 
     def test_finished_worker_request_releases_request_owned_cache_state(self):
         storer_closed: list[bool] = []
@@ -5608,6 +5712,19 @@ class TestWorkerRetrieveState:
             == adapter_mod.INDEXER_RETRIEVE_RESIDENT_SKIP
         )
 
+        state.indexer_npu_resident = False
+        state.indexer_npu_materialization_pending = True
+        state.dense_load_ticket = object()
+        assert (
+            LMCacheConnectorV1Impl._shared_sparse_decode_indexer_retrieve_mode(
+                request, state, 512
+            )
+            == adapter_mod.INDEXER_RETRIEVE_RESIDENT_SKIP
+        )
+        state.indexer_npu_resident = True
+        state.indexer_npu_materialization_pending = False
+        state.dense_load_ticket = None
+
         request.load_spec.lmcache_cached_tokens = 768
         assert (
             LMCacheConnectorV1Impl._shared_sparse_decode_indexer_retrieve_mode(
@@ -5668,7 +5785,7 @@ class TestWorkerRetrieveState:
         assert kwargs["cached_metadata_token_ids"] == list(range(256))
         assert "prepared_sparse_source" not in kwargs
 
-    def test_full_indexer_materialization_commits_at_finalization(self):
+    def test_pending_indexer_materialization_stays_pending_at_finalization(self):
         impl = _make_impl()
         request = _make_request()
         request.is_sparse_decode = True
@@ -5683,8 +5800,8 @@ class TestWorkerRetrieveState:
             SimpleNamespace(requests=[request])
         )
 
-        assert state.indexer_npu_resident is True
-        assert state.indexer_npu_materialization_pending is False
+        assert state.indexer_npu_resident is False
+        assert state.indexer_npu_materialization_pending is True
 
     def test_current_shared_state_skip_requires_validation_signature(self):
         impl = _make_impl()

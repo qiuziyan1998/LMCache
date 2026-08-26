@@ -1124,32 +1124,65 @@ class LMCacheEngine:
         *,
         req_id: str,
         kv_group: int,
+        local_admission: Optional[Any] = None,
+        tp_admission: Optional[Any] = None,
+        phase: str = "materialization",
     ) -> bool:
         """Return one collective materialization decision for all TP ranks."""
 
+        perf_enabled = cold_start_perf_enabled()
+        perf_started = cold_start_perf_now() if perf_enabled else None
+        if local_admission is not None:
+            local_ready = bool(local_ready and local_admission.result())
         if self.metadata.world_size <= 1:
-            return bool(local_ready)
-        collective = getattr(self, "collective_all_true_fn", None)
-        if not callable(collective):
+            result = bool(local_ready)
+        elif not callable(
+            collective := getattr(self, "collective_all_true_fn", None)
+        ):
             logger.error(
                 "RemoteFill shared materialization lacks a TP consensus "
                 "callback: req_id=%s kv_group=%s",
                 req_id,
                 kv_group,
             )
-            return False
-        result = bool(collective(bool(local_ready)))
-        if cold_start_perf_enabled():
+            result = False
+        else:
+            result = bool(collective(bool(local_ready)))
+        if tp_admission is not None and not tp_admission.done():
+            tp_admission.set_result(result)
+        if perf_enabled:
             cold_start_perf_log(
                 logger,
                 "remote_fill_materialization_consensus",
+                started=perf_started,
                 req_id=req_id,
                 kv_group=kv_group,
+                phase=phase,
                 rank=self.metadata.worker_id,
                 local_ready=bool(local_ready),
                 all_ranks_ready=result,
             )
         return result
+
+    def remote_fill_all_ranks_ready(
+        self,
+        local_ready: bool,
+        *,
+        req_id: str,
+        kv_group: int,
+        phase: str,
+    ) -> bool:
+        """Return the TP-wide readiness decision for one RemoteFill phase.
+
+        This is a host-only ordered collective. It never queries or
+        synchronizes device work.
+        """
+        return self._remote_fill_all_ranks_materialized(
+            local_ready,
+            req_id=req_id,
+            kv_group=kv_group,
+            phase=phase,
+        )
 
     def _validate_shared_layerwise_envelope(
         self,
@@ -4730,6 +4763,10 @@ class LMCacheEngine:
                             True,
                             req_id=req_id,
                             kv_group=kv_group,
+                            local_admission=kwargs.get(
+                                "_remote_fill_local_admission"
+                            ),
+                            tp_admission=kwargs.get("_remote_fill_tp_admission"),
                         )
                     ):
                         raise _RemoteFillMaterializationError(
@@ -4907,6 +4944,12 @@ class LMCacheEngine:
                                 False,
                                 req_id=req_id,
                                 kv_group=kv_group,
+                                local_admission=kwargs.get(
+                                    "_remote_fill_local_admission"
+                                ),
+                                tp_admission=kwargs.get(
+                                    "_remote_fill_tp_admission"
+                                ),
                             )
                         raise _RemoteFillMaterializationError(
                             "RemoteFill shared-handle envelope validation failed"
@@ -4961,6 +5004,12 @@ class LMCacheEngine:
                                 view_error is None,
                                 req_id=req_id,
                                 kv_group=kv_group,
+                                local_admission=kwargs.get(
+                                    "_remote_fill_local_admission"
+                                ),
+                                tp_admission=kwargs.get(
+                                    "_remote_fill_tp_admission"
+                                ),
                             )
                         ):
                             raise _RemoteFillMaterializationError(

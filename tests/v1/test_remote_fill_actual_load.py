@@ -3,6 +3,7 @@
 
 # Standard
 from collections import defaultdict
+from concurrent.futures import Future
 import logging
 from types import SimpleNamespace
 
@@ -717,6 +718,27 @@ def test_remote_fill_materialization_consensus_uses_all_rank_result() -> None:
         kv_group=0,
     )
     assert votes == [True]
+
+
+def test_remote_fill_materialization_consensus_includes_ticket_admission() -> None:
+    engine = _engine(_PairStorageManager())
+    local_admission: Future = Future()
+    tp_admission: Future = Future()
+    local_admission.set_result(False)
+    votes = []
+    engine.collective_all_true_fn = lambda local_ready: (
+        votes.append(local_ready) or local_ready
+    )
+
+    assert not engine._remote_fill_all_ranks_materialized(
+        True,
+        req_id="actual",
+        kv_group=0,
+        local_admission=local_admission,
+        tp_admission=tp_admission,
+    )
+    assert votes == [False]
+    assert tp_admission.result() is False
 
 
 def test_remote_fill_materialization_consensus_fails_closed_without_callback(
