@@ -6661,10 +6661,13 @@ class LMCacheConnectorV1Impl:
             )
         failed_req_ids = []
         for req_id, entry in list(futures.items()):
-            try:
-                for future in (entry[1], *entry[5:6]):
+            request_failed = False
+            for future in (entry[1], *entry[5:6]):
+                try:
                     future.result()
-            except BaseException:
+                except BaseException:
+                    request_failed = True
+            if request_failed:
                 failed_req_ids.append(req_id)
         if failed_req_ids:
             # A failed future is reported through get_finished(), which also

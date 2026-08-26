@@ -74,6 +74,25 @@ def test_cold_compact_drain_waits_for_both_dependencies() -> None:
     assert "request" in impl._dsa_cold_load_futures
 
 
+def test_capture_barrier_waits_for_indexer_after_latent_failure() -> None:
+    impl = _make_impl()
+    latent_future = MagicMock()
+    latent_future.done.return_value = True
+    latent_future.result.side_effect = RuntimeError("latent load failed")
+    indexer_future = MagicMock()
+    indexer_future.done.return_value = True
+    impl._dsa_cold_load_futures = {
+        "request": (1, latent_future, object(), set(), 0.0, indexer_future)
+    }
+    impl._synchronize_dsa_cold_dense_load = MagicMock()
+
+    impl.synchronize_staged_sfa_capture_unsafe_loads()
+
+    latent_future.result.assert_called_once_with()
+    indexer_future.result.assert_called_once_with()
+    impl._synchronize_dsa_cold_dense_load.assert_called_once_with()
+
+
 def test_cold_compact_indexer_uses_direct_sparse_retrieve_path(monkeypatch) -> None:
     monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
     impl = _make_impl()
