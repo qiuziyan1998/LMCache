@@ -1147,7 +1147,12 @@ class LMCacheEngine:
             )
             result = False
         else:
-            result = bool(collective(bool(local_ready)))
+            try:
+                result = bool(collective(bool(local_ready)))
+            except BaseException as exc:
+                if tp_admission is not None and not tp_admission.done():
+                    tp_admission.set_exception(exc)
+                raise
         if tp_admission is not None and not tp_admission.done():
             tp_admission.set_result(result)
         if perf_enabled:

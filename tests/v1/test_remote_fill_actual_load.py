@@ -741,6 +741,26 @@ def test_remote_fill_materialization_consensus_includes_ticket_admission() -> No
     assert tp_admission.result() is False
 
 
+def test_materialization_collective_error_unblocks_ticket_admission() -> None:
+    engine = _engine(_PairStorageManager())
+    tp_admission: Future = Future()
+    error = RuntimeError("collective failed")
+
+    def fail_collective(_local_ready):
+        raise error
+
+    engine.collective_all_true_fn = fail_collective
+
+    with pytest.raises(RuntimeError, match="collective failed"):
+        engine._remote_fill_all_ranks_materialized(
+            True,
+            req_id="actual",
+            kv_group=0,
+            tp_admission=tp_admission,
+        )
+    assert tp_admission.exception() is error
+
+
 def test_dense_bootstrap_admission_requires_vote_without_local_full_hint() -> None:
     engine = _engine(_PairStorageManager())
 

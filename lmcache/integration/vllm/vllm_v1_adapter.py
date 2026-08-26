@@ -7052,40 +7052,44 @@ class LMCacheConnectorV1Impl:
             dependency_wait_ms = (
                 cold_start_perf_now() - dependency_wait_started
             ) * 1000
+            seal_started = cold_start_perf_now()
             all_submitted = True
-            if dense_bootstrap_required:
-                host_submission_voted = True
-                all_submitted = (
-                    self.lmcache_engine.remote_fill_all_ranks_ready(
-                        local_submitted,
+            local_ready_to_publish = False
+            try:
+                if indexer_error is not None:
+                    raise indexer_error
+                self._record_dsa_cold_dense_load_readiness(
+                    state,
+                    indexer_readiness,
+                    tuple(plan.get("indexer_source_owners", ())),
+                    future_wait_ms=dependency_wait_ms,
+                )
+                state.indexer_npu_resident = not dense_bootstrap_required
+                state.indexer_npu_materialization_pending = dense_bootstrap_required
+                state.location = retrieve_location
+                state.metadata_warm = state.has_cache()
+                state.token_count = token_count
+                self._refresh_prepared_sparse_sources(state, token_count)
+                if state.prepared_sparse_sources.get(0) is None:
+                    raise RuntimeError("Cold compact latent source was not sealed")
+                local_ready_to_publish = True
+            finally:
+                # Every TP rank must vote once even if local sealing fails.
+                sealed_at = cold_start_perf_now()
+                if dense_bootstrap_required:
+                    host_submission_voted = True
+                    all_submitted = self.lmcache_engine.remote_fill_all_ranks_ready(
+                        local_submitted and local_ready_to_publish,
                         req_id=request.req_id,
                         kv_group=1,
                         phase="host_submission",
                     )
-                )
-            if indexer_error is not None:
-                raise indexer_error
             if not all_submitted:
                 raise RuntimeError("dense bootstrap TP host submission failed")
-            self._record_dsa_cold_dense_load_readiness(
-                state,
-                indexer_readiness,
-                tuple(plan.get("indexer_source_owners", ())),
-                future_wait_ms=dependency_wait_ms,
-            )
             plan.pop("dense_load_ticket", None)
             plan.pop("dense_load_retirement", None)
             plan.pop("indexer_source_owners", None)
 
-            seal_started = cold_start_perf_now()
-            state.indexer_npu_resident = not dense_bootstrap_required
-            state.indexer_npu_materialization_pending = dense_bootstrap_required
-            state.location = retrieve_location
-            state.metadata_warm = state.has_cache()
-            state.token_count = token_count
-            self._refresh_prepared_sparse_sources(state, token_count)
-            if state.prepared_sparse_sources.get(0) is None:
-                raise RuntimeError("Cold compact latent source was not sealed")
             completed_at = cold_start_perf_now()
             state._dsa_cold_load_completed_at = completed_at
             cold_start_perf_log(
@@ -7102,7 +7106,7 @@ class LMCacheConnectorV1Impl:
                 ),
                 queue_ms=round(indexer_queue_ms, 3),
                 indexer_future_wait_ms=round(dependency_wait_ms, 3),
-                seal_ms=round((completed_at - seal_started) * 1000, 3),
+                seal_ms=round((sealed_at - seal_started) * 1000, 3),
             )
             return state
         except BaseException as exc:

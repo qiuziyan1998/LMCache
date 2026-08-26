@@ -2112,6 +2112,59 @@ class TestWorkerRetrieveState:
             phase="host_submission",
         )
 
+    def test_cold_compact_seals_local_state_before_host_submission_vote(self):
+        impl = _make_impl()
+        impl.num_layers = 1
+        impl._num_layers_for_group = lambda _group: 1
+        order = []
+        ticket = object()
+        vote = MagicMock(
+            side_effect=lambda ready, **_kwargs: order.append("vote") or ready
+        )
+        impl.lmcache_engine = SimpleNamespace(
+            gpu_connector=SimpleNamespace(
+                dense_bootstrap_load_submitted=lambda value: value is ticket,
+            ),
+            remote_fill_all_ranks_ready=vote,
+        )
+
+        def record(state, readiness, *_args, **_kwargs):
+            order.append("record")
+            state.dense_load_ticket = readiness
+
+        def seal(state, _tokens):
+            order.append("seal")
+            state.prepared_sparse_sources[0] = object()
+
+        impl._record_dsa_cold_dense_load_readiness = record
+        impl._refresh_prepared_sparse_sources = seal
+        request = SimpleNamespace(
+            req_id="req-1",
+            load_spec=SimpleNamespace(lmcache_cached_tokens=1),
+        )
+        plan = {
+            "request": request,
+            "token_count": 1,
+            "tokens": [1],
+            "token_mask": torch.ones(1, dtype=torch.bool),
+            "planned_at": 0.0,
+            "plan_started": 0.0,
+            "latent_shared_ready": Future(),
+            "dense_bootstrap_required": True,
+        }
+        dependency = Future()
+        dependency.set_result((None, ticket, 0.0, 0.0))
+
+        result = impl._run_dsa_cold_compact_load(
+            plan,
+            None,
+            dependency,
+            live_state=WorkerRetrieveState(req_id="req-1"),
+        )
+
+        assert result.dense_load_ticket is ticket
+        assert order == ["record", "seal", "vote"]
+
     def test_finished_worker_request_releases_request_owned_cache_state(self):
         storer_closed: list[bool] = []
 
