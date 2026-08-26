@@ -1057,6 +1057,11 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
                 "Invalid compact page logical size: "
                 f"logical_size={logical_size}, physical_size={physical_size}"
             )
+        positions = tuple(cached_positions)
+        if not positions:
+            raise SharedCPUCacheValidationError(
+                "Compact layer page must contain at least one token"
+            )
         return LayerPageMemoryObj(
             raw_data=None,
             metadata=MemoryObjMetadata(
@@ -1067,15 +1072,14 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
                 ref_count=1,
                 pin_count=0,
                 fmt=fmt,
-                cached_positions=torch.tensor(
-                    list(cached_positions), dtype=torch.int64
-                ),
+                cached_positions=torch.tensor(positions, dtype=torch.int64),
                 shapes=[shape] * batch.num_layers,
                 dtypes=[dtype] * batch.num_layers,
             ),
             parent_allocator=self,
             num_layers=batch.num_layers,
             raw_view_size=logical_size,
+            valid_tokens=len(positions),
         )
 
     def allocate(

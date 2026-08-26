@@ -12,6 +12,40 @@ from lmcache.v1.metadata import LMCacheMetadata
 
 
 MOONCAKE_PAYLOAD_LAYOUT_TAG = "lmcache.tag.payload_v2"
+MOONCAKE_VALID_TOKENS_TAG = "lmcache.tag.internal.valid_tokens"
+
+
+def mooncake_valid_tokens(key: CacheEngineKey, chunk_size: int) -> int:
+    """Return the authoritative token count encoded in a page key.
+
+    Full-page keys intentionally omit the internal tag and therefore retain
+    their historical identity. Partial-page keys must carry a positive count
+    smaller than ``chunk_size``.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    tag_name = MOONCAKE_VALID_TOKENS_TAG.removeprefix("lmcache.tag.")
+    tagged = dict(key.tags or ()).get(tag_name)
+    if tagged is None:
+        return chunk_size
+    try:
+        valid_tokens = int(tagged)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid partial-page token count: {tagged!r}") from error
+    if not 0 < valid_tokens < chunk_size:
+        raise ValueError(
+            "Partial-page token count must be between 1 and chunk_size - 1: "
+            f"valid_tokens={valid_tokens}, chunk_size={chunk_size}"
+        )
+    return valid_tokens
+
+
+def mooncake_legacy_key(key: CacheEngineKey) -> str:
+    """Return the pre-partial-page serialization for legacy tail reads."""
+    marker = "@internal.valid_tokens%"
+    return "@".join(
+        part for part in key.to_string().split("@") if not part.startswith(marker[1:])
+    )
 
 
 def mooncake_payload_layout(
@@ -91,10 +125,9 @@ def mooncake_layer_pages_enabled(config: object) -> bool:
     """Return whether the experimental LocalCPU layer-page layout is enabled."""
     extra_config = getattr(config, "extra_config", None) or {}
     shared = bool(
-        getattr(
-            config,
+        extra_config.get(
             "enable_shared_cpu_cache",
-            extra_config.get("enable_shared_cpu_cache", False),
+            getattr(config, "enable_shared_cpu_cache", False),
         )
     )
     return (

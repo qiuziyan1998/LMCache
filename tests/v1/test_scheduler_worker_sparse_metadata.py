@@ -20,6 +20,9 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LoadSpec,
     RequestTracker,
     WorkerRetrieveState,
+    _has_live_group1_source_for_dp,
+    _has_live_latent_source_for_dp,
+    _live_split_source_dp_rank,
 )
 from tests.v1.connector_test_utils import make_worker_impl
 
@@ -51,6 +54,7 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl.config.enable_sparse_attention = True
     impl.config.enable_shared_cpu_cache = False
     impl.config.use_layerwise = True
+    impl.config.dsa_group1_load_mode = "p2p_preferred"
     impl.config.priority_limit = None
     impl.kv_role = "kv_both"
     impl.force_skip_save = False
@@ -452,6 +456,492 @@ def test_dsa_cold_compact_is_disabled_with_vllm_prefix_caching() -> None:
     )
 
     assert not impl.supports_dsa_cold_compact_load()
+
+
+def test_live_split_does_not_require_decoder_cold_load() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key == "mooncake_direct_npu_prefill_store"
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        kv_transfer_config=SimpleNamespace(
+            get_from_extra_config=lambda side, default: {
+                "prefill": {"tp_size": 2},
+                "decode": {"tp_size": 2},
+            }.get(side, default)
+        ),
+    )
+    impl.use_layerwise = False
+    impl.async_loading = False
+    impl._release_request_lookup_pins = MagicMock()
+    impl._drop_worker_retrieve_state = MagicMock()
+    request = SimpleNamespace(
+        request_id="live-prefill",
+        status=adapter_module.RequestStatus.FINISHED_STOPPED,
+        kv_transfer_params={"do_remote_decode": True},
+    )
+
+    assert impl.supports_dsa_live_split()
+    assert not impl.supports_dsa_live_latent_split()
+    assert not impl.supports_dsa_cold_compact_load()
+    impl.request_finished(request, [])
+    assert request.kv_transfer_params["request_live_split"] is True
+
+
+def test_live_split_honors_shared_cpu_flag_from_extra_config() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = False
+    impl.config.extra_config = {"enable_shared_cpu_cache": True}
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key == "mooncake_direct_npu_prefill_store"
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+
+    assert impl.supports_dsa_live_split()
+
+
+@pytest.mark.parametrize(
+    "mode", ("persistent_serial", "persistent_parallel_prefetch")
+)
+def test_persistent_group1_modes_disable_live_split(mode: str) -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.dsa_group1_load_mode = mode
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key == "mooncake_direct_npu_prefill_store"
+    )
+
+    assert not impl.supports_dsa_live_split()
+
+
+def test_live_latent_split_requires_explicit_opt_in() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "mooncake_direct_npu_prefill_store",
+            "enable_dsa_live_latent_split",
+            "mooncake_reuse_vllm_transfer_engine",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        kv_transfer_config=SimpleNamespace(
+            get_from_extra_config=lambda side, default: {
+                "prefill": {"tp_size": 2},
+                "decode": {"tp_size": 2},
+            }.get(side, default)
+        ),
+    )
+
+    assert impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_source_activation_requires_transport_negotiation() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "mooncake_direct_npu_prefill_store",
+            "enable_dsa_live_latent_split",
+            "mooncake_reuse_vllm_transfer_engine",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+    impl._live_latent_split_requested = False
+
+    assert impl.supports_dsa_live_latent_split()
+    assert impl._live_latent_split_requested is False
+
+    impl.configure_live_latent_source(True)
+    assert impl._live_latent_split_requested is True
+
+    impl.configure_live_latent_source(False)
+    assert impl._live_latent_split_requested is False
+
+
+def test_live_latent_split_requires_shared_transfer_engine() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "mooncake_direct_npu_prefill_store",
+            "enable_dsa_live_latent_split",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+
+    assert not impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_decoder_does_not_require_prefill_direct_store() -> None:
+    impl = _make_scheduler_impl()
+    impl.kv_role = "kv_consumer"
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "enable_dsa_live_latent_split",
+            "mooncake_reuse_vllm_transfer_engine",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+
+    assert not impl.supports_dsa_live_split()
+    assert impl.supports_dsa_cold_compact_load()
+    assert impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_producer_still_requires_direct_store() -> None:
+    impl = _make_scheduler_impl()
+    impl.kv_role = "kv_producer"
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "enable_dsa_live_latent_split",
+            "mooncake_reuse_vllm_transfer_engine",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+
+    assert not impl.supports_dsa_live_split()
+    assert not impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_kv_both_accepts_each_local_protocol_half() -> None:
+    impl = _make_scheduler_impl()
+    impl.kv_role = "kv_both"
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.use_layerwise = True
+    enabled = {
+        "mooncake_direct_npu_prefill_store",
+        "enable_dsa_live_latent_split",
+        "mooncake_reuse_vllm_transfer_engine",
+    }
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key in enabled
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        kv_transfer_config=SimpleNamespace(
+            get_from_extra_config=lambda side, default: {
+                "prefill": {"tp_size": 2},
+                "decode": {"tp_size": 2},
+            }.get(side, default)
+        ),
+    )
+
+    assert impl.supports_dsa_live_split()
+    assert impl.supports_dsa_cold_compact_load()
+    assert impl.supports_dsa_live_latent_split()
+
+    impl.config.enable_dsa_cold_compact_load = False
+    assert impl.supports_dsa_live_latent_split()
+
+    impl.config.enable_dsa_cold_compact_load = True
+    enabled.remove("mooncake_direct_npu_prefill_store")
+    assert impl.supports_dsa_live_latent_split()
+
+    impl.config.enable_dsa_cold_compact_load = False
+    assert not impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_source_gate_requires_exact_tp0_dp_descriptor() -> None:
+    hybrid = {
+        "format": "layer_slot_runs_v1",
+        "tp_rank": 0,
+        "dp_rank": 2,
+        "group_byte_totals": [0, 64],
+        "latent_group_byte_total": 128,
+        "compact_layout": {
+            "group_id": 1,
+            "token_count": 4,
+            "layers": [{"layer_id": 0}],
+            "runs": [{"token_count": 4}],
+        },
+        "latent_layout": {
+            "group_id": 0,
+            "token_count": 4,
+            "layers": [{"layer_id": 0}],
+            "pages": [{"token_count": 4}],
+        },
+    }
+    params = {
+        "ascend_live_split_source_v1": {"descriptors": [hybrid]}
+    }
+
+    assert _has_live_latent_source_for_dp(params, 2, 4)
+    assert not _has_live_latent_source_for_dp(params, 1, 4)
+    assert not _has_live_latent_source_for_dp(params, 2, 5)
+    assert not _has_live_latent_source_for_dp({}, 2, 4)
+    assert not _has_live_latent_source_for_dp(
+        {
+            "ascend_live_split_source_v1": {
+                "descriptors": [{**hybrid, "latent_layout": None}]
+            }
+        },
+        2,
+        4,
+    )
+    for malformed in (
+        {**hybrid, "tp_rank": None},
+        {**hybrid, "tp_rank": 0.0},
+        {**hybrid, "dp_rank": "bad"},
+        {
+            **hybrid,
+            "latent_layout": {
+                **hybrid["latent_layout"],
+                "token_count": "bad",
+            },
+        },
+        {
+            **hybrid,
+            "latent_layout": {
+                **hybrid["latent_layout"],
+                "token_count": 4.0,
+            },
+        },
+    ):
+        assert not _has_live_latent_source_for_dp(
+            {
+                "ascend_live_split_source_v1": {
+                    "descriptors": [malformed]
+                }
+            },
+            2,
+            4,
+        )
+
+
+def test_live_group1_source_gate_requires_complete_tp_set() -> None:
+    def descriptor(tp_rank: int, *, tokens: int = 4) -> dict:
+        return {
+            "tp_rank": tp_rank,
+            "dp_rank": 1,
+            "group_byte_totals": [0, 64],
+            "compact_layout": {
+                "group_id": 1,
+                "token_count": tokens,
+                "layers": [{"layer_id": 0}],
+                "runs": [{"token_count": tokens}],
+            },
+        }
+
+    complete = {
+        "ascend_live_split_source_v1": {
+            "descriptors": [descriptor(0), descriptor(1)]
+        }
+    }
+    assert _has_live_group1_source_for_dp(complete, 1, 4, 2)
+    assert not _has_live_group1_source_for_dp({}, 1, 4, 2)
+    assert not _has_live_group1_source_for_dp(
+        {
+            "ascend_live_split_source_v1": {
+                "descriptors": [descriptor(0)]
+            }
+        },
+        1,
+        4,
+        2,
+    )
+    assert not _has_live_group1_source_for_dp(complete, 0, 4, 2)
+    assert not _has_live_group1_source_for_dp(
+        {
+            "ascend_live_split_source_v1": {
+                "descriptors": [descriptor(0), descriptor(1, tokens=3)]
+            }
+        },
+        1,
+        4,
+        2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("negotiated", "mode", "expected"),
+    [
+        (False, "p2p_preferred", False),
+        (True, "p2p_preferred", True),
+        (True, "persistent_serial", False),
+        (True, "persistent_parallel_prefetch", False),
+    ],
+)
+def test_cold_meta_requires_two_sided_latent_activation(
+    negotiated: bool,
+    mode: str,
+    expected: bool,
+) -> None:
+    impl = _make_scheduler_impl()
+    impl._block_size = 2
+    impl._dsa_cold_indexer_block_ids = {}
+    impl._live_latent_split_requested = negotiated
+    impl.config.dsa_group1_load_mode = mode
+    impl._vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_index=1)
+    )
+    tokens = [1, 2, 3, 4]
+    request = SimpleNamespace(
+        request_id="req-live",
+        all_token_ids=tokens,
+        prompt_token_ids=tokens,
+        sampling_params=SimpleNamespace(extra_args=None),
+        mm_features=None,
+        mm_hashes=None,
+        kv_transfer_params={
+            "live_split_capabilities": (
+                "ascend_live_split_v2",
+                "ascend_live_split_compact_v1",
+                "ascend_live_split_latent_cpu_v1",
+            ),
+            "remote_block_ids": [1, 2],
+            "remote_dp_rank": 0,
+            "ascend_live_split_source_v1": {
+                "descriptors": [{
+                    "tp_rank": 0,
+                    "dp_rank": 0,
+                    "format": "layer_slot_runs_v1",
+                    "group_byte_totals": [0, 64],
+                    "latent_group_byte_total": 128,
+                    "compact_layout": {
+                        "group_id": 1,
+                        "token_count": len(tokens),
+                        "layers": [{"layer_id": 0}],
+                        "runs": [{"token_count": len(tokens)}],
+                    },
+                    "latent_layout": {
+                        "group_id": 0,
+                        "token_count": len(tokens),
+                        "layers": [{"layer_id": 0}],
+                        "pages": [{"token_count": len(tokens)}],
+                    },
+                }]
+            },
+        },
+    )
+    load_spec = LoadSpec(
+        vllm_cached_tokens=0,
+        lmcache_cached_tokens=len(tokens),
+        can_load=True,
+    )
+    load_spec.dsa_cold_load_generation = 1
+    blocks = SimpleNamespace(
+        get_unhashed_block_ids_all_groups=lambda: [[], [10, 11]]
+    )
+
+    meta = impl._build_dsa_cold_compact_meta(request, blocks, load_spec)
+
+    assert getattr(meta, "live_split_requested", False) is (
+        mode == "p2p_preferred"
+    )
+    assert meta.live_split_latent_cpu is expected
+
+
+def test_cold_meta_does_not_negotiate_live_split_without_source() -> None:
+    impl = _make_scheduler_impl()
+    impl._block_size = 2
+    impl._dsa_cold_indexer_block_ids = {}
+    impl.config.dsa_group1_load_mode = "p2p_preferred"
+    impl._vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_index=0,
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+        )
+    )
+    tokens = [1, 2, 3, 4]
+    request = SimpleNamespace(
+        request_id="req-persistent-fallback",
+        all_token_ids=tokens,
+        prompt_token_ids=tokens,
+        sampling_params=SimpleNamespace(extra_args=None),
+        mm_features=None,
+        mm_hashes=None,
+        kv_transfer_params={
+            "live_split_capabilities": (
+                "ascend_live_split_v2",
+                "ascend_live_split_compact_v1",
+            ),
+            "live_split_transfer_id": "capability-without-source",
+            "remote_block_ids": [1, 2],
+            "remote_dp_rank": 0,
+        },
+    )
+    load_spec = LoadSpec(
+        vllm_cached_tokens=0,
+        lmcache_cached_tokens=len(tokens),
+        can_load=True,
+    )
+    blocks = SimpleNamespace(
+        get_unhashed_block_ids_all_groups=lambda: [[], [10, 11]]
+    )
+
+    meta = impl._build_dsa_cold_compact_meta(request, blocks, load_spec)
+
+    assert getattr(meta, "live_split_requested", False) is False
+    assert getattr(meta, "live_split_remote_block_ids", None) is None
+
+
+def test_dp2_live_split_requires_explicit_global_source_route() -> None:
+    parallel = SimpleNamespace(data_parallel_size=2, data_parallel_index=1)
+    base = {
+        "live_split_capabilities": ("ascend_live_split_v2",),
+        "remote_dp_rank": 0,
+    }
+
+    assert _live_split_source_dp_rank(base, parallel) is None
+    assert _live_split_source_dp_rank(
+        {
+            **base,
+            "live_split_capabilities": (
+                "ascend_live_split_v2",
+                "ascend_live_split_dp_routing_v1",
+            ),
+        },
+        parallel,
+    ) == 0
+    assert _live_split_source_dp_rank(
+        {**base, "remote_dp_rank": True}, parallel
+    ) is None
+    assert _live_split_source_dp_rank(
+        {**base, "remote_dp_rank": 2}, parallel
+    ) is None
 
 
 def test_dsa_cold_compact_alloc_metadata_has_only_indexer_slots() -> None:
@@ -1116,12 +1606,15 @@ class TestDisaggSpecOwnership:
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
     def test_cold_compact_resume_marker_is_one_shot(self) -> None:
         impl = _make_scheduler_impl()
+        impl._manager = SimpleNamespace(lookup_client=MagicMock())
         req_id = "cold-resume"
         prompt_len = 8193
         request = SimpleNamespace(
+            request_id=req_id,
             req_id=req_id,
             prompt_token_ids=list(range(prompt_len)),
             block_ids=list(range(513)),
+            num_tokens=prompt_len,
             num_computed_tokens=prompt_len - 1,
             sampling_params=SimpleNamespace(extra_args=None),
         )
@@ -1135,11 +1628,35 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         impl.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=0,
             lmcache_cached_tokens=prompt_len,
-            can_load=True,
+            can_load=False,
             dsa_committed_end=prompt_len,
             dsa_remap_frontier=prompt_len - 1,
         )
         impl.load_specs[req_id].dsa_cold_compact_load = True
+        cold_meta = SimpleNamespace(req_id=req_id)
+        impl._build_dsa_cold_compact_meta = MagicMock(return_value=cold_meta)
+
+        # The first allocation callback admits the asynchronous full-prefix
+        # load and emits its no-forward worker metadata.
+        impl.update_state_after_alloc(request, prompt_len - 1, object())
+        assert impl.load_specs[req_id].can_load is True
+        initial = impl.build_connector_meta(
+            StubSchedulerOutput(
+                finished_req_ids=set(),
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=StubCachedRequestData([], [], []),
+                num_scheduled_tokens={},
+            )
+        )
+        assert initial.dsa_cold_compact_load_pending is True
+        assert initial.requests == [cold_meta]
+
+        # A completed async load is scheduled a second time with no newly
+        # allocated external tokens. This is the real transition that used to
+        # clear can_load immediately before the first sparse resume.
+        impl._dsa_cold_loaded_req_ids = {req_id}
+        impl.update_state_after_alloc(request, 0)
+        assert impl.load_specs[req_id].can_load is False
 
         first = impl.build_connector_meta(
             StubSchedulerOutput(
@@ -1151,6 +1668,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         ).requests[0]
 
         assert first.is_sparse_decode
+        assert first.load_spec.can_load is True
         assert first.load_spec.dsa_committed_end == prompt_len
         assert first.load_spec.dsa_remap_frontier == prompt_len - 1
         assert first.dsa_nonresident_frontier == prompt_len - 1
@@ -2492,7 +3010,7 @@ class TestDecodeWindowSaveMetadata:
             tracker.req_id: 12288
         }
 
-    def test_two_group_decode_window_save_without_shared_cpu_allows_latent_only(
+    def test_two_group_decode_window_save_without_shared_cpu_requires_indexer(
         self,
     ) -> None:
         impl, tracker, scheduler_output = self._build_decode_window_case(
@@ -2502,18 +3020,10 @@ class TestDecodeWindowSaveMetadata:
 
         meta = impl.build_connector_meta(scheduler_output)
 
-        assert len(meta.requests) == 2
-        req_meta = next(
-            request
-            for request in meta.requests
-            if request.is_decode_window_save
-        )
-        assert req_meta.is_decode_window_save is True
-        assert req_meta.save_spec is not None
-        assert req_meta.save_spec.can_save_indexer is False
-        assert tracker.decode_window_save_next_start == 512
+        assert meta.requests == []
+        assert tracker.decode_window_save_next_start == 256
 
-    def test_deep_window_group_plan_explains_latent_only_commit_groups(
+    def test_deep_window_group_plan_is_not_emitted_for_partial_groups(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         impl, tracker, scheduler_output = self._build_decode_window_case(
@@ -2534,7 +3044,7 @@ class TestDecodeWindowSaveMetadata:
         plans = [
             event for event in events if event.get("event") == "window_group_plan"
         ]
-        assert len(plans) == 1
+        assert plans == []
 
         finished = StubSchedulerOutput(
             finished_req_ids={tracker.req_id},
@@ -2543,13 +3053,7 @@ class TestDecodeWindowSaveMetadata:
             num_scheduled_tokens={},
         )
         impl.build_connector_meta(finished)
-        assert tracker.req_id not in impl._mtp_dw_deep_window_group_planned_reqs
-        assert plans[0]["stage"] == "deep"
-        assert plans[0]["latent_only"] is True
-        assert plans[0]["indexer_disabled"] is True
-        assert plans[0]["kv_group0_save"] is True
-        assert plans[0]["kv_group1_save"] is False
-        assert plans[0]["required_groups"] == [0]
+        assert not hasattr(impl, "_mtp_dw_deep_window_group_planned_reqs")
 
     def test_deep_window_group_plan_requires_both_gates_and_dedupes_request(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2577,7 +3081,7 @@ class TestDecodeWindowSaveMetadata:
         monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
         deep_impl, _, deep_output = self._build_decode_window_case(
             shared_cpu=False,
-            indexer_blocks=False,
+            indexer_blocks=True,
         )
         deep_impl.build_connector_meta(deep_output)
         deep_impl.build_connector_meta(deep_output)

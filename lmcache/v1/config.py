@@ -312,6 +312,33 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "dsa_group1_load_mode": {
+        "type": str,
+        "default": "p2p_preferred",
+        "env_converter": str,
+        "description": (
+            "Group-1 cold-load policy: prefer live P2P, force serial "
+            "persistent load, or overlap persistent prefetch with Group 0."
+        ),
+    },
+    "enable_npu_transfer_validation": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+        "description": "Validate NPU transfer slots, cached destinations, and "
+        "registered source spans before native kernel launch.",
+    },
+    "enable_npu_content_diagnostics": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": (
+            "Fingerprint sampled Group-1 source, P2P destination, first "
+            "decoder-consume, and selected top-k tensors. Diagnostic NPU-to-CPU "
+            "readback may synchronize device work; keep disabled outside "
+            "correctness investigations."
+        ),
+    },
     "enable_shared_cpu_cache": {
         "type": bool,
         "default": False,
@@ -610,6 +637,24 @@ def _validate_config(self):
             "min_retrieve_tokens must be >= 0, got %d" % self.min_retrieve_tokens
         )
 
+    group1_load_modes = {
+        "p2p_preferred",
+        "persistent_serial",
+        "persistent_parallel_prefetch",
+    }
+    if self.dsa_group1_load_mode not in group1_load_modes:
+        raise ValueError(
+            "dsa_group1_load_mode must be one of "
+            f"{sorted(group1_load_modes)}, got {self.dsa_group1_load_mode!r}"
+        )
+
+    if self.dsa_two_groups and not self.use_layerwise:
+        raise ValueError(
+            "dsa_two_groups=true requires use_layerwise=true. The dense "
+            "non-layerwise retrieve path only materializes KV group 0 and "
+            "must not run with an uninitialized Group-1 index cache."
+        )
+
     if self.enable_blending:
         if not self.save_unfull_chunk:
             logger.warning(
@@ -696,6 +741,37 @@ def _validate_config(self):
             raise ValueError(
                 "enable_dsa_cold_compact_load requires "
                 + ", ".join(f"{name}=true" for name in missing_flags)
+            )
+
+    if self.dsa_group1_load_mode == "persistent_parallel_prefetch":
+        prefetch_requirements = {
+            "enable_dsa_cold_compact_load": self.enable_dsa_cold_compact_load,
+            "use_layerwise": self.use_layerwise,
+            "enable_sparse_attention": self.enable_sparse_attention,
+            "dsa_two_groups": self.dsa_two_groups,
+            "enable_shared_cpu_cache": enable_shared_cpu_cache,
+            "remote_url=mooncakestore://...": str(self.remote_url).startswith(
+                "mooncakestore://"
+            ),
+            "extra_config.save_only_first_rank": bool(
+                extra_config.get("save_only_first_rank", False)
+            ),
+            "extra_config.mooncake_page_first_multi_buffer": bool(
+                extra_config.get("mooncake_page_first_multi_buffer", False)
+            ),
+            "extra_config.mooncake_layer_merged_page_objects": bool(
+                extra_config.get("mooncake_layer_merged_page_objects", False)
+            ),
+        }
+        missing_prefetch_requirements = [
+            name
+            for name, enabled in prefetch_requirements.items()
+            if not enabled
+        ]
+        if missing_prefetch_requirements:
+            raise ValueError(
+                "dsa_group1_load_mode=persistent_parallel_prefetch requires "
+                + ", ".join(missing_prefetch_requirements)
             )
 
     if self.experimental_sampled_layerwise_lookup:

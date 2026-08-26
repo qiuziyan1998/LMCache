@@ -120,6 +120,41 @@ class MemoryFormat(Enum):
         return 0
 
 
+def _layer_page_shape(
+    shape: torch.Size,
+    fmt: MemoryFormat,
+    valid_tokens: int,
+    full_tokens: Optional[int] = None,
+) -> torch.Size:
+    """Resize one layer-page shape without changing its byte layout."""
+    if valid_tokens < 1:
+        raise ValueError("Layer-page valid_tokens must be positive")
+    token_dim = fmt.token_dim()
+    if token_dim < len(shape):
+        source_tokens = int(shape[token_dim])
+        if full_tokens is not None and source_tokens != full_tokens:
+            raise ValueError("Layer-page full_tokens does not match its shape")
+        if valid_tokens > source_tokens:
+            raise ValueError("Layer-page valid_tokens exceeds its full shape")
+        resized = list(shape)
+        resized[token_dim] = valid_tokens
+        return torch.Size(resized)
+    if fmt not in (
+        MemoryFormat.KV_MLA_LATENT_FMT,
+        MemoryFormat.KV_DSA_INDEX_FMT,
+    ):
+        raise ValueError("Layer-page shape has no token dimension")
+    if full_tokens is None and len(shape) == 1:
+        raise ValueError("Flat layer-page shape requires full_tokens")
+    source_tokens = full_tokens or int(shape[0])
+    if valid_tokens > source_tokens or shape.numel() % source_tokens:
+        raise ValueError("Flat layer-page shape is not token divisible")
+    target_numel = shape.numel() // source_tokens * valid_tokens
+    if len(shape) > 1 and int(shape[0]) == source_tokens:
+        return torch.Size([valid_tokens, *shape[1:]])
+    return torch.Size([target_numel])
+
+
 @dataclass
 class FreeBlock:
     """Metadata class used by the memory allocators"""
@@ -164,6 +199,9 @@ class MemoryObjMetadata:
     shapes: Optional[list[torch.Size]] = None
     dtypes: Optional[list[torch.dtype]] = None
 
+    # Authoritative logical token count for merged layer pages.
+    valid_tokens: Optional[int] = None
+
     def to_dict(self):
         # Note(Kuntai): this is used for serializing MemoryObjMetadata via
         # msgpack.
@@ -177,6 +215,7 @@ class MemoryObjMetadata:
             "fmt": self.fmt.value,
             "shapes": [list(shape) for shape in self.shapes] if self.shapes else None,
             "dtypes": [str(dtype) for dtype in self.dtypes] if self.dtypes else None,
+            "valid_tokens": self.valid_tokens,
         }
 
     @staticmethod
@@ -200,6 +239,7 @@ class MemoryObjMetadata:
             fmt=MemoryFormat(d["fmt"]),
             shapes=shapes,
             dtypes=dtypes,
+            valid_tokens=d.get("valid_tokens"),
         )
 
     def get_size(self) -> int:
@@ -753,7 +793,15 @@ class TensorMemoryObj(MemoryObj):
 
     def get_num_tokens(self) -> int:
         with self.lock:
+            if self.meta.valid_tokens is not None:
+                return int(self.meta.valid_tokens)
+            if self.meta.cached_positions is not None:
+                return len(self.meta.cached_positions)
             token_dim = self.meta.fmt.token_dim()
+            if token_dim >= len(self.meta.shape):
+                raise ValueError(
+                    "Flat memory object requires valid_tokens metadata"
+                )
             return self.meta.shape[token_dim]
 
     def pin(self) -> bool:
@@ -932,6 +980,7 @@ class LayerPageMemoryObj(TensorMemoryObj):
         num_layers: int,
         group_prefix_sum: Optional[tuple[int, ...]] = None,
         raw_view_size: Optional[int] = None,
+        valid_tokens: Optional[int] = None,
     ) -> None:
         super().__init__(
             raw_data,
@@ -952,6 +1001,29 @@ class LayerPageMemoryObj(TensorMemoryObj):
             raise ValueError("Layer page requires a homogeneous layer layout")
         self.num_layers = num_layers
         self.layer_size = sizes.pop()
+        if valid_tokens is None:
+            token_dim = metadata.fmt.token_dim()
+            if token_dim >= len(metadata.shape) and len(metadata.shape) == 1:
+                raise ValueError("Flat layer page requires valid_tokens")
+            valid_tokens = int(
+                metadata.shape[token_dim]
+                if token_dim < len(metadata.shape)
+                else metadata.shape[0]
+            )
+        self.valid_tokens = valid_tokens
+        if (
+            _layer_page_shape(
+                metadata.shape,
+                metadata.fmt,
+                valid_tokens,
+                full_tokens=valid_tokens,
+            )
+            != metadata.shape
+        ):
+            raise ValueError(
+                "Layer-page valid_tokens must match its physical layer shape"
+            )
+        self.meta.valid_tokens = self.valid_tokens
         self._base_data_ptr = self.data_ptr
 
     @property
@@ -1684,13 +1756,74 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         batch_size: int,
         num_layers: int,
         fmt: MemoryFormat,
+        valid_tokens: Optional[Union[int, list[int]]] = None,
+        full_tokens: Optional[int] = None,
     ) -> Optional[List[LayerPageMemoryObj]]:
-        """Allocate one homogeneous all-layer object per token chunk."""
+        """Allocate one exact-size all-layer object per token chunk."""
         if num_layers < 1:
             raise ValueError("num_layers must be positive")
         shapes, dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
         if len(shapes) != 1 or len(dtypes) != 1:
             return None
+        token_dim = fmt.token_dim()
+        if full_tokens is None:
+            if token_dim >= len(shapes[0]) and len(shapes[0]) == 1:
+                raise ValueError("Flat layer-page shape requires full_tokens")
+            full_tokens = int(
+                shapes[0][token_dim]
+                if token_dim < len(shapes[0])
+                else shapes[0][0]
+            )
+        full_shape = _layer_page_shape(
+            shapes[0], fmt, full_tokens, full_tokens=full_tokens
+        )
+        token_counts = (
+            [full_tokens] * batch_size
+            if valid_tokens is None
+            else [valid_tokens] * batch_size
+            if isinstance(valid_tokens, int)
+            else list(valid_tokens)
+        )
+        if len(token_counts) != batch_size or any(
+            not 0 < count <= full_tokens for count in token_counts
+        ):
+            raise ValueError("Invalid layer-page valid_tokens batch")
+        if len(set(token_counts)) != 1:
+            positions_by_count: dict[int, list[int]] = {}
+            for index, count in enumerate(token_counts):
+                positions_by_count.setdefault(count, []).append(index)
+            pages_by_position: list[Optional[LayerPageMemoryObj]] = [
+                None
+            ] * batch_size
+            allocated_pages: list[LayerPageMemoryObj] = []
+            for count, positions in positions_by_count.items():
+                allocated = self.batched_allocate_layer_pages(
+                    [full_shape],
+                    dtypes,
+                    len(positions),
+                    num_layers,
+                    fmt,
+                    count,
+                    full_tokens,
+                )
+                if allocated is None:
+                    for page in allocated_pages:
+                        page.ref_count_down()
+                    return None
+                allocated_pages.extend(allocated)
+                for position, page in zip(positions, allocated, strict=True):
+                    pages_by_position[position] = page
+            return [
+                page
+                for page in pages_by_position
+                if page is not None
+            ]
+        count = token_counts[0]
+        shapes = [
+            _layer_page_shape(
+                full_shape, fmt, count, full_tokens=full_tokens
+            )
+        ]
         return self._batched_allocate(
             shapes * num_layers,
             dtypes * num_layers,
@@ -1698,6 +1831,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             fmt,
             materialize_views=False,
             page_layers=num_layers,
+            page_valid_tokens=count,
         )  # type: ignore[return-value]
 
     def _batched_allocate(
@@ -1709,6 +1843,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         *,
         materialize_views: bool,
         page_layers: int = 0,
+        page_valid_tokens: Optional[int] = None,
     ) -> Optional[List[TensorMemoryObj]]:
         shapes, dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
 
@@ -1774,6 +1909,11 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                     group_prefix_sum=group_prefix_sum,
                     raw_view_size=unit_aligned_size,
                     **({"num_layers": page_layers} if page_layers else {}),
+                    **(
+                        {"valid_tokens": page_valid_tokens}
+                        if page_layers
+                        else {}
+                    ),
                 )
             )
 
@@ -2562,13 +2702,23 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         batch_size: int,
         num_layers: int,
         fmt: MemoryFormat,
+        valid_tokens: Optional[Union[int, list[int]]] = None,
+        full_tokens: Optional[int] = None,
     ) -> Optional[List[LayerPageMemoryObj]]:
         """Allocate layer pages from the pinned allocator."""
         allocate = getattr(self.pin_allocator, "batched_allocate_layer_pages", None)
         if not callable(allocate):
             return None
         with self.host_mem_lock:
-            return allocate(shapes, dtypes, batch_size, num_layers, fmt)
+            return allocate(
+                shapes,
+                dtypes,
+                batch_size,
+                num_layers,
+                fmt,
+                valid_tokens,
+                full_tokens,
+            )
 
     @_lmcache_nvtx_annotate
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):

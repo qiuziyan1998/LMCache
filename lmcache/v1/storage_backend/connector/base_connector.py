@@ -308,6 +308,17 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         """Persist externally owned buffers in the connector's page format."""
         raise NotImplementedError
 
+    async def batched_get_external_pages(
+        self,
+        keys: List[CacheEngineKey],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        owners: tuple[Any, ...],
+        req_id: str,
+    ) -> None:
+        """Retrieve page values directly into externally owned buffers."""
+        raise NotImplementedError
+
     def batched_external_pages_exist(
         self, keys: List[CacheEngineKey]
     ) -> List[bool]:

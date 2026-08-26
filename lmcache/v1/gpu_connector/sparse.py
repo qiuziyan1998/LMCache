@@ -85,6 +85,22 @@ def build_prepared_sparse_source(
         covered_tokens = sum(normalized_chunk_counts)
         if covered_tokens < total_tokens:
             return None
+        if covered_tokens != total_tokens:
+            raise ValueError(
+                "Prepared sparse chunk coverage must match total_tokens exactly: "
+                f"coverage={covered_tokens}, total_tokens={total_tokens}."
+            )
+        if len(normalized_chunk_counts) > 1 and (
+            any(
+                count != normalized_chunk_counts[0]
+                for count in normalized_chunk_counts[:-1]
+            )
+            or normalized_chunk_counts[-1] > normalized_chunk_counts[0]
+        ):
+            raise ValueError(
+                "Prepared sparse chunks require full non-tail chunks and one "
+                "optional final partial chunk."
+            )
 
     layers: list[PreparedSparseSourceLayer] = []
     pointer_device: Optional[torch.device] = None

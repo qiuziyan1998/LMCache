@@ -296,6 +296,137 @@ def test_layer_page_batch_owns_one_object_per_chunk() -> None:
     assert allocator.memcheck()
 
 
+@pytest.mark.parametrize("chunk_size", [256, 512, 1024])
+def test_layer_pages_use_exact_partial_shapes_and_bytes(chunk_size: int) -> None:
+    valid_counts = sorted(
+        {
+            count
+            for count in (1, 255, 256, 257, 511, 512, 513, chunk_size - 1)
+            if count <= chunk_size
+        }
+    )
+    shape = torch.Size([chunk_size, 4])
+    allocator = TensorMemoryAllocator(
+        torch.zeros(
+            chunk_size * 4 * 2 * 2 * len(valid_counts) + 65536,
+            dtype=torch.uint8,
+        )
+    )
+    pages = allocator.batched_allocate_layer_pages(
+        shape,
+        torch.float16,
+        batch_size=len(valid_counts),
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=valid_counts,
+    )
+
+    assert pages is not None
+    for page, valid_tokens in zip(pages, valid_counts, strict=True):
+        expected_layer_bytes = valid_tokens * 4 * torch.float16.itemsize
+        assert page.valid_tokens == valid_tokens
+        assert page.metadata.valid_tokens == valid_tokens
+        assert page.layer_size == expected_layer_bytes
+        assert page.get_size() == expected_layer_bytes * 2
+        assert page.get_shapes() == [torch.Size([valid_tokens, 4])] * 2
+        assert all(
+            page.layer_tensor(layer).shape == torch.Size([valid_tokens, 4])
+            for layer in range(2)
+        )
+
+    allocator.batched_free(pages)
+    assert allocator.memcheck()
+
+
+def test_partial_layer_pages_batch_equal_token_counts_together() -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(65536, dtype=torch.uint8))
+    calls = []
+    allocate = allocator.address_manager.batched_allocate
+
+    def recording_allocate(size, batch_size):
+        calls.append(batch_size)
+        return allocate(size, batch_size)
+
+    allocator.address_manager.batched_allocate = recording_allocate
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8, 4]),
+        torch.float16,
+        batch_size=3,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=[8, 3, 8],
+    )
+
+    assert pages is not None
+    assert calls == [2, 1]
+    assert [page.valid_tokens for page in pages] == [8, 3, 8]
+    assert [page.layer_size for page in pages] == [64, 24, 64]
+    allocator.batched_free(pages)
+    assert allocator.memcheck()
+
+
+@pytest.mark.parametrize(
+    "fmt,width",
+    (
+        (MemoryFormat.KV_MLA_LATENT_FMT, 9),
+        (MemoryFormat.KV_DSA_INDEX_FMT, 3),
+    ),
+)
+def test_flat_layer_pages_preserve_full_and_tail_byte_layout(fmt, width) -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(8192, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([4 * width]),
+        torch.float16,
+        batch_size=2,
+        num_layers=2,
+        fmt=fmt,
+        valid_tokens=[4, 3],
+        full_tokens=4,
+    )
+
+    assert pages is not None
+    for page, tokens in zip(pages, (4, 3), strict=True):
+        values = torch.arange(tokens * width, dtype=torch.float16)
+        assert page.get_shape() == torch.Size([tokens * width])
+        assert page.layer_size == values.numel() * values.element_size()
+        for layer in range(2):
+            page.layer_tensor(layer).copy_(values)
+            assert torch.equal(page.layer_tensor(layer), values)
+    allocator.batched_free(pages)
+    assert allocator.memcheck()
+
+
+def test_flat_layer_pages_require_explicit_full_token_count() -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(8192, dtype=torch.uint8))
+
+    with pytest.raises(ValueError, match="requires full_tokens"):
+        allocator.batched_allocate_layer_pages(
+            torch.Size([4 * 9]),
+            torch.float16,
+            batch_size=1,
+            num_layers=2,
+            fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+            valid_tokens=3,
+        )
+
+
+def test_partial_layer_page_batch_rolls_back_on_allocation_failure() -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
+
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([256, 4]),
+        torch.float16,
+        batch_size=2,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=[1, 255],
+    )
+
+    assert pages is None
+    assert allocator.memcheck()
+    assert allocator.total_allocated_size == 0
+
+
 def test_layer_page_rejects_pointer_access_after_release() -> None:
     allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
     pages = allocator.batched_allocate_layer_pages(
@@ -304,6 +435,7 @@ def test_layer_page_rejects_pointer_access_after_release() -> None:
         batch_size=1,
         num_layers=2,
         fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        full_tokens=8,
     )
     assert pages is not None
     page = pages[0]

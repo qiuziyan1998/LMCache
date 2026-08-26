@@ -8,6 +8,11 @@ import torch
 
 # First Party
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.mooncake_layout import (
+    mooncake_legacy_key,
+    mooncake_page_key,
+    mooncake_valid_tokens,
+)
 from lmcache.v1.token_database import ChunkedTokenDatabase, SegmentTokenDatabase
 
 # Local
@@ -64,6 +69,17 @@ def test_chunked_token_database(chunk_length, save_unfull_chunk):
             assert ed == original_results[j + i][1]
 
 
+def test_chunked_token_database_rejects_mismatched_key_inputs():
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=16, backend="cpu")
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+    tokens = generate_tokens(16, "cpu")
+
+    with pytest.raises(ValueError, match="mask length"):
+        list(db.process_tokens(tokens=tokens, mask=torch.ones(15, dtype=torch.bool)))
+    with pytest.raises(ValueError, match="counts must match"):
+        list(db.process_tokens(hashes=[1, 2], offsets=[16]))
+
+
 def test_mooncake_page_keys_include_payload_layout_signature(monkeypatch):
     cfg = LMCacheEngineConfig.from_legacy(chunk_size=256, backend="cpu")
     cfg.extra_config = {"mooncake_page_first_multi_buffer": True}
@@ -90,6 +106,30 @@ def test_mooncake_page_keys_include_payload_layout_signature(monkeypatch):
         ChunkedTokenDatabase(cfg, dumb_metadata()).mooncake_payload_layout
         != db.mooncake_payload_layout
     )
+
+
+@pytest.mark.parametrize("chunk_size", [256, 512, 1024])
+@pytest.mark.parametrize("length", [1, 255, 256, 257, 511, 512, 513])
+def test_partial_page_keys_encode_only_tail_length(
+    chunk_size: int, length: int
+) -> None:
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=chunk_size, backend="cpu")
+    cfg.extra_config = {"mooncake_page_first_multi_buffer": True}
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+    results = list(db.process_tokens(tokens=generate_tokens(length, "cpu")))
+
+    for start, end, key in results:
+        valid_tokens = end - start
+        assert mooncake_valid_tokens(key, chunk_size) == valid_tokens
+        assert ("internal.valid_tokens" in dict(key.tags or ())) == (
+            valid_tokens < chunk_size
+        )
+    page_keys = [mooncake_page_key(key, 2) for _, _, key in results]
+    assert len(page_keys) == len(set(page_keys))
+    if results and results[-1][1] - results[-1][0] < chunk_size:
+        tail = results[-1][2]
+        assert "internal.valid_tokens" in tail.to_string()
+        assert "internal.valid_tokens" not in mooncake_legacy_key(tail)
 
 
 @pytest.mark.parametrize("kv_group", [0, 1])

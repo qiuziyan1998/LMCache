@@ -34,10 +34,12 @@ from lmcache.utils import (
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.memory_management import (
+    LayerPageMemoryObj,
     MemoryFormat,
     MemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mooncake_layout import mooncake_valid_tokens
 from lmcache.v1.storage_backend import CreateStorageBackends, is_cuda_worker
 from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
@@ -444,6 +446,143 @@ class StorageManager:
 
         return required_futures
 
+    @staticmethod
+    def _supports_layer_page_backends(
+        selected: Sequence[StorageBackendInterface],
+    ) -> bool:
+        return any(
+            isinstance(backend, LocalCPUBackend)
+            and bool(getattr(backend, "use_hot", False))
+            for backend in selected
+        ) and all(
+            isinstance(backend, LocalCPUBackend)
+            or (
+                isinstance(backend, RemoteBackend)
+                and backend.connection is not None
+                and callable(
+                    getattr(backend.connection, "batched_put_external_pages", None)
+                )
+            )
+            for backend in selected
+        )
+
+    def supports_batched_put_layer_pages(
+        self, location: Optional[str] = None
+    ) -> bool:
+        """Whether selected backends accept one physical page for all layers."""
+        return self._supports_layer_page_backends(
+            [
+                backend
+                for _, backend in self.get_active_storage_backends(
+                    location=location
+                )
+            ]
+        )
+
+    def batched_put_layer_pages(
+        self,
+        keys: Sequence[CacheEngineKey],
+        pages: List[LayerPageMemoryObj],
+        location: Optional[str] = None,
+        req_id: str = "",
+    ) -> list[Future]:
+        """Store each physical page once locally and remotely."""
+        if (
+            len(keys) != len(pages)
+            or len(set(keys)) != len(keys)
+            or len({id(page) for page in pages}) != len(pages)
+        ):
+            raise ValueError("Layer-page put requires one unique key and page")
+        if not pages:
+            return []
+        selected = list(self.get_active_storage_backends(location=location))
+        if not self._supports_layer_page_backends(
+            [backend for _, backend in selected]
+        ):
+            raise RuntimeError("Selected storage backends do not support layer pages")
+
+        layer_count = pages[0].num_layers
+        if any(
+            not page.is_valid()
+            or page.num_layers != layer_count
+            or page.get_size() != page.layer_size * layer_count
+            or len(page.metadata.dtypes or ()) != layer_count
+            or any(dtype != key.dtype for dtype in page.metadata.dtypes or ())
+            or page.valid_tokens
+            != mooncake_valid_tokens(key, int(self.config.chunk_size))
+            for key, page in zip(keys, pages, strict=True)
+        ):
+            raise ValueError("Layer-page put metadata does not match its key")
+        local = next(
+            backend
+            for _, backend in selected
+            if isinstance(backend, LocalCPUBackend)
+            and bool(getattr(backend, "use_hot", False))
+        )
+        remote = next(
+            (
+                backend
+                for _, backend in selected
+                if isinstance(backend, RemoteBackend)
+            ),
+            None,
+        )
+        required_futures: list[Future] = []
+        if remote is None:
+            local.batched_submit_layer_pages(keys, pages)
+        else:
+            owner_by_storage = {
+                int(page.raw_data.untyped_storage().data_ptr()): page.raw_data
+                for page in pages
+            }
+            for page in pages:
+                page.ref_count_up()
+            try:
+                future = self.batched_put_external_pages(
+                    keys,
+                    [
+                        [page.layer_data_ptr(layer) for layer in range(layer_count)]
+                        for page in pages
+                    ],
+                    [[page.layer_size] * layer_count for page in pages],
+                    tuple(owner_by_storage.values()),
+                    None,
+                    req_id,
+                )
+            except Exception:
+                for page in pages:
+                    page.ref_count_down()
+                raise
+
+            completion: Future = Future()
+
+            def finish_pages(
+                completed_remote: Future,
+                held=tuple(pages),
+                page_keys=tuple(keys),
+            ) -> None:
+                error = None
+                try:
+                    completed_remote.result()
+                    # A local page hit must also represent a durable remote page.
+                    local.batched_submit_layer_pages(page_keys, list(held))
+                except Exception as caught:
+                    error = caught
+                finally:
+                    for page in held:
+                        page.ref_count_down()
+                if not completion.done():
+                    if error is None:
+                        completion.set_result(None)
+                    else:
+                        completion.set_exception(error)
+
+            future.add_done_callback(finish_pages)
+            required_futures.append(completion)
+        for page in pages:
+            page.ref_count_down()
+        return required_futures
+
     def batched_put_external_pages(
         self,
         keys: Sequence[CacheEngineKey],
@@ -467,6 +606,25 @@ class StorageManager:
             owners,
             ready_event,
             req_id,
+        )
+
+    def batched_get_external_pages(
+        self,
+        keys: Sequence[CacheEngineKey],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        owners: tuple[Any, ...],
+        req_id: str,
+    ) -> None:
+        """Load remote pages directly into externally owned buffers."""
+        backend = self.storage_backends.get("RemoteBackend")
+        if not isinstance(backend, RemoteBackend):
+            raise RuntimeError("Direct page load requires RemoteBackend")
+        with self._bypass_lock:
+            if "RemoteBackend" in self._bypassed_backends:
+                raise RuntimeError("RemoteBackend is bypassed")
+        backend.batched_get_external_pages(
+            keys, buffer_ptrs, buffer_sizes, owners, req_id
         )
 
     def batched_external_pages_exist(
@@ -655,8 +813,13 @@ class StorageManager:
             and keys
             and keys[0]
         ):
-            local_backend = self.storage_backends["LocalCPUBackend"]
-            if local_backend.contains(keys[0][0]):
+            local_backend = cast(
+                LocalCPUBackend,
+                self.storage_backends["LocalCPUBackend"],
+            )
+            if local_backend.contains_all_exact(
+                key for layer_keys in keys for key in layer_keys
+            ):
                 location = "LocalCPUBackend"
         backend = self.storage_backends[location]
         use_blocking = self._layerwise_get_prefers_blocking(location, backend)

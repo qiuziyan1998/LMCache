@@ -2,7 +2,16 @@
 # Standard
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Union,
+)
 import threading
 import time
 
@@ -17,12 +26,12 @@ from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_ann
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
+    LayerPageMemoryObj,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
     MixedMemoryAllocator,
     PagedCpuGpuMemoryAllocator,
-    LayerPageMemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import mooncake_layer_pages_enabled
@@ -312,7 +321,30 @@ class LocalCPUBackend(AllocatorBackendInterface):
             raise ValueError("Layer-page admission requires one unique key per page")
         if any(not page.is_valid() for page in pages):
             raise ValueError("Layer-page admission cannot store invalid pages")
-        self.batched_submit_put_task(keys, pages)
+        if not self.use_hot:
+            return
+        stored_keys: list[CacheEngineKey] = []
+        with self.cpu_lock:
+            for key, page in zip(keys, pages, strict=True):
+                existing = self.hot_cache.get(key)
+                if self._compatible_layer_page(existing, page):
+                    continue
+                page.ref_count_up()
+                self.hot_cache[key] = page
+                stored_keys.append(key)
+                if existing is not None:
+                    # Other request owners retain their own references. Only
+                    # the cache mapping's reference is transferred here.
+                    self.cache_policy.update_on_force_evict(key)
+                    existing.ref_count_down()
+            for key in stored_keys:
+                if self.batched_msg_sender is not None:
+                    self.batched_msg_sender.add_kv_op(
+                        op_type=OpType.ADMIT,
+                        key=key.chunk_hash,
+                    )
+            if stored_keys:
+                self.cache_policy.update_on_put_many(stored_keys)
 
     def batched_get_layer_page_prefix(
         self, keys: Sequence[CacheEngineKey]
@@ -332,6 +364,44 @@ class LocalCPUBackend(AllocatorBackendInterface):
         """Return whether any key exists without resolving page aliases."""
         with self.cpu_lock:
             return any(key in self.hot_cache for key in keys)
+
+    def contains_all_exact(self, keys: Iterable[CacheEngineKey]) -> bool:
+        """Return whether every exact key exists under one cache lock."""
+        with self.cpu_lock:
+            return all(key in self.hot_cache for key in keys)
+
+    def contains_compatible_layer_pages_exact(
+        self,
+        keys: Sequence[CacheEngineKey],
+        expected_pages: Sequence[LayerPageMemoryObj],
+    ) -> bool:
+        """Validate exact-key winners before publishing a live page import."""
+        if len(keys) != len(expected_pages):
+            return False
+        with self.cpu_lock:
+            for key, expected in zip(keys, expected_pages, strict=True):
+                actual = self.hot_cache.get(key)
+                if not self._compatible_layer_page(actual, expected):
+                    return False
+        return True
+
+    @staticmethod
+    def _compatible_layer_page(
+        actual: Optional[MemoryObj], expected: LayerPageMemoryObj
+    ) -> bool:
+        return bool(
+            isinstance(actual, LayerPageMemoryObj)
+            and actual.is_valid()
+            and actual.get_size() == expected.get_size()
+            and actual.valid_tokens == expected.valid_tokens
+            and actual.num_layers == expected.num_layers
+            and actual.layer_size == expected.layer_size
+            and actual.meta.fmt == expected.meta.fmt
+            and actual.meta.shape == expected.meta.shape
+            and actual.meta.dtype == expected.meta.dtype
+            and actual.meta.shapes == expected.meta.shapes
+            and actual.meta.dtypes == expected.meta.dtypes
+        )
 
     def get_blocking(
         self,
@@ -949,14 +1019,24 @@ class LocalCPUBackend(AllocatorBackendInterface):
         num_layers: int,
         fmt: MemoryFormat,
         busy_loop: bool = True,
+        valid_tokens: Optional[Union[int, list[int]]] = None,
+        full_tokens: Optional[int] = None,
+        eviction: bool = True,
     ) -> Optional[list[LayerPageMemoryObj]]:
-        """Allocate layer pages, evicting cache entries when required."""
+        """Allocate exact-size layer pages, evicting entries when required."""
         allocate = getattr(
             self.memory_allocator, "batched_allocate_layer_pages", None
         )
         if not callable(allocate):
             return None
-        pages = allocate(shapes, dtypes, batch_size, num_layers, fmt)
+        allocation_args = (shapes, dtypes, batch_size, num_layers, fmt)
+        pages = allocate(
+            *allocation_args,
+            valid_tokens,
+            full_tokens,
+        )
+        if pages is None and not eviction:
+            return None
         evicted = 0
         deadline = time.monotonic() + float(
             getattr(self.config, "blocking_timeout_secs", 60)
@@ -992,7 +1072,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 if not busy_loop or time.monotonic() >= deadline:
                     break
                 time.sleep(0.1)
-            pages = allocate(shapes, dtypes, batch_size, num_layers, fmt)
+            pages = allocate(
+                *allocation_args,
+                valid_tokens,
+                full_tokens,
+            )
         self.stats_monitor.update_local_cpu_evict_metrics(evicted)
         return pages
 

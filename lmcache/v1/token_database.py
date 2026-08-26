@@ -27,6 +27,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
     MOONCAKE_PAYLOAD_LAYOUT_TAG,
+    MOONCAKE_VALID_TOKENS_TAG,
     mooncake_page_layout_enabled,
     mooncake_payload_layout,
 )
@@ -234,6 +235,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
     def _make_key_by_hash(
         self, chunk_hash: int, request_configs: Optional[dict] = None,
         kv_group: int = 0,
+        valid_tokens: Optional[int] = None,
     ):
         assert self.metadata is not None
         config = getattr(self, "config", None)
@@ -252,6 +254,14 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             request_configs[MOONCAKE_PAYLOAD_LAYOUT_TAG] = (
                 self.mooncake_payload_layout
             )
+            chunk_size = int(getattr(config, "chunk_size", 0))
+            if valid_tokens is not None and valid_tokens != chunk_size:
+                if not 0 < valid_tokens < chunk_size:
+                    raise ValueError(
+                        "Partial cache-key length must be between 1 and "
+                        f"chunk_size - 1: {valid_tokens}"
+                    )
+                request_configs[MOONCAKE_VALID_TOKENS_TAG] = valid_tokens
         if kv_group == 1 and bool(getattr(config, "dsa_two_groups", False)):
             request_configs = dict(request_configs or {})
             request_configs[DSA_INDEX_CACHE_SCHEMA_TAG] = DSA_INDEX_CACHE_SCHEMA
@@ -421,6 +431,8 @@ class ChunkedTokenDatabase(TokenDatabase):
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
+        if mask is not None and tokens is not None and mask.numel() != len(tokens):
+            raise ValueError("The mask length must match the token length.")
         if mask is not None:
             num_falses = mask.numel() - mask.long().sum().item()
         else:
@@ -446,7 +458,10 @@ class ChunkedTokenDatabase(TokenDatabase):
                             start_idx,
                             end_idx,
                             self._make_key_by_hash(
-                                hash_val, request_configs, kv_group=kv_group
+                                hash_val,
+                                request_configs,
+                                kv_group=kv_group,
+                                valid_tokens=end_idx - start_idx,
                             ),
                         )
                     else:
@@ -455,15 +470,20 @@ class ChunkedTokenDatabase(TokenDatabase):
             assert offsets is not None, (
                 "If hashes are provided, offsets must also be provided."
             )
+            if len(hashes) != len(offsets):
+                raise ValueError("Hash and offset counts must match.")
             start_idx = 0
-            for hash_val, offset in zip(hashes, offsets, strict=False):
+            for hash_val, offset in zip(hashes, offsets, strict=True):
                 end_idx = start_idx + offset
                 if make_key:
                     yield (
                         start_idx,
                         end_idx,
                         self._make_key_by_hash(
-                            hash_val, request_configs, kv_group=kv_group
+                            hash_val,
+                            request_configs,
+                            kv_group=kv_group,
+                            valid_tokens=offset,
                         ),
                     )
                 else:
@@ -509,6 +529,7 @@ class ChunkedTokenDatabase(TokenDatabase):
                         current_hash,
                         request_configs,
                         kv_group=kv_group,
+                        valid_tokens=end_idx - start_idx,
                     ),
                 )
             else:

@@ -110,6 +110,21 @@ def test_build_prepared_sparse_source_waits_for_token_coverage() -> None:
     assert source is None
 
 
+@pytest.mark.parametrize("chunk_counts", [(4, 3), (3, 4, 1)])
+def test_build_prepared_sparse_source_rejects_invalid_tail_coverage(
+    chunk_counts: tuple[int, ...],
+) -> None:
+    chunks = len(chunk_counts)
+    with pytest.raises(ValueError, match="coverage|non-tail chunks"):
+        build_prepared_sparse_source(
+            [[torch.empty(1)] * chunks],
+            [torch.arange(chunks, dtype=torch.int64)],
+            num_layers=1,
+            total_tokens=6 if chunks == 2 else 8,
+            chunk_token_counts=chunk_counts,
+        )
+
+
 def test_build_prepared_sparse_source_rejects_wrong_pointer_device() -> None:
     with pytest.raises(ValueError, match="wrong device"):
         build_prepared_sparse_source(

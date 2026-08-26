@@ -392,6 +392,40 @@ class RemoteBackend(StorageBackendInterface):
         )
         return future
 
+    def batched_get_external_pages(
+        self,
+        keys: Sequence[CacheEngineKey],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        owners: tuple[Any, ...],
+        req_id: str,
+    ) -> None:
+        """Retrieve remote pages directly into registered external buffers."""
+        if self.connection is None:
+            raise RuntimeError("Remote connection is unavailable")
+        normalized = list(keys)
+        if self._mla_worker_id_as0_mode:
+            normalized = [key.with_new_worker_id(0) for key in normalized]
+        future = asyncio.run_coroutine_threadsafe(
+            self.connection.batched_get_external_pages(
+                normalized, buffer_ptrs, buffer_sizes, owners, req_id
+            ),
+            self.loop,
+        )
+        try:
+            future.result(self.config.blocking_timeout_secs)
+        except TimeoutError as timeout_error:
+            # The connector may be running an uncancellable native write into
+            # externally owned destinations. Drain it so its serialization lock
+            # and buffer registrations remain valid before surfacing timeout.
+            try:
+                future.result()
+            except BaseException as native_error:
+                raise TimeoutError(
+                    "Direct external page load failed after timing out"
+                ) from native_error
+            raise timeout_error
+
     def batched_external_pages_exist(
         self, keys: Sequence[CacheEngineKey]
     ) -> List[bool]:

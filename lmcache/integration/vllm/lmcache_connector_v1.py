@@ -8,6 +8,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -27,7 +28,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
+class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -48,6 +49,31 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
     def supports_dsa_compact_external_load(self) -> bool:
         return self._lmcache_engine.supports_dsa_cold_compact_load()
 
+    @property
+    def supports_dsa_live_split_source(self) -> bool:
+        return self._lmcache_engine.supports_dsa_live_split()
+
+    @property
+    def supports_dsa_live_latent_split_source(self) -> bool:
+        return self._lmcache_engine.supports_dsa_live_latent_source()
+
+    @property
+    def supports_dsa_live_latent_split_destination(self) -> bool:
+        return self._lmcache_engine.supports_dsa_live_latent_destination()
+
+    def configure_live_latent_source(self, enabled: bool) -> None:
+        """Enable latent live-source capture after transport negotiation.
+
+        The implementation deliberately defaults this feature to disabled so
+        that upgrading LMCache without a hybrid-capable transport cannot make
+        an older consumer reject the otherwise valid group-1 descriptor.
+        """
+        configure = getattr(
+            self._lmcache_engine, "configure_live_latent_source", None
+        )
+        if callable(configure):
+            configure(enabled)
+
     # ==============================
     # Worker-side methods
     # ==============================
@@ -60,6 +86,18 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             dictionary of layer names, kv cache
         """
         self._lmcache_engine.register_kv_caches(kv_caches)
+
+    def _take_live_split_destination_plans(
+        self, handled_groups: tuple[int, ...]
+    ) -> dict[str, dict[str, Any]]:
+        """Internal worker hook consumed by AscendMultiConnector."""
+        return self._lmcache_engine.take_live_split_destination_plans(
+            handled_groups
+        )
+
+    def _accept_live_split_results(self, results: dict[str, str]) -> None:
+        """Internal worker hook for negotiated live-transfer acknowledgements."""
+        self._lmcache_engine.accept_live_split_results(results)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """
@@ -176,6 +214,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         return self._lmcache_engine.get_completed_decode_window_saves()
 
+    def build_connector_worker_meta(self):
+        build = getattr(self._lmcache_engine, "build_connector_worker_meta", None)
+        return build() if callable(build) else None
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process
@@ -242,6 +284,15 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         """
         self._lmcache_engine.update_connector_output(connector_output)
 
+    def update_connector_worker_metadata(
+        self, worker_metadata: Any, active_req_ids: set[str]
+    ) -> None:
+        update = getattr(
+            self._lmcache_engine, "update_connector_worker_metadata", None
+        )
+        if callable(update):
+            update(worker_metadata, active_req_ids)
+
     def request_finished(
         self,
         request: "Request",
@@ -258,3 +309,12 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             returned by the engine.
         """
         return self._lmcache_engine.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        # LMCache's layerwise DSA path owns both groups, while its scheduler
+        # completion bookkeeping is keyed by the primary group's block table.
+        return self.request_finished(request, block_ids[0])
