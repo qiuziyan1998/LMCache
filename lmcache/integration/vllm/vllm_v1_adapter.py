@@ -5864,7 +5864,7 @@ class LMCacheConnectorV1Impl:
             self._dsa_cold_load_executor = executor
         return executor
 
-    def _synchronize_dsa_cold_dense_load(self) -> None:
+    def _synchronize_dsa_cold_dense_load(self, stream: Any = None) -> None:
         assert self.lmcache_engine is not None
         synchronize = getattr(
             self.lmcache_engine.gpu_connector,
@@ -5873,7 +5873,21 @@ class LMCacheConnectorV1Impl:
         )
         if synchronize is None:
             raise RuntimeError("NPU connector has no dense load-stream sync API")
-        synchronize()
+        if stream is None:
+            synchronize()
+        else:
+            synchronize(stream)
+
+    def _synchronize_dsa_cold_dense_readiness(self, readiness: Any) -> None:
+        assert self.lmcache_engine is not None
+        synchronize = getattr(
+            self.lmcache_engine.gpu_connector,
+            "synchronize_dense_load_readiness",
+            None,
+        )
+        if synchronize is None:
+            raise RuntimeError("NPU connector has no dense load readiness sync API")
+        synchronize(readiness)
 
     def _record_dsa_cold_dense_load_readiness(
         self,
@@ -6307,6 +6321,9 @@ class LMCacheConnectorV1Impl:
         """Load group 1 directly, or after group 0 in shared-CPU mode."""
         if npu_device_id is not None:
             torch.npu.set_device(npu_device_id)
+        producer_stream = (
+            torch.npu.current_stream() if npu_device_id is not None else None
+        )
         assert self.lmcache_engine is not None
         started = cold_start_perf_now()
         queue_ms = (started - plan["planned_at"]) * 1000
@@ -6428,12 +6445,17 @@ class LMCacheConnectorV1Impl:
             )
             if record is None:
                 raise RuntimeError("NPU connector has no dense load readiness API")
-            readiness = record()
+            readiness = (
+                record() if producer_stream is None else record(producer_stream)
+            )
         except BaseException:
             if not source_owners:
                 source_owners = self._dense_load_source_owners(retrieve_state)
+            self._synchronize_dsa_cold_dense_load(producer_stream)
             self._release_dense_load_source_owners(
-                source_owners, self.lmcache_engine
+                source_owners,
+                self.lmcache_engine,
+                synchronize=False,
             )
             raise
         plan["indexer_source_owners"] = source_owners
@@ -6465,6 +6487,7 @@ class LMCacheConnectorV1Impl:
         token_mask = plan["token_mask"]
         state = live_state or WorkerRetrieveState(req_id=request.req_id)
         started = cold_start_perf_now()
+        indexer_readiness = None
         try:
             if previous_latent_future is not None:
                 try:
@@ -6562,11 +6585,12 @@ class LMCacheConnectorV1Impl:
             latent_shared_ready = plan["latent_shared_ready"]
             if not latent_shared_ready.done():
                 latent_shared_ready.set_exception(exc)
-            # Do not release scheduler blocks or registered tensor storage while
-            # the sibling native transfer can still be writing into it.
-            if not indexer_future.done():
+            # Resolve the sibling result even when Group 0 failed before its
+            # normal dependency wait. A successful result carries the exact
+            # producer-stream fence; a failed result fenced its stream locally.
+            if indexer_readiness is None:
                 try:
-                    indexer_future.result()
+                    _, indexer_readiness, _, _ = indexer_future.result()
                 except BaseException:
                     pass
             owners_by_id = {
@@ -6578,7 +6602,8 @@ class LMCacheConnectorV1Impl:
             }
             combined_owners = tuple(owners_by_id.values())
             try:
-                self._synchronize_dsa_cold_dense_load()
+                if indexer_readiness is not None:
+                    self._synchronize_dsa_cold_dense_readiness(indexer_readiness)
             except BaseException:
                 # The transfer may still be writing. Preserve every owner on
                 # the surfaced state so the scheduler can retain the blocks
