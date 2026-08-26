@@ -741,6 +741,17 @@ def test_remote_fill_materialization_consensus_includes_ticket_admission() -> No
     assert tp_admission.result() is False
 
 
+def test_dense_bootstrap_admission_requires_vote_without_local_full_hint() -> None:
+    engine = _engine(_PairStorageManager())
+
+    assert not engine._remote_fill_materialization_vote_required(
+        {"request_configs": {}}
+    )
+    assert engine._remote_fill_materialization_vote_required(
+        {"_remote_fill_tp_admission": Future(), "request_configs": {}}
+    )
+
+
 def test_remote_fill_materialization_consensus_fails_closed_without_callback(
 ) -> None:
     engine = _engine(_PairStorageManager())

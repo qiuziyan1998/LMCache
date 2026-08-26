@@ -1997,6 +1997,16 @@ class LMCacheEngine:
             and self._should_use_shared_layerwise_retrieve(1)
         )
 
+    def _remote_fill_materialization_vote_required(
+        self, kwargs: dict[str, Any]
+    ) -> bool:
+        """Return whether this retrieve owns the TP materialization vote."""
+        return kwargs.get("_remote_fill_tp_admission") is not None or bool(
+            self._remote_fill_pair_lookup_enabled()
+            and self._remote_fill_local_full_hint(kwargs.get("request_configs"))
+            is not None
+        )
+
     def _lookup_remote_fill_two_group_prefix(
         self,
         chunks: list[tuple[int, int, CacheEngineKey]],
@@ -4499,14 +4509,10 @@ class LMCacheEngine:
         # consensus must be entered by every rank or by none. A prefiller
         # prefix-hit retrieve carries a remote_fill_plan without the decoder's
         # LOCAL_FULL hint, so its passive ranks never enter the consensus and
-        # an unconditional rank0 entry deadlocks the collective.
-        remote_fill_load = bool(
-            self._remote_fill_pair_lookup_enabled()
-            and self._remote_fill_local_full_hint(
-                kwargs.get("request_configs")
-            )
-            is not None
-        )
+        # an unconditional rank0 entry deadlocks the collective. The decoder's
+        # admission future explicitly assigns this vote even if worker metadata
+        # omitted the diagnostic LOCAL_FULL hint.
+        remote_fill_load = self._remote_fill_materialization_vote_required(kwargs)
         if not keys_layer_major:
             for layer_id in range(self.num_layers):
                 self._broadcast_shared_envelope(
@@ -4898,13 +4904,7 @@ class LMCacheEngine:
 
         phase = kwargs.get("shared_cpu_phase", "dense_prefix")
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
-        remote_fill_load = bool(
-            self._remote_fill_pair_lookup_enabled()
-            and self._remote_fill_local_full_hint(
-                kwargs.get("request_configs")
-            )
-            is not None
-        )
+        remote_fill_load = self._remote_fill_materialization_vote_required(kwargs)
         assert_layerwise_gpu_connector(self.gpu_connector)
         mem_obj_consumer = None
         to_release: list[MemoryObj] = []
