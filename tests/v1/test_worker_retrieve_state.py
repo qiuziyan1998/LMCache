@@ -75,6 +75,7 @@ def test_cold_compact_drain_waits_for_both_dependencies() -> None:
 
 
 def test_cold_compact_indexer_uses_direct_sparse_retrieve_path(monkeypatch) -> None:
+    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
     impl = _make_impl()
     impl.num_layers = 2
     impl.device = "cpu"
@@ -95,6 +96,7 @@ def test_cold_compact_indexer_uses_direct_sparse_retrieve_path(monkeypatch) -> N
         assert kwargs["marker"] == "sparse"
         assert kwargs["direct_external_pages"] is True
         assert kwargs["_defer_direct_load_readiness"] is True
+        assert kwargs["_cold_perf_breakdown"] is plan["indexer_perf"]
         yield None
         yield torch.ones(4, dtype=torch.bool)
         yield torch.ones(4, dtype=torch.bool)
@@ -131,6 +133,8 @@ def test_cold_compact_indexer_uses_direct_sparse_retrieve_path(monkeypatch) -> N
     assert torch.equal(result[0], torch.ones(4, dtype=torch.bool))
     assert result[1] is readiness
     assert plan["indexer_source_owners"] == (owner,)
+    assert plan["indexer_perf"]["layer_submit_host_ms"] >= 0
+    assert plan["indexer_perf"]["readiness_record_ms"] >= 0
     npu.set_device.assert_called_once_with(3)
     record.assert_called_once_with(producer_stream)
     impl.lmcache_engine.retrieve_layer.assert_not_called()
