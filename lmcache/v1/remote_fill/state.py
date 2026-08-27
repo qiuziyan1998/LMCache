@@ -366,6 +366,8 @@ class RemoteFillStateCore:
         self._native_hard_timeout_sec = native_hard_timeout_sec
         self._terminal_record_ttl_sec = terminal_record_ttl_sec
         self._clock = clock
+        self._terminal_prune_interval_sec = min(1.0, terminal_record_ttl_sec)
+        self._next_terminal_prune_at = self._clock() + self._terminal_prune_interval_sec
         self._token_factory = token_factory
         self._lock = RLock()
         self._transactions: dict[str, _Transaction] = {}
@@ -1681,7 +1683,9 @@ class RemoteFillStateCore:
                     self._mark_fatal_locked(transaction)
             if transaction.state is TransactionState.ABORT_REQUESTED:
                 self._finish_abort_if_drained_locked(transaction)
-        self._prune_terminal_records_locked(now)
+        if now >= self._next_terminal_prune_at:
+            self._next_terminal_prune_at = now + self._terminal_prune_interval_sec
+            self._prune_terminal_records_locked(now)
 
     def _expire_unarmed_window_locked(
         self,

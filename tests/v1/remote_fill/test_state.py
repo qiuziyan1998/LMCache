@@ -3,6 +3,7 @@
 
 # Standard
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import Mock
 
 # Third Party
 import msgspec
@@ -16,6 +17,7 @@ from lmcache.v1.remote_fill import (
     PageDisposition,
     PreparedPage,
     ReplyLostError,
+    RemoteFillStateCore,
     ResultCode,
     TerminalOutcome,
     TransactionState,
@@ -867,6 +869,47 @@ def test_terminal_pruning_restores_operation_record_capacity(harness) -> None:
     second_factory = type(harness.requests)("transfer-2")
 
     assert harness.client.execute(second_factory.open()).code is ResultCode.ACCEPTED
+
+
+def test_terminal_pruning_is_rate_limited(harness, monkeypatch) -> None:
+    """Frequent safety refreshes do not repeatedly scan terminal history."""
+
+    prune = Mock(wraps=harness.state._prune_terminal_records_locked)
+    monkeypatch.setattr(harness.state, "_prune_terminal_records_locked", prune)
+
+    for _ in range(100):
+        harness.service.run_maintenance()
+    assert prune.call_count == 0
+
+    harness.clock.advance(1.0)
+    for _ in range(100):
+        harness.service.run_maintenance()
+    assert prune.call_count == 1
+
+
+def test_terminal_pruning_interval_does_not_exceed_record_ttl(
+    harness,
+    monkeypatch,
+) -> None:
+    """A subsecond replay TTL is not extended by pruning throttling."""
+
+    state = RemoteFillStateCore(
+        destination_engine_epoch=7,
+        shared_cache_generation=11,
+        descriptor_verification_key=b"test descriptor verification key",
+        negotiation=harness.negotiation,
+        page_lifecycle=harness.lifecycle,
+        terminal_record_ttl_sec=0.1,
+        clock=harness.clock,
+    )
+
+    prune = Mock(wraps=state._prune_terminal_records_locked)
+    monkeypatch.setattr(state, "_prune_terminal_records_locked", prune)
+
+    harness.clock.advance(0.1)
+    state.run_maintenance()
+
+    assert prune.call_count == 1
 
 
 def test_one_record_capacity_still_allows_arm_report_and_finish(harness) -> None:
