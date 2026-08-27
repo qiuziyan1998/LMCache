@@ -6501,9 +6501,6 @@ class LMCacheConnectorV1Impl:
         producer_setup_started = stage_start()
         if npu_device_id is not None:
             torch.npu.set_device(npu_device_id)
-        producer_stream = (
-            torch.npu.current_stream() if npu_device_id is not None else None
-        )
         finish_stage("producer_setup_ms", producer_setup_started)
         assert self.lmcache_engine is not None
         started = cold_start_perf_now()
@@ -6535,6 +6532,7 @@ class LMCacheConnectorV1Impl:
                 "Cold compact indexer load requires dense source retention"
             )
         retrieve_kwargs_started = stage_start()
+        readiness_out: list[Any] = []
         retrieve_kwargs = {
             "kvcaches": indexer_kvcaches,
             "slot_mapping": indexer_slots,
@@ -6545,6 +6543,7 @@ class LMCacheConnectorV1Impl:
             "shared_cpu_phase": "dsa_cold_compact_indexer",
             "shared_cpu_request_ordinal": 0,
             "_retain_shared_dense_cache": True,
+            "_dense_load_readiness_out": readiness_out,
             **retrieve_state.cache_kwargs(1, dsa_two_groups=True),
         }
         finish_stage("retrieve_kwargs_ms", retrieve_kwargs_started)
@@ -6563,6 +6562,7 @@ class LMCacheConnectorV1Impl:
             if callable(prefetch):
                 prefetch_kwargs = dict(retrieve_kwargs)
                 prefetch_kwargs.pop("_retain_shared_dense_cache")
+                prefetch_kwargs.pop("_dense_load_readiness_out")
                 try:
                     prefetch(
                         plan["tokens"],
@@ -6640,21 +6640,14 @@ class LMCacheConnectorV1Impl:
                     "Cold compact indexer retrieve did not retain its sources"
                 )
             finish_stage("result_check_ms", result_check_started)
-            record = getattr(
-                self.lmcache_engine.gpu_connector,
-                "record_dense_load_readiness",
-                None,
-            )
-            if record is None:
-                raise RuntimeError("NPU connector has no dense load readiness API")
             readiness_started = stage_start()
-            readiness = (
-                record() if producer_stream is None else record(producer_stream)
-            )
+            if len(readiness_out) != 1:
+                raise RuntimeError("Cold compact indexer readiness was not recorded")
+            readiness = readiness_out[0]
             finish_stage("readiness_record_ms", readiness_started)
         except BaseException:
             if not load_stream_fenced:
-                self._synchronize_dsa_cold_dense_load(producer_stream)
+                self._synchronize_dsa_cold_dense_load()
             self._release_dense_load_source_owners(
                 prefetch_owners,
                 self.lmcache_engine,

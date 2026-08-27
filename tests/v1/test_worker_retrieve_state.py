@@ -109,6 +109,7 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
 
     def dense_retrieve(_tokens, _mask, **kwargs):
         kwargs["cached_memory_objs"][:] = [[owner], [owner]]
+        kwargs["_dense_load_readiness_out"].append(readiness)
         assert kwargs["_retain_shared_dense_cache"] is True
         assert kwargs["shared_cpu_phase"] == "dsa_cold_compact_indexer"
         assert "vllm_cached_tokens" not in kwargs
@@ -160,7 +161,7 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
     assert plan["indexer_perf"]["layer_submit_host_ms"] >= 0
     assert plan["indexer_perf"]["readiness_record_ms"] >= 0
     npu.set_device.assert_called_once_with(3)
-    record.assert_called_once_with(producer_stream)
+    record.assert_not_called()
     impl.lmcache_engine.retrieve_layer.assert_called_once()
     impl.lmcache_engine.retrieve_layer_head_token_wise.assert_not_called()
     impl._sparse_retrieve_kwargs.assert_not_called()
@@ -177,6 +178,7 @@ def test_cold_compact_shared_indexer_waits_for_latent_publication() -> None:
     def dense_retrieve(_tokens, _mask, **kwargs):
         assert "direct_external_pages" not in kwargs
         kwargs["cached_memory_objs"][:] = [[owner]]
+        kwargs["_dense_load_readiness_out"].append(readiness)
         entered.set_result(None)
         yield None
         yield None
@@ -251,6 +253,7 @@ def test_cold_compact_prefetches_before_dense_retrieve() -> None:
     def prefetch(_tokens, _mask, **kwargs):
         nonlocal prefetch_cache_id
         assert "_retain_shared_dense_cache" not in kwargs["retrieve_kwargs"]
+        assert "_dense_load_readiness_out" not in kwargs["retrieve_kwargs"]
         prefetch_cache_id = id(kwargs["retrieve_kwargs"]["cached_memory_objs"])
         kwargs["retrieve_kwargs"]["cached_memory_objs"][:] = [[prefetch_owner]]
         prefetched.set_result(None)
@@ -259,6 +262,7 @@ def test_cold_compact_prefetches_before_dense_retrieve() -> None:
         assert id(kwargs["cached_memory_objs"]) == prefetch_cache_id
         assert not kwargs["cached_memory_objs"]
         kwargs["cached_memory_objs"][:] = [[dense_owner]]
+        kwargs["_dense_load_readiness_out"].append(readiness)
         materialized.set_result(None)
         yield None
         yield None
@@ -370,6 +374,7 @@ def test_cold_compact_prefetch_failure_releases_and_uses_dense_path() -> None:
     def dense_retrieve(_tokens, _mask, **kwargs):
         assert not kwargs["cached_memory_objs"]
         kwargs["cached_memory_objs"][:] = [[dense_owner]]
+        kwargs["_dense_load_readiness_out"].append(readiness)
         yield None
         yield None
         yield torch.ones(1, dtype=torch.bool)
@@ -573,16 +578,9 @@ def test_failed_cold_indexer_does_not_double_release_adopted_source(
     with pytest.raises(RuntimeError, match=expected):
         impl._run_dsa_cold_indexer_load(plan, 3)
 
-    if failure == "transfer":
-        synchronize.assert_called_once_with()
-    else:
-        synchronize.assert_called_once_with(producer_stream)
+    synchronize.assert_called_once_with()
     connector.record_dense_load_readiness.assert_not_called()
-    assert calls == (
-        ["close", "sync_load"]
-        if failure == "transfer"
-        else ["close", "sync_producer"]
-    )
+    assert calls == ["close", "sync_load"]
     assert owner.released == 0
     assert "indexer_source_owners" not in plan
 
