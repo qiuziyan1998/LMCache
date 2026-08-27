@@ -4431,6 +4431,23 @@ class LMCacheEngine:
             if mem_obj.is_valid():
                 mem_obj.ref_count_down()
 
+    def _release_retained_dense_retrieve_objs(
+        self,
+        memory_objs: list[MemoryObj],
+        *,
+        unpin: bool,
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Fence failed dense loads before releasing retained sources."""
+        if memory_objs and kwargs.get("_retain_shared_dense_cache"):
+            synchronize = getattr(
+                self.gpu_connector, "synchronize_dense_load_stream", None
+            )
+            if not callable(synchronize):
+                raise RuntimeError("Dense source cleanup requires load-stream sync")
+            synchronize()
+        self._release_shared_retrieve_objs(memory_objs, unpin=unpin)
+
     def _dense_retrieve_token_results(
         self,
         tokens: Union[torch.Tensor, list[int]],
@@ -4896,7 +4913,7 @@ class LMCacheEngine:
                     + list(keys_layer_major[layer_id][planned_page_chunks:])
                     for layer_id in range(self.num_layers)
                 ]
-            if self._adopt_dense_shared_retrieve_cache(
+            adopted = self._adopt_dense_shared_retrieve_cache(
                 req_id=req_id,
                 starts=starts,
                 ends=ends,
@@ -4905,8 +4922,11 @@ class LMCacheEngine:
                 handles=handles_by_layer,
                 kv_group=kv_group,
                 kwargs=kwargs,
-            ):
+            )
+            if adopted:
                 to_release.clear()
+            elif kwargs.get("_retain_shared_dense_cache"):
+                raise RuntimeError("Dense shared source retention failed")
             retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(
                 monitor_req_id,
@@ -4956,7 +4976,11 @@ class LMCacheEngine:
             try:
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
             finally:
-                self._release_shared_retrieve_objs(to_release, unpin=True)
+                self._release_retained_dense_retrieve_objs(
+                    to_release,
+                    unpin=True,
+                    kwargs=kwargs,
+                )
 
     def _retrieve_layer_shared_passive(
         self,
@@ -5204,17 +5228,21 @@ class LMCacheEngine:
                 mem_obj_consumer = None
                 if finish_started:
                     consumer_finish_s += cold_start_perf_now() - finish_started
-            if resolved_layers and self._adopt_dense_shared_retrieve_cache(
-                req_id=req_id,
-                starts=starts,
-                ends=ends,
-                keys_layer_major=keys_layer_major,
-                memory_objs=resolved_layers,
-                handles=handles_by_layer,
-                kv_group=kv_group,
-                kwargs=kwargs,
-            ):
-                to_release.clear()
+            if resolved_layers:
+                adopted = self._adopt_dense_shared_retrieve_cache(
+                    req_id=req_id,
+                    starts=starts,
+                    ends=ends,
+                    keys_layer_major=keys_layer_major,
+                    memory_objs=resolved_layers,
+                    handles=handles_by_layer,
+                    kv_group=kv_group,
+                    kwargs=kwargs,
+                )
+                if adopted:
+                    to_release.clear()
+                elif kwargs.get("_retain_shared_dense_cache"):
+                    raise RuntimeError("Dense shared source retention failed")
 
             retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -5259,7 +5287,11 @@ class LMCacheEngine:
             try:
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
             finally:
-                self._release_shared_retrieve_objs(to_release, unpin=False)
+                self._release_retained_dense_retrieve_objs(
+                    to_release,
+                    unpin=False,
+                    kwargs=kwargs,
+                )
 
     def skip_shared_layerwise_retrieve(
         self,

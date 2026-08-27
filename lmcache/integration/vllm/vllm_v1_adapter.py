@@ -1009,6 +1009,7 @@ class WorkerRetrieveState:
         repr=False,
     )
     dense_load_readiness: Optional[Any] = field(default=None, repr=False)
+    dense_load_readiness_consumed: bool = field(default=False, repr=False)
     dense_load_source_owners: tuple[Any, ...] = field(
         default_factory=tuple,
         repr=False,
@@ -4122,9 +4123,10 @@ class LMCacheConnectorV1Impl:
         engine = getattr(self, "lmcache_engine", None)
         state = None
         if hasattr(self, "_worker_retrieve_state"):
-            state = self._worker_retrieve_state.pop(req_id, None)
+            state = self._worker_retrieve_state.get(req_id)
         if state is not None:
             self._release_shared_worker_retrieve_state(state, engine)
+            self._worker_retrieve_state.pop(req_id, None)
             self._mark_worker_retrieve_registry_changed()
         elif engine is not None:
             release_fn = getattr(engine, "release_shared_cpu_sparse_request", None)
@@ -4177,10 +4179,26 @@ class LMCacheConnectorV1Impl:
         """Drop worker bindings and release the engine-owned request lease."""
 
         req_id = state.req_id
+        readiness = state.dense_load_readiness
+        if readiness is not None:
+            synchronize = getattr(
+                getattr(engine, "gpu_connector", None),
+                "synchronize_dense_load_readiness",
+                None,
+            )
+            if not callable(synchronize):
+                raise RuntimeError(
+                    "NPU connector has no dense load readiness sync API"
+                )
+            synchronize(readiness)
+            state.dense_load_readiness = None
+            state.dense_load_readiness_consumed = False
         LMCacheConnectorV1Impl._release_dense_load_source_owners(
-            state.dense_load_source_owners, engine
+            state.dense_load_source_owners,
+            engine,
+            synchronize=readiness is None,
         )
-        state.dense_load_readiness = None
+        state.dense_load_readiness_consumed = False
         state.dense_load_source_owners = ()
         state.prepared_sparse_sources.clear()
         for kv_group in (0, 1):
@@ -4505,6 +4523,9 @@ class LMCacheConnectorV1Impl:
             "dense_prefix_seed": state.dense_prefix_seed,
             "prepared_sparse_sources": dict(state.prepared_sparse_sources),
             "dense_load_readiness": state.dense_load_readiness,
+            "dense_load_readiness_consumed": (
+                state.dense_load_readiness_consumed
+            ),
             "dense_load_source_owners": state.dense_load_source_owners,
         }
 
@@ -6039,6 +6060,7 @@ class LMCacheConnectorV1Impl:
         if record is None:
             raise RuntimeError("NPU connector has no dense load readiness API")
         state.dense_load_readiness = record() if readiness is None else readiness
+        state.dense_load_readiness_consumed = False
         owners: list[Any] = []
         seen: set[int] = set()
         for owner in additional_owners:
@@ -6051,7 +6073,7 @@ class LMCacheConnectorV1Impl:
         self, state: WorkerRetrieveState
     ) -> None:
         readiness = state.dense_load_readiness
-        if readiness is None:
+        if readiness is None or state.dense_load_readiness_consumed:
             return
         assert self.lmcache_engine is not None
         consume = getattr(
@@ -6062,7 +6084,7 @@ class LMCacheConnectorV1Impl:
         if consume is None:
             raise RuntimeError("NPU connector has no dense load readiness API")
         consume(readiness)
-        state.dense_load_readiness = None
+        state.dense_load_readiness_consumed = True
 
     def _submit_dsa_cold_compact_load(self, request: ReqMeta) -> None:
         futures = getattr(self, "_dsa_cold_load_futures", None)
@@ -6456,7 +6478,7 @@ class LMCacheConnectorV1Impl:
     def _run_dsa_cold_indexer_load(
         self, plan: dict[str, Any], npu_device_id: Optional[int]
     ) -> tuple[torch.Tensor, Any, float, float]:
-        """Load group 1 directly, or after group 0 in shared-CPU mode."""
+        """Load Group 1 densely after Group 0 shared-CPU publication."""
         perf_breakdown = {} if cold_start_perf_enabled() else None
         if perf_breakdown is not None:
             plan["indexer_perf"] = perf_breakdown
@@ -6499,115 +6521,118 @@ class LMCacheConnectorV1Impl:
         )
         finish_stage("slot_mapping_submit_ms", slot_submit_started)
         retrieve_state = WorkerRetrieveState(req_id=request.req_id)
-        shared_retrieve = getattr(
-            self.lmcache_engine, "_should_use_shared_layerwise_retrieve", None
+        supports_dense_retention = getattr(
+            self.lmcache_engine, "supports_dense_sparse_cache_retention", None
         )
-        shared_cpu_enabled = bool(
-            callable(shared_retrieve) and shared_retrieve(1)
-        )
+        if not callable(supports_dense_retention) or not supports_dense_retention():
+            raise RuntimeError(
+                "Cold compact indexer load requires dense source retention"
+            )
         retrieve_kwargs_started = stage_start()
-        retrieve_kwargs, _, _ = self._sparse_retrieve_kwargs(
-            request,
-            retrieve_state,
-            None,
-            kvcaches=indexer_kvcaches,
-            slot_mapping=indexer_slots,
-            sync=True,
-            kv_group=1,
-            request_ordinal=0,
-            dsa_two_groups=True,
-            token_count=plan["token_count"],
-            shared_cpu_enabled=shared_cpu_enabled,
-            shared_cpu_preflight_state=None,
-        )
+        retrieve_kwargs = {
+            "kvcaches": indexer_kvcaches,
+            "slot_mapping": indexer_slots,
+            "sync": True,
+            "kv_group": 1,
+            "req_id": request.req_id,
+            "request_configs": request.request_configs,
+            "shared_cpu_phase": "dsa_cold_compact_indexer",
+            "shared_cpu_request_ordinal": 0,
+            "_retain_shared_dense_cache": True,
+            **retrieve_state.cache_kwargs(1, dsa_two_groups=True),
+        }
         finish_stage("retrieve_kwargs_ms", retrieve_kwargs_started)
-        if perf_breakdown is not None:
-            retrieve_kwargs["_cold_perf_breakdown"] = perf_breakdown
-        load_mode = str(
+        prefetch_owners: tuple[Any, ...] = ()
+        if (
             getattr(
                 getattr(self, "config", None),
                 "dsa_group1_load_mode",
                 "p2p_preferred",
             )
-        )
-        if shared_cpu_enabled and load_mode == "persistent_parallel_prefetch":
+            == "persistent_parallel_prefetch"
+        ):
             prefetch = getattr(
                 self.lmcache_engine, "prefetch_shared_layer_pages", None
             )
             if callable(prefetch):
-                prefetch_perf_started = stage_start()
-                prefetch_started = cold_start_perf_now()
-                cold_start_perf_log(
-                    logger,
-                    "group1_persistent_prefetch_start",
-                    req_id=request.req_id,
-                    tokens=plan["token_count"],
-                )
+                prefetch_kwargs = dict(retrieve_kwargs)
+                prefetch_kwargs.pop("_retain_shared_dense_cache")
                 try:
-                    location = prefetch(
+                    prefetch(
                         plan["tokens"],
                         plan["token_mask"],
-                        retrieve_kwargs=retrieve_kwargs,
+                        retrieve_kwargs=prefetch_kwargs,
                     )
-                    retrieve_state.location = location
-                    retrieve_kwargs["cached_retrieve_location"] = location
+                    prefetch_owners = self._dense_load_source_owners(retrieve_state)
+                    retrieve_state.clear_group(1)
                 except Exception as error:
-                    owners = self._dense_load_source_owners(retrieve_state)
                     self._release_dense_load_source_owners(
-                        owners, self.lmcache_engine
+                        self._dense_load_source_owners(retrieve_state),
+                        self.lmcache_engine,
+                        synchronize=False,
                     )
                     retrieve_state.clear_group(1)
-                    cold_start_perf_log(
-                        logger,
-                        "group1_persistent_prefetch_fallback",
-                        started=prefetch_started,
-                        req_id=request.req_id,
-                        error=repr(error),
-                    )
                     logger.warning(
                         "Group-1 persistent prefetch failed for %s; using "
                         "the serial persistent path: %s",
                         request.req_id,
                         error,
                     )
-                finish_stage("prefetch_ms", prefetch_perf_started)
-        if shared_cpu_enabled:
-            latent_gate_started = stage_start()
-            try:
-                plan["latent_shared_ready"].result()
-            except BaseException:
-                owners = self._dense_load_source_owners(retrieve_state)
-                self._release_dense_load_source_owners(
-                    owners, self.lmcache_engine
-                )
-                retrieve_state.clear_group(1)
-                raise
-            finish_stage("latent_gate_wait_ms", latent_gate_started)
-        if not shared_cpu_enabled:
-            retrieve_kwargs["direct_external_pages"] = True
-            retrieve_kwargs["_defer_direct_load_readiness"] = True
+        latent_gate_started = stage_start()
+        try:
+            plan["latent_shared_ready"].result()
+        except BaseException:
+            self._release_dense_load_source_owners(
+                prefetch_owners,
+                self.lmcache_engine,
+                synchronize=False,
+            )
+            raise
+        finish_stage("latent_gate_wait_ms", latent_gate_started)
         generator_started = stage_start()
-        retriever = self.lmcache_engine.retrieve_layer_head_token_wise(
-            plan["tokens"],
-            plan["token_mask"],
-            **retrieve_kwargs,
-        )
+        try:
+            retriever = self.lmcache_engine.retrieve_layer(
+                plan["tokens"],
+                plan["token_mask"],
+                **retrieve_kwargs,
+            )
+        except BaseException:
+            self._release_dense_load_source_owners(
+                prefetch_owners,
+                self.lmcache_engine,
+                synchronize=False,
+            )
+            raise
         finish_stage("generator_create_ms", generator_started)
         result = None
-        source_owners: tuple[Any, ...] = ()
+        load_stream_fenced = False
         try:
             layer_submit_started = stage_start()
             try:
-                result = next(retriever)
-                for _ in range(self.num_layers):
-                    result = retriever.send(None)
+                try:
+                    result = next(retriever)
+                    for _ in range(self.num_layers + 1):
+                        result = next(retriever)
+                except BaseException:
+                    # The engine fences retained-source cleanup internally;
+                    # fence any remaining load-stream work before outer-state
+                    # cleanup as well.
+                    self._synchronize_dsa_cold_dense_load()
+                    load_stream_fenced = True
+                    raise
             finally:
                 retriever.close()
             finish_stage("layer_submit_host_ms", layer_submit_started)
             result_check_started = stage_start()
-            source_owners = self._dense_load_source_owners(retrieve_state)
             if result is None or int(result.sum().item()) != plan["token_count"]:
                 raise RuntimeError("Cold compact indexer retrieve was incomplete")
+            if plan["token_count"] and not (
+                any(retrieve_state.cached_memory_objs_indexer)
+                or any(retrieve_state.cached_tensors_indexer)
+            ):
+                raise RuntimeError(
+                    "Cold compact indexer retrieve did not retain its sources"
+                )
             finish_stage("result_check_ms", result_check_started)
             record = getattr(
                 self.lmcache_engine.gpu_connector,
@@ -6622,16 +6647,19 @@ class LMCacheConnectorV1Impl:
             )
             finish_stage("readiness_record_ms", readiness_started)
         except BaseException:
-            if not source_owners:
-                source_owners = self._dense_load_source_owners(retrieve_state)
-            self._synchronize_dsa_cold_dense_load(producer_stream)
+            if not load_stream_fenced:
+                self._synchronize_dsa_cold_dense_load(producer_stream)
             self._release_dense_load_source_owners(
-                source_owners,
+                prefetch_owners,
                 self.lmcache_engine,
                 synchronize=False,
             )
             raise
-        plan["indexer_source_owners"] = source_owners
+        self._release_dense_load_source_owners(
+            prefetch_owners,
+            self.lmcache_engine,
+            synchronize=False,
+        )
         return result, readiness, cold_start_perf_now() - started, queue_ms
 
     def synchronize_staged_sfa_capture_unsafe_loads(self) -> None:
@@ -6841,6 +6869,8 @@ class LMCacheConnectorV1Impl:
                 # The stream is already fenced. Release both adopted and
                 # not-yet-adopted indexer owners exactly once, without a
                 # redundant second device synchronization.
+                state.dense_load_readiness = None
+                state.dense_load_readiness_consumed = False
                 self._release_dense_load_source_owners(
                     combined_owners,
                     self.lmcache_engine,

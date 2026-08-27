@@ -976,6 +976,49 @@ def test_dense_shared_cache_adoption_is_capability_gated():
     assert caches["cached_chunk_ptrs_npu"][0].tolist() == [101]
 
 
+def test_failed_retained_dense_cleanup_fences_before_source_release():
+    calls = []
+    owner = SimpleNamespace(
+        is_pinned=True,
+        unpin=lambda: calls.append("unpin"),
+        is_valid=lambda: True,
+        ref_count_down=lambda: calls.append("release"),
+    )
+    engine = object.__new__(LMCacheEngine)
+    engine.gpu_connector = SimpleNamespace(
+        synchronize_dense_load_stream=lambda: calls.append("sync")
+    )
+
+    engine._release_retained_dense_retrieve_objs(
+        [owner],
+        unpin=True,
+        kwargs={"_retain_shared_dense_cache": True},
+    )
+
+    assert calls == ["sync", "unpin", "release"]
+
+
+def test_failed_retained_dense_cleanup_without_sync_preserves_source():
+    calls = []
+    owner = SimpleNamespace(
+        is_pinned=True,
+        unpin=lambda: calls.append("unpin"),
+        is_valid=lambda: True,
+        ref_count_down=lambda: calls.append("release"),
+    )
+    engine = object.__new__(LMCacheEngine)
+    engine.gpu_connector = SimpleNamespace()
+
+    with pytest.raises(RuntimeError, match="requires load-stream sync"):
+        engine._release_retained_dense_retrieve_objs(
+            [owner],
+            unpin=True,
+            kwargs={"_retain_shared_dense_cache": True},
+        )
+
+    assert calls == []
+
+
 class _FakeLayerwiseStorageManager:
     def __init__(
         self,
@@ -2192,9 +2235,10 @@ class _FakeLocalCPUBackend:
 
 
 class _FakeResolvableMemoryObj:
-    def __init__(self):
+    def __init__(self, events=None):
         self.is_pinned = False
         self.ref_count_down_count = 0
+        self.events = events
 
     def is_valid(self):
         return self.ref_count_down_count == 0
@@ -2203,9 +2247,13 @@ class _FakeResolvableMemoryObj:
         self.is_pinned = True
 
     def unpin(self):
+        if self.events is not None:
+            self.events.append("unpin")
         self.is_pinned = False
 
     def ref_count_down(self):
+        if self.events is not None:
+            self.events.append("release")
         self.ref_count_down_count += 1
 
 
@@ -2220,9 +2268,14 @@ def noop_pin_monitor(monkeypatch):
 
 
 class _FakeLayerwiseGPUConnector:
-    def __init__(self):
+    def __init__(self, events=None):
         self.close_count = 0
         self.sent = []
+        self.events = events
+
+    def synchronize_dense_load_stream(self):
+        if self.events is not None:
+            self.events.append("sync")
 
     def batched_to_gpu(self, starts, ends, **kwargs):
         try:
@@ -2235,24 +2288,28 @@ class _FakeLayerwiseGPUConnector:
 
 
 class _FakePassiveSharedView:
-    def __init__(self):
+    def __init__(self, events=None):
         self.ref_count_down_count = 0
+        self.events = events
 
     def is_valid(self):
         return self.ref_count_down_count == 0
 
     def ref_count_down(self):
+        if self.events is not None:
+            self.events.append("release")
         self.ref_count_down_count += 1
 
 
 class _FakePassiveSharedAllocator:
-    def __init__(self):
+    def __init__(self, events=None):
         self.views = []
         self.shm_name = "/lmcache-test"
         self.slab_size = 4096
+        self.events = events
 
     def create_view(self, *args, **kwargs):
-        view = _FakePassiveSharedView()
+        view = _FakePassiveSharedView(self.events)
         self.views.append(view)
         return view
 
@@ -2270,6 +2327,7 @@ def _make_passive_shared_retrieve_engine(
     requests: tuple[tuple[str, int], ...] = (("req-1", 0),),
 ) -> LMCacheEngine:
     engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace()
     engine.gpu_connector = _FakeLayerwiseGPUConnector()
     engine.num_layers = num_layers
     engine.shared_cpu_cache_generation = 9
@@ -2309,9 +2367,16 @@ def _make_passive_shared_retriever(
     req_id: str = "req-1",
     request_ordinal: int = 0,
     kv_group: int = 0,
+    retain: bool = False,
 ):
     ret_mask = torch.zeros(4, dtype=torch.bool)
     keys_by_layer = _make_key().split_layers(engine.num_layers)
+    kwargs = {
+        "shared_cpu_phase": "dense_prefix",
+        "shared_cpu_request_ordinal": request_ordinal,
+    }
+    if retain:
+        kwargs["_retain_shared_dense_cache"] = True
     retriever = engine._retrieve_layer_shared_passive(
         starts_all=[0],
         ends_all=[4],
@@ -2320,10 +2385,7 @@ def _make_passive_shared_retriever(
         monitor_req_id=123,
         req_id=req_id,
         kv_group=kv_group,
-        kwargs={
-            "shared_cpu_phase": "dense_prefix",
-            "shared_cpu_request_ordinal": request_ordinal,
-        },
+        kwargs=kwargs,
     )
     return retriever, ret_mask
 
@@ -5169,6 +5231,31 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
         next(retriever)
     assert [mem.ref_count_down_count for mem in mem_objs] == [1, 1]
 
+    events = []
+    mem_objs = [_FakeResolvableMemoryObj(events) for _ in range(2)]
+    engine.gpu_connector = _FakeLayerwiseGPUConnector(events)
+    engine._adopt_dense_shared_retrieve_cache = lambda **_kwargs: False
+    with pytest.raises(RuntimeError, match="retention failed"):
+        list(
+            engine._retrieve_layer_shared_rank0(
+                starts=[0],
+                ends=[4],
+                keys_layer_major=keys_by_layer,
+                chunk_locations_layer_major=[[chunk_location], [chunk_location]],
+                location=chunk_location,
+                ret_mask=ret_mask,
+                monitor_req_id=123,
+                req_id="req-retain-fail",
+                kv_group=kv_group,
+                kwargs={
+                    "shared_cpu_phase": "dense_prefix",
+                    "_retain_shared_dense_cache": True,
+                },
+            )
+        )
+    assert events[0] == "sync"
+    assert events.count("unpin") == events.count("release") == 2
+
 
 @pytest.mark.parametrize("kv_group", [0, 1])
 def test_shared_dense_passive_retriever_releases_before_result_tail(
@@ -5209,6 +5296,23 @@ def test_shared_dense_passive_retriever_releases_before_result_tail(
     ] == [1, 1]
     with pytest.raises(StopIteration):
         next(retriever)
+    events = []
+    failure_engine = _make_passive_shared_retrieve_engine(kv_group=kv_group)
+    failure_engine.gpu_connector = _FakeLayerwiseGPUConnector(events)
+    failure_engine.shared_cpu_cache_passive_allocator = (
+        _FakePassiveSharedAllocator(events)
+    )
+    failure_engine._adopt_dense_shared_retrieve_cache = lambda **_kwargs: False
+    with pytest.raises(RuntimeError, match="retention failed"):
+        list(
+            _make_passive_shared_retriever(
+                failure_engine,
+                kv_group=kv_group,
+                retain=True,
+            )[0]
+        )
+    assert events[0] == "sync"
+    assert events.count("release") == 2
 
 
 def test_shared_dense_passive_compact_batch_preserves_layerwise_consumption(
