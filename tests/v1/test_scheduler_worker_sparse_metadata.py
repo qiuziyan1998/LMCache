@@ -493,6 +493,25 @@ def test_live_split_does_not_require_decoder_cold_load() -> None:
     assert request.kv_transfer_params["request_live_split"] is True
 
 
+@pytest.mark.parametrize("compact", [False, True])
+def test_request_finished_delays_only_compact_block_release(compact: bool) -> None:
+    impl = _make_scheduler_impl()
+    impl.use_layerwise = False
+    impl.async_loading = False
+    impl._release_request_lookup_pins = MagicMock()
+    impl._drop_worker_retrieve_state = MagicMock()
+    request = SimpleNamespace(
+        request_id="finished",
+        status=adapter_module.RequestStatus.FINISHED_STOPPED,
+        kv_transfer_params=None,
+        dsa_compact_allocated=compact,
+    )
+
+    delay_free, _ = impl.request_finished(request, [])
+
+    assert delay_free is compact
+
+
 def test_live_split_honors_shared_cpu_flag_from_extra_config() -> None:
     impl = _make_scheduler_impl()
     impl.config.dsa_two_groups = True

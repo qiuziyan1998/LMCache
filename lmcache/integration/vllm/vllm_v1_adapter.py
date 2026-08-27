@@ -4155,8 +4155,14 @@ class LMCacheConnectorV1Impl:
         self,
         req_ids: set[str],
     ) -> set[str]:
+        states = getattr(self, "_worker_retrieve_state", {})
+        finished_sending = {
+            req_id
+            for req_id in req_ids
+            if getattr(states.get(req_id), "_dsa_cold_prune_protected", False)
+        }
         self._release_finished_worker_requests(req_ids)
-        return set()
+        return finished_sending
 
     def _complete_worker_save_step(self) -> None:
         self._wait_for_save_done = True
@@ -9336,6 +9342,7 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        aborted_cold: set[str] = set()
         live_pending = getattr(self, "_dsa_live_split_pending", None)
         if live_pending and finished_req_ids:
             for req_id in finished_req_ids.intersection(live_pending):
@@ -9360,6 +9367,7 @@ class LMCacheConnectorV1Impl:
                     self._dsa_cold_aborted_req_ids = aborted_ids
                 aborted_ids.update(aborted_cold)
         releasable_req_ids = set(finished_req_ids)
+        releasable_req_ids -= aborted_cold
         if releasable_req_ids and not getattr(self, "_wait_for_save_done", True):
             connector_metadata = self._parent._get_connector_metadata()
             assert isinstance(connector_metadata, LMCacheConnectorMetadata)
@@ -10837,7 +10845,7 @@ class LMCacheConnectorV1Impl:
                     request_tracker.num_lmcache_cached_tokens
                 )
 
-        return False, return_params
+        return bool(getattr(request, "dsa_compact_allocated", False)), return_params
 
     @_lmcache_nvtx_annotate
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:

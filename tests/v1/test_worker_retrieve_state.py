@@ -1947,6 +1947,56 @@ class TestWorkerRetrieveState:
 
         engine.release_shared_cpu_sparse_request.assert_called_once_with("req-1")
 
+    def test_compact_finish_reports_sending_after_exact_readiness_cleanup(self):
+        readiness = object()
+        connector = SimpleNamespace(
+            synchronize_dense_load_readiness=MagicMock()
+        )
+        engine = SimpleNamespace(
+            gpu_connector=connector,
+            release_shared_cpu_sparse_request=MagicMock(),
+            lookup_unpin=MagicMock(),
+        )
+        impl = _make_impl()
+        impl._manager = SimpleNamespace(lmcache_engine=engine)
+        state = WorkerRetrieveState(
+            req_id="compact",
+            dense_load_readiness=readiness,
+        )
+        state._dsa_cold_prune_protected = True
+        impl._worker_retrieve_state = {"compact": state}
+
+        assert impl._finalize_worker_requests_after_store({"compact"}) == {
+            "compact"
+        }
+
+        connector.synchronize_dense_load_readiness.assert_called_once_with(readiness)
+        assert impl._worker_retrieve_state == {}
+
+    def test_compact_finish_sync_failure_retains_state_and_reports_nothing(self):
+        readiness = object()
+        impl = _make_impl()
+        state = WorkerRetrieveState(
+            req_id="compact",
+            dense_load_readiness=readiness,
+        )
+        state._dsa_cold_prune_protected = True
+        impl._worker_retrieve_state = {"compact": state}
+        impl._manager = SimpleNamespace(
+            lmcache_engine=SimpleNamespace(
+                gpu_connector=SimpleNamespace(
+                    synchronize_dense_load_readiness=MagicMock(
+                        side_effect=RuntimeError("sync failed")
+                    )
+                )
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="sync failed"):
+            impl._finalize_worker_requests_after_store({"compact"})
+
+        assert impl._worker_retrieve_state["compact"] is state
+
     def test_get_finished_releases_worker_state_after_save(self):
         impl = _make_impl()
         impl._wait_for_save_done = True
@@ -1962,6 +2012,27 @@ class TestWorkerRetrieveState:
             call(set()),
             call({"req-1"}),
         ]
+
+    def test_get_finished_keeps_active_aborted_cold_load_owned_by_drain(self):
+        impl = _make_impl()
+        impl._wait_for_save_done = True
+        impl._finalize_worker_requests_after_store = MagicMock(return_value=set())
+        impl._dsa_cold_load_futures = {
+            "compact": (
+                1,
+                Future(),
+                object(),
+                set(),
+                0.0,
+                Future(),
+            )
+        }
+
+        assert impl.get_finished({"compact"}) == (None, None)
+
+        impl._finalize_worker_requests_after_store.assert_called_once_with(set())
+        assert impl._dsa_cold_aborted_req_ids == {"compact"}
+        assert "compact" in impl._dsa_cold_load_futures
 
     def test_get_finished_defers_cleanup_until_wait_for_save(self):
         request = SimpleNamespace(
