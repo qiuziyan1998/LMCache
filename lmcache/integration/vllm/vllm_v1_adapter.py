@@ -9116,7 +9116,17 @@ class LMCacheConnectorV1Impl:
                     vllm_cached_tokens=0,
                     lmcache_cached_tokens=lmcache_cached_for_sparse,
                     can_load=lmcache_cached_for_sparse > 0,
-                    dsa_committed_end=committed_end,
+                    # Stage the scratch-gated frontier, not the raw chunk-
+                    # aligned value: decode-window saves advance the
+                    # committed end one window (256) at a time, and a
+                    # frontier inside (0, dsa_scratch_capacity) would alias
+                    # live KV positions in the staged remap kernel's unified
+                    # index space (the runner treats it as fatal). Gating to
+                    # 0 keeps those steps on a legal boundary=0 staged graph
+                    # (absolute reads only, empty retrieve) until the
+                    # committed end crosses the scratch reservation; saves
+                    # continue normally meanwhile.
+                    dsa_committed_end=dsa_release_frontier,
                     dsa_remap_frontier=dsa_remap_frontier,
                     dsa_scratch_capacity=self._dsa_scratch_capacity,
                 )
