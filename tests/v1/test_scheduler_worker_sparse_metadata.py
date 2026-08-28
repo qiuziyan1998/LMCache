@@ -632,6 +632,91 @@ def test_dsa_cold_compact_worker_retains_sources_when_stream_sync_fails() -> Non
     impl._release_shared_worker_retrieve_state.assert_not_called()
 
 
+def test_dsa_cold_compact_worker_syncs_before_retrievers_release_sources(
+) -> None:
+    events: list[str] = []
+
+    class FakeRetriever:
+        def __init__(self, name: str, values: list[object]) -> None:
+            self.name = name
+            self.values = iter(values)
+
+        def __next__(self):
+            events.append(f"{self.name}:next")
+            return next(self.values)
+
+        def send(self, _value):
+            events.append(f"{self.name}:send")
+            return next(self.values)
+
+        def close(self) -> None:
+            events.append(f"{self.name}:close")
+
+    completed = torch.tensor([True])
+    latent_retriever = FakeRetriever("latent", [completed, completed])
+    indexer_retriever = FakeRetriever(
+        "indexer", [None, None, completed]
+    )
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    impl.num_layers = 1
+    impl.device = torch.device("cpu")
+    impl._num_layers_for_group = lambda _kv_group: 1
+    impl._kvcaches_for_group = lambda _kv_group: []
+    impl._sparse_retrieve_kwargs = MagicMock(return_value=({}, None, None))
+    impl._synchronize_dsa_cold_dense_load = lambda: events.append("sync")
+    impl._refresh_prepared_sparse_sources = lambda state, _token_count: (
+        state.prepared_sparse_sources.__setitem__(0, object())
+    )
+    impl._release_unadopted_shared_request_objects = MagicMock()
+    impl._release_shared_worker_retrieve_state = MagicMock()
+    impl.lmcache_engine = SimpleNamespace(
+        retrieve_layer_head_token_wise=MagicMock(
+            return_value=latent_retriever
+        ),
+        retrieve_layer=MagicMock(return_value=indexer_retriever),
+    )
+    request = SimpleNamespace(
+        req_id="cold-source-lifetime",
+        load_spec=SimpleNamespace(lmcache_cached_tokens=1),
+        token_ids=[1],
+        indexer_slot_mapping=[torch.tensor([0])],
+        request_configs=None,
+    )
+
+    state = impl._run_dsa_cold_compact_load(request, None)
+
+    assert state.req_id == request.req_id
+    assert events == [
+        "latent:next",
+        "indexer:next",
+        "indexer:next",
+        "latent:send",
+        "sync",
+        "indexer:next",
+        "latent:close",
+        "indexer:close",
+    ]
+    impl._release_unadopted_shared_request_objects.assert_not_called()
+    impl._release_shared_worker_retrieve_state.assert_not_called()
+
+
+def test_dsa_cold_collective_fence_waits_in_submission_order() -> None:
+    events: list[str] = []
+    first = MagicMock()
+    first.result.side_effect = lambda: events.append("first")
+    second = MagicMock()
+    second.result.side_effect = lambda: events.append("second")
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    impl._dsa_cold_load_futures = {
+        "first": (1, first, object(), set(), 0.0),
+        "second": (1, second, object(), set(), 0.0),
+    }
+
+    impl._wait_for_dsa_cold_collectives_before_foreground()
+
+    assert events == ["first", "second"]
+
+
 def test_dsa_cold_compact_finished_signal_waits_for_future(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
