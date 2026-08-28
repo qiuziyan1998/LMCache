@@ -1201,6 +1201,38 @@ def test_partial_layer_page_is_a_complete_layerwise_chunk() -> None:
     )
 
 
+def test_layer_page_store_miss_skips_legacy_lookup() -> None:
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        enable_shared_cpu_cache=True,
+        use_layerwise=True,
+        remote_url="mooncakestore://test",
+        extra_config={
+            "save_only_first_rank": True,
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+        },
+    )
+    engine.retrieve_locations = ["RemoteBackend"]
+    keys = _make_key().split_layers(4)
+    engine.storage_manager = _FakeLayerwiseStorageManager(keys)
+    engine.storage_manager.batched_contains = lambda *_args, **_kwargs: pytest.fail(
+        "page-store preflight used the legacy lookup"
+    )
+
+    assert (
+        engine._layerwise_chunk_location_if_fully_stored(
+            keys,
+            req_id="page-miss",
+            kv_group=0,
+            start=0,
+            end=17,
+            allow_legacy_fallback=False,
+        )
+        is None
+    )
+
+
 class _FakeLookupTokenDatabase:
     def process_tokens(
         self,

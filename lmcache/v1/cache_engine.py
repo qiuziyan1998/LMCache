@@ -1564,6 +1564,7 @@ class LMCacheEngine:
         start: int,
         end: int,
         repair_partial: bool = False,
+        allow_legacy_fallback: bool = True,
     ) -> Optional[str]:
         """Return the backend location only when all layers already exist."""
         assert self.storage_manager is not None
@@ -1579,6 +1580,8 @@ class LMCacheEngine:
             )
             if page_hits == 1 and len(page_mapping) == 1:
                 return next(iter(page_mapping))
+            if not allow_legacy_fallback:
+                return None
         hit_layers, block_mapping = self.storage_manager.batched_contains(
             keys_multi_layer,
             self.retrieve_locations,
@@ -1698,6 +1701,7 @@ class LMCacheEngine:
         kv_group: int,
         start: int,
         end: int,
+        allow_legacy_fallback: bool = True,
     ) -> bool:
         return (
             self._layerwise_chunk_location_if_fully_stored(
@@ -1707,6 +1711,7 @@ class LMCacheEngine:
                 start=start,
                 end=end,
                 repair_partial=True,
+                allow_legacy_fallback=allow_legacy_fallback,
             )
             is not None
         )
