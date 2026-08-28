@@ -551,6 +551,63 @@ def test_external_commit_retention_trace_identifies_layer_page_allocation_evicti
         PinMonitor.DestroyInstance()
 
 
+def test_capacity_reclaim_is_bounded_and_skips_pinned_pages() -> None:
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=8,
+        local_cpu=True,
+        lmcache_instance_id="bounded_capacity_reclaim",
+    )
+    PinMonitor.GetOrCreate(config)
+    allocator = TensorMemoryAllocator(torch.zeros(4 * 4096, dtype=torch.uint8))
+    backend = LocalCPUBackend(config=config, memory_allocator=allocator)
+    keys = [_page_key(0, 0), _page_key(1, 0)]
+    pages = backend.batched_allocate_layer_pages(
+        [torch.Size([8])],
+        [torch.bfloat16],
+        batch_size=2,
+        num_layers=2,
+        fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+        valid_tokens=8,
+        full_tokens=8,
+        eviction=False,
+    )
+    assert pages is not None
+    backend.batched_submit_layer_pages(keys, pages)
+    for page in pages:
+        page.ref_count_down()
+    assert pages[1].pin()
+
+    try:
+        assert not backend.reclaim_evictable_capacity(
+            2 * 4096,
+            min_free_bytes=2 * 4096,
+            min_free_ratio=0,
+            num_layers=2,
+            cause="test_capacity_reclaim",
+        )
+        assert backend.get_keys() == keys
+
+        pages[1].unpin()
+        assert backend.reclaim_evictable_capacity(
+            4096,
+            min_free_bytes=2 * 4096,
+            min_free_ratio=0,
+            num_layers=2,
+            cause="test_capacity_reclaim",
+        )
+        assert backend.get_keys() == keys[1:]
+        assert backend.get_allocator_capacity_bytes()[0] == 3 * 4096
+    finally:
+        if pages[1].metadata.pin_count:
+            pages[1].unpin()
+        for key in backend.get_keys():
+            backend.remove(key)
+        allocator.close()
+        LMCStatsMonitor.unregister_all_metrics()
+        LMCStatsMonitor.DestroyInstance()
+        PinMonitor.DestroyInstance()
+
+
 def test_external_commit_rejects_wrong_kind_existing_winner(
     page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
 ) -> None:

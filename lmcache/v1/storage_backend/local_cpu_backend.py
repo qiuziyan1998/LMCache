@@ -27,7 +27,7 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
-from lmcache.v1.cold_start_perf import cold_start_perf_enabled
+from lmcache.v1.cold_start_perf import cold_start_perf_enabled, cold_start_perf_log
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     LayerPageMemoryObj,
@@ -1453,38 +1453,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
             getattr(self.config, "blocking_timeout_secs", 60)
         )
         while pages is None and self.use_hot:
-            keys: list[CacheEngineKey] = []
             with self.cpu_lock:
-                candidates = self.cache_policy.get_evict_candidates(
-                    self.hot_cache, num_candidates=1
+                keys, objects = self._pop_layer_page_evict_candidate_locked(
+                    num_layers,
+                    cause="layer_page_allocate_evict",
                 )
-                if candidates:
-                    key = candidates[0]
-                    keys = (
-                        [key]
-                        if isinstance(self.hot_cache.get(key), LayerPageMemoryObj)
-                        or not isinstance(key, LayerCacheEngineKey)
-                        else [
-                            item
-                            for item in key.split_layers(num_layers)
-                            if item in self.hot_cache
-                        ]
-                    )
-                    objects = []
-                    for item in keys:
-                        memory_obj = self.hot_cache.pop(item)
-                        self._record_external_retention_mutation_locked(
-                            item,
-                            cause="layer_page_allocate_evict",
-                            operation="remove",
-                            old_obj=memory_obj,
-                            new_obj=None,
-                        )
-                        objects.append(memory_obj)
-                    for item in keys:
-                        self.cache_policy.update_on_force_evict(item)
-                else:
-                    objects = []
             for memory_obj in objects:
                 memory_obj.ref_count_down()
             evicted += len(keys)
@@ -1614,6 +1587,106 @@ class LocalCPUBackend(AllocatorBackendInterface):
         ):
             raise RuntimeError("allocator returned invalid capacity bytes")
         return free_bytes, heap_bytes
+
+    def reclaim_evictable_capacity(
+        self,
+        required_bytes: int,
+        *,
+        min_free_bytes: int,
+        min_free_ratio: float,
+        num_layers: int,
+        cause: str,
+    ) -> bool:
+        """Evict enough eligible entries to accommodate one allocation.
+
+        The method scans once and never waits or allocates. If the pressure
+        snapshot proves all eligible entries insufficient, it changes nothing.
+
+        Args:
+            required_bytes: Incoming allocation size to accommodate.
+            min_free_bytes: Absolute free-capacity floor after allocation.
+            min_free_ratio: Heap-relative free-capacity floor after allocation.
+            num_layers: Layer count used to expand legacy layerwise keys.
+            cause: Retention-trace cause recorded for removed entries.
+
+        Returns:
+            Whether the allocator reached the required free-capacity target.
+
+        Raises:
+            ValueError: If an argument is invalid.
+        """
+
+        if (
+            required_bytes < 0
+            or min_free_bytes < 0
+            or not 0 <= min_free_ratio <= 1
+            or num_layers <= 0
+            or not cause
+        ):
+            raise ValueError("invalid LocalCPU capacity-reclaim request")
+        started = time.perf_counter() if cold_start_perf_enabled() else None
+        free_before, heap_bytes = self.get_allocator_capacity_bytes()
+        target_free_bytes = required_bytes + max(
+            min_free_bytes,
+            int(heap_bytes * min_free_ratio),
+        )
+        evictable_bytes = 0
+        evicted_bytes = 0
+        evicted_keys = 0
+        removed: list[MemoryObj] = []
+        if free_before < target_free_bytes:
+            with self.cpu_lock:
+                if self.use_hot:
+                    evictable_bytes = sum(
+                        memory_obj.get_physical_size()
+                        for memory_obj in self.hot_cache.values()
+                        if memory_obj.can_evict
+                    )
+                if free_before + evictable_bytes >= target_free_bytes:
+                    while free_before + evicted_bytes < target_free_bytes:
+                        keys, objects = self._pop_layer_page_evict_candidate_locked(
+                            num_layers,
+                            cause=cause,
+                        )
+                        if not objects:
+                            break
+                        evicted_keys += len(keys)
+                        evicted_bytes += sum(
+                            memory_obj.get_physical_size() for memory_obj in objects
+                        )
+                        removed.extend(objects)
+
+        for memory_obj in removed:
+            memory_obj.ref_count_down()
+        free_after = (
+            self.get_allocator_capacity_bytes()[0] if removed else free_before
+        )
+        sufficient = free_after >= target_free_bytes
+        self.stats_monitor.update_local_cpu_evict_metrics(evicted_keys)
+        if not sufficient:
+            self.stats_monitor.update_local_cpu_evict_failed_count(1)
+        if started is not None:
+            cold_start_perf_log(
+                logger,
+                cause,
+                started=started,
+                target_free_bytes=target_free_bytes,
+                free_before=free_before,
+                free_after=free_after,
+                evictable_bytes=evictable_bytes,
+                evicted_bytes=evicted_bytes,
+                evicted_keys=evicted_keys,
+                outcome=(
+                    "reclaimed"
+                    if sufficient and evicted_keys
+                    else "not_needed"
+                    if sufficient
+                    else "raced"
+                    if evicted_keys
+                    else "insufficient"
+                ),
+            )
+        return sufficient
 
     def close(self) -> None:
         if self.batched_msg_sender is not None:
@@ -1983,3 +2056,40 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     "Failed to notify controller of admitted layer page %s",
                     key,
                 )
+
+    def _pop_layer_page_evict_candidate_locked(
+        self,
+        num_layers: int,
+        *,
+        cause: str,
+    ) -> tuple[list[CacheEngineKey], list[MemoryObj]]:
+        candidates = self.cache_policy.get_evict_candidates(
+            self.hot_cache, num_candidates=1
+        )
+        if not candidates:
+            return [], []
+        key = candidates[0]
+        keys = (
+            [key]
+            if isinstance(self.hot_cache.get(key), LayerPageMemoryObj)
+            or not isinstance(key, LayerCacheEngineKey)
+            else [
+                item
+                for item in key.split_layers(num_layers)
+                if item in self.hot_cache
+            ]
+        )
+        objects = []
+        for item in keys:
+            memory_obj = self.hot_cache.pop(item)
+            self._record_external_retention_mutation_locked(
+                item,
+                cause=cause,
+                operation="remove",
+                old_obj=memory_obj,
+                new_obj=None,
+            )
+            objects.append(memory_obj)
+        for item in keys:
+            self.cache_policy.update_on_force_evict(item)
+        return keys, objects
