@@ -81,7 +81,7 @@ from lmcache.v1.mooncake_layout import (
 )
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.remote_fill.security import content_digest
-from lmcache.v1.remote_fill_diagnostics import log_remote_fill_validation_failure
+from lmcache.v1.remote_fill_diagnostics import log_remote_fill_diagnostic
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
     first_last_layer_keys,
@@ -2349,8 +2349,9 @@ class LMCacheEngine:
         required_store_end, destination_engine_epoch = hint
         plan = self._remote_fill_lookup_plans.get(lookup_id)
         if plan is None:
-            log_remote_fill_validation_failure(
+            log_remote_fill_diagnostic(
                 logger,
+                event="remote_fill_fallback",
                 code="RF-D-001",
                 stage="actual_load_admission",
                 action="PERSISTENT_FALLBACK_OR_RECOMPUTE",
@@ -6246,8 +6247,9 @@ class LMCacheEngine:
                     or self._remote_fill_local_full_hint(request_configs) is None
                 ):
                     raise
-                log_remote_fill_validation_failure(
+                log_remote_fill_diagnostic(
                     logger,
+                    event="remote_fill_materialization_failure",
                     code="RF-D-004",
                     stage="passive_materialization",
                     action="RECOMPUTE",
@@ -6299,8 +6301,9 @@ class LMCacheEngine:
                         details={"error": str(exc)},
                     )
                 )
-                log_remote_fill_validation_failure(
+                log_remote_fill_diagnostic(
                     logger,
+                    event="remote_fill_plan_validation_failure",
                     code="RF-D-003",
                     stage="retained_plan_validation",
                     action="RECOMPUTE",
@@ -6565,8 +6568,9 @@ class LMCacheEngine:
                 ):
                     raise
                 self.lookup_unpin(req_id)
-                log_remote_fill_validation_failure(
+                log_remote_fill_diagnostic(
                     logger,
+                    event="remote_fill_materialization_failure",
                     code="RF-D-004",
                     stage="rank0_materialization",
                     action="RECOMPUTE",
@@ -6879,8 +6883,9 @@ class LMCacheEngine:
                 except Exception as exc:
                     if lookup_id is not None:
                         self._release_lookup_pins(lookup_id)
-                    log_remote_fill_validation_failure(
+                    log_remote_fill_diagnostic(
                         logger,
+                        event="remote_fill_lookup_failure",
                         code="RF-D-002",
                         stage="paired_prefix_lookup",
                         action="RECOMPUTE",

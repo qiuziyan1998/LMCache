@@ -3,7 +3,9 @@
 
 # First Party
 from lmcache.v1.remote_fill_diagnostics import (
+    REMOTE_FILL_DIAGNOSTIC_MARKER,
     REMOTE_FILL_VALIDATION_MARKER,
+    log_remote_fill_diagnostic,
     log_remote_fill_validation_failure,
 )
 
@@ -89,6 +91,7 @@ from .transport import (
 __all__ = [
     "PROTOCOL_VERSION",
     "REMOTE_FILL_ENVELOPE_VERSION",
+    "REMOTE_FILL_DIAGNOSTIC_MARKER",
     "REMOTE_FILL_SERVICE_HEADER",
     "REMOTE_FILL_VALIDATION_MARKER",
     "AbortRequest",
@@ -147,6 +150,7 @@ __all__ = [
     "encode_request",
     "encode_response",
     "manifest_digest",
+    "log_remote_fill_diagnostic",
     "log_remote_fill_validation_failure",
     "request_payload_digest",
     "seal_descriptor",

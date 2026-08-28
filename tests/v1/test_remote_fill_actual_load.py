@@ -315,6 +315,8 @@ def test_group1_lookup_error_releases_group0_and_recomputes(caplog) -> None:
     assert [key.kv_group for key in keys] == [0]
     assert locations == ["RemoteBackend"]
     assert '"code":"RF-D-002"' in caplog.text
+    assert '"diagnostic_name":"decoder_paired_prefix_lookup_failure"' in caplog.text
+    assert '"event":"remote_fill_lookup_failure"' in caplog.text
     assert '"action":"RECOMPUTE"' in caplog.text
 
 
@@ -453,6 +455,8 @@ def test_local_full_hint_without_any_prefix_is_visible_and_recomputes(
     assert snapshot.local_prefix_missing_at_load_total == 1
     assert snapshot.unexpected_remote_get_total == 0
     assert '"code":"RF-D-001"' in caplog.text
+    assert '"diagnostic_name":"decoder_retained_prefix_missing"' in caplog.text
+    assert '"event":"remote_fill_fallback"' in caplog.text
     assert '"action":"PERSISTENT_FALLBACK_OR_RECOMPUTE"' in caplog.text
 
 
