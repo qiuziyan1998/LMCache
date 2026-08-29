@@ -73,7 +73,27 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl.load_specs = {}
     impl._requests_priority = {}
     impl._cold_perf_lookup_started = {}
+    impl.skip_last_n_tokens = 0
     return impl
+
+
+def _make_preempted_lookup_request(
+    req_id: str,
+    prompt_len: int,
+    output_tokens: list[int],
+) -> SimpleNamespace:
+    prompt = list(range(prompt_len))
+    return SimpleNamespace(
+        request_id=req_id,
+        status=adapter_module.RequestStatus.PREEMPTED,
+        priority=0,
+        prompt_token_ids=prompt,
+        num_prompt_tokens=prompt_len,
+        all_token_ids=prompt + output_tokens,
+        num_tokens=prompt_len + len(output_tokens),
+        num_output_tokens=len(output_tokens),
+        sampling_params=None,
+    )
 
 
 def _make_vllm_request(
@@ -510,6 +530,54 @@ def test_request_finished_delays_only_compact_block_release(compact: bool) -> No
     delay_free, _ = impl.request_finished(request, [])
 
     assert delay_free is compact
+
+
+def test_preempted_lookup_without_decode_cache_uses_prompt_boundary() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    request = _make_preempted_lookup_request(
+        "partial-tail-resume",
+        22_012,
+        [100_001, 100_002],
+    )
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = -1
+    lookup_client.lookup.return_value = len(request.prompt_token_ids)
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+
+    matched = impl.get_num_new_matched_tokens(request, 0)
+
+    assert matched == 22_012
+    assert lookup_client.lookup.call_args.args[0] == request.prompt_token_ids
+    load_spec = impl.load_specs[request.request_id]
+    assert load_spec.lmcache_cached_tokens == 22_012
+    assert load_spec.dsa_cold_compact_load
+    assert load_spec.dsa_committed_end == 22_012
+    assert load_spec.dsa_remap_frontier == 22_012
+    assert request.num_tokens - matched == 2
+
+
+def test_preempted_lookup_with_decode_cache_keeps_all_tokens() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.save_decode_cache = True
+    impl.config.min_retrieve_tokens = 0
+    request = _make_preempted_lookup_request(
+        "decode-cache-resume",
+        22_012,
+        [100_001, 100_002],
+    )
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = -1
+    lookup_client.lookup.return_value = len(request.all_token_ids)
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+
+    matched = impl.get_num_new_matched_tokens(request, 0)
+
+    assert matched == len(request.all_token_ids) - 1
+    assert lookup_client.lookup.call_args.args[0] == request.all_token_ids
 
 
 def test_live_split_honors_shared_cpu_flag_from_extra_config() -> None:

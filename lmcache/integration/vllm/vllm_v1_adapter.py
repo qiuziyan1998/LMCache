@@ -9543,6 +9543,23 @@ class LMCacheConnectorV1Impl:
             return 0
 
         req_id = request.request_id
+        resumed = getattr(request, "status", None) == RequestStatus.PREEMPTED
+        prompt_token_ids = getattr(request, "prompt_token_ids", None)
+        resumed_prompt_lookup = (
+            resumed
+            and not self.config.save_decode_cache
+            and prompt_token_ids is not None
+        )
+        request_prompt_tokens = len(prompt_token_ids or ())
+        lookup_query_tokens = (
+            request_prompt_tokens
+            if resumed_prompt_lookup
+            else request.num_tokens
+        )
+        lookup_query_tokens = max(
+            lookup_query_tokens - getattr(self, "skip_last_n_tokens", 0),
+            0,
+        )
         lookup_call_started = (
             cold_start_perf_now() if cold_start_perf_enabled() else 0.0
         )
@@ -9568,9 +9585,13 @@ class LMCacheConnectorV1Impl:
             )
             self._requests_priority[req_id] = getattr(request, "priority", 0)
 
-            # token_ids = request.prompt_token_ids
-            # all token ids covers the preemption case
-            token_ids = request.all_token_ids
+            # Decode output is not persisted when save_decode_cache is false.
+            # Including it after preemption changes the prompt-tail chunk key.
+            if resumed_prompt_lookup:
+                assert prompt_token_ids is not None
+                token_ids = prompt_token_ids
+            else:
+                token_ids = request.all_token_ids
 
             # If the request has multimodal hashes, apply them to the token ids
             mm_hashes, mm_positions = extract_mm_features(request)
@@ -9611,6 +9632,12 @@ class LMCacheConnectorV1Impl:
             started=lookup_started or None,
             req_id=req_id,
             prompt_tokens=request.num_tokens,
+            request_prompt_tokens=request_prompt_tokens,
+            lookup_query_tokens=lookup_query_tokens,
+            query_scope=(
+                "prompt" if resumed_prompt_lookup else "all_tokens"
+            ),
+            resumed=resumed,
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
             lookup_call_ms=round(
@@ -9625,11 +9652,22 @@ class LMCacheConnectorV1Impl:
         # blocks are cached, we need to recompute the last token.
         # This will be removed in the future if vLLM's scheduler provides
         # a better support for this case.
+        full_request_hit = num_external_hit_tokens == request.num_tokens
+        full_resumed_prompt_hit = (
+            resumed_prompt_lookup
+            and lookup_query_tokens == request_prompt_tokens
+            and num_external_hit_tokens == lookup_query_tokens
+        )
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
-        # In, full-prompt-hit case, we need to recompute the last token
-        if num_external_hit_tokens == request.num_tokens:
+        # A hit covering every logical token still recomputes the final token.
+        # A prompt-scoped resume has uncached output tokens after the hit and
+        # therefore keeps the complete prompt frontier.
+        if full_request_hit:
             need_to_allocate -= 1
+        compact_remap_frontier = num_external_hit_tokens - int(
+            full_request_hit
+        )
 
         # Check if hit tokens meet the minimum for retrieve
         # If below minimum, skip retrieve but still record hit tokens
@@ -9643,7 +9681,7 @@ class LMCacheConnectorV1Impl:
         dsa_cold_compact_load = (
             self.supports_dsa_cold_compact_load()
             and num_computed_tokens == 0
-            and num_external_hit_tokens == request.num_tokens
+            and (full_request_hit or full_resumed_prompt_hit)
             and need_to_allocate > 0
             and cdiv(num_external_hit_tokens, self._block_size)
             == cdiv(need_to_allocate, self._block_size)
@@ -9654,7 +9692,7 @@ class LMCacheConnectorV1Impl:
             # route (frontier_too_short FATAL). Such prompts take the normal
             # dense-prefix load path instead (short-context full-resident
             # policy).
-            and num_external_hit_tokens - 1 >= self._dsa_scratch_capacity
+            and compact_remap_frontier >= self._dsa_scratch_capacity
             # Short-context full-resident policy (方案 A): a prompt within the
             # threshold is served from resident main blocks, so compact KV load
             # is pure overhead. Skip it in favor of normal dense-prefix load.
@@ -9702,7 +9740,7 @@ class LMCacheConnectorV1Impl:
 
         if dsa_prefix_hit:
             remap_frontier = (
-                num_external_hit_tokens - 1
+                compact_remap_frontier
                 if dsa_cold_compact_load
                 else num_external_hit_tokens
             )
