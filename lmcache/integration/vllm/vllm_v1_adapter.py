@@ -882,7 +882,7 @@ class RequestTracker:
         vllm_cached_tokens: the number of tokens that are cached in vLLM
         is only used for preempted requests
         all_token_ids: the full token list from the vLLM request, used to
-        restore token_ids for preempted requests to ensure chunk keys match
+        rebuild the scheduled token history after preemption
         """
 
         if new_block_ids is not None and not isinstance(new_block_ids, (list, tuple)):
@@ -920,10 +920,9 @@ class RequestTracker:
             self.dsa_current_released_frontier = 0
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
 
-            # FIX: For preempted requests, restore token_ids from the full
-            # token list to ensure chunk keys match what was used during
-            # lookup. The lookup uses request.all_token_ids, so we need the
-            # same tokens for retrieve.
+            # Rebuild the scheduled token history after preemption. Resumed
+            # lookup stops at the prompt or a published decode-window frontier;
+            # new_token_ids may contain later output that vLLM will recompute.
             num_tokens_needed = max(
                 num_computed_tokens + len(new_token_ids),
                 lmcache_cached_tokens,
@@ -1887,6 +1886,9 @@ class LMCacheConnectorV1Impl:
         self._retrieve_stats_row_count = 0
         self._retrieve_stats_token_count = 0
         self._cold_perf_lookup_started: dict[str, float] = {}
+        # Freeze (query_end, scope, committed_end) while an async lookup is
+        # pending so a later decode-window completion cannot change its meaning.
+        self._resume_lookup_queries: dict[str, tuple[int, str, int]] = {}
         self._cold_perf_load_started: dict[str, tuple[float, int]] = {}
         self._cold_perf_dense_load_started: dict[str, tuple[float, int]] = {}
         self._cold_perf_dense_load_completed: dict[str, float] = {}
@@ -9545,19 +9547,34 @@ class LMCacheConnectorV1Impl:
         req_id = request.request_id
         resumed = getattr(request, "status", None) == RequestStatus.PREEMPTED
         prompt_token_ids = getattr(request, "prompt_token_ids", None)
-        resumed_prompt_lookup = (
-            resumed
-            and not self.config.save_decode_cache
-            and prompt_token_ids is not None
-        )
         request_prompt_tokens = len(prompt_token_ids or ())
-        lookup_query_tokens = (
-            request_prompt_tokens
-            if resumed_prompt_lookup
-            else request.num_tokens
-        )
+        query_end = request.num_tokens
+        query_scope = "all_tokens"
+        decode_committed_end = 0
+        if resumed and prompt_token_ids is not None:
+            query = self._resume_lookup_queries.get(req_id)
+            if query is None:
+                query_end = request_prompt_tokens
+                query_scope = "prompt"
+                tracker = self._request_trackers.get(req_id)
+                if tracker is not None:
+                    decode_committed_end = int(
+                        tracker.decode_window_save_committed_end
+                    )
+                    if (
+                        self._should_decode_window_save(tracker)
+                        and request_prompt_tokens
+                        < decode_committed_end
+                        <= request.num_tokens
+                        and decode_committed_end % self._lmcache_chunk_size == 0
+                    ):
+                        query_end = decode_committed_end
+                        query_scope = "decode_committed"
+                query = (query_end, query_scope, decode_committed_end)
+                self._resume_lookup_queries[req_id] = query
+            query_end, query_scope, decode_committed_end = query
         lookup_query_tokens = max(
-            lookup_query_tokens - getattr(self, "skip_last_n_tokens", 0),
+            query_end - getattr(self, "skip_last_n_tokens", 0),
             0,
         )
         lookup_call_started = (
@@ -9585,22 +9602,22 @@ class LMCacheConnectorV1Impl:
             )
             self._requests_priority[req_id] = getattr(request, "priority", 0)
 
-            # Decode output is not persisted when save_decode_cache is false.
-            # Including it after preemption changes the prompt-tail chunk key.
-            if resumed_prompt_lookup:
-                assert prompt_token_ids is not None
-                token_ids = prompt_token_ids
+            # A resume queries either the immutable prompt or the highest
+            # decode-window frontier published after worker-side completion.
+            # Output beyond that verified boundary is recomputed by vLLM.
+            if resumed and prompt_token_ids is not None:
+                token_ids = (
+                    prompt_token_ids
+                    if query_scope == "prompt"
+                    else request.all_token_ids[:query_end]
+                )
             else:
                 token_ids = request.all_token_ids
 
             # If the request has multimodal hashes, apply them to the token ids
             mm_hashes, mm_positions = extract_mm_features(request)
             if mm_hashes and mm_positions:
-                token_ids = _apply_mm_hashes(
-                    request.prompt_token_ids,
-                    mm_hashes,
-                    mm_positions,
-                )
+                token_ids = _apply_mm_hashes(token_ids, mm_hashes, mm_positions)
 
             request_configs = extract_request_configs(request.sampling_params)
             if self.skip_last_n_tokens > 0:
@@ -9632,11 +9649,11 @@ class LMCacheConnectorV1Impl:
             started=lookup_started or None,
             req_id=req_id,
             prompt_tokens=request.num_tokens,
+            request_tokens=request.num_tokens,
             request_prompt_tokens=request_prompt_tokens,
             lookup_query_tokens=lookup_query_tokens,
-            query_scope=(
-                "prompt" if resumed_prompt_lookup else "all_tokens"
-            ),
+            query_scope=query_scope,
+            decode_committed_end=decode_committed_end,
             resumed=resumed,
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
@@ -9653,16 +9670,17 @@ class LMCacheConnectorV1Impl:
         # This will be removed in the future if vLLM's scheduler provides
         # a better support for this case.
         full_request_hit = num_external_hit_tokens == request.num_tokens
-        full_resumed_prompt_hit = (
-            resumed_prompt_lookup
-            and lookup_query_tokens == request_prompt_tokens
-            and num_external_hit_tokens == lookup_query_tokens
+        full_resumed_query_hit = (
+            resumed
+            and query_scope != "all_tokens"
+            and lookup_query_tokens == query_end
+            and num_external_hit_tokens == query_end
         )
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
         # A hit covering every logical token still recomputes the final token.
-        # A prompt-scoped resume has uncached output tokens after the hit and
-        # therefore keeps the complete prompt frontier.
+        # A scoped resume has uncached output after its verified query and
+        # therefore keeps that complete frontier.
         if full_request_hit:
             need_to_allocate -= 1
         compact_remap_frontier = num_external_hit_tokens - int(
@@ -9681,7 +9699,7 @@ class LMCacheConnectorV1Impl:
         dsa_cold_compact_load = (
             self.supports_dsa_cold_compact_load()
             and num_computed_tokens == 0
-            and (full_request_hit or full_resumed_prompt_hit)
+            and (full_request_hit or full_resumed_query_hit)
             and need_to_allocate > 0
             and cdiv(num_external_hit_tokens, self._block_size)
             == cdiv(need_to_allocate, self._block_size)
@@ -9799,11 +9817,7 @@ class LMCacheConnectorV1Impl:
             )
         mm_hashes, mm_positions = extract_mm_features(request)
         if mm_hashes and mm_positions:
-            token_ids = _apply_mm_hashes(
-                request.prompt_token_ids[: len(token_ids)],
-                mm_hashes,
-                mm_positions,
-            )
+            token_ids = _apply_mm_hashes(token_ids, mm_hashes, mm_positions)
         indexer_slot_mapping = [
             _build_slot_mapping(
                 indexer_block_ids,
@@ -9908,6 +9922,7 @@ class LMCacheConnectorV1Impl:
         # Clear local status in lookup client when a new request is
         # successfully scheduled.
         assert self.lookup_client is not None
+        self._resume_lookup_queries.pop(request.request_id, None)
         self.lookup_client.clear_lookup_status(request.request_id)
 
         self._unfinished_requests[request.request_id] = request
@@ -10368,6 +10383,7 @@ class LMCacheConnectorV1Impl:
 
         for finished_req_id in scheduler_output.finished_req_ids:
             tracker = self._request_trackers.pop(finished_req_id, None)
+            self._resume_lookup_queries.pop(finished_req_id, None)
             self._dsa_kv_policy_states.pop(finished_req_id, None)
             if tracker is not None:
                 self._trace_decode_window_decision(
@@ -10823,6 +10839,7 @@ class LMCacheConnectorV1Impl:
         # This callback runs in the scheduler process. Worker-owned state is
         # released when the same request ID reaches worker-side get_finished().
         self._cold_perf_lookup_started.pop(request.request_id, None)
+        self._resume_lookup_queries.pop(request.request_id, None)
         self._dsa_kv_policy_states.pop(request.request_id, None)
         self._release_request_lookup_pins(request.request_id)
         # Layerwise save uses request-scoped generators. If request finishes

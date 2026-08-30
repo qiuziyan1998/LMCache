@@ -67,6 +67,7 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl._dsa_kv_policy_log = False
     impl._dsa_kv_policy_states = {}
     impl._cold_perf_lookup_started = {}
+    impl._resume_lookup_queries = {}
     impl._discard_partial_chunks = True
     impl._request_trackers = {}
     impl._unfinished_requests = {}
@@ -516,6 +517,7 @@ def test_live_split_does_not_require_decoder_cold_load() -> None:
 @pytest.mark.parametrize("compact", [False, True])
 def test_request_finished_delays_only_compact_block_release(compact: bool) -> None:
     impl = _make_scheduler_impl()
+    impl._resume_lookup_queries["finished"] = (22_016, "decode_committed", 22_016)
     impl.use_layerwise = False
     impl.async_loading = False
     impl._release_request_lookup_pins = MagicMock()
@@ -530,10 +532,12 @@ def test_request_finished_delays_only_compact_block_release(compact: bool) -> No
     delay_free, _ = impl.request_finished(request, [])
 
     assert delay_free is compact
+    assert "finished" not in impl._resume_lookup_queries
 
 
 def test_preempted_lookup_without_decode_cache_uses_prompt_boundary() -> None:
     impl = _make_scheduler_impl()
+    impl.config.save_decode_cache = False
     impl.config.enable_dsa_cold_compact_load = True
     impl.config.dsa_two_groups = True
     impl.config.enable_shared_cpu_cache = True
@@ -545,7 +549,11 @@ def test_preempted_lookup_without_decode_cache_uses_prompt_boundary() -> None:
     )
     lookup_client = MagicMock()
     lookup_client.lookup_cache.return_value = -1
-    lookup_client.lookup.return_value = len(request.prompt_token_ids)
+    lookup_client.lookup.side_effect = lambda tokens, **_: (
+        len(request.prompt_token_ids)
+        if len(tokens) == len(request.prompt_token_ids)
+        else 21_504
+    )
     impl._manager = SimpleNamespace(lookup_client=lookup_client)
 
     matched = impl.get_num_new_matched_tokens(request, 0)
@@ -560,9 +568,12 @@ def test_preempted_lookup_without_decode_cache_uses_prompt_boundary() -> None:
     assert request.num_tokens - matched == 2
 
 
-def test_preempted_lookup_with_decode_cache_keeps_all_tokens() -> None:
+def test_preempted_lookup_with_decode_cache_recomputes_output_suffix() -> None:
     impl = _make_scheduler_impl()
     impl.config.save_decode_cache = True
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
     impl.config.min_retrieve_tokens = 0
     request = _make_preempted_lookup_request(
         "decode-cache-resume",
@@ -571,13 +582,136 @@ def test_preempted_lookup_with_decode_cache_keeps_all_tokens() -> None:
     )
     lookup_client = MagicMock()
     lookup_client.lookup_cache.return_value = -1
-    lookup_client.lookup.return_value = len(request.all_token_ids)
+    lookup_client.lookup.side_effect = lambda tokens, **_: (
+        len(request.prompt_token_ids)
+        if len(tokens) == len(request.prompt_token_ids)
+        else 21_504
+    )
     impl._manager = SimpleNamespace(lookup_client=lookup_client)
 
     matched = impl.get_num_new_matched_tokens(request, 0)
 
-    assert matched == len(request.all_token_ids) - 1
-    assert lookup_client.lookup.call_args.args[0] == request.all_token_ids
+    assert impl.config.save_decode_cache
+    assert matched == len(request.prompt_token_ids)
+    assert lookup_client.lookup.call_args.args[0] == request.prompt_token_ids
+    assert impl.load_specs[request.request_id].dsa_cold_compact_load
+    assert request.num_tokens - matched == request.num_output_tokens
+
+
+def test_preempted_lookup_uses_published_decode_window() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    impl._decode_window_save_window_size = impl._lmcache_chunk_size
+    request = _make_preempted_lookup_request(
+        "decode-window-resume",
+        22_012,
+        [100_001, 100_002, 100_003, 100_004, 100_005, 100_006],
+    )
+    committed_end = 22_016
+    impl._request_trackers[request.request_id] = SimpleNamespace(
+        prompt_len=len(request.prompt_token_ids),
+        token_ids=list(request.all_token_ids),
+        decode_window_save_committed_end=committed_end,
+        disagg_spec=None,
+        skip_save=False,
+        request_configs=None,
+        is_decode_phase=True,
+    )
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = -1
+    lookup_client.lookup.side_effect = lambda tokens, **_: len(tokens)
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+
+    matched = impl.get_num_new_matched_tokens(request, 0)
+
+    assert matched == committed_end
+    assert (
+        lookup_client.lookup.call_args.args[0]
+        == request.all_token_ids[:committed_end]
+    )
+    assert impl.load_specs[request.request_id].dsa_cold_compact_load
+    assert request.num_tokens - matched == 2
+
+
+def test_preempted_lookup_never_claims_unverified_decode_window() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    impl._decode_window_save_window_size = impl._lmcache_chunk_size
+    request = _make_preempted_lookup_request(
+        "decode-window-short-hit",
+        22_012,
+        [100_001, 100_002, 100_003, 100_004, 100_005, 100_006],
+    )
+    committed_end = 22_016
+    actual_hit = 21_760
+    impl._request_trackers[request.request_id] = SimpleNamespace(
+        prompt_len=len(request.prompt_token_ids),
+        token_ids=list(request.all_token_ids),
+        decode_window_save_committed_end=committed_end,
+        disagg_spec=None,
+        skip_save=False,
+        request_configs=None,
+        is_decode_phase=True,
+    )
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = -1
+    lookup_client.lookup.return_value = actual_hit
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+
+    matched = impl.get_num_new_matched_tokens(request, 0)
+
+    assert matched == actual_hit
+    assert impl.load_specs[request.request_id].lmcache_cached_tokens == actual_hit
+    assert not getattr(
+        impl.load_specs[request.request_id], "dsa_cold_compact_load", False
+    )
+
+
+def test_preempted_async_lookup_freezes_decode_window_query() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    impl._decode_window_save_window_size = impl._lmcache_chunk_size
+    request = _make_preempted_lookup_request(
+        "decode-window-async",
+        22_012,
+        list(range(100_001, 100_263)),
+    )
+    initial_end = 22_016
+    tracker = SimpleNamespace(
+        prompt_len=len(request.prompt_token_ids),
+        token_ids=list(request.all_token_ids),
+        decode_window_save_committed_end=initial_end,
+        disagg_spec=None,
+        skip_save=False,
+        request_configs=None,
+        is_decode_phase=True,
+    )
+    impl._request_trackers[request.request_id] = tracker
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.side_effect = [-1, initial_end]
+    lookup_client.lookup.return_value = None
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+
+    assert impl.get_num_new_matched_tokens(request, 0) is None
+    tracker.decode_window_save_committed_end = 22_272
+    matched = impl.get_num_new_matched_tokens(request, 0)
+
+    assert matched == initial_end
+    lookup_client.lookup.assert_called_once()
+    assert lookup_client.lookup.call_args.args[0] == request.all_token_ids[:initial_end]
+    assert impl._resume_lookup_queries[request.request_id][:2] == (
+        initial_end,
+        "decode_committed",
+    )
 
 
 def test_live_split_honors_shared_cpu_flag_from_extra_config() -> None:
