@@ -115,7 +115,9 @@ def _key(worker_id: int = 3) -> CacheEngineKey:
 
 
 def _read(reader: RemoteExternalPageReader) -> None:
-    reader.get_pages([_key()], [[100]], [[16]], (object(),), "request")
+    reader.batched_get_external_pages(
+        [_key()], [[100]], [[16]], (object(),), "request"
+    )
 
 
 def test_reader_keeps_local_cpu_absent_and_normalizes_passive_keys(
@@ -156,7 +158,9 @@ def test_reader_keeps_local_cpu_absent_and_normalizes_passive_keys(
     reader = RemoteExternalPageReader(_config(), _metadata())
     owner = object()
     try:
-        reader.get_pages([_key()], [[100]], [[16]], (owner,), "request-1")
+        reader.batched_get_external_pages(
+            [_key()], [[100]], [[16]], (owner,), "request-1"
+        )
     finally:
         reader.close()
 
@@ -277,7 +281,9 @@ def test_reader_latches_unknown_direct_get_as_fatal(
     owner = object()
 
     with pytest.raises(NativeExternalPageTransferUnknownError):
-        reader.get_pages([_key()], [[100]], [[16]], (owner,), "request")
+        reader.batched_get_external_pages(
+            [_key()], [[100]], [[16]], (owner,), "request"
+        )
     with pytest.raises(RuntimeError, match="state=FATAL"):
         _read(reader)
     with pytest.raises(RuntimeError, match="fatal"):

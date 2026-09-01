@@ -2099,15 +2099,9 @@ class LMCacheEngine:
 
     def _persistent_direct_hbm_split_group_enabled(self) -> bool:
         """Return whether lookup must use persistent proof plus G0 overlay."""
-
-        return (
-            getattr(
-                self.config,
-                "dsa_group1_load_mode",
-                "p2p_preferred",
-            )
-            == "persistent_direct_hbm"
-        )
+        return getattr(
+            self.config, "dsa_group1_load_mode", "p2p_preferred"
+        ) == "persistent_direct_hbm"
 
     def _lookup_persistent_direct_hbm_prefix(
         self,
@@ -2124,19 +2118,7 @@ class LMCacheEngine:
         if "RemoteBackend" not in search_range:
             return 0
 
-        retained: dict[str, list[CacheEngineKey]] = defaultdict(list)
-
-        def release(mapping: dict[str, list[CacheEngineKey]]) -> None:
-            if not pin:
-                return
-            for location, keys in mapping.items():
-                if keys:
-                    self.storage_manager.batched_unpin(keys, [location])
-
-        def retain(mapping: dict[str, list[CacheEngineKey]]) -> None:
-            for location, keys in mapping.items():
-                retained[location].extend(keys)
-
+        local_mapping: dict[str, list[CacheEngineKey]] = {}
         try:
             pair_count, persistent_mapping = (
                 self.storage_manager.batched_contains_two_group_layer_pages(
@@ -2161,7 +2143,6 @@ class LMCacheEngine:
                 return 0
 
             local_count = 0
-            local_mapping: dict[str, list[CacheEngineKey]] = {}
             if "LocalCPUBackend" in search_range:
                 local_count, local_mapping = (
                     self.storage_manager.batched_contains_layer_pages(
@@ -2176,11 +2157,9 @@ class LMCacheEngine:
                     or set(local_mapping) - {"LocalCPUBackend"}
                     or len(local_keys) != local_count
                 ):
-                    release(local_mapping)
                     raise RuntimeError(
                         "Group-0 LocalCPU overlay returned invalid prefix mapping"
                     )
-                retain(local_mapping)
 
             plan = tuple(
                 _RemoteFillChunkLookupPlan(
@@ -2188,11 +2167,9 @@ class LMCacheEngine:
                     end=end,
                     chunk_hash=key.chunk_hash,
                     locations_by_group=(
-                        (
-                            "LocalCPUBackend"
-                            if index < local_count
-                            else "RemoteBackend"
-                        ),
+                        "LocalCPUBackend"
+                        if index < local_count
+                        else "RemoteBackend",
                         "RemoteBackend",
                     ),
                     page_by_group=(True, True),
@@ -2201,14 +2178,17 @@ class LMCacheEngine:
             )
             if pin:
                 assert lookup_id is not None
-                for location, keys in retained.items():
+                for location, keys in local_mapping.items():
                     self.lookup_pins[lookup_id][location].extend(keys)
                 self._remote_fill_lookup_plans[lookup_id] = _RemoteFillLookupPlan(
                     plan
                 )
             return plan[-1].end
         except Exception:
-            release(dict(retained))
+            if pin:
+                for location, keys in local_mapping.items():
+                    if keys:
+                        self.storage_manager.batched_unpin(keys, [location])
             raise
 
     def _lookup_remote_fill_two_group_prefix(

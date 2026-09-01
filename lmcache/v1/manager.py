@@ -37,33 +37,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _run_with_timeout(
-    callback: Callable[[], Any],
-    timeout: float,
-    thread_name: str,
-) -> tuple[bool, Optional[Exception]]:
-    """Run one shutdown callback without waiting past its timeout."""
-    done = threading.Event()
-    errors: list[Exception] = []
-
-    def run() -> None:
-        try:
-            callback()
-        except Exception as error:
-            errors.append(error)
-        finally:
-            done.set()
-
-    threading.Thread(
-        target=run,
-        daemon=True,
-        name=thread_name,
-    ).start()
-    if not done.wait(timeout):
-        return False, None
-    return True, errors[0] if errors else None
-
-
 class LMCacheManager:
     """
     LMCacheManager manages the lifecycle of LMCache internal components.
@@ -279,12 +252,23 @@ class LMCacheManager:
             """Helper to close a resource with timeout protection."""
             try:
                 logger.info("Closing %s...", name)
-                completed, error = _run_with_timeout(
-                    close_fn,
-                    timeout,
-                    f"lmcache-close-{name}",
-                )
-                if not completed:
+                done = threading.Event()
+                close_errors: list[Exception] = []
+
+                def run_close() -> None:
+                    try:
+                        close_fn()
+                    except Exception as error:
+                        close_errors.append(error)
+                    finally:
+                        done.set()
+
+                threading.Thread(
+                    target=run_close,
+                    daemon=True,
+                    name=f"lmcache-close-{name}",
+                ).start()
+                if not done.wait(timeout):
                     logger.error(
                         "%s close operation timed out after %ss. "
                         "Continuing with shutdown...",
@@ -292,8 +276,8 @@ class LMCacheManager:
                         timeout,
                     )
                     errors.append((name, "Timeout"))
-                elif error is not None:
-                    raise error
+                elif close_errors:
+                    raise close_errors[0]
                 else:
                     logger.info("%s closed successfully", name)
             except Exception as e:
