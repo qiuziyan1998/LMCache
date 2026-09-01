@@ -1632,8 +1632,19 @@ def test_mooncake_cancelled_get_drains_native_read(layout: str) -> None:
     assert memory_obj.ref_count == 0
 
 
-def test_mooncake_direct_external_get_registers_storage_and_validates_bytes() -> None:
+def test_mooncake_direct_external_get_registers_storage_and_validates_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls = []
+    events = []
+    monkeypatch.setattr(
+        mooncake_connector, "cold_start_perf_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        mooncake_connector,
+        "cold_start_perf_log",
+        lambda _logger, event, **fields: events.append((event, fields)),
+    )
 
     class _Store:
         def register_buffer(self, ptr, size):
@@ -1676,6 +1687,15 @@ def test_mooncake_direct_external_get_registers_storage_and_validates_bytes() ->
 
     assert [call[0] for call in calls].count("register") == 1
     assert [call[0] for call in calls].count("get") == 2
+    assert [event for event, _ in events] == [
+        "direct_npu_page_get",
+        "direct_npu_page_get",
+    ]
+    for _, fields in events:
+        assert fields["setup_ms"] >= 0
+        assert fields["lock_wait_ms"] >= 0
+        assert fields["transfer_ms"] >= 0
+        assert fields["native_thread_cpu_ms"] >= 0
 
 
 def test_mooncake_cancelled_direct_external_get_drains_native_read() -> None:

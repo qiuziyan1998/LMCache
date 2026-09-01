@@ -6846,17 +6846,34 @@ class LMCacheConnectorV1Impl:
         token_mask = plan["token_mask"]
         state = live_state or WorkerRetrieveState(req_id=request.req_id)
         started = cold_start_perf_now()
+        perf_enabled = cold_start_perf_enabled()
         indexer_readiness = None
+        predecessor_wait_ms = 0.0
+        latent_materialize_ms = 0.0
+        latent_materialize_thread_cpu_ms = 0.0
         try:
             if previous_latent_future is not None:
+                predecessor_wait_started = (
+                    cold_start_perf_now() if perf_enabled else 0.0
+                )
                 try:
                     previous_latent_future.result()
                 except BaseException:
                     # The predecessor's failure must not reorder or poison this
                     # request's fixed group-0 collective publication slot.
                     pass
+                if perf_enabled:
+                    predecessor_wait_ms = (
+                        cold_start_perf_now() - predecessor_wait_started
+                    ) * 1000
             retrieve_location = "LocalCPU"
             if live_state is None:
+                latent_materialize_started = (
+                    cold_start_perf_now() if perf_enabled else 0.0
+                )
+                latent_materialize_thread_cpu_started = (
+                    time.thread_time_ns() if perf_enabled else 0
+                )
                 empty_slots = torch.empty(0, dtype=torch.long)
                 retrieve_kwargs, _, _ = self._sparse_retrieve_kwargs(
                     request,
@@ -6896,6 +6913,14 @@ class LMCacheConnectorV1Impl:
                 retrieve_location = retrieve_kwargs.get(
                     "cached_retrieve_location"
                 )
+                if perf_enabled:
+                    latent_materialize_ms = (
+                        cold_start_perf_now() - latent_materialize_started
+                    ) * 1000
+                    latent_materialize_thread_cpu_ms = (
+                        time.thread_time_ns()
+                        - latent_materialize_thread_cpu_started
+                    ) / 1_000_000
             latent_shared_ready = plan["latent_shared_ready"]
             if not latent_shared_ready.done():
                 latent_shared_ready.set_result(None)
@@ -6943,6 +6968,12 @@ class LMCacheConnectorV1Impl:
                 remote_ms=round(indexer_remote_s * 1000, 3),
                 queue_ms=round(indexer_queue_ms, 3),
                 event_wait_ms=round(dependency_wait_ms, 3),
+                indexer_wait_ms=round(dependency_wait_ms, 3),
+                predecessor_wait_ms=round(predecessor_wait_ms, 3),
+                latent_materialize_ms=round(latent_materialize_ms, 3),
+                latent_materialize_thread_cpu_ms=round(
+                    latent_materialize_thread_cpu_ms, 3
+                ),
                 seal_ms=round((completed_at - seal_started) * 1000, 3),
                 **plan.get("indexer_perf", {}),
             )

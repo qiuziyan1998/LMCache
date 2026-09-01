@@ -6649,7 +6649,9 @@ class TestWorkerRetrieveState:
         )
         assert gate.done()
 
-    def test_live_split_indexer_success_still_loads_persistent_group0(self):
+    def test_live_split_indexer_success_still_loads_persistent_group0(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
         impl = _make_impl()
         impl.num_layers = 1
         impl.device = "cpu"
@@ -6687,10 +6689,27 @@ class TestWorkerRetrieveState:
         }
         dependency = Future()
         dependency.set_result((None, None, 0.0, 0.0))
+        previous = Future()
+        previous.set_result(None)
+        events = []
+        monkeypatch.setattr(adapter_mod, "cold_start_perf_enabled", lambda: True)
+        monkeypatch.setattr(
+            adapter_mod,
+            "cold_start_perf_log",
+            lambda _logger, event, **fields: events.append((event, fields)),
+        )
 
-        impl._run_dsa_cold_compact_load(plan, None, dependency)
+        impl._run_dsa_cold_compact_load(
+            plan, None, dependency, previous_latent_future=previous
+        )
 
         retrieve.assert_called_once()
+        event, fields = events[-1]
+        assert event == "cold_compact_retrieve_complete"
+        assert fields["predecessor_wait_ms"] >= 0
+        assert fields["latent_materialize_ms"] >= 0
+        assert fields["latent_materialize_thread_cpu_ms"] >= 0
+        assert fields["indexer_wait_ms"] == fields["event_wait_ms"]
 
     def test_live_split_failure_runs_one_persistent_group0_get(self):
         impl = _make_impl()

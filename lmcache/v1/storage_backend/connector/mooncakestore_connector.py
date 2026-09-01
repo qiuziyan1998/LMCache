@@ -8,7 +8,7 @@ from importlib import import_module
 import json
 import os
 from threading import Lock
-from time import perf_counter
+from time import perf_counter, thread_time_ns
 from typing import Any, Callable, List, Optional, cast, no_type_check
 
 # Third Party
@@ -2593,6 +2593,7 @@ class MooncakestoreConnector(RemoteConnector):
         req_id: str,
     ) -> None:
         """Read exact Mooncake pages directly into accelerator tensor storage."""
+        started = cold_start_perf_now() if cold_start_perf_enabled() else None
         native_unknown = getattr(self, "_external_native_unknown_error", None)
         if native_unknown is not None:
             raise native_unknown
@@ -2609,30 +2610,46 @@ class MooncakestoreConnector(RemoteConnector):
             for key, sizes in zip(keys, buffer_sizes, strict=True)
         ]
 
-        started = cold_start_perf_now() if cold_start_perf_enabled() else None
+        setup_ms = (
+            (cold_start_perf_now() - started) * 1000
+            if started is not None
+            else 0.0
+        )
 
         def get() -> Any:
             if owners and owners[0].device.type == "npu":
                 torch.npu.set_device(owners[0].device)
             self._register_external_owners(owners)
             transfer_started = cold_start_perf_now() if started is not None else None
+            thread_cpu_started = thread_time_ns() if started is not None else None
             statuses = self.store.batch_get_into_multi_buffers(
                 page_keys, buffer_ptrs, buffer_sizes
+            )
+            thread_cpu_ms = (
+                (thread_time_ns() - thread_cpu_started) / 1_000_000
+                if thread_cpu_started is not None
+                else 0.0
             )
             transfer_ms = (
                 (cold_start_perf_now() - transfer_started) * 1000
                 if transfer_started is not None
                 else 0.0
             )
-            return statuses, transfer_ms
+            return statuses, transfer_ms, thread_cpu_ms
 
+        lock_wait_started = cold_start_perf_now() if started is not None else None
         async with self._external_put_lock:
+            lock_wait_ms = (
+                (cold_start_perf_now() - lock_wait_started) * 1000
+                if lock_wait_started is not None
+                else 0.0
+            )
             hard_deadline = self._external_native_deadline()
             task = asyncio.create_task(asyncio.to_thread(get))
             self._inflight_put_tasks.add(task)
             task.add_done_callback(self._inflight_put_tasks.discard)
             try:
-                statuses, transfer_ms = await asyncio.wait_for(
+                statuses, transfer_ms, thread_cpu_ms = await asyncio.wait_for(
                     asyncio.shield(task), timeout=self.config.transfer_timeout
                 )
             except asyncio.CancelledError:
@@ -2698,7 +2715,10 @@ class MooncakestoreConnector(RemoteConnector):
                 pages=len(page_keys),
                 buffers=sum(map(len, buffer_ptrs)),
                 bytes=sum(map(sum, buffer_sizes)),
+                setup_ms=round(setup_ms, 3),
+                lock_wait_ms=round(lock_wait_ms, 3),
                 transfer_ms=transfer_ms,
+                native_thread_cpu_ms=round(thread_cpu_ms, 3),
                 status="ok",
             )
 
