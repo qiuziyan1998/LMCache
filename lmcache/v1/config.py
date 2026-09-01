@@ -909,14 +909,6 @@ def _validate_config(self):
         )
     remote_fill_active = bool(self.enable_remote_lmcache_store)
     if remote_fill_active:
-        if (
-            self.dsa_group1_load_mode == "persistent_direct_hbm"
-            and bool(extra_config.get("save_chunk_meta", False))
-        ):
-            raise ValueError(
-                "dsa_group1_load_mode=persistent_direct_hbm requires "
-                "extra_config.save_chunk_meta=false"
-            )
         # These are invariants of the only implemented RemoteFill protocol,
         # not deployment choices: layerwise DSA two-group pages, immutable
         # final-only publication, non-evicting reservations, and prefiller-

@@ -844,6 +844,12 @@ class MooncakestoreConnector(RemoteConnector):
         )
         return max(transfer_timeout, float(configured_timeout))
 
+    def _external_native_deadline(self) -> float:
+        error = getattr(self, "_external_native_unknown_error", None)
+        if error is not None:
+            raise error
+        return perf_counter() + self._external_native_hard_timeout_secs()
+
     def _metadata_for_raw_key(
         self,
         key: CacheEngineKey,
@@ -2480,14 +2486,7 @@ class MooncakestoreConnector(RemoteConnector):
             return placement, wait_ms, transfer_ms
 
         async with self._external_put_lock:
-            native_unknown = getattr(
-                self, "_external_native_unknown_error", None
-            )
-            if native_unknown is not None:
-                raise native_unknown
-            hard_deadline = (
-                perf_counter() + self._external_native_hard_timeout_secs()
-            )
+            hard_deadline = self._external_native_deadline()
             task = asyncio.create_task(asyncio.to_thread(put))
             self._inflight_put_tasks.add(task)
             task.add_done_callback(self._inflight_put_tasks.discard)
@@ -2628,14 +2627,7 @@ class MooncakestoreConnector(RemoteConnector):
             return statuses, transfer_ms
 
         async with self._external_put_lock:
-            native_unknown = getattr(
-                self, "_external_native_unknown_error", None
-            )
-            if native_unknown is not None:
-                raise native_unknown
-            hard_deadline = (
-                perf_counter() + self._external_native_hard_timeout_secs()
-            )
+            hard_deadline = self._external_native_deadline()
             task = asyncio.create_task(asyncio.to_thread(get))
             self._inflight_put_tasks.add(task)
             task.add_done_callback(self._inflight_put_tasks.discard)

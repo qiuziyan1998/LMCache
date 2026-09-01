@@ -1474,7 +1474,6 @@ def test_dsa_cold_compact_alloc_metadata_has_only_indexer_slots() -> None:
     assert req_meta.dsa_current_released_frontier == 0
     assert req_meta.dsa_nonresident_frontier == 8191
     assert req_meta.load_spec.dsa_cold_load_generation == 1
-    assert req_meta.load_spec.dsa_cold_hbm_allocated_at is not None
 
 
 def test_dsa_cold_compact_submit_captures_current_npu_device(

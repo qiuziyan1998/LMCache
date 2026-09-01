@@ -640,14 +640,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         required_group0_keys: Sequence[CacheEngineKey],
         ready_reservations: Mapping[CacheEngineKey, LayerPageMemoryObj],
     ) -> ExternalTwoGroupCommitResult:
-        """Atomically publish an exact externally filled Group-0 prefix.
-
-        This is the one-group counterpart of
-        :meth:`commit_external_two_group_prefix_if_absent`.  It deliberately
-        returns the existing immutable result type so lifecycle callers can
-        share release and rollback handling.  Pair-specific retention tracing
-        remains on the legacy wrapper.
-        """
+        """Atomically publish an exact externally filled Group-0 prefix."""
 
         self._validate_canonical_page_keys(required_group0_keys)
         if any(key.kv_group != 0 for key in required_group0_keys):

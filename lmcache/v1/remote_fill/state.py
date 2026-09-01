@@ -380,8 +380,6 @@ class RemoteFillStateCore:
 
     @property
     def _direct_groups(self) -> tuple[int, ...]:
-        """Return the fixed group set selected by exact negotiation."""
-
         return (0, 1) if self._negotiation.shared_group1 else (0,)
 
     @staticmethod

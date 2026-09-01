@@ -2098,10 +2098,7 @@ class LMCacheEngine:
         )
 
     def _persistent_direct_hbm_split_group_enabled(self) -> bool:
-        """Return whether lookup must use persistent proof plus G0 overlay."""
-        return getattr(
-            self.config, "dsa_group1_load_mode", "p2p_preferred"
-        ) == "persistent_direct_hbm"
+        return self.config.dsa_group1_load_mode == "persistent_direct_hbm"
 
     def _lookup_persistent_direct_hbm_prefix(
         self,
@@ -8128,15 +8125,7 @@ class LMCacheEngineBuilder:
 
     @classmethod
     def destroy(cls, instance_id: str) -> None:
-        """Close and deregister one engine only after successful teardown.
-
-        Args:
-            instance_id: Builder identity of the engine to destroy.
-
-        Raises:
-            Exception: If engine close fails. The builder retains the engine
-                and all same-ID registry entries so replacement is blocked.
-        """
+        """Close and deregister an engine only after successful teardown."""
         # TODO: unit test for this
         logger.info(f"Destroying LMCacheEngine instance: {instance_id}")
 
