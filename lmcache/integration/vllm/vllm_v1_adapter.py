@@ -9420,16 +9420,20 @@ class LMCacheConnectorV1Impl:
                         exc_info=True,
                     )
                     raise
-                try:
-                    self._synchronize_dsa_cold_dense_load()
-                except BaseException:
-                    logger.critical(
-                        "Cold compact load failed and its dense load stream "
-                        "could not be synchronized; retaining request blocks: %s",
-                        req_id,
-                        exc_info=True,
-                    )
-                    continue
+                direct_hbm = bool(
+                    getattr(request.load_spec, "dsa_group1_direct_hbm", False)
+                )
+                if not direct_hbm:
+                    try:
+                        self._synchronize_dsa_cold_dense_load()
+                    except BaseException:
+                        logger.critical(
+                            "Cold compact load failed and its dense load stream "
+                            "could not be synchronized; retaining request blocks: %s",
+                            req_id,
+                            exc_info=True,
+                        )
+                        continue
                 failed_state = getattr(exc, "_lmcache_dsa_cold_state", None)
                 states = getattr(self, "_worker_retrieve_state", {})
                 if (

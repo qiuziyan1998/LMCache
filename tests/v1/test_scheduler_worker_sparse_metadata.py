@@ -1858,6 +1858,41 @@ def test_dsa_cold_compact_failed_state_releases_after_sync_retry() -> None:
     assert impl._invalid_block_ids == {100, 101}
 
 
+def test_direct_hbm_known_failure_skips_legacy_dense_stream_sync() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    future = Future()
+    future.set_exception(RuntimeError("direct load failed"))
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(
+            dsa_cold_load_generation=1,
+            dsa_group1_direct_hbm=True,
+            lmcache_cached_tokens=8192,
+        )
+    )
+    impl._dsa_cold_load_futures = {
+        "direct-failed": (
+            1,
+            future,
+            request,
+            {100, 101},
+            0.0,
+            _completed_future(),
+        )
+    }
+    impl._synchronize_dsa_cold_dense_load = MagicMock(
+        side_effect=AssertionError("legacy stream must not be touched")
+    )
+    impl._release_request_lookup_pins = MagicMock()
+    impl._invalid_block_ids = set()
+    impl.lmcache_engine = object()
+
+    assert impl._drain_dsa_cold_load_futures() == {"direct-failed"}
+    impl._synchronize_dsa_cold_dense_load.assert_not_called()
+    impl._release_request_lookup_pins.assert_called_once_with("direct-failed")
+    assert impl._invalid_block_ids == {100, 101}
+    assert not hasattr(impl, "_dsa_cold_load_futures")
+
+
 def test_dsa_cold_ready_state_survives_cross_rank_completion_gap() -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     state = WorkerRetrieveState(
