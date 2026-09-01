@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Optional, Union
+import asyncio
 import threading
 import time
 
@@ -16,6 +17,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.lookup_client.async_lookup_message import (
     LookupCleanupMsg,
+    LookupCleanupResponseMsg,
     LookupRequestMsg,
     LookupResponseMsg,
 )
@@ -124,7 +126,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         # A lock is needed since we need another thread to pull
         # responses from the lookup_and_prefetch server
         # (e.g., worker process).
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
         # map from lookup_id (i.e., req_id) to req's status.
         # None indicates ongoing.
@@ -139,6 +141,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
 
         # Track lookup_ids that have been aborted for cleanup
         self.aborted_lookups: set[str] = set()
+        self.cleanup_res_for_each_worker: dict[str, set[int]] = {}
 
         self.running = True
 
@@ -162,10 +165,11 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         None means ongoing;
         int >= 0 means number of hit tokens
         """
-        # Check if any aborted lookups are finished, send cleanup messages
-        self._cleanup_finished_aborted_lookups()
-
         with self.lock:
+            # Do not reuse a request ID until every response from its cancelled
+            # lookup has arrived. The worker defers cleanup until that response.
+            if lookup_id in self.aborted_lookups:
+                return None
             if (req_status := self.reqs_status.get(lookup_id, -1)) == -1:
                 self.reqs_status[lookup_id] = None
                 self.first_lookup_time[lookup_id] = time.time()
@@ -225,11 +229,27 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             try:
                 msg_buf = self.pull_socket.recv(copy=False)
                 # Deserialize message using msgspec
-                msg = msgspec.msgpack.decode(msg_buf, type=LookupResponseMsg)
+                msg = msgspec.msgpack.decode(
+                    msg_buf,
+                    type=Union[LookupResponseMsg, LookupCleanupResponseMsg],
+                )
                 lookup_id = msg.lookup_id
-                res = msg.num_hit_tokens
 
                 with self.lock:
+                    if isinstance(msg, LookupCleanupResponseMsg):
+                        workers = self.cleanup_res_for_each_worker.setdefault(
+                            lookup_id, set()
+                        )
+                        workers.add(msg.worker_id)
+                        if len(workers) == self.world_size:
+                            self.cleanup_res_for_each_worker.pop(lookup_id, None)
+                            self.res_for_each_worker.pop(lookup_id, None)
+                            self.reqs_status.pop(lookup_id, None)
+                            self.first_lookup_time.pop(lookup_id, None)
+                            self.aborted_lookups.discard(lookup_id)
+                        continue
+
+                    res = msg.num_hit_tokens
                     if lookup_id not in self.res_for_each_worker:
                         self.res_for_each_worker[lookup_id] = [res]
                     else:
@@ -253,11 +273,15 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                                 max_hit,
                             )
 
-                        # NOTE: it is possible that the number of hit
-                        # tokens is different across (TP and PP) ranks, so we
-                        # can use the minimum value as the number of
-                        # hit tokens.
-                        self.reqs_status[lookup_id] = min_hit
+                        if lookup_id in self.aborted_lookups:
+                            # Do not resurrect scheduler state. The tombstone is
+                            # cleared only after every worker acknowledges cleanup.
+                            self.first_lookup_time.pop(lookup_id, None)
+                        else:
+                            # NOTE: it is possible that the number of hit
+                            # tokens is different across (TP and PP) ranks, so
+                            # use the minimum number of hit tokens.
+                            self.reqs_status[lookup_id] = min_hit
 
             except Exception as e:
                 logger.error("Error processing response from worker: %s", e)
@@ -267,26 +291,19 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             self.reqs_status.pop(lookup_id, None)
             self.first_lookup_time.pop(lookup_id, None)
 
-    def cancel_lookup(self, lookup_id: str) -> None:
-        """Mark lookup as aborted. Cleanup will happen after task finishes."""
-        self.aborted_lookups.add(lookup_id)
-
-    def _cleanup_finished_aborted_lookups(self) -> None:
-        """Check for finished aborted lookups and send cleanup messages to workers."""
-        # A lookup whose status is None is still loading.
-        # We wait for it to finish before cleanup.
-        finished_lookups = [
-            lookup_id
-            for lookup_id in self.aborted_lookups
-            if self.reqs_status.get(lookup_id) is not None
-        ]
-        if finished_lookups:
-            self.aborted_lookups.difference_update(finished_lookups)
-
-        # Tell the server to free the reserved memory buffers for each aborted lookup.
-        for lookup_id in finished_lookups:
+    def cleanup_lookup(self, lookup_id: str) -> None:
+        """Queue ordered worker cleanup and discard scheduler-side status."""
+        with self.lock:
+            already_pending = lookup_id in self.aborted_lookups
+            self.aborted_lookups.add(lookup_id)
+            self.reqs_status.pop(lookup_id, None)
+            self.first_lookup_time.pop(lookup_id, None)
+        if not already_pending:
             self._send_cleanup_message(lookup_id)
-            self.clear_lookup_status(lookup_id)
+
+    def cancel_lookup(self, lookup_id: str) -> None:
+        """Cancel a lookup and release worker state after terminal response."""
+        self.cleanup_lookup(lookup_id)
 
     def _send_cleanup_message(self, lookup_id: str) -> None:
         """Send cleanup message to workers to release memory objects."""
@@ -351,7 +368,13 @@ class LMCacheAsyncLookupServer:
         )
 
         self.lmcache_engine = lmcache_engine
+        self.worker_id = int(metadata.worker_id)
         self.running = True
+        self._cleanup_lock = threading.Lock()
+        # Request processing only submits the lookup coroutine. Cleanup arriving
+        # next on the FIFO ZMQ pipe must therefore wait for the terminal response,
+        # not merely for submission ordering.
+        self._cleanup_state: dict[str, str] = {}
 
         logger.info(
             "lmcache lookup server start with"
@@ -380,17 +403,25 @@ class LMCacheAsyncLookupServer:
 
                 if isinstance(msg, LookupRequestMsg):
                     # Handle lookup request
-                    self.lmcache_engine.async_lookup_and_prefetch(
-                        lookup_id=msg.lookup_id,
-                        hashes=msg.hashes,
-                        offsets=msg.offsets,
-                        pin=True,
-                        request_configs=msg.request_configs,
-                    )
+                    with self._cleanup_lock:
+                        self._cleanup_state[msg.lookup_id] = "pending"
+                    try:
+                        self.lmcache_engine.async_lookup_and_prefetch(
+                            lookup_id=msg.lookup_id,
+                            hashes=msg.hashes,
+                            offsets=msg.offsets,
+                            pin=True,
+                            request_configs=msg.request_configs,
+                        )
+                    except BaseException:
+                        # Synchronous setup failed before a storage-loop lookup
+                        # could own the terminal response. Complete the same
+                        # response/cleanup handshake with a conservative miss.
+                        self.send_response_to_scheduler(msg.lookup_id, 0)
+                        raise
 
                 elif isinstance(msg, LookupCleanupMsg):
-                    # Handle cleanup request - release memory objects for aborted lookup
-                    self.lmcache_engine.cleanup_memory_objs(msg.lookup_id)
+                    self._request_cleanup(msg.lookup_id)
 
                 else:
                     logger.warning("Unknown message type: %s", type(msg))
@@ -398,7 +429,27 @@ class LMCacheAsyncLookupServer:
             except Exception as e:
                 logger.error("Error processing request from scheduler: %s", e)
 
-    def send_response_to_scheduler(self, lookup_id: str, num_hit_tokens: int):
+    def send_response_to_scheduler(
+        self, lookup_id: str, num_hit_tokens: int
+    ) -> None:
+        """Send responses from the storage loop that owns the PUSH socket."""
+        loop = self.lmcache_engine.storage_manager.loop
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is not loop:
+            loop.call_soon_threadsafe(
+                self._send_response_to_scheduler,
+                lookup_id,
+                num_hit_tokens,
+            )
+            return
+        self._send_response_to_scheduler(lookup_id, num_hit_tokens)
+
+    def _send_response_to_scheduler(
+        self, lookup_id: str, num_hit_tokens: int
+    ) -> None:
         # Create structured response message
         msg = LookupResponseMsg(
             lookup_id=lookup_id,
@@ -406,8 +457,48 @@ class LMCacheAsyncLookupServer:
         )
 
         # Serialize message using msgspec
-        msg_buf = msgspec.msgpack.encode(msg)
-        self.push_socket.send(msg_buf, copy=False)
+        cleanup = False
+        with self._cleanup_lock:
+            if self._cleanup_state.get(lookup_id) == "cleanup_requested":
+                self._cleanup_state.pop(lookup_id, None)
+                cleanup = True
+            else:
+                self._cleanup_state.pop(lookup_id, None)
+        try:
+            msg_buf = msgspec.msgpack.encode(msg)
+            self.push_socket.send(msg_buf, copy=False)
+            if cleanup:
+                # Preserve response-before-cleanup-ack ordering on this worker's
+                # PUSH pipe. The client retains its tombstone until the ack.
+                self._complete_cleanup(lookup_id)
+        except BaseException:
+            logger.exception(
+                "Failed to send async lookup terminal response: lookup_id=%s",
+                lookup_id,
+            )
+            raise
+
+    def _request_cleanup(self, lookup_id: str) -> None:
+        cleanup = False
+        with self._cleanup_lock:
+            state = self._cleanup_state.get(lookup_id)
+            if state in ("pending", "cleanup_requested"):
+                self._cleanup_state[lookup_id] = "cleanup_requested"
+            else:
+                self._cleanup_state.pop(lookup_id, None)
+                cleanup = True
+        if cleanup:
+            loop = self.lmcache_engine.storage_manager.loop
+            loop.call_soon_threadsafe(self._complete_cleanup, lookup_id)
+
+    def _complete_cleanup(self, lookup_id: str) -> None:
+        """Release lookup ownership and acknowledge from the response thread."""
+        self.lmcache_engine.cleanup_memory_objs(lookup_id)
+        msg = LookupCleanupResponseMsg(
+            lookup_id=lookup_id,
+            worker_id=self.worker_id,
+        )
+        self.push_socket.send(msgspec.msgpack.encode(msg), copy=False)
 
     def close(self):
         self.running = False

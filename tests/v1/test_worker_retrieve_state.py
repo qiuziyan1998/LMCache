@@ -122,11 +122,15 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
         yield torch.ones(4, dtype=torch.bool)
 
     record = MagicMock(return_value=readiness)
+    synchronize = MagicMock()
     impl._sparse_retrieve_kwargs = MagicMock(
         side_effect=AssertionError("dense load built sparse retrieve metadata")
     )
     impl.lmcache_engine = SimpleNamespace(
-        gpu_connector=SimpleNamespace(record_dense_load_readiness=record),
+        gpu_connector=SimpleNamespace(
+            record_dense_load_readiness=record,
+            synchronize_dense_load_readiness=synchronize,
+        ),
         supports_dense_sparse_cache_retention=lambda: True,
         retrieve_layer=MagicMock(side_effect=dense_retrieve),
         retrieve_layer_head_token_wise=MagicMock(
@@ -162,6 +166,7 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
     assert plan["indexer_perf"]["readiness_record_ms"] >= 0
     npu.set_device.assert_called_once_with(3)
     record.assert_not_called()
+    synchronize.assert_called_once_with(readiness)
     impl.lmcache_engine.retrieve_layer.assert_called_once()
     impl.lmcache_engine.retrieve_layer_head_token_wise.assert_not_called()
     impl._sparse_retrieve_kwargs.assert_not_called()
@@ -188,6 +193,7 @@ def test_cold_compact_shared_indexer_waits_for_latent_publication() -> None:
         supports_dense_sparse_cache_retention=lambda: True,
         gpu_connector=SimpleNamespace(
             record_dense_load_readiness=lambda: readiness,
+            synchronize_dense_load_readiness=lambda value: None,
         ),
         retrieve_layer=MagicMock(side_effect=dense_retrieve),
     )
@@ -273,6 +279,7 @@ def test_cold_compact_prefetches_before_dense_retrieve() -> None:
         prefetch_shared_layer_pages=MagicMock(side_effect=prefetch),
         gpu_connector=SimpleNamespace(
             record_dense_load_readiness=lambda: readiness,
+            synchronize_dense_load_readiness=lambda value: None,
         ),
         retrieve_layer=MagicMock(side_effect=dense_retrieve),
     )
@@ -383,7 +390,8 @@ def test_cold_compact_prefetch_failure_releases_and_uses_dense_path() -> None:
         supports_dense_sparse_cache_retention=lambda: True,
         prefetch_shared_layer_pages=failed_prefetch,
         gpu_connector=SimpleNamespace(
-            record_dense_load_readiness=lambda: readiness
+            record_dense_load_readiness=lambda: readiness,
+            synchronize_dense_load_readiness=lambda value: None,
         ),
         retrieve_layer=MagicMock(side_effect=dense_retrieve),
     )
@@ -406,6 +414,49 @@ def test_cold_compact_prefetch_failure_releases_and_uses_dense_path() -> None:
     assert "indexer_source_owners" not in plan
     prefetch_owner.unpin.assert_called_once_with()
     prefetch_owner.ref_count_down.assert_called_once_with()
+
+
+def test_cold_compact_direct_group1_bypasses_gate_and_layer_generator() -> None:
+    impl = _make_impl()
+    direct_load = MagicMock()
+    retrieve = MagicMock(
+        side_effect=AssertionError("direct Group-1 load entered layer generator")
+    )
+    impl.lmcache_engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(
+            validate_layerwise_slot_mapping=MagicMock(),
+        ),
+        load_group1_pages_direct=direct_load,
+        retrieve_layer=retrieve,
+    )
+    gate = Future()
+    token_mask = torch.ones(4, dtype=torch.bool)
+    request = SimpleNamespace(req_id="request", request_configs={"x": 1})
+    plan = {
+        "request": request,
+        "tokens": [1, 2, 3, 4],
+        "token_mask": token_mask,
+        "token_count": 4,
+        "indexer_slots_cpu": torch.arange(4),
+        "indexer_kvcaches": [object()],
+        "planned_at": adapter_mod.cold_start_perf_now(),
+        "latent_shared_ready": gate,
+        "group1_direct_hbm": True,
+    }
+
+    result = impl._run_dsa_cold_indexer_load(plan, None)
+
+    assert result[0] is token_mask
+    assert result[1] is None
+    assert not gate.done()
+    direct_load.assert_called_once_with(
+        plan["tokens"],
+        plan["indexer_slots_cpu"],
+        plan["indexer_kvcaches"],
+        request.request_configs,
+        request.req_id,
+    )
+    retrieve.assert_not_called()
 
 
 def test_cold_compact_dense_failure_releases_prefetch_owner_only() -> None:

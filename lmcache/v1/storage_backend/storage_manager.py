@@ -896,6 +896,8 @@ class StorageManager:
         lookup_id: str,
         cum_chunk_lengths_total: list[int],
         tier_expected_chunks: list[int],
+        loading_tasks: Optional[list[asyncio.Task]] = None,
+        setup_failed: bool = False,
     ) -> None:
         """
         Callback function when all prefetch tasks
@@ -905,7 +907,21 @@ class StorageManager:
         self.event_manager.update_event_status(
             EventType.LOADING, lookup_id, status=EventStatus.DONE
         )
-        res = task.result()
+        try:
+            res = task.result()
+        except BaseException:
+            logger.exception("Async lookup failed: lookup_id=%s", lookup_id)
+            self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
+            return
+
+        lookup_failed = setup_failed or any(
+            loading_task.cancelled() or loading_task.exception() is not None
+            for loading_task in loading_tasks or ()
+        )
+        if lookup_failed:
+            logger.error("Async lookup failed: lookup_id=%s", lookup_id)
+            self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
+            return
 
         # Calculate total retrieved chunks across all tiers based on actual results
         # from batched_get_non_blocking, not the batched_async_contains results.
@@ -961,7 +977,7 @@ class StorageManager:
             if actual_chunks < expected_chunks:
                 # Release all chunks in subsequent tiers since they won't be used
                 for subsequent_tier in res[tier_idx + 1 :]:
-                    for mem_obj in subsequent_tier:
+                    for _, mem_obj in subsequent_tier:
                         mem_obj.ref_count_down()
                 break
 
@@ -1026,52 +1042,59 @@ class StorageManager:
         tier_expected_chunks = []
         # we also keep track of the keys for each tier and each chunk
         loading_task_keys: list[list[CacheEngineKey]] = []
-        for backend_name, backend in self.get_active_storage_backends(
-            search_range=search_range
-        ):
-            num_hit_chunks = await backend.batched_async_contains(lookup_id, keys, pin)
-
-            if num_hit_chunks == 0:
-                continue
-
-            num_total_hit_chunks += num_hit_chunks
-            tier_expected_chunks.append(num_hit_chunks)
-
-            backend_keys = keys[:num_hit_chunks]
-            loading_task_keys.append(backend_keys)
-
-            assert self.async_serializer is not None, (
-                "Async serializer must be initialized via post_init before using "
-                "async_lookup_and_prefetch."
-            )
-            # num_hit_chunks is only used for the multi serializer
-            get_coro = self.async_serializer.run(
-                backend.batched_get_non_blocking(
-                    lookup_id,
-                    backend_keys,
-                    {"cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]},
-                ),
-                num_hit_chunks,
-            )
-            loading_task = asyncio.create_task(get_coro)
-            loading_task.add_done_callback(
-                functools.partial(
-                    self.prefetch_single_done_callback,
-                    keys=keys,
-                    backend_name=backend_name,
+        setup_failed = False
+        try:
+            for backend_name, backend in self.get_active_storage_backends(
+                search_range=search_range
+            ):
+                num_hit_chunks = await backend.batched_async_contains(
+                    lookup_id, keys, pin
                 )
-            )
 
-            loading_tasks.append(loading_task)
+                if num_hit_chunks == 0:
+                    continue
 
-            cum_chunk_lengths = cum_chunk_lengths[num_hit_chunks:]
+                num_total_hit_chunks += num_hit_chunks
+                tier_expected_chunks.append(num_hit_chunks)
 
-            if num_total_hit_chunks == num_total_chunks:
-                break
-            keys = keys[num_hit_chunks:]
+                backend_keys = keys[:num_hit_chunks]
+                loading_task_keys.append(backend_keys)
+
+                assert self.async_serializer is not None, (
+                    "Async serializer must be initialized via post_init before using "
+                    "async_lookup_and_prefetch."
+                )
+                # num_hit_chunks is only used for the multi serializer
+                get_coro = self.async_serializer.run(
+                    backend.batched_get_non_blocking(
+                        lookup_id,
+                        backend_keys,
+                        {"cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]},
+                    ),
+                    num_hit_chunks,
+                )
+                loading_task = asyncio.create_task(get_coro)
+                loading_task.add_done_callback(
+                    functools.partial(
+                        self.prefetch_single_done_callback,
+                        keys=keys,
+                        backend_name=backend_name,
+                    )
+                )
+
+                loading_tasks.append(loading_task)
+
+                cum_chunk_lengths = cum_chunk_lengths[num_hit_chunks:]
+
+                if num_total_hit_chunks == num_total_chunks:
+                    break
+                keys = keys[num_hit_chunks:]
+        except BaseException:
+            setup_failed = True
+            logger.exception("Async lookup setup failed: lookup_id=%s", lookup_id)
 
         # If no chunks were hit across all backends, respond immediately and return.
-        if num_total_hit_chunks == 0:
+        if num_total_hit_chunks == 0 and not setup_failed:
             if self.async_lookup_server is not None:
                 self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
             return
@@ -1086,9 +1109,13 @@ class StorageManager:
         #  Tuple(loading_task_keys[1][0] : MemoryObj2)
         #  Tuple(loading_task_keys[1][1] : MemoryObj3)
         async def gather_with_keys() -> list[list[tuple[CacheEngineKey, MemoryObj]]]:
-            loading_results = await asyncio.gather(*loading_tasks)
+            loading_results = await asyncio.gather(
+                *loading_tasks, return_exceptions=True
+            )
             return [
-                list(zip(keys, results, strict=False))
+                []
+                if isinstance(results, BaseException)
+                else list(zip(keys, results, strict=False))
                 for keys, results in zip(
                     loading_task_keys, loading_results, strict=False
                 )
@@ -1108,6 +1135,8 @@ class StorageManager:
                 lookup_id,
                 cum_chunk_lengths_total,
                 tier_expected_chunks,
+                loading_tasks,
+                setup_failed,
             )
         )
 
@@ -1709,6 +1738,8 @@ class StorageManager:
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
+                if self._requires_strict_backend_close(backend):
+                    raise
 
             del self.storage_backends[backend_name]
 
@@ -1794,6 +1825,8 @@ class StorageManager:
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
+                if self._requires_strict_backend_close(backend):
+                    raise
             del self.storage_backends[backend_name]
 
             # --- create ---
@@ -1831,14 +1864,21 @@ class StorageManager:
     def close(self):
         logger.info("Closing StorageManager...")
 
-        # Close all backends
-        for name, backend in self.storage_backends.items():
+        # Remote backends may own registrations into the LocalCPU slab, so
+        # close every dependent backend before the allocator that backs it.
+        ordered_backends = sorted(
+            self.storage_backends.items(),
+            key=lambda item: item[0] == "LocalCPUBackend",
+        )
+        for name, backend in ordered_backends:
             try:
                 logger.info(f"Closing storage backend: {name}")
                 backend.close()
                 logger.info(f"Storage backend {name} closed successfully")
             except Exception as e:
                 logger.error(f"Error closing backend {name}: {e}")
+                if self._requires_strict_backend_close(backend):
+                    raise
 
         # Stop event loop
         try:
@@ -1865,3 +1905,17 @@ class StorageManager:
             logger.info("Storage manager thread already stopped")
 
         logger.info("Storage manager closed.")
+
+    @staticmethod
+    def _requires_strict_backend_close(
+        backend: StorageBackendInterface,
+    ) -> bool:
+        checker = getattr(backend, "requires_strict_external_close", None)
+        return bool(callable(checker) and checker())
+
+    def requires_strict_external_close(self) -> bool:
+        """Return whether any backend has accepted external HBM ownership."""
+        return any(
+            self._requires_strict_backend_close(backend)
+            for backend in self.storage_backends.values()
+        )

@@ -105,6 +105,7 @@ class ConnectorContext:
             (wrapped as SafeLocalCPUBackend if None)
         config: Optional LMCache engine configuration
         parsed_url: Parsed representation of the URL
+        external_page_only: Whether LocalCPU must remain absent for direct reads
     """
 
     def __init__(
@@ -114,16 +115,24 @@ class ConnectorContext:
         local_cpu_backend: Optional[LocalCPUBackend],
         config: Optional[LMCacheEngineConfig],
         metadata: Optional[LMCacheMetadata],
+        external_page_only: bool = False,
     ):
         self.url = url
         self.loop = loop
-        # Wrap None as SafeLocalCPUBackend to satisfy type requirements
-        # The SafeLocalCPUBackend will raise an error if allocate() is called
-        self.local_cpu_backend: LocalCPUBackend = (
-            local_cpu_backend
-            if local_cpu_backend is not None
-            else SafeLocalCPUBackend(config)
-        )
+        self.external_page_only = external_page_only
+        if external_page_only:
+            if config is None or metadata is None:
+                raise ValueError(
+                    "External-page-only connectors require config and metadata"
+                )
+            self.local_cpu_backend: Optional[LocalCPUBackend] = local_cpu_backend
+        else:
+            # Preserve the legacy scheduler-role stub outside the narrow reader.
+            self.local_cpu_backend = (
+                local_cpu_backend
+                if local_cpu_backend is not None
+                else SafeLocalCPUBackend(config)
+            )
         self.config = config
         self.metadata = metadata
 
@@ -133,6 +142,10 @@ class ConnectorContext:
         useful for S3Connector where we need to preallocate filesystem buffers
         in ramfs for zero-copy transfers
         """
+        if self.local_cpu_backend is None:
+            raise RuntimeError(
+                "External-page-only connectors have no LocalCPU chunk buffer"
+            )
         return self.local_cpu_backend.get_full_chunk_size_bytes()
 
 
@@ -168,6 +181,7 @@ class ConnectorManager:
         local_cpu_backend: Optional[LocalCPUBackend],
         config: Optional[LMCacheEngineConfig] = None,
         metadata: Optional[LMCacheMetadata] = None,
+        external_page_only: bool = False,
     ) -> None:
         logger.info("Initializing ConnectorManager")
         self.context = ConnectorContext(
@@ -176,6 +190,7 @@ class ConnectorManager:
             local_cpu_backend=local_cpu_backend,
             config=config,
             metadata=metadata,
+            external_page_only=external_page_only,
         )
         self.adapters: List[ConnectorAdapter] = []
         self._remote_adapters_builtin_launcher()
@@ -298,6 +313,7 @@ def CreateConnector(
     local_cpu_backend: Optional[LocalCPUBackend],
     config: Optional[LMCacheEngineConfig] = None,
     metadata: Optional[LMCacheMetadata] = None,
+    external_page_only: bool = False,
 ) -> InstrumentedRemoteConnector:
     """
     Create a remote connector from the given URL.
@@ -339,6 +355,7 @@ def CreateConnector(
         local_cpu_backend: The local CPU backend (can be None for scheduler role)
         config: Optional LMCache engine configuration
         metadata: Optional LMCache engine metadata
+        external_page_only: Keep LocalCPU absent for direct external-page reads
 
     Returns:
         RemoteConnector: The created connector
@@ -351,7 +368,14 @@ def CreateConnector(
     if "://" not in url:
         raise ValueError(f"Invalid remote url {url}: missing scheme")
 
-    manager = ConnectorManager(url, loop, local_cpu_backend, config, metadata)
+    manager = ConnectorManager(
+        url,
+        loop,
+        local_cpu_backend,
+        config,
+        metadata,
+        external_page_only,
+    )
     connector = manager.create_connector()
 
     return InstrumentedRemoteConnector(connector)

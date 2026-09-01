@@ -7,8 +7,8 @@ decoupling the vLLM adapter from internal LMCache implementation details.
 """
 
 # Standard
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+import threading
 import time
 import traceback
 
@@ -35,6 +35,33 @@ if TYPE_CHECKING:
     from lmcache.v1.lookup_client.lmcache_lookup_client import LMCacheLookupServer
 
 logger = init_logger(__name__)
+
+
+def _run_with_timeout(
+    callback: Callable[[], Any],
+    timeout: float,
+    thread_name: str,
+) -> tuple[bool, Optional[Exception]]:
+    """Run one shutdown callback without waiting past its timeout."""
+    done = threading.Event()
+    errors: list[Exception] = []
+
+    def run() -> None:
+        try:
+            callback()
+        except Exception as error:
+            errors.append(error)
+        finally:
+            done.set()
+
+    threading.Thread(
+        target=run,
+        daemon=True,
+        name=thread_name,
+    ).start()
+    if not done.wait(timeout):
+        return False, None
+    return True, errors[0] if errors else None
 
 
 class LMCacheManager:
@@ -244,23 +271,31 @@ class LMCacheManager:
         start_time = time.time()
         errors: list[tuple[str, Union[str, Exception]]] = []
 
-        def _safe_close(name: str, close_fn, timeout: float = 10.0):
+        def _safe_close(
+            name: str,
+            close_fn: Callable[[], Any],
+            timeout: float = 10.0,
+        ) -> None:
             """Helper to close a resource with timeout protection."""
             try:
                 logger.info("Closing %s...", name)
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(close_fn)
-                    try:
-                        future.result(timeout=timeout)
-                        logger.info("%s closed successfully", name)
-                    except TimeoutError:
-                        logger.error(
-                            "%s close operation timed out after %ss. "
-                            "Continuing with shutdown...",
-                            name,
-                            timeout,
-                        )
-                        errors.append((name, "Timeout"))
+                completed, error = _run_with_timeout(
+                    close_fn,
+                    timeout,
+                    f"lmcache-close-{name}",
+                )
+                if not completed:
+                    logger.error(
+                        "%s close operation timed out after %ss. "
+                        "Continuing with shutdown...",
+                        name,
+                        timeout,
+                    )
+                    errors.append((name, "Timeout"))
+                elif error is not None:
+                    raise error
+                else:
+                    logger.info("%s closed successfully", name)
             except Exception as e:
                 logger.error("Error closing %s: %s", name, e)
                 errors.append((name, e))
@@ -294,25 +329,16 @@ class LMCacheManager:
             _safe_close("lookup_client", self._lookup_client.close, timeout=10.0)
 
         # Destroy cache engine
+        engine_instance_id = self._service_factory.get_engine_instance_id()
+        logger.info("Destroying LMCache engine: %s", engine_instance_id)
         try:
-            engine_instance_id = self._service_factory.get_engine_instance_id()
-            logger.info("Destroying LMCache engine: %s", engine_instance_id)
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    LMCacheEngineBuilder.destroy, engine_instance_id
-                )
-                try:
-                    future.result(timeout=15.0)
-                    logger.info("LMCache engine destroyed successfully")
-                except TimeoutError:
-                    logger.error(
-                        "Cache engine destroy timed out after 15s. "
-                        "Continuing with shutdown..."
-                    )
-                    errors.append(("cache_engine", "Timeout"))
-        except Exception as e:
-            logger.error("Error destroying cache engine: %s", e)
-            errors.append(("cache_engine", e))
+            # Engine close owns native registrations and implements its own
+            # bounded ownership protocol. Never detach it into a timeout
+            # thread: a late destroy could otherwise race replacement or I/O.
+            LMCacheEngineBuilder.destroy(engine_instance_id)
+        except Exception:
+            logger.exception("Error destroying cache engine")
+            raise
 
         elapsed = time.time() - start_time
         if errors:

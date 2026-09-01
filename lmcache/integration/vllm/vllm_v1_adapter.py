@@ -670,6 +670,10 @@ class LoadSpec:
     dsa_release_frontier: Optional[int] = None
     # Frontier released from the current vLLM block table.
     dsa_current_released_frontier: int = 0
+    # Load Group 1 directly from persistent storage into its final HBM blocks.
+    dsa_group1_direct_hbm: bool = False
+    # Monotonic timestamp taken immediately after final HBM allocation.
+    dsa_cold_hbm_allocated_at: Optional[float] = None
 
 
 @dataclass
@@ -3592,9 +3596,13 @@ class LMCacheConnectorV1Impl:
         manager = getattr(self, "_manager", None)
         if manager is None:
             return
-        engine = manager.lmcache_engine
+        engine = getattr(manager, "lmcache_engine", None)
         if engine is not None:
             engine.lookup_unpin(req_id)
+            return
+        lookup_client = getattr(manager, "lookup_client", None)
+        if lookup_client is not None:
+            lookup_client.cleanup_lookup(req_id)
 
     def _maybe_lookup_unpin_for_request(self, request: ReqMeta) -> None:
         if self._is_decode_window_save_request(request):
@@ -3817,6 +3825,14 @@ class LMCacheConnectorV1Impl:
         return drained
 
     def update_connector_output(self, connector_output: Any) -> None:
+        finished_recving = set(
+            getattr(connector_output, "finished_recving", None) or ()
+        )
+        active_direct = getattr(
+            self, "_dsa_group1_direct_hbm_active_req_id", None
+        )
+        if active_direct in finished_recving:
+            del self._dsa_group1_direct_hbm_active_req_id
         validation_blocks = getattr(
             self, "_dsa_cold_indexer_block_ids", None
         )
@@ -3825,15 +3841,21 @@ class LMCacheConnectorV1Impl:
             if cold_loaded is None:
                 cold_loaded = set()
                 self._dsa_cold_loaded_req_ids = cold_loaded
+            cold_failed = getattr(self, "_dsa_cold_failed_req_ids", None)
+            if cold_failed is None:
+                cold_failed = set()
+                self._dsa_cold_failed_req_ids = cold_failed
             invalid_blocks = set(
                 getattr(connector_output, "invalid_block_ids", None) or ()
             )
-            for req_id in (
-                getattr(connector_output, "finished_recving", None) or ()
-            ):
+            for req_id, request_blocks in validation_blocks.items():
+                if request_blocks.intersection(invalid_blocks):
+                    cold_failed.add(req_id)
+                    cold_loaded.discard(req_id)
+            for req_id in finished_recving:
                 load_spec = self.load_specs.get(req_id)
                 request_blocks = validation_blocks.pop(req_id, None)
-                failed = request_blocks is None or bool(
+                failed = req_id in cold_failed or request_blocks is None or bool(
                     request_blocks.intersection(invalid_blocks)
                 )
                 if (
@@ -3842,8 +3864,11 @@ class LMCacheConnectorV1Impl:
                     and getattr(load_spec, "dsa_cold_compact_load", False)
                 ):
                     cold_loaded.add(req_id)
+                cold_failed.discard(req_id)
             if not validation_blocks:
                 del self._dsa_cold_indexer_block_ids
+            if not cold_failed:
+                del self._dsa_cold_failed_req_ids
         completed = getattr(connector_output, "completed_decode_window_saves", None)
         if not completed:
             return
@@ -4121,7 +4146,9 @@ class LMCacheConnectorV1Impl:
             getattr(self, "_worker_retrieve_registry_version", 0),
         )
 
-    def _drop_worker_retrieve_state(self, req_id: str) -> None:
+    def _drop_worker_retrieve_state(
+        self, req_id: str, *, release_lookup_pins: bool = True
+    ) -> None:
         engine = getattr(self, "lmcache_engine", None)
         state = None
         if hasattr(self, "_worker_retrieve_state"):
@@ -4134,7 +4161,8 @@ class LMCacheConnectorV1Impl:
             release_fn = getattr(engine, "release_shared_cpu_sparse_request", None)
             if callable(release_fn):
                 release_fn(req_id)
-        self._release_request_lookup_pins(req_id)
+        if release_lookup_pins:
+            self._release_request_lookup_pins(req_id)
 
     def _release_finished_worker_requests(self, req_ids: Iterable[str]) -> None:
         """Release request-owned cache state in the worker process."""
@@ -6020,6 +6048,13 @@ class LMCacheConnectorV1Impl:
         self._refresh_kvcaches_list()
         self._build_kv_layer_groups()
         self._manager.post_init()
+        preflight = getattr(
+            self.lmcache_engine,
+            "preflight_group1_direct_hbm",
+            None,
+        )
+        if callable(preflight):
+            preflight(self._kvcaches_for_group(1))
 
     def _get_dsa_cold_load_executor(self) -> ThreadPoolExecutor:
         executor = getattr(self, "_dsa_cold_load_executor", None)
@@ -6130,6 +6165,7 @@ class LMCacheConnectorV1Impl:
             "planned_at": cold_start_perf_now(),
             "plan_started": plan_started,
             "latent_shared_ready": Future(),
+            "group1_direct_hbm": request.load_spec.dsa_group1_direct_hbm,
         }
         submitted_at = cold_start_perf_now()
         cold_start_perf_log(
@@ -6148,13 +6184,34 @@ class LMCacheConnectorV1Impl:
         previous_latent_future = getattr(
             self, "_dsa_cold_last_latent_future", None
         )
-        latent_future = executor.submit(
-            self._run_dsa_cold_compact_load,
-            plan,
-            npu_device_id,
-            indexer_future,
-            previous_latent_future,
-        )
+        try:
+            latent_future = executor.submit(
+                self._run_dsa_cold_compact_load,
+                plan,
+                npu_device_id,
+                indexer_future,
+                previous_latent_future,
+            )
+        except BaseException as submit_error:
+            # The staged Group-1 path waits on this gate before it can finish.
+            # Resolve it before draining the already-submitted sibling, or a
+            # failed second submit deadlocks this exception path forever.
+            latent_shared_ready = plan["latent_shared_ready"]
+            if not latent_shared_ready.done():
+                latent_shared_ready.set_exception(submit_error)
+            # Indexer work may already target the allocated blocks. Fence it
+            # before unwinding so those blocks cannot be reused.
+            try:
+                indexer_future.result()
+            except BaseException as indexer_error:
+                requires_restart = getattr(
+                    self.lmcache_engine,
+                    "remote_fill_requires_paired_restart",
+                    None,
+                )
+                if callable(requires_restart) and requires_restart():
+                    raise indexer_error
+            raise submit_error
         self._dsa_cold_last_latent_future = latent_future
         futures[request.req_id] = (
             generation,
@@ -6519,6 +6576,27 @@ class LMCacheConnectorV1Impl:
         if callable(validate_slots):
             validate_slots(indexer_slots_cpu, indexer_kvcaches, kv_group=1)
         finish_stage("slot_validate_ms", slot_validate_started)
+        if plan.get("group1_direct_hbm", False):
+            direct_load = getattr(
+                self.lmcache_engine,
+                "load_group1_pages_direct",
+                None,
+            )
+            if not callable(direct_load):
+                raise RuntimeError("Group-1 direct-HBM loader is unavailable")
+            direct_load(
+                plan["tokens"],
+                indexer_slots_cpu,
+                indexer_kvcaches,
+                request.request_configs,
+                request.req_id,
+            )
+            return (
+                plan["token_mask"],
+                None,
+                cold_start_perf_now() - started,
+                queue_ms,
+            )
         slot_submit_started = stage_start()
         indexer_slots = indexer_slots_cpu.to(
             device=self.device,
@@ -6661,22 +6739,37 @@ class LMCacheConnectorV1Impl:
             self.lmcache_engine,
             synchronize=False,
         )
+        # Do not publish a request while Group 1 can still be writing its
+        # final HBM blocks from this background worker.
+        self._synchronize_dsa_cold_dense_readiness(readiness)
         return result, readiness, cold_start_perf_now() - started, queue_ms
 
     def synchronize_staged_sfa_capture_unsafe_loads(self) -> None:
-        """Finish background NPU loads before serving-time graph capture.
+        """Finish legacy background NPU loads before serving-time graph capture.
 
         Cold compact workers issue synchronous NPU copies and stream waits.
         Those operations cannot overlap an ACL graph capture in another
         thread. Completed futures remain queued for ``get_finished`` so their
         normal publication and scheduler notification semantics are preserved.
+        The opt-in direct-HBM mode uses request-local terminal completion and
+        remains parked until both groups finish, so warm batches must not wait
+        for those unrelated request futures here.
         """
         futures = getattr(self, "_dsa_cold_load_futures", None)
         if not futures:
             return
+        capture_unsafe = {
+            req_id: entry
+            for req_id, entry in futures.items()
+            if not getattr(
+                getattr(entry[2], "load_spec", None),
+                "dsa_group1_direct_hbm",
+                False,
+            )
+        }
         pending_req_ids = [
             req_id
-            for req_id, entry in futures.items()
+            for req_id, entry in capture_unsafe.items()
             if any(
                 not future.done()
                 for future in (entry[1], *entry[5:6])
@@ -6689,12 +6782,24 @@ class LMCacheConnectorV1Impl:
                 pending_req_ids,
             )
         failed_req_ids = []
-        for req_id, entry in list(futures.items()):
+        for req_id, entry in capture_unsafe.items():
             request_failed = False
             for future in (entry[1], *entry[5:6]):
                 try:
                     future.result()
                 except BaseException:
+                    requires_restart = getattr(
+                        self.lmcache_engine,
+                        "remote_fill_requires_paired_restart",
+                        None,
+                    )
+                    if callable(requires_restart) and requires_restart():
+                        logger.critical(
+                            "Cold compact load has unknown native DMA state; "
+                            "refusing further model or graph execution",
+                            exc_info=True,
+                        )
+                        raise
                     request_failed = True
             if request_failed:
                 failed_req_ids.append(req_id)
@@ -6799,11 +6904,17 @@ class LMCacheConnectorV1Impl:
             dependency_wait_ms = (
                 cold_start_perf_now() - dependency_wait_started
             ) * 1000
-            self._record_dsa_cold_dense_load_readiness(
-                state,
-                indexer_readiness,
-                tuple(plan.get("indexer_source_owners", ())),
-            )
+            if plan.get("group1_direct_hbm", False):
+                if indexer_readiness is not None:
+                    raise RuntimeError(
+                        "Direct Group-1 load returned an unexpected CPU-source fence"
+                    )
+            else:
+                self._record_dsa_cold_dense_load_readiness(
+                    state,
+                    indexer_readiness,
+                    tuple(plan.get("indexer_source_owners", ())),
+                )
 
             seal_started = cold_start_perf_now()
             state.indexer_npu_resident = True
@@ -9267,6 +9378,22 @@ class LMCacheConnectorV1Impl:
                     final_unhidden_ms=round(
                         (published_at - completed_at) * 1000, 3
                     ),
+                    hbm_parked_ms=round(
+                        (
+                            published_at
+                            - (
+                                getattr(
+                                    request.load_spec,
+                                    "dsa_cold_hbm_allocated_at",
+                                    None,
+                                )
+                                or submitted_at
+                            )
+                        )
+                        * 1000,
+                        3,
+                    ),
+                    indexer_blocks=len(indexer_block_ids),
                 )
                 logger.info(
                     "[DSA_COLD_COMPACT] request=%s generation=%d "
@@ -9279,6 +9406,20 @@ class LMCacheConnectorV1Impl:
                     (cold_start_perf_now() - submitted_at) * 1000,
                 )
             except BaseException as exc:
+                requires_restart = getattr(
+                    self.lmcache_engine,
+                    "remote_fill_requires_paired_restart",
+                    None,
+                )
+                if callable(requires_restart) and requires_restart():
+                    logger.critical(
+                        "Cold compact Group-1 load has unknown native DMA "
+                        "state; refusing to publish completion or reuse HBM "
+                        "blocks for request %s",
+                        req_id,
+                        exc_info=True,
+                    )
+                    raise
                 try:
                     self._synchronize_dsa_cold_dense_load()
                 except BaseException:
@@ -9306,8 +9447,36 @@ class LMCacheConnectorV1Impl:
                         failed_state, self.lmcache_engine
                     )
                 self._invalid_block_ids.update(indexer_block_ids)
-                if was_aborted:
-                    self._release_request_lookup_pins(req_id)
+                # A known-terminal failed attempt owns no usable sparse source.
+                # Release its lookup plan on both abort and recompute fallback.
+                self._release_request_lookup_pins(req_id)
+                failed_at = cold_start_perf_now()
+                cold_start_perf_log(
+                    logger,
+                    "worker_load_failed",
+                    req_id=req_id,
+                    tokens=getattr(
+                        request.load_spec, "lmcache_cached_tokens", 0
+                    ),
+                    mode="dsa_cold_compact",
+                    hbm_parked_ms=round(
+                        (
+                            failed_at
+                            - (
+                                getattr(
+                                    request.load_spec,
+                                    "dsa_cold_hbm_allocated_at",
+                                    None,
+                                )
+                                or submitted_at
+                            )
+                        )
+                        * 1000,
+                        3,
+                    ),
+                    indexer_blocks=len(indexer_block_ids),
+                    error_type=type(exc).__name__,
+                )
                 logger.exception(
                     "[DSA_COLD_COMPACT] request=%s generation=%d "
                     "status=failed indexer_blocks=%d elapsed_ms=%.3f",
@@ -9545,6 +9714,17 @@ class LMCacheConnectorV1Impl:
             return 0
 
         req_id = request.request_id
+        deferred_direct = getattr(
+            self, "_dsa_group1_direct_hbm_deferred_req_ids", None
+        )
+        if deferred_direct is not None and req_id in deferred_direct:
+            if getattr(
+                self, "_dsa_group1_direct_hbm_active_req_id", None
+            ) is not None:
+                return None
+            deferred_direct.remove(req_id)
+            if not deferred_direct:
+                del self._dsa_group1_direct_hbm_deferred_req_ids
         resumed = getattr(request, "status", None) == RequestStatus.PREEMPTED
         prompt_token_ids = getattr(request, "prompt_token_ids", None)
         request_prompt_tokens = len(prompt_token_ids or ())
@@ -9718,6 +9898,31 @@ class LMCacheConnectorV1Impl:
                 self, "_dsa_kv_policy_threshold", 0
             )
         )
+        group1_direct_hbm = bool(
+            dsa_cold_compact_load
+            and getattr(
+                self.config,
+                "dsa_group1_load_mode",
+                "p2p_preferred",
+            )
+            == "persistent_direct_hbm"
+        )
+        if group1_direct_hbm and getattr(
+            self, "_dsa_group1_direct_hbm_active_req_id", None
+        ) not in (None, req_id):
+            # A parked request owns neither HBM nor LocalCPU pins. Discard the
+            # completed proof so the request performs a fresh authoritative
+            # lookup after the scheduler-global direct-load slot opens.
+            self._release_request_lookup_pins(req_id)
+            self.load_specs.pop(req_id, None)
+            deferred_direct = getattr(
+                self, "_dsa_group1_direct_hbm_deferred_req_ids", None
+            )
+            if deferred_direct is None:
+                deferred_direct = set()
+                self._dsa_group1_direct_hbm_deferred_req_ids = deferred_direct
+            deferred_direct.add(req_id)
+            return None
         below_min_retrieve = (
             not dsa_prefix_hit
             and min_retrieve > 0
@@ -9755,6 +9960,7 @@ class LMCacheConnectorV1Impl:
         )
         if dsa_cold_compact_load:
             self.load_specs[req_id].dsa_cold_compact_load = True
+            self.load_specs[req_id].dsa_group1_direct_hbm = group1_direct_hbm
 
         if dsa_prefix_hit:
             remap_frontier = (
@@ -9977,18 +10183,39 @@ class LMCacheConnectorV1Impl:
         self.load_specs[request.request_id].can_load = True
         load_spec = self.load_specs[request.request_id]
         if getattr(load_spec, "dsa_cold_compact_load", False):
-            if blocks is None:
-                raise ValueError("Cold compact load requires KVCacheBlocks metadata")
-            generation = getattr(self, "_dsa_cold_load_generation", 0) + 1
-            self._dsa_cold_load_generation = generation
-            load_spec.dsa_cold_load_generation = generation
+            try:
+                if blocks is None:
+                    raise ValueError(
+                        "Cold compact load requires KVCacheBlocks metadata"
+                    )
+                if load_spec.dsa_group1_direct_hbm:
+                    active_direct = getattr(
+                        self, "_dsa_group1_direct_hbm_active_req_id", None
+                    )
+                    if active_direct not in (None, request.request_id):
+                        raise RuntimeError(
+                            "Group-1 direct-HBM allocation bypassed scheduler "
+                            f"admission: active={active_direct}, "
+                            f"request={request.request_id}"
+                        )
+                load_spec.dsa_cold_hbm_allocated_at = cold_start_perf_now()
+                generation = getattr(self, "_dsa_cold_load_generation", 0) + 1
+                self._dsa_cold_load_generation = generation
+                load_spec.dsa_cold_load_generation = generation
+                req_meta = self._build_dsa_cold_compact_meta(
+                    request, blocks, load_spec
+                )
+            except BaseException:
+                self._release_request_lookup_pins(request.request_id)
+                self.load_specs.pop(request.request_id, None)
+                raise
             pending = getattr(self, "_pending_dsa_cold_load_metas", None)
             if pending is None:
                 pending = {}
                 self._pending_dsa_cold_load_metas = pending
-            pending[request.request_id] = (
-                self._build_dsa_cold_compact_meta(request, blocks, load_spec)
-            )
+            pending[request.request_id] = req_meta
+            if load_spec.dsa_group1_direct_hbm:
+                self._dsa_group1_direct_hbm_active_req_id = request.request_id
 
     def _should_decode_window_save(self, tracker: RequestTracker) -> bool:
         window_size = getattr(self, "_decode_window_save_window_size", 0)
@@ -10385,6 +10612,13 @@ class LMCacheConnectorV1Impl:
             tracker = self._request_trackers.pop(finished_req_id, None)
             self._resume_lookup_queries.pop(finished_req_id, None)
             self._dsa_kv_policy_states.pop(finished_req_id, None)
+            deferred_direct = getattr(
+                self, "_dsa_group1_direct_hbm_deferred_req_ids", None
+            )
+            if deferred_direct is not None:
+                deferred_direct.discard(finished_req_id)
+                if not deferred_direct:
+                    del self._dsa_group1_direct_hbm_deferred_req_ids
             if tracker is not None:
                 self._trace_decode_window_decision(
                     tracker, decision="request_finish", reason="request_finished"
@@ -10407,7 +10641,17 @@ class LMCacheConnectorV1Impl:
             self._unfinished_requests.pop(finished_req_id, None)
             self.load_specs.pop(finished_req_id, None)
             if pending_cold is not None:
-                pending_cold.pop(finished_req_id, None)
+                removed_pending = pending_cold.pop(finished_req_id, None)
+                if (
+                    removed_pending is not None
+                    and getattr(
+                        self,
+                        "_dsa_group1_direct_hbm_active_req_id",
+                        None,
+                    )
+                    == finished_req_id
+                ):
+                    del self._dsa_group1_direct_hbm_active_req_id
             cold_loaded = getattr(self, "_dsa_cold_loaded_req_ids", None)
             if cold_loaded is not None:
                 cold_loaded.discard(finished_req_id)
@@ -10420,13 +10664,33 @@ class LMCacheConnectorV1Impl:
                 validation_blocks.pop(finished_req_id, None)
                 if not validation_blocks:
                     del self._dsa_cold_indexer_block_ids
+            cold_failed = getattr(self, "_dsa_cold_failed_req_ids", None)
+            if cold_failed is not None:
+                cold_failed.discard(finished_req_id)
+                if not cold_failed:
+                    del self._dsa_cold_failed_req_ids
 
         if pending_cold:
-            meta.dsa_cold_compact_load_pending = True
-            for req_meta in pending_cold.values():
+            active_direct = getattr(
+                self, "_dsa_group1_direct_hbm_active_req_id", None
+            )
+            for req_id, req_meta in list(pending_cold.items()):
+                direct = bool(
+                    req_meta.load_spec is not None
+                    and req_meta.load_spec.dsa_group1_direct_hbm
+                )
+                if direct and active_direct not in (None, req_id):
+                    continue
                 meta.add_request(req_meta)
-            pending_cold.clear()
-            del self._pending_dsa_cold_load_metas
+                pending_cold.pop(req_id)
+                if direct:
+                    if active_direct is None:
+                        self._dsa_group1_direct_hbm_active_req_id = req_id
+                    break
+            if meta.requests:
+                meta.dsa_cold_compact_load_pending = True
+            if not pending_cold:
+                del self._pending_dsa_cold_load_metas
         elif pending_cold is not None:
             del self._pending_dsa_cold_load_metas
 
@@ -10838,10 +11102,41 @@ class LMCacheConnectorV1Impl:
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         # This callback runs in the scheduler process. Worker-owned state is
         # released when the same request ID reaches worker-side get_finished().
+        req_id = request.request_id
         self._cold_perf_lookup_started.pop(request.request_id, None)
         self._resume_lookup_queries.pop(request.request_id, None)
         self._dsa_kv_policy_states.pop(request.request_id, None)
-        self._release_request_lookup_pins(request.request_id)
+        pending_cold = getattr(self, "_pending_dsa_cold_load_metas", None)
+        pending_meta = (
+            pending_cold.pop(req_id, None) if pending_cold is not None else None
+        )
+        predispatch_cancelled = pending_meta is not None
+        if pending_cold is not None and not pending_cold:
+            del self._pending_dsa_cold_load_metas
+        active_direct = (
+            getattr(self, "_dsa_group1_direct_hbm_active_req_id", None) == req_id
+        )
+        if predispatch_cancelled:
+            if active_direct:
+                del self._dsa_group1_direct_hbm_active_req_id
+            self.load_specs.pop(req_id, None)
+            validation_blocks = getattr(
+                self, "_dsa_cold_indexer_block_ids", None
+            )
+            if validation_blocks is not None:
+                validation_blocks.pop(req_id, None)
+                if not validation_blocks:
+                    del self._dsa_cold_indexer_block_ids
+            self._release_request_lookup_pins(req_id)
+        elif not active_direct:
+            self._release_request_lookup_pins(req_id)
+        deferred_direct = getattr(
+            self, "_dsa_group1_direct_hbm_deferred_req_ids", None
+        )
+        if deferred_direct is not None:
+            deferred_direct.discard(request.request_id)
+            if not deferred_direct:
+                del self._dsa_group1_direct_hbm_deferred_req_ids
         # Layerwise save uses request-scoped generators. If request finishes
         # without entering wait_for_save (abort/error/evict path), make sure
         # we release the generator entry to avoid leaking state.
@@ -10850,17 +11145,15 @@ class LMCacheConnectorV1Impl:
         ):
             self._drop_layerwise_save_storers(request.request_id)
 
-        self._drop_worker_retrieve_state(request.request_id)
+        self._drop_worker_retrieve_state(req_id, release_lookup_pins=False)
         transitions = getattr(self, "_mtp_dw_deep_retrieve_transitions", None)
         if transitions is not None:
             transitions.pop(request.request_id, None)
 
-        # Cleanup if request was aborted
-        if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:
-            # Cancel any ongoing async lookup and prefetch tasks on workers
-            lookup_id = request.request_id
-            assert self.lookup_client is not None
-            self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
+        assert self.lookup_client is not None
+        # Worker-side lookup ownership remains live for emitted direct loads;
+        # only discard the scheduler's completed status in that state.
+        self.lookup_client.clear_lookup_status(req_id)
 
         params = (
             request.kv_transfer_params
@@ -10893,7 +11186,8 @@ class LMCacheConnectorV1Impl:
                     request_tracker.num_lmcache_cached_tokens
                 )
 
-        return bool(getattr(request, "dsa_compact_allocated", False)), return_params
+        delay_free = bool(getattr(request, "dsa_compact_allocated", False))
+        return delay_free and not predispatch_cancelled, return_params
 
     @_lmcache_nvtx_annotate
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:

@@ -79,6 +79,9 @@ class HitLimitLookupClient(LookupClientInterface):
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.actual_lookup_client.clear_lookup_status(lookup_id)
 
+    def cleanup_lookup(self, lookup_id: str) -> None:
+        self.actual_lookup_client.cleanup_lookup(lookup_id)
+
     def supports_producer_reuse(self) -> bool:
         return self.actual_lookup_client.supports_producer_reuse()
 

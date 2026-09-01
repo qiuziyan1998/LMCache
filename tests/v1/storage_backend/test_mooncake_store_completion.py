@@ -41,6 +41,8 @@ def _make_mooncake_connector(
     calls: list,
     *,
     remote_fill_enabled: bool = False,
+    external_page_only: bool = False,
+    store_cls: type | None = None,
 ) -> tuple[MooncakestoreConnector, asyncio.AbstractEventLoop]:
     class _Store:
         def setup(self, *args):
@@ -58,10 +60,22 @@ def _make_mooncake_connector(
         def close(self):
             calls.append(("close",))
 
+        @staticmethod
+        def batch_get_into_multi_buffers(keys, ptrs, sizes):
+            return [sum(page_sizes) for page_sizes in sizes]
+
+        @staticmethod
+        def batch_put_from_multi_buffers(keys, ptrs, sizes, replica):
+            return [0] * len(keys)
+
+        @staticmethod
+        def batch_is_exist(keys):
+            return [1] * len(keys)
+
     package = ModuleType("mooncake")
     package.__path__ = []  # type: ignore[attr-defined]
     store_module = ModuleType("mooncake.store")
-    store_module.MooncakeDistributedStore = _Store
+    store_module.MooncakeDistributedStore = store_cls or _Store
     store_module.ReplicateConfig = type("ReplicateConfig", (), {})
     package.store = store_module
     monkeypatch.setitem(sys.modules, "mooncake", package)
@@ -74,6 +88,13 @@ def _make_mooncake_connector(
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=8,
         enable_remote_lmcache_store=remote_fill_enabled,
+        use_layerwise=external_page_only,
+        dsa_two_groups=external_page_only,
+        remote_url=(
+            "mooncakestore://127.0.0.1:50051"
+            if external_page_only
+            else None
+        ),
         extra_config={
             "local_hostname": "configured-host",
             "metadata_server": "metadata",
@@ -98,7 +119,81 @@ def _make_mooncake_connector(
         memory_allocator=SimpleNamespace(),
     )
     loop = asyncio.new_event_loop()
-    return MooncakestoreConnector("", 0, "", loop, local_cpu, config), loop
+    try:
+        connector = MooncakestoreConnector(
+            "",
+            0,
+            "",
+            loop,
+            None if external_page_only else local_cpu,
+            config,
+            metadata,
+            external_page_only=external_page_only,
+        )
+    except BaseException:
+        loop.close()
+        raise
+    return connector, loop
+
+
+def test_external_page_only_mooncake_has_no_local_cpu_slab(monkeypatch) -> None:
+    calls = []
+    connector, loop = _make_mooncake_connector(
+        monkeypatch,
+        {
+            "enable_shared_cpu_cache": True,
+            "save_only_first_rank": True,
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+            "save_chunk_meta": False,
+        },
+        calls,
+        external_page_only=True,
+    )
+    try:
+        assert connector.local_cpu_backend is None
+        assert connector._external_native_hard_timeout_seconds == 120
+        assert connector.batched_external_pages_exist([_key(7)]) == [True]
+        asyncio.run(connector.close())
+    finally:
+        loop.close()
+
+    assert not any(call[0] in {"register", "unregister"} for call in calls)
+
+
+def test_mooncake_closes_store_when_post_setup_validation_fails(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class _MissingPageAPIStore:
+        @staticmethod
+        def setup(*args):
+            calls.append(("setup", args))
+            return 0
+
+        @staticmethod
+        def batch_is_exist(keys):
+            return [1] * len(keys)
+
+        @staticmethod
+        def close():
+            calls.append(("close",))
+
+    with pytest.raises(RuntimeError, match="batch_get_into_multi_buffers"):
+        _make_mooncake_connector(
+            monkeypatch,
+            {
+                "mooncake_page_first_multi_buffer": True,
+                "mooncake_layer_merged_page_objects": True,
+                "save_chunk_meta": False,
+            },
+            calls,
+            external_page_only=True,
+            store_cls=_MissingPageAPIStore,
+        )
+
+    assert [call[0] for call in calls] == ["setup", "close"]
 
 
 @pytest.mark.parametrize(
@@ -859,6 +954,49 @@ def test_mooncake_page_put_fast_paths_reuse_input_arrays() -> None:
     assert connector.replica_config.preferred_segment == "local-segment"
 
 
+def test_mooncake_page_put_can_target_only_group1() -> None:
+    class _ReplicateConfig:
+        pass
+
+    calls = []
+
+    class _Store:
+        @staticmethod
+        def batch_put_from_multi_buffers(keys, ptrs, sizes, replica):
+            calls.append((keys, replica))
+            return [0] * len(keys)
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.store = _Store()
+    connector._replicate_config_cls = _ReplicateConfig
+    connector.replica_config = _ReplicateConfig()
+    request_configs = {
+        "lmcache.mooncake_preferred_segment": "decoder-segment",
+        "lmcache.mooncake_preferred_kv_group": 1,
+    }
+    keys = [
+        CacheEngineKey(
+            "test",
+            1,
+            0,
+            group,
+            torch.float16,
+            request_configs=request_configs,
+            kv_group=group,
+        )
+        for group in (0, 1)
+    ]
+
+    connector._batch_put_multi_buffers_by_segment(
+        keys, ["g0", "g1"], [[10], [20]], [[1], [1]]
+    )
+
+    assert calls[0][0] == ["g0"]
+    assert calls[0][1] is connector.replica_config
+    assert calls[1][0] == ["g1"]
+    assert calls[1][1].preferred_segment == "decoder-segment"
+
+
 def test_mooncake_page_put_mixed_none_statuses_remain_aligned() -> None:
     class _ReplicateConfig:
         pass
@@ -1586,6 +1724,274 @@ def test_mooncake_cancelled_direct_external_get_drains_native_read() -> None:
     asyncio.run(cancel_get())
 
 
+def test_direct_get_uses_engine_native_hard_timeout_after_soft_timeout() -> None:
+    release = threading.Event()
+
+    class _Store:
+        @staticmethod
+        def batch_get_into_multi_buffers(keys, ptrs, sizes):
+            assert release.wait(1)
+            return [sum(page_sizes) for page_sizes in sizes]
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector.config = SimpleNamespace(transfer_timeout=0.01)
+    connector._external_native_hard_timeout_seconds = 0.2
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (None, None, None, 2)
+    connector._register_external_owners = lambda owners: None
+    connector._external_put_lock = asyncio.Lock()
+    connector._inflight_put_tasks = set()
+    connector.store = _Store()
+    owner = torch.empty(32, dtype=torch.uint8)
+    timer = threading.Timer(0.05, release.set)
+    timer.start()
+    try:
+        with pytest.raises(TimeoutError, match="timed out"):
+            asyncio.run(
+                connector.batched_get_external_pages(
+                    [_key(1)],
+                    [[owner.data_ptr()]],
+                    [[32]],
+                    (owner,),
+                    "request",
+                )
+            )
+        assert not hasattr(connector, "_external_native_unknown_error")
+    finally:
+        release.set()
+        timer.join()
+
+
+@pytest.mark.parametrize("operation", ["put", "get"])
+def test_queued_external_transfer_rechecks_fatal_inside_lock(
+    operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_entered = threading.Event()
+    native_release = threading.Event()
+    native_calls = []
+
+    def native_put(*_args):
+        native_calls.append("put")
+        native_entered.set()
+        if len(native_calls) == 1:
+            assert native_release.wait(timeout=5.0)
+        return [0], [], 0, 1, 1
+
+    def native_get(*_args):
+        native_calls.append("get")
+        native_entered.set()
+        if len(native_calls) == 1:
+            assert native_release.wait(timeout=5.0)
+        return [32]
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector.config = SimpleNamespace(transfer_timeout=0.01)
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=8)
+    )
+    connector._metadata_for_raw_key = lambda key: (None, None, None, 2)
+    connector._register_external_owners = lambda owners: None
+    connector._external_put_lock = asyncio.Lock()
+    connector._inflight_put_tasks = set()
+    connector._batch_put_multi_buffers_by_segment = native_put
+    connector.store = SimpleNamespace(
+        batch_get_into_multi_buffers=native_get
+    )
+    owner = torch.empty(32, dtype=torch.uint8)
+
+    async def run() -> None:
+        hard_wait_entered = asyncio.Event()
+        allow_unknown = asyncio.Event()
+
+        async def fail_native_wait(
+            task,
+            *,
+            deadline: float,
+            operation: str,
+        ):
+            del deadline
+            hard_wait_entered.set()
+            await allow_unknown.wait()
+            raise NativeExternalPageTransferUnknownError(operation, task)
+
+        monkeypatch.setattr(
+            mooncake_connector,
+            "_wait_external_native_until_hard_deadline",
+            fail_native_wait,
+        )
+
+        async def submit(req_id: str) -> None:
+            if operation == "put":
+                await connector.batched_put_external_pages(
+                    [_key(1)],
+                    [[owner.data_ptr()]],
+                    [[32]],
+                    (owner,),
+                    None,
+                    req_id,
+                )
+            else:
+                await connector.batched_get_external_pages(
+                    [_key(1)],
+                    [[owner.data_ptr()]],
+                    [[32]],
+                    (owner,),
+                    req_id,
+                )
+
+        tasks = []
+        try:
+            first = asyncio.create_task(submit("first"))
+            tasks.append(first)
+            while not native_entered.is_set():
+                await asyncio.sleep(0)
+            second = asyncio.create_task(submit("second"))
+            tasks.append(second)
+            await asyncio.sleep(0)
+            assert connector._external_put_lock.locked()
+            assert not second.done()
+            await hard_wait_entered.wait()
+            allow_unknown.set()
+            results = await asyncio.gather(
+                first, second, return_exceptions=True
+            )
+
+            fatal = connector._external_native_unknown_error
+            assert isinstance(fatal, NativeExternalPageTransferUnknownError)
+            assert results[0] is fatal
+            assert results[1] is fatal
+            assert native_calls == [operation]
+        finally:
+            allow_unknown.set()
+            native_release.set()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            while connector._inflight_put_tasks:
+                await asyncio.sleep(0)
+
+    try:
+        asyncio.run(run())
+    finally:
+        native_release.set()
+
+
+def test_external_reader_close_refuses_failed_buffer_unregistration() -> None:
+    calls = []
+    connector = object.__new__(MooncakestoreConnector)
+    connector._external_page_only = True
+    connector._external_buffers = {0x1000: 32}
+    connector._shared_external_buffers = {}
+    connector._inflight_put_tasks = set()
+    connector._direct_push_transport = None
+    connector.store = SimpleNamespace(
+        unregister_buffer=lambda ptr: calls.append(("unregister", ptr)) or -1,
+        close=lambda: calls.append(("close",)),
+    )
+
+    with pytest.raises(RuntimeError, match="still in use"):
+        asyncio.run(connector.close())
+
+    assert connector._external_buffers == {0x1000: 32}
+    assert calls == [("unregister", 0x1000)]
+
+
+def test_external_close_timeout_prevents_late_teardown_mutation() -> None:
+    calls = []
+    unregister_started = threading.Event()
+    unregister_release = threading.Event()
+    errors: list[BaseException] = []
+
+    def unregister(ptr: int) -> int:
+        calls.append(("unregister", ptr))
+        unregister_started.set()
+        assert unregister_release.wait(timeout=1.0)
+        return 0
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector._external_page_only = True
+    connector._external_buffers = {0x1000: 32}
+    connector._shared_external_buffers = {0x2000: 64}
+    connector._inflight_put_tasks = set()
+    connector._direct_push_transport = None
+    connector.store = SimpleNamespace(
+        unregister_buffer=unregister,
+        close=lambda: calls.append(("close",)),
+    )
+
+    def close_connector() -> None:
+        try:
+            asyncio.run(connector.close())
+        except BaseException as error:
+            errors.append(error)
+
+    close_thread = threading.Thread(target=close_connector)
+    close_thread.start()
+    assert unregister_started.wait(timeout=1.0)
+    connector.mark_external_close_unknown(TimeoutError("outer close deadline"))
+    unregister_release.set()
+    close_thread.join(timeout=1.0)
+
+    assert not close_thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert connector._external_buffers == {0x1000: 32}
+    assert connector._shared_external_buffers == {0x2000: 64}
+    assert calls == [("unregister", 0x1000)]
+
+
+def test_external_owner_replacement_retains_stale_registration_on_failure() -> None:
+    calls = []
+    connector = object.__new__(MooncakestoreConnector)
+    connector._external_buffers = {0x1000: 32}
+    connector._shared_global_te = None
+    connector.store = SimpleNamespace(
+        unregister_buffer=lambda ptr: calls.append(("unregister", ptr)) or -1,
+        register_buffer=lambda ptr, size: calls.append(("register", ptr, size)) or 0,
+    )
+    storage = SimpleNamespace(data_ptr=lambda: 0x2000, nbytes=lambda: 64)
+    owner = SimpleNamespace(
+        device=SimpleNamespace(type="npu"),
+        untyped_storage=lambda: storage,
+    )
+
+    with pytest.raises(RuntimeError, match="still in use"):
+        connector._register_external_owners((owner,))
+
+    assert connector._external_buffers == {0x1000: 32}
+    assert calls == [("unregister", 0x1000)]
+
+
+def test_external_owner_resize_does_not_reregister_after_failed_unregister() -> None:
+    calls = []
+    connector = object.__new__(MooncakestoreConnector)
+    connector._external_buffers = {0x1000: 32}
+    connector._shared_global_te = None
+    connector.store = SimpleNamespace(
+        unregister_buffer=lambda ptr: calls.append(("unregister", ptr)) or -1,
+        register_buffer=lambda ptr, size: calls.append(("register", ptr, size)) or 0,
+    )
+    storage = SimpleNamespace(data_ptr=lambda: 0x1000, nbytes=lambda: 64)
+    owner = SimpleNamespace(
+        device=SimpleNamespace(type="npu"),
+        untyped_storage=lambda: storage,
+    )
+
+    with pytest.raises(RuntimeError, match="still in use"):
+        connector._register_external_owners((owner,))
+
+    assert connector._external_buffers == {0x1000: 32}
+    assert calls == [("unregister", 0x1000)]
+
+
 def test_external_page_reuses_registered_cpu_allocator_storage() -> None:
     calls = []
     owner = torch.empty(64, dtype=torch.uint8)
@@ -1706,7 +2112,8 @@ def test_remote_direct_get_timeout_drains_before_next_registration() -> None:
     connector.save_chunk_meta = False
     connector._page_first_multi_buffer = True
     connector._page_num_layers = 2
-    connector.config = SimpleNamespace(transfer_timeout=60)
+    connector.config = SimpleNamespace(transfer_timeout=0.01)
+    connector._external_native_hard_timeout_seconds = 1
     connector.local_cpu_backend = SimpleNamespace(
         metadata=SimpleNamespace(chunk_size=8)
     )
@@ -1719,17 +2126,25 @@ def test_remote_direct_get_timeout_drains_before_next_registration() -> None:
     loop = asyncio.new_event_loop()
     loop_thread = threading.Thread(target=loop.run_forever)
     loop_thread.start()
-    backend = object.__new__(RemoteBackend)
-    backend.connection = connector
-    backend.loop = loop
-    backend.config = SimpleNamespace(blocking_timeout_secs=0.01)
-    backend._mla_worker_id_as0_mode = False
+
+    def make_backend(timeout: float) -> RemoteBackend:
+        backend = object.__new__(RemoteBackend)
+        backend.connection = connector
+        backend.loop = loop
+        backend.config = SimpleNamespace(
+            blocking_timeout_secs=timeout,
+            remote_fill_native_hard_timeout_ms=1000,
+        )
+        backend._mla_worker_id_as0_mode = False
+        return backend
+
+    backends = (make_backend(0.01), make_backend(1))
     owners = [torch.empty(32, dtype=torch.uint8) for _ in range(2)]
     errors = []
 
     def load(index):
         try:
-            backend.batched_get_external_pages(
+            backends[index].batched_get_external_pages(
                 [_key(index + 1)],
                 [[owners[index].data_ptr()]],
                 [[32]],
@@ -1744,7 +2159,6 @@ def test_remote_direct_get_timeout_drains_before_next_registration() -> None:
     try:
         first.start()
         assert first_started.wait(timeout=1)
-        backend.config.blocking_timeout_secs = 1
         second.start()
         second.join(timeout=0.05)
         assert second.is_alive()
@@ -1763,6 +2177,35 @@ def test_remote_direct_get_timeout_drains_before_next_registration() -> None:
         ]
     finally:
         release_first.set()
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=1)
+        loop.close()
+
+
+def test_remote_direct_get_preserves_unknown_native_completion() -> None:
+    class _Connection:
+        @staticmethod
+        async def batched_get_external_pages(*args) -> None:
+            await asyncio.sleep(0.03)
+            raise NativeExternalPageTransferUnknownError(
+                "get", asyncio.get_running_loop().create_future()
+            )
+
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever)
+    loop_thread.start()
+    backend = object.__new__(RemoteBackend)
+    backend.connection = _Connection()
+    backend.loop = loop
+    backend.config = SimpleNamespace(blocking_timeout_secs=0.01)
+    backend._mla_worker_id_as0_mode = False
+    owner = torch.empty(32, dtype=torch.uint8)
+    try:
+        with pytest.raises(NativeExternalPageTransferUnknownError):
+            backend.batched_get_external_pages(
+                [_key(1)], [[owner.data_ptr()]], [[32]], (owner,), "request"
+            )
+    finally:
         loop.call_soon_threadsafe(loop.stop)
         loop_thread.join(timeout=1)
         loop.close()

@@ -281,6 +281,7 @@ class _RemoteFillMetricCounters:
 
 _TERMINAL_STATES = {
     TransactionState.LOCAL_FULL,
+    TransactionState.GROUP0_LOCAL,
     TransactionState.PERSISTENT_ONLY,
     TransactionState.PERSISTENCE_FAILED,
     TransactionState.CANCELLED,
@@ -376,6 +377,12 @@ class RemoteFillStateCore:
         self._expired_reservation_operations: set[str] = set()
         self._metrics = _RemoteFillMetricCounters()
         self._closed = False
+
+    @property
+    def _direct_groups(self) -> tuple[int, ...]:
+        """Return the fixed group set selected by exact negotiation."""
+
+        return (0, 1) if self._negotiation.shared_group1 else (0,)
 
     @staticmethod
     def _validate_negotiation_spec(negotiation: NegotiationSpec) -> None:
@@ -1509,9 +1516,10 @@ class RemoteFillStateCore:
             )
             for page in window.control_pages
         )
-        exact_coverage = self._has_exact_two_group_coverage(
+        exact_coverage = self._has_exact_direct_group_coverage(
             required_pages,
             request.required_store_end,
+            self._direct_groups,
         )
         if (
             transaction.publication_ineligible
@@ -1529,7 +1537,7 @@ class RemoteFillStateCore:
             in (PageDisposition.EXISTING, PageDisposition.ALLOCATED)
         )
         try:
-            local_full = self._lifecycle.commit_pages(
+            local_complete = self._lifecycle.commit_pages(
                 transaction.transfer_id,
                 required_pages,
                 prepared_pages,
@@ -1539,11 +1547,11 @@ class RemoteFillStateCore:
             self._mark_fatal_locked(transaction)
             return self._fatal_response(request, transaction)
         except Exception:
-            local_full = False
-        if not isinstance(local_full, bool):
+            local_complete = False
+        if not isinstance(local_complete, bool):
             self._mark_fatal_locked(transaction)
             return self._fatal_response(request, transaction)
-        if local_full:
+        if local_complete:
             self._metrics.published_bytes += sum(
                 window.total_bytes
                 for window in transaction.windows.values()
@@ -1562,10 +1570,16 @@ class RemoteFillStateCore:
                     self._set_window_state_locked(window, WindowState.COMMITTED)
                     for reservation in window.reservations:
                         reservation.state = WindowState.COMMITTED
+            if self._direct_groups == (0, 1):
+                terminal_state = TransactionState.LOCAL_FULL
+                terminal_outcome = TerminalOutcome.LOCAL_FULL
+            else:
+                terminal_state = TransactionState.GROUP0_LOCAL
+                terminal_outcome = TerminalOutcome.PERSISTENT_ONLY
             self._set_terminal_locked(
                 transaction,
-                TransactionState.LOCAL_FULL,
-                TerminalOutcome.LOCAL_FULL,
+                terminal_state,
+                terminal_outcome,
             )
             for window in transaction.windows.values():
                 if window.state is WindowState.COMMITTED:
@@ -1850,38 +1864,37 @@ class RemoteFillStateCore:
         )
 
     @staticmethod
-    def _has_exact_two_group_coverage(
+    def _has_exact_direct_group_coverage(
         pages: tuple[ControlPage, ...],
         required_store_end: int,
+        direct_groups: tuple[int, ...],
     ) -> bool:
         if required_store_end == 0:
             return not pages
+        expected_groups = set(direct_groups)
+        if not expected_groups or not expected_groups.issubset({0, 1}):
+            return False
         by_chunk: dict[int, list[ControlPage]] = {}
         for page in pages:
             by_chunk.setdefault(page.chunk_index, []).append(page)
         intervals: list[tuple[int, int]] = []
         for chunk_pages in by_chunk.values():
-            if len(chunk_pages) != 2 or {page.kv_group for page in chunk_pages} != {
-                0,
-                1,
-            }:
+            if len(chunk_pages) != len(direct_groups) or {
+                page.kv_group for page in chunk_pages
+            } != expected_groups:
                 return False
-            first, second = chunk_pages
-            metadata_first = (
-                first.chunk_start,
-                first.chunk_end,
-                first.valid_tokens,
-                first.layer_count,
-                first.layout_tag,
-            )
-            metadata_second = (
-                second.chunk_start,
-                second.chunk_end,
-                second.valid_tokens,
-                second.layer_count,
-                second.layout_tag,
-            )
-            if metadata_first != metadata_second:
+            first = chunk_pages[0]
+            metadata = {
+                (
+                    page.chunk_start,
+                    page.chunk_end,
+                    page.valid_tokens,
+                    page.layer_count,
+                    page.layout_tag,
+                )
+                for page in chunk_pages
+            }
+            if len(metadata) != 1:
                 return False
             intervals.append(
                 (first.chunk_start, first.chunk_start + first.valid_tokens)
@@ -1899,14 +1912,18 @@ class RemoteFillStateCore:
         pages: tuple[ControlPage, ...],
     ) -> bool:
         chunk_size = self._negotiation.chunk_size
-        return all(
+        groups_by_chunk: dict[int, set[int]] = {}
+        for page in pages:
+            groups_by_chunk.setdefault(page.chunk_index, set()).add(page.kv_group)
+        expected_groups = set(self._direct_groups)
+        return bool(groups_by_chunk) and all(
             page.layout_tag == self._negotiation.layout_tag
             and page.layer_count == self._negotiation.layer_count
             and page.chunk_end - page.chunk_start == page.valid_tokens
             and 0 < page.valid_tokens <= chunk_size
             and page.chunk_start == page.chunk_index * chunk_size
             for page in pages
-        )
+        ) and all(groups == expected_groups for groups in groups_by_chunk.values())
 
     def _finish_abort_if_drained_locked(self, transaction: _Transaction) -> None:
         if transaction.state is not TransactionState.ABORT_REQUESTED:

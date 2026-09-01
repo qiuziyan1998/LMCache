@@ -94,6 +94,9 @@ class LMCacheBypassLookupClient(LookupClientInterface):
     def supports_producer_reuse(self) -> bool:
         return True
 
+    def cleanup_lookup(self, lookup_id: str) -> None:
+        self.lmcache_engine.cleanup_memory_objs(lookup_id)
+
     def close(self):
         # No resources to clean up for bypass client
         logger.info("LMCacheBypassLookupClient closed")

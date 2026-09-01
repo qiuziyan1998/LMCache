@@ -227,10 +227,13 @@ def test_remote_fill_rejects_empty_advertised_control_host():
         config.validate()
 
 
-def test_remote_fill_rejects_undersized_control_manifest():
+def test_remote_fill_legacy_preserves_paired_control_manifest_bound():
     config = _remote_fill_config(remote_fill_max_control_pages_per_window=7)
 
-    with pytest.raises(ValueError, match="max_control_pages"):
+    with pytest.raises(
+        ValueError,
+        match=r"max_control_pages.*direct_groups=\(0, 1\).*8 pages",
+    ):
         config.validate()
 
 
@@ -301,6 +304,121 @@ def test_group1_parallel_prefetch_accepts_complete_page_layout_contract():
 
     config.validate()
     assert mooncake_layer_pages_enabled(config)
+
+
+def _persistent_direct_hbm_config(
+    *,
+    external_lookup_client: str | None = None,
+    **extra_overrides: object,
+) -> LMCacheEngineConfig:
+    extra_config = {
+        "enable_shared_cpu_cache": True,
+        "save_only_first_rank": True,
+        "mooncake_page_first_multi_buffer": True,
+        "mooncake_layer_merged_page_objects": True,
+        **extra_overrides,
+    }
+    return LMCacheEngineConfig.from_defaults(
+        use_layerwise=True,
+        enable_sparse_attention=True,
+        save_unfull_chunk=True,
+        dsa_two_groups=True,
+        enable_dsa_cold_compact_load=True,
+        enable_remote_lmcache_store=True,
+        dsa_group1_load_mode="persistent_direct_hbm",
+        pd_role="receiver",
+        external_lookup_client=external_lookup_client,
+        remote_url="mooncakestore://metadata",
+        extra_config=extra_config,
+    )
+
+
+def test_group1_persistent_direct_hbm_accepts_complete_contract():
+    config = _persistent_direct_hbm_config()
+
+    config.validate()
+
+    assert config.dsa_group1_load_mode == "persistent_direct_hbm"
+
+
+def test_group1_persistent_direct_hbm_accepts_sender_without_decoder_slab():
+    config = _persistent_direct_hbm_config()
+    config.pd_role = "sender"
+    config.enable_dsa_cold_compact_load = False
+    config.extra_config = {
+        **config.extra_config,
+        "enable_shared_cpu_cache": False,
+    }
+
+    config.validate()
+
+
+def test_group1_persistent_direct_hbm_requires_explicit_pd_role():
+    config = _persistent_direct_hbm_config()
+    config.pd_role = None
+
+    with pytest.raises(ValueError, match="pd_role=sender\\|receiver"):
+        config.validate()
+
+
+def test_group1_persistent_direct_hbm_accepts_exact_group0_control_bound():
+    config = _persistent_direct_hbm_config()
+    config.chunk_size = 1024
+    config.remote_fill_window_tokens = 4096
+    config.remote_fill_max_control_pages_per_window = 4
+
+    config.validate()
+
+    assert config.remote_fill_max_control_pages_per_window == 4
+
+
+def test_group1_persistent_direct_hbm_rejects_undersized_group0_control_bound():
+    config = _persistent_direct_hbm_config()
+    config.chunk_size = 1024
+    config.remote_fill_window_tokens = 4096
+    config.remote_fill_max_control_pages_per_window = 3
+
+    with pytest.raises(
+        ValueError,
+        match=r"max_control_pages.*direct_groups=\(0,\).*4 pages",
+    ):
+        config.validate()
+
+
+def test_group1_persistent_direct_hbm_rejects_external_lookup_client():
+    config = _persistent_direct_hbm_config(external_lookup_client="mooncake")
+
+    with pytest.raises(ValueError, match="external_lookup_client=None"):
+        config.validate()
+
+
+@pytest.mark.parametrize(
+    ("override", "requirement"),
+    [
+        ({"save_chunk_meta": True}, "save_chunk_meta=false"),
+        (
+            {"remote_enable_mla_worker_id_as0": False},
+            "remote_enable_mla_worker_id_as0!=false",
+        ),
+        ({"shared_cpu_cache_strict": False}, "shared_cpu_cache_strict=true"),
+    ],
+)
+def test_group1_persistent_direct_hbm_rejects_unsafe_contract(
+    override,
+    requirement,
+):
+    config = _persistent_direct_hbm_config(**override)
+
+    with pytest.raises(ValueError, match=requirement):
+        config.validate()
+
+
+def test_group1_persistent_direct_hbm_requires_remote_fill_placement():
+    config = _persistent_direct_hbm_config()
+    config.enable_remote_lmcache_store = False
+
+    with pytest.raises(ValueError, match="enable_remote_lmcache_store=true"):
+        config.validate()
 
 
 @pytest.mark.parametrize(

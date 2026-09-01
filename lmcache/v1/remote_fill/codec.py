@@ -307,8 +307,18 @@ def _validate_reserve(
         if prior_metadata != metadata:
             raise ProtocolValidationError("two-group chunk metadata is inconsistent")
         total_bytes += page.expected_bytes
-    if any(groups != {0, 1} for groups in groups_by_chunk.values()):
-        raise ProtocolValidationError("each chunk requires exactly groups 0 and 1")
+    observed_group_sets = {
+        frozenset(groups) for groups in groups_by_chunk.values()
+    }
+    if len(observed_group_sets) != 1:
+        raise ProtocolValidationError(
+            "all chunks require one uniform direct-group set"
+        )
+    observed_groups = next(iter(observed_group_sets))
+    if observed_groups not in (frozenset({0}), frozenset({0, 1})):
+        raise ProtocolValidationError(
+            "each chunk requires exactly group 0 or groups 0 and 1"
+        )
     if total_bytes > limits.max_window_bytes:
         raise ProtocolValidationError("window byte count exceeds limit")
 

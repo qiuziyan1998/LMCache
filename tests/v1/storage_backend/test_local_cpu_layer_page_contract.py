@@ -350,6 +350,62 @@ def test_external_commit_rejects_mismatched_groups(
         )
 
 
+def test_external_group0_commit_rejects_wrong_group_and_foreign_ready_key(
+    page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
+) -> None:
+    backend, allocate = page_backend
+
+    with pytest.raises(ValueError, match="requires Group 0 keys"):
+        backend.commit_external_group0_prefix_if_absent([_page_key(0, 1)], {})
+
+    required = [_page_key(0, 0)]
+    with pytest.raises(ValueError, match="belong to the required prefix"):
+        backend.commit_external_group0_prefix_if_absent(
+            required,
+            {_page_key(1, 0): allocate(1)[0]},
+        )
+
+
+def test_external_group0_commit_combines_existing_and_ready_coverage(
+    page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
+) -> None:
+    backend, allocate = page_backend
+    required = [_page_key(index, 0) for index in range(2)]
+    existing, duplicate, new_page = allocate(3)
+    backend.batched_submit_layer_pages_if_absent([required[0]], [existing])
+
+    result = backend.commit_external_group0_prefix_if_absent(
+        required,
+        {required[0]: duplicate, required[1]: new_page},
+    )
+
+    assert result == ExternalTwoGroupCommitResult(
+        committed=True,
+        inserted_keys=(required[1],),
+        existing_keys=(required[0],),
+        redundant_pages=(duplicate,),
+    )
+    assert backend.contains_all_exact(required)
+
+
+def test_external_group0_missing_page_is_atomic(
+    page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
+) -> None:
+    backend, allocate = page_backend
+    required = [_page_key(index, 0) for index in range(2)]
+    ready_page = allocate(1)[0]
+
+    result = backend.commit_external_group0_prefix_if_absent(
+        required,
+        {required[0]: ready_page},
+    )
+
+    assert not result.committed
+    assert result.missing_keys == (required[1],)
+    assert result.redundant_pages == (ready_page,)
+    assert not backend.contains_any_exact(required)
+
+
 def test_external_commit_missing_reservation_inserts_nothing(
     page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
 ) -> None:

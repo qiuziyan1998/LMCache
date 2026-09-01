@@ -276,7 +276,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "remote_fill_max_inflight_bytes": {
         "type": int,
-        "default": 2 * 1024**3,
+        "default": 8 * 1024**3,
         "env_converter": int,
     },
     "remote_fill_max_reserved_bytes": {
@@ -316,7 +316,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "remote_fill_max_control_pages_per_window": {
         "type": int,
-        # Zero derives the exact two-group bound from window/chunk size.
+        # Zero derives the exact direct-group bound from window/chunk size.
         "default": 0,
         "env_converter": int,
     },
@@ -490,7 +490,8 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": str,
         "description": (
             "Group-1 cold-load policy: prefer live P2P, force serial "
-            "persistent load, or overlap persistent prefetch with Group 0."
+            "persistent load, overlap persistent prefetch with Group 0, or "
+            "load persistent pages directly into final HBM."
         ),
     },
     "enable_npu_transfer_validation": {
@@ -811,6 +812,7 @@ def _validate_config(self):
 
     group1_load_modes = {
         "p2p_preferred",
+        "persistent_direct_hbm",
         "persistent_serial",
         "persistent_parallel_prefetch",
     }
@@ -907,6 +909,14 @@ def _validate_config(self):
         )
     remote_fill_active = bool(self.enable_remote_lmcache_store)
     if remote_fill_active:
+        if (
+            self.dsa_group1_load_mode == "persistent_direct_hbm"
+            and bool(extra_config.get("save_chunk_meta", False))
+        ):
+            raise ValueError(
+                "dsa_group1_load_mode=persistent_direct_hbm requires "
+                "extra_config.save_chunk_meta=false"
+            )
         # These are invariants of the only implemented RemoteFill protocol,
         # not deployment choices: layerwise DSA two-group pages, immutable
         # final-only publication, non-evicting reservations, and prefiller-
@@ -948,13 +958,20 @@ def _validate_config(self):
             raise ValueError(
                 "remote_fill_window_tokens must be a positive multiple of chunk_size"
             )
-        required_control_pages = (self.remote_fill_window_tokens // self.chunk_size) * 2
+        direct_groups = (
+            (0,) if self.dsa_group1_load_mode == "persistent_direct_hbm" else (0, 1)
+        )
+        required_control_pages = (
+            self.remote_fill_window_tokens // self.chunk_size
+        ) * len(direct_groups)
         if self.remote_fill_max_control_pages_per_window == 0:
             self.remote_fill_max_control_pages_per_window = required_control_pages
         elif self.remote_fill_max_control_pages_per_window < required_control_pages:
             raise ValueError(
-                "remote_fill_max_control_pages_per_window is too small for one "
-                "two-group window"
+                "remote_fill_max_control_pages_per_window="
+                f"{self.remote_fill_max_control_pages_per_window} is too small for "
+                f"direct_groups={direct_groups}; requires at least "
+                f"{required_control_pages} pages per window"
             )
         positive_remote_fill_values = {
             "remote_fill_max_active_transactions": (
@@ -1043,13 +1060,14 @@ def _validate_config(self):
                 + ", ".join(f"{name}=true" for name in missing_flags)
             )
 
-    if self.dsa_group1_load_mode == "persistent_parallel_prefetch":
-        prefetch_requirements = {
-            "enable_dsa_cold_compact_load": self.enable_dsa_cold_compact_load,
+    if self.dsa_group1_load_mode in {
+        "persistent_parallel_prefetch",
+        "persistent_direct_hbm",
+    }:
+        persistent_requirements = {
             "use_layerwise": self.use_layerwise,
             "enable_sparse_attention": self.enable_sparse_attention,
             "dsa_two_groups": self.dsa_two_groups,
-            "enable_shared_cpu_cache": enable_shared_cpu_cache,
             "remote_url=mooncakestore://...": str(self.remote_url).startswith(
                 "mooncakestore://"
             ),
@@ -1063,15 +1081,64 @@ def _validate_config(self):
                 extra_config.get("mooncake_layer_merged_page_objects", False)
             ),
         }
-        missing_prefetch_requirements = [
+        if self.dsa_group1_load_mode == "persistent_parallel_prefetch":
+            persistent_requirements.update(
+                {
+                    "enable_dsa_cold_compact_load": (
+                        self.enable_dsa_cold_compact_load
+                    ),
+                    "enable_shared_cpu_cache": enable_shared_cpu_cache,
+                }
+            )
+        if self.dsa_group1_load_mode == "persistent_direct_hbm":
+            save_only_first_rank = bool(
+                extra_config.get("save_only_first_rank", False)
+            )
+            persistent_requirements.update(
+                {
+                    "pd_role=sender|receiver": self.pd_role
+                    in {"sender", "receiver"},
+                    "enable_remote_lmcache_store=true": bool(
+                        self.enable_remote_lmcache_store
+                    ),
+                    "extra_config.remote_enable_mla_worker_id_as0!=false": bool(
+                        extra_config.get(
+                            "remote_enable_mla_worker_id_as0",
+                            save_only_first_rank,
+                        )
+                    ),
+                    "extra_config.save_chunk_meta=false": not bool(
+                        extra_config.get("save_chunk_meta", False)
+                    ),
+                    "external_lookup_client=None": (
+                        self.external_lookup_client is None
+                    ),
+                }
+            )
+            if self.pd_role == "receiver":
+                persistent_requirements.update(
+                    {
+                        "enable_dsa_cold_compact_load": (
+                            self.enable_dsa_cold_compact_load
+                        ),
+                        "enable_shared_cpu_cache": enable_shared_cpu_cache,
+                        "shared_cpu_cache_strict=true": bool(
+                            extra_config.get(
+                                "shared_cpu_cache_strict",
+                                self.shared_cpu_cache_strict,
+                            )
+                        ),
+                    }
+                )
+        missing_persistent_requirements = [
             name
-            for name, enabled in prefetch_requirements.items()
+            for name, enabled in persistent_requirements.items()
             if not enabled
         ]
-        if missing_prefetch_requirements:
+        if missing_persistent_requirements:
             raise ValueError(
-                "dsa_group1_load_mode=persistent_parallel_prefetch requires "
-                + ", ".join(missing_prefetch_requirements)
+                f"dsa_group1_load_mode={self.dsa_group1_load_mode} requires "
+                + ", ".join(missing_persistent_requirements)
             )
 
     if self.experimental_sampled_layerwise_lookup:

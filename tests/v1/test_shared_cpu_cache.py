@@ -2083,7 +2083,11 @@ class _MisleadingGroupShapeConnector:
         return torch.Size([num_tokens, hidden])
 
 
-def _make_engine_for_sparse_capacity(*, max_local_cpu_size: float):
+def _make_engine_for_sparse_capacity(
+    *,
+    max_local_cpu_size: float,
+    group1_load_mode: str = "p2p_preferred",
+) -> LMCacheEngine:
     engine = object.__new__(LMCacheEngine)
     extra_config = {
         "vllm_max_model_len": 1024,
@@ -2091,6 +2095,7 @@ def _make_engine_for_sparse_capacity(*, max_local_cpu_size: float):
     }
     engine.config = SimpleNamespace(
         enable_sparse_attention=True,
+        dsa_group1_load_mode=group1_load_mode,
         chunk_size=256,
         max_local_cpu_size=max_local_cpu_size,
         extra_config=extra_config,
@@ -2517,6 +2522,23 @@ def test_engine_contract_requires_index_materialization_for_strict_sparse():
         engine._validate_shared_cpu_cache_contract()
 
 
+def test_direct_hbm_contract_does_not_require_group1_cpu_materialization():
+    engine = _make_engine_for_contract(
+        use_layerwise=True,
+        sparse=True,
+        shared=True,
+    )
+    engine.broadcast_object_fn = lambda obj, src=0: obj
+    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.get_extra_config_value = (
+        lambda key, default=None: False
+        if key == "shared_cpu_materialize_index_on_decode_cold"
+        else default
+    )
+
+    engine._validate_shared_cpu_cache_contract()
+
+
 def test_rank0_post_init_broadcasts_startup_error_on_storage_failure(
     monkeypatch,
 ):
@@ -2588,6 +2610,32 @@ def test_sparse_capacity_preflight_records_startup_estimate():
     assert estimate["configured_worst_case_bytes"] == (
         estimate["one_max_request_bytes"] * 32
     )
+
+
+def test_direct_hbm_sparse_capacity_sizes_group0_only():
+    engine = _make_engine_for_sparse_capacity(
+        max_local_cpu_size=1,
+        group1_load_mode="persistent_direct_hbm",
+    )
+
+    engine._report_shared_cpu_sparse_capacity_sanity()
+
+    estimate = engine.config.extra_config[
+        "shared_cpu_sparse_startup_capacity_estimate"
+    ]
+    assert estimate["kv_groups"] == [0]
+
+
+def test_direct_hbm_capacity_can_fit_when_legacy_pair_does_not():
+    direct = _make_engine_for_sparse_capacity(
+        max_local_cpu_size=0.0082,
+        group1_load_mode="persistent_direct_hbm",
+    )
+    legacy = _make_engine_for_sparse_capacity(max_local_cpu_size=0.0082)
+
+    direct._report_shared_cpu_sparse_capacity_sanity()
+    with pytest.raises(ValueError, match="one maximum request cannot fit"):
+        legacy._report_shared_cpu_sparse_capacity_sanity()
 
 
 def test_shared_cpu_index_group_dtype_uses_single_dtype_metadata():

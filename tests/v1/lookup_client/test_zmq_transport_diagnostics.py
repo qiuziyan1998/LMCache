@@ -244,6 +244,20 @@ def test_lookup_failure_log_contains_request_context(monkeypatch) -> None:
     assert "started_at=" in message and "failed_at=" in message
 
 
+def test_sync_lookup_cleanup_releases_every_worker_before_local_clear() -> None:
+    client = object.__new__(LMCacheLookupClient)
+    client.reqs_status = {"request-42": 512}
+    client.transport = MagicMock(world_size=2)
+    client.transport.send_and_recv_all.return_value = [b"\x01", b"\x01"]
+
+    client.cleanup_lookup("request-42")
+
+    client.transport.send_and_recv_all.assert_called_once_with(
+        [lmcache_lookup_client._LOOKUP_CLEANUP_OP, "request-42", ""]
+    )
+    assert client.lookup_cache("request-42") == -1
+
+
 class _ServerTransport:
     def __init__(self) -> None:
         self.requests: queue.Queue = queue.Queue()
@@ -269,6 +283,8 @@ class _LookupEngine:
     @staticmethod
     def lookup(**kwargs) -> int:
         return 256
+
+    cleanup_memory_objs = MagicMock()
 
 
 def test_lookup_server_logs_start_and_slow_completion(monkeypatch) -> None:
@@ -296,3 +312,31 @@ def test_lookup_server_logs_start_and_slow_completion(monkeypatch) -> None:
     assert "client_timeout_ms=0" in started
     assert "lookup_id=request-7 mode=hashes input_count=1" in completed
     assert "result_tokens=256 client_timeout_ms=0" in completed
+
+
+def test_lookup_server_handles_cleanup_without_running_lookup() -> None:
+    transport = _ServerTransport()
+    transport.requests = queue.Queue()
+    transport.requests.put(
+        (
+            b"client",
+            [
+                lmcache_lookup_client._LOOKUP_CLEANUP_OP,
+                "request-cleanup",
+                "",
+            ],
+        )
+    )
+    engine = _LookupEngine()
+    engine.lookup = MagicMock(return_value=256)
+    engine.cleanup_memory_objs = MagicMock()
+    server = lmcache_lookup_client.LMCacheLookupServer(
+        engine, SimpleNamespace(), transport
+    )
+    try:
+        assert transport.response_sent.wait(timeout=1)
+    finally:
+        server.close()
+
+    engine.cleanup_memory_objs.assert_called_once_with("request-cleanup")
+    engine.lookup.assert_not_called()

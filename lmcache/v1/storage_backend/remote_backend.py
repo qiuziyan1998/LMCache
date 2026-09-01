@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future, TimeoutError
-from typing import Any, Callable, List, Optional, Sequence, Set
+from enum import Enum
+from typing import Any, Callable, List, Optional, Sequence, Set, cast
 import asyncio
 import threading
 import time
@@ -9,11 +10,16 @@ import time
 # First Party
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    _lmcache_nvtx_annotate,
+    start_loop_in_thread_with_exceptions,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.exceptions import IrrecoverableException
 from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.connector import CreateConnector
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
@@ -21,6 +27,18 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.naive_serde import CreateSerde
 
 logger = init_logger(__name__)
+
+
+def _bounded_external_timeout_secs(*timeouts: float) -> float:
+    deadline = max(0.0, *timeouts)
+    return deadline + min(1.0, max(0.01, deadline * 0.01))
+
+
+class _ExternalPageReaderState(Enum):
+    OPEN = "OPEN"
+    CLOSING = "CLOSING"
+    CLOSED = "CLOSED"
+    FATAL = "FATAL"
 
 
 class RemoteBackend(StorageBackendInterface):
@@ -31,8 +49,14 @@ class RemoteBackend(StorageBackendInterface):
         loop: asyncio.AbstractEventLoop,
         local_cpu_backend: Optional[LocalCPUBackend],
         dst_device: str = "cuda",
+        external_page_only: bool = False,
     ):
         super().__init__(dst_device=dst_device)
+        if external_page_only and local_cpu_backend is not None:
+            raise ValueError(
+                "External-page-only RemoteBackend cannot own LocalCPU storage"
+            )
+        self.external_page_only = external_page_only
         self.put_tasks: Set[CacheEngineKey] = set()
         # Single-key callers must observe the completion of the writer that
         # actually owns a pending key.  ``put_tasks`` remains a set because it
@@ -42,8 +66,18 @@ class RemoteBackend(StorageBackendInterface):
             CacheEngineKey, list[Callable[[CacheEngineKey], None]]
         ] = {}
         self.lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._close_future: Optional[Future] = None
+        self._external_page_fatal_error: Optional[BaseException] = None
+        self._strict_external_destination_ownership = external_page_only
 
         assert config.remote_url is not None
+        if external_page_only and not config.remote_url.startswith(
+            "mooncakestore://"
+        ):
+            raise ValueError(
+                "External-page-only RemoteBackend requires mooncakestore://"
+            )
 
         self.remote_url = config.remote_url
 
@@ -60,10 +94,11 @@ class RemoteBackend(StorageBackendInterface):
         self.failure_time = -1000000.0
         self.init_connection()
 
-        assert config.remote_serde is not None
-        self.serializer, self.deserializer = CreateSerde(
-            config.remote_serde, metadata, config
-        )
+        if not external_page_only:
+            assert config.remote_serde is not None
+            self.serializer, self.deserializer = CreateSerde(
+                config.remote_serde, metadata, config
+            )
 
         # Precompute MLA mode status.  When save_only_first_rank is disabled,
         # workers store distinct per-rank keys, so remote must not collapse
@@ -103,6 +138,11 @@ class RemoteBackend(StorageBackendInterface):
         # TODO(Jiayi): If we want to have cache admission policies,
         # we must make decision (whether to send or not) at the local side
 
+        self._get_blocking_failed_count = 0
+        self._put_failed_count = 0
+        if external_page_only:
+            return
+
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
         # NOTE: Health monitoring is now handled at the LMCacheEngine level
@@ -111,9 +151,6 @@ class RemoteBackend(StorageBackendInterface):
         # register RemoteBackendHealthCheck for each RemoteBackend.
 
         self._setup_metrics()
-
-        self._get_blocking_failed_count = 0
-        self._put_failed_count = 0
 
     def _setup_metrics(self):
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
@@ -144,12 +181,18 @@ class RemoteBackend(StorageBackendInterface):
             return
         try:
             assert self.config.remote_url is not None
+            connector_kwargs = (
+                {"external_page_only": True}
+                if getattr(self, "external_page_only", False)
+                else {}
+            )
             self.connection = CreateConnector(
                 self.config.remote_url,
                 self.loop,
                 self.local_cpu_backend,
                 self.config,
                 self.metadata,
+                **connector_kwargs,
             )
             logger.info(
                 f"Connection initialized/re-established at {self.config.remote_url}"
@@ -158,6 +201,8 @@ class RemoteBackend(StorageBackendInterface):
             logger.error("Irrecoverable error during connection initialization")
             raise
         except Exception as e:
+            if getattr(self, "external_page_only", False):
+                raise
             with self.lock:
                 self.failure_time = time.time()
             logger.warning(f"Failed to initialize/re-establish remote connection: {e}")
@@ -553,7 +598,24 @@ class RemoteBackend(StorageBackendInterface):
         owners: tuple[Any, ...],
         req_id: str,
     ) -> None:
-        """Retrieve remote pages directly into registered external buffers."""
+        """Retrieve pages directly into caller-owned external buffers.
+
+        Args:
+            keys: Page keys in destination order.
+            buffer_ptrs: Destination pointer runs for each page.
+            buffer_sizes: Byte lengths matching each pointer run.
+            owners: Objects retaining all destination allocations.
+            req_id: Request identity used for diagnostics.
+
+        Raises:
+            RuntimeError: If the remote connection is unavailable.
+            NativeExternalPageTransferUnknownError: If the operation does not
+                reach a terminal state by the independent outer deadline.
+            Exception: If the connector reports a known terminal failure.
+        """
+        fatal_error = getattr(self, "_external_page_fatal_error", None)
+        if fatal_error is not None:
+            raise fatal_error
         if self.connection is None:
             raise RuntimeError("Remote connection is unavailable")
         normalized = list(keys)
@@ -565,24 +627,46 @@ class RemoteBackend(StorageBackendInterface):
             ),
             self.loop,
         )
+        # Submission accepted an operation that writes into externally owned
+        # HBM. Strict teardown remains sticky even for terminal failure.
+        self._strict_external_destination_ownership = True
         try:
-            future.result(self.config.blocking_timeout_secs)
+            future.result(self._external_page_outer_timeout_secs())
+        except NativeExternalPageTransferUnknownError as error:
+            self._external_page_fatal_error = error
+            raise
         except TimeoutError as timeout_error:
-            # The connector may be running an uncancellable native write into
-            # externally owned destinations. Drain it so its serialization lock
-            # and buffer registrations remain valid before surfacing timeout.
-            try:
-                future.result()
-            except BaseException as native_error:
-                raise TimeoutError(
-                    "Direct external page load failed after timing out"
-                ) from native_error
-            raise timeout_error
+            if future.done():
+                try:
+                    future.result(timeout=0)
+                except NativeExternalPageTransferUnknownError as error:
+                    self._external_page_fatal_error = error
+                    raise
+                return
+            error = NativeExternalPageTransferUnknownError(
+                "get", cast(asyncio.Future[Any], future)
+            )
+            self._external_page_fatal_error = error
+            raise error from timeout_error
 
     def batched_external_pages_exist(
         self, keys: Sequence[CacheEngineKey]
     ) -> List[bool]:
-        """Check arbitrary Mooncake pages through the storage event loop."""
+        """Check exact Mooncake page existence without allocating LocalCPU.
+
+        Args:
+            keys: Page keys to check.
+
+        Returns:
+            One existence result per input key.
+
+        Raises:
+            NativeExternalPageTransferUnknownError: If an earlier direct read
+                left native destination ownership unknown.
+        """
+        fatal_error = getattr(self, "_external_page_fatal_error", None)
+        if fatal_error is not None:
+            raise fatal_error
         if self.connection is None:
             return [False] * len(keys)
         normalized = list(keys)
@@ -933,13 +1017,311 @@ class RemoteBackend(StorageBackendInterface):
         )
         return self.local_cpu_backend
 
-    def close(self):
-        try:
+    def begin_close(self) -> Future:
+        """Submit connector close and return its terminal future.
+
+        Returns:
+            The single retained future after accepting external HBM ownership.
+            Legacy backends retain their prior per-call submission behavior.
+
+        Raises:
+            RuntimeError: If an earlier external-page DMA has unknown ownership.
+            AssertionError: If no remote connection was initialized.
+        """
+        fatal_error = getattr(self, "_external_page_fatal_error", None)
+        if fatal_error is not None:
+            raise RuntimeError(
+                "Remote backend close refused because external-page DMA "
+                "completion is unknown"
+            ) from fatal_error
+        if not self.requires_strict_external_close():
             assert self.connection is not None
-            future = asyncio.run_coroutine_threadsafe(
+            return asyncio.run_coroutine_threadsafe(
                 self.connection.close(), self.loop
             )
-            future.result()
+        with self._close_lock:
+            if self._close_future is None:
+                assert self.connection is not None
+                self._close_future = asyncio.run_coroutine_threadsafe(
+                    self.connection.close(), self.loop
+                )
+            return self._close_future
+
+    def close(self) -> None:
+        """Close the connector, retaining external-reader close ownership.
+
+        Raises:
+            Exception: In strict external-destination mode, if connector close
+                does not reach a known successful terminal state by its hard
+                deadline.
+        """
+        future: Optional[Future] = None
+        strict_close = self.requires_strict_external_close()
+        try:
+            future = self.begin_close()
+            timeout = None
+            if strict_close:
+                timeout = self._external_page_outer_timeout_secs()
+            future.result(timeout)
             logger.info("Remote backend closed.")
+        except TimeoutError as timeout_error:
+            if strict_close and future is not None:
+                if future.done():
+                    future.result(timeout=0)
+                    logger.info("Remote backend closed.")
+                    return
+                marker_error: BaseException | None = None
+                try:
+                    self.mark_external_close_unknown(timeout_error)
+                except BaseException as error:
+                    marker_error = error
+                # Cancellation cannot stop native teardown already in flight.
+                future.cancel()
+                if marker_error is not None:
+                    raise RuntimeError(
+                        "Failed to latch external-page close ownership"
+                    ) from marker_error
+            if strict_close:
+                raise
+            logger.warning(
+                "Error occurred when closing remote connection: %s",
+                timeout_error,
+            )
         except Exception as e:
+            if strict_close:
+                raise
             logger.warning(f"Error occurred when closing remote connection: {e}")
+
+    def requires_strict_external_close(self) -> bool:
+        """Return whether this backend has accepted external HBM ownership."""
+        return bool(
+            getattr(self, "_strict_external_destination_ownership", False)
+        )
+
+    def _external_page_outer_timeout_secs(self) -> float:
+        blocking_timeout = max(
+            0.0, float(getattr(self.config, "blocking_timeout_secs", 0.0))
+        )
+        native_timeout = max(
+            0.0,
+            float(
+                getattr(
+                    self.config,
+                    "remote_fill_native_hard_timeout_ms",
+                    30000.0,
+                )
+            )
+            / 1000.0,
+        )
+        connection = self._external_page_connector()
+        connector_timeout = max(
+            0.0,
+            float(
+                getattr(
+                    getattr(connection, "config", None),
+                    "transfer_timeout",
+                    0.0,
+                )
+            ),
+        )
+        return _bounded_external_timeout_secs(
+            blocking_timeout, native_timeout, connector_timeout
+        )
+
+    def _external_page_connector(self) -> Optional[RemoteConnector]:
+        """Return the concrete connector beneath metrics instrumentation."""
+        connection = self.connection
+        get_wrapped = getattr(connection, "getWrappedConnector", None)
+        if callable(get_wrapped):
+            connection = get_wrapped()
+        return connection
+
+    def mark_external_close_unknown(self, error: BaseException) -> None:
+        """Latch fail-stop teardown before best-effort close cancellation."""
+        self._external_page_fatal_error = error
+        marker = getattr(
+            self._external_page_connector(),
+            "mark_external_close_unknown",
+            None,
+        )
+        if not callable(marker):
+            raise RuntimeError(
+                "External-page connector lacks close fail-stop support"
+            )
+        marker(error)
+
+
+class RemoteExternalPageReader:
+    """Read Mooncake pages into caller-owned buffers without LocalCPU."""
+
+    def __init__(
+        self,
+        config: LMCacheEngineConfig,
+        metadata: LMCacheMetadata,
+    ) -> None:
+        """Create the reader and its dedicated storage event loop.
+
+        Args:
+            config: Validated Mooncake LMCache configuration.
+            metadata: Metadata for the local TP worker.
+
+        Raises:
+            ValueError: If the backend or writer-rank contract is invalid.
+            Exception: If the Mooncake connector cannot initialize.
+        """
+        if not str(config.remote_url).startswith("mooncakestore://"):
+            raise ValueError(
+                "RemoteExternalPageReader requires mooncakestore://"
+            )
+        if (
+            config.dsa_group1_load_mode == "persistent_direct_hbm"
+            and int(metadata.first_rank) != 0
+        ):
+            raise ValueError(
+                "persistent_direct_hbm requires writer first_rank == 0"
+            )
+
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=start_loop_in_thread_with_exceptions,
+            args=(self._loop,),
+            daemon=True,
+            name=f"lmcache-external-page-reader-{metadata.worker_id}",
+        )
+        self._lock = threading.Lock()
+        self._state = _ExternalPageReaderState.OPEN
+        self._backend: Optional[RemoteBackend] = None
+        self._fatal_error: Optional[BaseException] = None
+        native_timeout = max(
+            0.0,
+            float(config.remote_fill_native_hard_timeout_ms) / 1000.0,
+        )
+        connector_timeout = max(
+            0.0,
+            float((config.extra_config or {}).get("transfer_timeout", 0.0)),
+        )
+        self._shutdown_timeout = _bounded_external_timeout_secs(
+            float(config.blocking_timeout_secs),
+            native_timeout,
+            connector_timeout,
+        )
+        self._thread.start()
+        try:
+            self._backend = RemoteBackend(
+                config=config,
+                metadata=metadata,
+                loop=self._loop,
+                local_cpu_backend=None,
+                external_page_only=True,
+            )
+        except BaseException:
+            try:
+                self._stop_loop()
+            except BaseException:
+                logger.exception(
+                    "Failed to stop reader after initialization failure"
+                )
+            raise
+
+    def get_pages(
+        self,
+        keys: Sequence[CacheEngineKey],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        owners: tuple[Any, ...],
+        req_id: str,
+    ) -> None:
+        """Read exact pages into registered destination buffers.
+
+        Args:
+            keys: Base page keys in request order.
+            buffer_ptrs: Destination pointer runs per page.
+            buffer_sizes: Byte lengths matching each pointer run.
+            owners: Objects retaining every destination allocation.
+            req_id: Request identity for diagnostics.
+
+        Raises:
+            RuntimeError: If the reader is not open.
+            Exception: If the native read is terminally failed or unknown.
+        """
+        with self._lock:
+            try:
+                self._require_open().batched_get_external_pages(
+                    keys, buffer_ptrs, buffer_sizes, owners, req_id
+                )
+            except NativeExternalPageTransferUnknownError as error:
+                self._mark_fatal(error)
+                raise
+
+    def close(self) -> None:
+        """Close Mooncake and the event loop after native work is terminal.
+
+        Raises:
+            RuntimeError: If native completion is unknown or the event-loop
+                thread cannot stop. Unknown completion intentionally leaves
+                the reader alive and its registrations retained.
+        """
+        with self._lock:
+            if self._state is _ExternalPageReaderState.CLOSED:
+                return
+            if self._state is _ExternalPageReaderState.FATAL:
+                self._raise_fatal()
+            if self._state is _ExternalPageReaderState.OPEN:
+                self._state = _ExternalPageReaderState.CLOSING
+            backend = self._require_backend()
+
+        try:
+            backend.close()
+        except BaseException as error:
+            with self._lock:
+                self._mark_fatal(error)
+            raise
+
+        with self._lock:
+            if self._state is _ExternalPageReaderState.CLOSED:
+                return
+            if self._state is _ExternalPageReaderState.FATAL:
+                self._raise_fatal()
+            try:
+                self._stop_loop()
+            except BaseException as error:
+                self._mark_fatal(error)
+                raise
+            self._state = _ExternalPageReaderState.CLOSED
+            self._backend = None
+
+    def _require_open(self) -> RemoteBackend:
+        if self._state is _ExternalPageReaderState.CLOSED:
+            raise RuntimeError("RemoteExternalPageReader is closed")
+        if self._state is not _ExternalPageReaderState.OPEN:
+            raise RuntimeError(
+                "RemoteExternalPageReader is not open: "
+                f"state={self._state.value}"
+            )
+        return self._require_backend()
+
+    def _require_backend(self) -> RemoteBackend:
+        if self._backend is None:
+            raise RuntimeError("RemoteExternalPageReader has no backend")
+        return self._backend
+
+    def _mark_fatal(self, error: BaseException) -> None:
+        self._state = _ExternalPageReaderState.FATAL
+        if self._fatal_error is None:
+            self._fatal_error = error
+
+    def _raise_fatal(self) -> None:
+        raise RuntimeError(
+            "RemoteExternalPageReader is fatal; native ownership is retained"
+        ) from self._fatal_error
+
+    def _stop_loop(self) -> None:
+        if not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=self._shutdown_timeout)
+        if self._thread.is_alive():
+            raise RuntimeError(
+                "External-page reader event loop did not stop in time"
+            )
+        if not self._loop.is_closed():
+            self._loop.close()

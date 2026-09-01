@@ -22,6 +22,8 @@ from lmcache.v1.rpc.transport import (
 
 logger = init_logger(__name__)
 
+_LOOKUP_CLEANUP_OP = "__lmcache_lookup_cleanup__"
+
 
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -180,6 +182,19 @@ class LMCacheLookupClient(LookupClientInterface):
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.reqs_status.pop(lookup_id, None)
 
+    def cleanup_lookup(self, lookup_id: str) -> None:
+        """Release lookup pins on every worker before forgetting local state."""
+        responses = self.transport.send_and_recv_all(
+            [_LOOKUP_CLEANUP_OP, lookup_id, ""]
+        )
+        if len(responses) != self.transport.world_size:
+            raise RuntimeError(
+                "Lookup cleanup did not reach every worker: "
+                f"lookup_id={lookup_id}, responses={len(responses)}, "
+                f"workers={self.transport.world_size}"
+            )
+        self.clear_lookup_status(lookup_id)
+
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports
         producer kvcache reuse"""
@@ -257,6 +272,11 @@ class LMCacheLookupServer:
                     request_configs = (
                         json.loads(request_configs_str) if request_configs_str else None
                     )
+
+                    if data_frames[0] == _LOOKUP_CLEANUP_OP:
+                        self.lmcache_engine.cleanup_memory_objs(lookup_id)
+                        self.transport.send_response(identity, b"\x01")
+                        continue
 
                     lookup_started_at = _utc_timestamp()
                     lookup_started = time.perf_counter()

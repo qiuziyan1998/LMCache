@@ -196,6 +196,7 @@ class RequestFactory:
         *,
         token_hash_algorithm: str = "builtin",
         python_hash_seed: str = "0",
+        shared_group1: bool = True,
     ) -> NegotiateRequest:
         """Create a static layout negotiation request."""
 
@@ -209,7 +210,7 @@ class RequestFactory:
             group_dimensions=(576, 128),
             layer_count=79,
             save_only_first_rank=True,
-            shared_group1=True,
+            shared_group1=shared_group1,
             tp_size=8,
             dp_size=2,
             global_te_push=True,
@@ -222,6 +223,7 @@ class RequestFactory:
         chunk_count: int = 1,
         *,
         start_chunk: int = 0,
+        groups: tuple[int, ...] = (0, 1),
     ) -> tuple[ControlPage, ...]:
         """Create complete two-group pages for ``chunk_count`` chunks."""
 
@@ -239,7 +241,7 @@ class RequestFactory:
                 layout_tag="layout-v3",
             )
             for chunk in range(start_chunk, start_chunk + chunk_count)
-            for group in (0, 1)
+            for group in groups
         )
 
     def reserve(

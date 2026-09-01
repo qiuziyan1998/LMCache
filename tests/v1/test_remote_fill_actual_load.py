@@ -28,10 +28,11 @@ class _TokenDatabase:
         tokens=None,
         hashes=None,
         offsets=None,
+        mask=None,
         request_configs=None,
         kv_group=0,
     ):
-        del tokens, hashes, offsets
+        del tokens, hashes, offsets, mask
         for chunk_index in range(2):
             start = chunk_index * 4
             yield (
@@ -85,8 +86,11 @@ class _PairStorageManager:
     def __init__(self, local_pairs=0, remote_pairs=0):
         self.local_pairs = local_pairs
         self.remote_pairs = remote_pairs
+        self.local_page_hits = None
         self.pair_calls = []
+        self.page_calls = []
         self.page_results = {}
+        self.page_result_limits = {}
         self.page_errors = {}
         self.legacy_results = {}
         self.unpinned = []
@@ -122,11 +126,25 @@ class _PairStorageManager:
         search_range=None,
         pin=False,
     ):
-        del search_range, pin
         keys = list(keys)
+        self.page_calls.append((keys, search_range, pin))
+        if (
+            search_range == ["LocalCPUBackend"]
+            and self.local_page_hits is not None
+        ):
+            hits = min(int(self.local_page_hits), len(keys))
+            return (
+                hits,
+                {"LocalCPUBackend": keys[:hits]} if hits else {},
+            )
         error = self.page_errors.get(keys[0].kv_group)
         if error is not None:
             raise error
+        limit = self.page_result_limits.get(keys[0].kv_group)
+        if limit is not None:
+            if limit <= 0:
+                return 0, {}
+            self.page_result_limits[keys[0].kv_group] = limit - 1
         result = self.page_results.get(keys[0].kv_group)
         if result is None:
             return 0, {}
@@ -199,9 +217,11 @@ def _engine(storage_manager):
     )
     engine.gpu_connector = object()
     engine.shared_cpu_cache_strict = False
+    engine.shared_cpu_cache_generation = 1
     engine.config = SimpleNamespace(
         enable_remote_lmcache_store=True,
         dsa_two_groups=True,
+        dsa_group1_load_mode="p2p_preferred",
         use_layerwise=True,
         enable_shared_cpu_cache=True,
         chunk_size=4,
@@ -239,8 +259,9 @@ def test_complete_local_two_group_prefix_is_pinned_as_pairs() -> None:
     assert pin is True
     assert len(engine.lookup_pins["req"]["LocalCPUBackend"]) == 4
     assert {
-        chunk.location for chunk in engine._remote_fill_lookup_plans["req"].chunks
-    } == {"LocalCPUBackend"}
+        chunk.locations_by_group
+        for chunk in engine._remote_fill_lookup_plans["req"].chunks
+    } == {("LocalCPUBackend", "LocalCPUBackend")}
     chunk_plan = engine._remote_fill_retained_local_page_plan("req", 0, 8)
     assert chunk_plan is not None
     assert chunk_plan[0] == [(0, 4, 0x100), (4, 8, 0x101)]
@@ -279,8 +300,100 @@ def test_one_group_local_hole_uses_persistent_pairs_without_mixing() -> None:
     assert "LocalCPUBackend" not in engine.lookup_pins["req"]
     assert len(engine.lookup_pins["req"]["RemoteBackend"]) == 4
     assert {
-        chunk.location for chunk in engine._remote_fill_lookup_plans["req"].chunks
-    } == {"RemoteBackend"}
+        chunk.locations_by_group
+        for chunk in engine._remote_fill_lookup_plans["req"].chunks
+    } == {("RemoteBackend", "RemoteBackend")}
+
+
+def test_persistent_direct_hbm_uses_remote_pair_proof_then_group0_overlay() -> None:
+    storage = _PairStorageManager(local_pairs=2, remote_pairs=2)
+    storage.local_page_hits = 1
+    engine = _engine(storage)
+    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.enable_remote_lmcache_store = False
+
+    assert engine.lookup(list(range(8)), lookup_id="req", pin=True) == 8
+
+    assert [call[2] for call in storage.pair_calls] == [["RemoteBackend"]]
+    assert [call[3] for call in storage.pair_calls] == [False]
+    assert len(storage.page_calls) == 1
+    assert storage.page_calls[0][1:] == (["LocalCPUBackend"], True)
+    chunks = engine._remote_fill_lookup_plans["req"].chunks
+    assert [chunk.locations_by_group for chunk in chunks] == [
+        ("LocalCPUBackend", "RemoteBackend"),
+        ("RemoteBackend", "RemoteBackend"),
+    ]
+    candidates = list(engine.token_database.process_tokens())
+    assert engine._remote_fill_retrieve_plan("req", candidates, 0) == [
+        ("LocalCPUBackend", True),
+        ("RemoteBackend", True),
+    ]
+    assert engine._remote_fill_retrieve_plan("req", candidates, 1) == [
+        ("RemoteBackend", True),
+        ("RemoteBackend", True),
+    ]
+    assert engine._remote_fill_retained_local_page_plan("req", 0, 4) == (
+        [(0, 4, 0x100)],
+        ["LocalCPUBackend"],
+    )
+    assert engine._remote_fill_retained_local_page_plan("req", 0, 8) is None
+    assert engine._remote_fill_retained_local_page_plan("req", 1, 4) is None
+    assert "RemoteBackend" not in engine.lookup_pins["req"]
+    assert len(engine.lookup_pins["req"]["LocalCPUBackend"]) == 1
+
+
+def test_persistent_direct_hbm_stops_at_remote_pair_hole_without_legacy_probe() -> None:
+    storage = _PairStorageManager(remote_pairs=1)
+    storage.local_page_hits = 0
+    storage.page_results = {0: "RemoteBackend", 1: "RemoteBackend"}
+    storage.legacy_results = {0: "RemoteBackend", 1: "RemoteBackend"}
+    engine = _engine(storage)
+    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+
+    assert engine.lookup(list(range(8)), lookup_id="req", pin=True) == 4
+
+    assert len(storage.pair_calls) == 1
+    assert storage.pair_calls[0][2] == ["RemoteBackend"]
+    # The sole page lookup is the bounded G0 LocalCPU overlay; neither group
+    # enters the legacy persistent per-layer fallback after the pair hole.
+    assert len(storage.page_calls) == 1
+    assert storage.page_calls[0][1] == ["LocalCPUBackend"]
+    assert engine._remote_fill_lookup_plans["req"].chunks[0].locations_by_group == (
+        "RemoteBackend",
+        "RemoteBackend",
+    )
+
+
+def test_persistent_direct_hbm_requires_remote_backend_in_search_range() -> None:
+    storage = _PairStorageManager(local_pairs=2, remote_pairs=2)
+    engine = _engine(storage)
+    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+
+    assert (
+        engine.lookup(
+            list(range(8)),
+            search_range=["LocalCPUBackend"],
+            lookup_id="req",
+            pin=True,
+        )
+        == 0
+    )
+    assert storage.pair_calls == []
+    assert "req" not in engine._remote_fill_lookup_plans
+
+
+def test_persistent_direct_hbm_overlay_error_has_no_remote_pair_pins() -> None:
+    storage = _PairStorageManager(remote_pairs=2)
+    storage.page_errors = {0: RuntimeError("local overlay failed")}
+    engine = _engine(storage)
+    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+
+    assert engine.lookup(list(range(8)), lookup_id="req", pin=True) == 0
+
+    assert storage.pair_calls[0][3] is False
+    assert storage.unpinned == []
+    assert "req" not in engine._remote_fill_lookup_plans
+    assert engine.lookup_pins["req"] == {}
 
 
 def test_groups_from_different_persistent_tiers_do_not_form_a_hit() -> None:
@@ -323,13 +436,14 @@ def test_group1_lookup_error_releases_group0_and_recomputes(caplog) -> None:
 def test_page_and_legacy_groups_share_one_persistent_chunk_plan() -> None:
     storage = _PairStorageManager()
     storage.page_results = {0: "RemoteBackend"}
+    storage.page_result_limits = {0: 1}
     storage.legacy_results = {1: "RemoteBackend"}
     engine = _engine(storage)
 
     assert engine.lookup(list(range(8)), lookup_id="req", pin=True) == 4
 
     chunk = engine._remote_fill_lookup_plans["req"].chunks[0]
-    assert chunk.location == "RemoteBackend"
+    assert chunk.locations_by_group == ("RemoteBackend", "RemoteBackend")
     assert chunk.page_by_group == (True, False)
     with pytest.raises(RuntimeError, match="do not match"):
         engine._remote_fill_retrieve_plan(
@@ -359,8 +473,9 @@ def test_missing_local_prefix_rechecks_and_falls_back_to_persistent() -> None:
 
     assert engine.lookup(list(range(8)), lookup_id="actual", pin=True) == 8
     assert {
-        chunk.location for chunk in engine._remote_fill_lookup_plans["actual"].chunks
-    } == {"RemoteBackend"}
+        chunk.locations_by_group
+        for chunk in engine._remote_fill_lookup_plans["actual"].chunks
+    } == {("RemoteBackend", "RemoteBackend")}
     assert "LocalCPUBackend" not in engine.lookup_pins["actual"]
 
 
@@ -391,6 +506,28 @@ def test_local_full_hint_records_retained_paired_actual_load(
     assert "[LMCACHE_COLD_PERF]" in caplog.text
     assert '"req_id":"actual"' in caplog.text
     assert '"clock_domain"' in caplog.text
+
+
+def test_persistent_direct_hbm_group0_overlay_is_retained_actual_load() -> None:
+    storage = _PairStorageManager(remote_pairs=2)
+    storage.local_page_hits = 2
+    engine = _engine(storage)
+    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+
+    assert (
+        engine.lookup(
+            list(range(8)),
+            lookup_id="actual",
+            pin=True,
+            request_configs=_local_full_hint(),
+        )
+        == 8
+    )
+
+    snapshot = engine.remote_fill_actual_load_metrics_snapshot()
+    assert snapshot.retained_at_load_total == 1
+    assert snapshot.local_prefix_missing_at_load_total == 0
+    assert snapshot.unexpected_remote_get_total == 0
 
 
 def test_local_full_hint_records_missing_local_prefix_and_remote_fallback(

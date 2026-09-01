@@ -260,13 +260,28 @@ def test_response_descriptor_digest_detects_pointer_mutation(harness) -> None:
         decode_response(msgspec.msgpack.encode(builtins), ProtocolLimits())
 
 
-def test_incomplete_two_group_chunk_is_rejected(harness) -> None:
-    """A group-0-only page cannot form a direct-fill control window."""
+def test_group0_only_window_is_wire_valid(harness) -> None:
+    """The stateless codec accepts the negotiated one-group wire shape."""
 
     pages = harness.requests.pages()[:1]
     request = seal_request(harness.requests.reserve(pages))
 
-    with pytest.raises(ProtocolValidationError, match="exactly groups 0 and 1"):
+    decoded = decode_request(
+        encode_request(request, ProtocolLimits()), ProtocolLimits()
+    )
+    assert decoded.control_pages == pages
+
+
+def test_mixed_direct_group_sets_are_rejected(harness) -> None:
+    """Every chunk in one window must use the same complete group set."""
+
+    pages = (
+        *harness.requests.pages(start_chunk=0, groups=(0,)),
+        *harness.requests.pages(start_chunk=1, groups=(0, 1)),
+    )
+    request = seal_request(harness.requests.reserve(pages))
+
+    with pytest.raises(ProtocolValidationError, match="uniform direct-group set"):
         encode_request(request, ProtocolLimits())
 
 
@@ -301,6 +316,14 @@ def test_negotiation_binds_builtin_hash_seed(harness) -> None:
         token_hash_algorithm="builtin",
         python_hash_seed="7",
     )
+    assert harness.client.execute(mismatch).code is ResultCode.RESERVATION_REJECTED
+
+
+def test_negotiation_binds_direct_group_shape(harness) -> None:
+    """A paired peer cannot enter the Group-0-only terminal state."""
+
+    assert harness.client.execute(harness.requests.negotiate()).code is ResultCode.OK
+    mismatch = harness.requests.negotiate(shared_group1=False)
     assert harness.client.execute(mismatch).code is ResultCode.RESERVATION_REJECTED
 
 

@@ -628,15 +628,55 @@ class LocalCPUBackend(AllocatorBackendInterface):
             )
             for key in pair
         ]
+        return self._commit_external_prefix_if_absent(
+            required_keys,
+            ready_reservations,
+            context="External two-group commit",
+            arm_retention_trace=cold_start_perf_enabled(),
+        )
+
+    def commit_external_group0_prefix_if_absent(
+        self,
+        required_group0_keys: Sequence[CacheEngineKey],
+        ready_reservations: Mapping[CacheEngineKey, LayerPageMemoryObj],
+    ) -> ExternalTwoGroupCommitResult:
+        """Atomically publish an exact externally filled Group-0 prefix.
+
+        This is the one-group counterpart of
+        :meth:`commit_external_two_group_prefix_if_absent`.  It deliberately
+        returns the existing immutable result type so lifecycle callers can
+        share release and rollback handling.  Pair-specific retention tracing
+        remains on the legacy wrapper.
+        """
+
+        self._validate_canonical_page_keys(required_group0_keys)
+        if any(key.kv_group != 0 for key in required_group0_keys):
+            raise ValueError("External Group-0 commit requires Group 0 keys")
+        return self._commit_external_prefix_if_absent(
+            required_group0_keys,
+            ready_reservations,
+            context="External Group-0 commit",
+            arm_retention_trace=False,
+        )
+
+    def _commit_external_prefix_if_absent(
+        self,
+        required_keys: Sequence[CacheEngineKey],
+        ready_reservations: Mapping[CacheEngineKey, LayerPageMemoryObj],
+        *,
+        context: str,
+        arm_retention_trace: bool,
+    ) -> ExternalTwoGroupCommitResult:
+        """Atomically admit one prevalidated canonical page prefix."""
+
         ready = dict(ready_reservations)
         ready_keys = list(ready)
         ready_pages = list(ready.values())
         self._validate_layer_page_batch(ready_keys, ready_pages)
-        trace_enabled = cold_start_perf_enabled()
         required_key_set = set(required_keys)
         if any(key not in required_key_set for key in ready_keys):
             raise ValueError(
-                "External two-group reservations must belong to the required prefix"
+                f"{context} reservations must belong to the required prefix"
             )
 
         if not self.use_hot:
@@ -690,7 +730,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             put_result = self._admit_layer_pages_locked(pending, existing_keys)
             retention_trace_id = self._arm_external_retention_trace_locked(
                 required_keys,
-                enabled=trace_enabled,
+                enabled=arm_retention_trace,
             )
             lock_hold_seconds = time.perf_counter() - lock_acquired
 

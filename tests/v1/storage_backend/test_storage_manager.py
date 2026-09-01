@@ -20,11 +20,11 @@ Key scenarios tested:
 """
 
 # Standard
-import asyncio
-import threading
 from collections import OrderedDict
 from concurrent.futures import Future
 from types import SimpleNamespace
+import asyncio
+import threading
 
 # Third Party
 import pytest
@@ -33,7 +33,7 @@ import torch
 # First Party
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.event_manager import EventManager, EventType
+from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.memory_management import MemoryFormat, TensorMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -65,6 +65,18 @@ class MockAsyncLookupServer:
 
     def send_response_to_scheduler(self, lookup_id: str, retrieved_length: int):
         self.responses.append((lookup_id, retrieved_length))
+
+
+def _keyed_results(
+    *tiers: list[MockMemoryObj],
+) -> list[list[tuple[str, MockMemoryObj]]]:
+    return [
+        [
+            (f"tier-{tier_idx}-chunk-{chunk_idx}", obj)
+            for chunk_idx, obj in enumerate(tier)
+        ]
+        for tier_idx, tier in enumerate(tiers)
+    ]
 
 
 @pytest.mark.parametrize(
@@ -348,6 +360,70 @@ def storage_manager(storage_manager_config, storage_manager_metadata, event_mana
     manager.close()
 
 
+def _close_only_storage_manager(backends) -> StorageManager:
+    manager = object.__new__(StorageManager)
+    manager.storage_backends = OrderedDict(backends)
+    manager.loop = SimpleNamespace(is_running=lambda: False)
+    manager.thread = SimpleNamespace(is_alive=lambda: False)
+    return manager
+
+
+def test_close_orders_remote_dependency_before_local_cpu() -> None:
+    calls = []
+
+    class Backend:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            calls.append(self.name)
+
+    manager = _close_only_storage_manager(
+        [
+            ("LocalCPUBackend", Backend("local")),
+            ("RemoteBackend", Backend("remote")),
+        ]
+    )
+
+    manager.close()
+
+    assert calls == ["remote", "local"]
+
+
+def test_strict_remote_close_failure_retains_local_cpu_and_loop() -> None:
+    calls = []
+
+    class LocalBackend:
+        def close(self) -> None:
+            calls.append("local")
+
+    class StrictRemoteBackend:
+        @staticmethod
+        def requires_strict_external_close() -> bool:
+            return True
+
+        @staticmethod
+        def close() -> None:
+            calls.append("remote")
+            raise RuntimeError("external HBM ownership unknown")
+
+    manager = _close_only_storage_manager(
+        [
+            ("LocalCPUBackend", LocalBackend()),
+            ("RemoteBackend", StrictRemoteBackend()),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="ownership unknown"):
+        manager.close()
+
+    assert calls == ["remote"]
+    assert list(manager.storage_backends) == [
+        "LocalCPUBackend",
+        "RemoteBackend",
+    ]
+
+
 class TestStorageManagerPrefetchCallback:
     """Test cases for StorageManager prefetch_all_done_callback."""
 
@@ -361,7 +437,7 @@ class TestStorageManagerPrefetchCallback:
         # Create mock memory objects for all chunks
         tier0_objs = [MockMemoryObj(i) for i in range(3)]
         tier1_objs = [MockMemoryObj(i + 3) for i in range(2)]
-        res = [tier0_objs, tier1_objs]
+        res = _keyed_results(tier0_objs, tier1_objs)
 
         # Create a mock future that returns the result
         loop = asyncio.new_event_loop()
@@ -401,7 +477,7 @@ class TestStorageManagerPrefetchCallback:
         tier0_objs = [MockMemoryObj(i) for i in range(3)]
         tier1_objs = [MockMemoryObj(i + 3) for i in range(1)]  # Only 1 instead of 2
         tier2_objs = [MockMemoryObj(i + 5) for i in range(2)]  # Got all 2
-        res = [tier0_objs, tier1_objs, tier2_objs]
+        res = _keyed_results(tier0_objs, tier1_objs, tier2_objs)
 
         # Create a mock future that returns the result
         loop = asyncio.new_event_loop()
@@ -449,7 +525,7 @@ class TestStorageManagerPrefetchCallback:
         tier0_objs = [MockMemoryObj(i) for i in range(2)]  # Only 2 instead of 3
         tier1_objs = [MockMemoryObj(i + 3) for i in range(2)]  # Got all 2
         tier2_objs = [MockMemoryObj(i + 5) for i in range(2)]  # Got all 2
-        res = [tier0_objs, tier1_objs, tier2_objs]
+        res = _keyed_results(tier0_objs, tier1_objs, tier2_objs)
 
         # Create a mock future that returns the result
         loop = asyncio.new_event_loop()
@@ -493,7 +569,7 @@ class TestStorageManagerPrefetchCallback:
         # All chunks retrieved successfully
         tier0_objs = [MockMemoryObj(i) for i in range(2)]
         tier1_objs = [MockMemoryObj(i + 2) for i in range(1)]
-        res = [tier0_objs, tier1_objs]
+        res = _keyed_results(tier0_objs, tier1_objs)
 
         # Create a mock future that returns the result
         loop = asyncio.new_event_loop()
@@ -530,7 +606,7 @@ class TestStorageManagerPrefetchCallback:
 
         # Only got 3 chunks instead of 5
         tier0_objs = [MockMemoryObj(i) for i in range(3)]
-        res = [tier0_objs]
+        res = _keyed_results(tier0_objs)
 
         # Create a mock future that returns the result
         loop = asyncio.new_event_loop()
@@ -559,3 +635,85 @@ class TestStorageManagerPrefetchCallback:
         # (no remaining chunks in current tier, no subsequent tiers)
         for obj in tier0_objs:
             assert not obj.ref_count_down_called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])
+async def test_async_lookup_setup_failure_sends_one_terminal_miss(
+    storage_manager, monkeypatch, failure_type
+):
+    class FailingContainsBackend:
+        async def batched_async_contains(self, *_args, **_kwargs):
+            raise failure_type("contains failed")
+
+    monkeypatch.setattr(
+        storage_manager,
+        "get_active_storage_backends",
+        lambda search_range=None: [("failing", FailingContainsBackend())],
+    )
+    key = CacheEngineKey("model", 1, 0, 0, torch.float16)
+
+    await storage_manager.async_lookup_and_prefetch(
+        "setup-failed", [key], [0, 256], pin=True
+    )
+    await asyncio.sleep(0)
+
+    assert storage_manager.async_lookup_server.responses == [("setup-failed", 0)]
+    assert (
+        storage_manager.event_manager.get_event_status(
+            EventType.LOADING, "setup-failed"
+        )
+        == EventStatus.DONE
+    )
+    assert storage_manager.event_manager.get_event_future(
+        EventType.LOADING, "setup-failed"
+    ).result() == []
+
+
+@pytest.mark.asyncio
+async def test_async_lookup_task_failure_preserves_successful_cleanup_results(
+    storage_manager, monkeypatch
+):
+    retained = MockMemoryObj(0)
+
+    class Backend:
+        def __init__(self, result=None, error=None):
+            self.result = result
+            self.error = error
+
+        async def batched_async_contains(self, *_args, **_kwargs):
+            return 1
+
+        async def batched_get_non_blocking(self, *_args, **_kwargs):
+            if self.error is not None:
+                raise self.error
+            return self.result
+
+    backends = [
+        ("successful", Backend(result=[retained])),
+        ("failing", Backend(error=RuntimeError("get failed"))),
+    ]
+    monkeypatch.setattr(
+        storage_manager,
+        "get_active_storage_backends",
+        lambda search_range=None: backends,
+    )
+    storage_manager.async_serializer = SimpleNamespace(
+        run=lambda coro, _num_chunks: coro
+    )
+    keys = [
+        CacheEngineKey("model", 1, 0, 0, torch.float16),
+        CacheEngineKey("model", 1, 0, 1, torch.float16),
+    ]
+
+    await storage_manager.async_lookup_and_prefetch(
+        "task-failed", keys, [0, 256, 512], pin=True
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert storage_manager.async_lookup_server.responses == [("task-failed", 0)]
+    cleanup_result = storage_manager.event_manager.get_event_future(
+        EventType.LOADING, "task-failed"
+    ).result()
+    assert cleanup_result == [[(keys[0], retained)], []]

@@ -161,7 +161,7 @@ class _RemoteFillChunkLookupPlan:
     # Raw chunk hash: int for builtin/64-bit algorithms, digest bytes for
     # digest-based algorithms (e.g. sha256_cbor in this vLLM fork).
     chunk_hash: Union[int, bytes]
-    location: str
+    locations_by_group: tuple[str, str]
     page_by_group: tuple[bool, bool]
 
 
@@ -523,6 +523,7 @@ class LMCacheEngine:
             self.config.enable_sparse_attention
             and self.dsa_two_groups
             and self.shared_cpu_cache_strict
+            and not self._persistent_direct_hbm_split_group_enabled()
             and not bool(
                 self._get_shared_config_value(
                     "shared_cpu_materialize_index_on_decode_cold",
@@ -804,7 +805,11 @@ class LMCacheEngine:
                 True,
             )
         )
-        if self.dsa_two_groups and materialize_index:
+        if (
+            self.dsa_two_groups
+            and materialize_index
+            and not self._persistent_direct_hbm_split_group_enabled()
+        ):
             kv_groups.append(1)
 
         bytes_per_chunk_all_layers = sum(
@@ -2092,6 +2097,120 @@ class LMCacheEngine:
             and self._should_use_shared_layerwise_retrieve(1)
         )
 
+    def _persistent_direct_hbm_split_group_enabled(self) -> bool:
+        """Return whether lookup must use persistent proof plus G0 overlay."""
+
+        return (
+            getattr(
+                self.config,
+                "dsa_group1_load_mode",
+                "p2p_preferred",
+            )
+            == "persistent_direct_hbm"
+        )
+
+    def _lookup_persistent_direct_hbm_prefix(
+        self,
+        chunks: list[tuple[int, int, CacheEngineKey]],
+        group_keys: dict[int, list[LayerCacheEngineKey]],
+        *,
+        search_range: list[str],
+        lookup_id: Optional[str],
+        pin: bool,
+    ) -> int:
+        """Prove a Mooncake pair prefix, then overlay its G0 LocalCPU prefix."""
+
+        assert self.storage_manager is not None
+        if "RemoteBackend" not in search_range:
+            return 0
+
+        retained: dict[str, list[CacheEngineKey]] = defaultdict(list)
+
+        def release(mapping: dict[str, list[CacheEngineKey]]) -> None:
+            if not pin:
+                return
+            for location, keys in mapping.items():
+                if keys:
+                    self.storage_manager.batched_unpin(keys, [location])
+
+        def retain(mapping: dict[str, list[CacheEngineKey]]) -> None:
+            for location, keys in mapping.items():
+                retained[location].extend(keys)
+
+        try:
+            pair_count, persistent_mapping = (
+                self.storage_manager.batched_contains_two_group_layer_pages(
+                    group_keys[0],
+                    group_keys[1],
+                    ["RemoteBackend"],
+                    False,
+                )
+            )
+            if not 0 <= pair_count <= len(chunks):
+                raise RuntimeError(
+                    "Persistent two-group lookup returned an invalid prefix"
+                )
+            persistent_keys = persistent_mapping.get("RemoteBackend", [])
+            if set(persistent_mapping) - {"RemoteBackend"} or len(
+                persistent_keys
+            ) != 2 * pair_count:
+                raise RuntimeError(
+                    "Persistent two-group lookup returned invalid backend mapping"
+                )
+            if pair_count == 0:
+                return 0
+
+            local_count = 0
+            local_mapping: dict[str, list[CacheEngineKey]] = {}
+            if "LocalCPUBackend" in search_range:
+                local_count, local_mapping = (
+                    self.storage_manager.batched_contains_layer_pages(
+                        group_keys[0][:pair_count],
+                        ["LocalCPUBackend"],
+                        pin,
+                    )
+                )
+                local_keys = local_mapping.get("LocalCPUBackend", [])
+                if (
+                    not 0 <= local_count <= pair_count
+                    or set(local_mapping) - {"LocalCPUBackend"}
+                    or len(local_keys) != local_count
+                ):
+                    release(local_mapping)
+                    raise RuntimeError(
+                        "Group-0 LocalCPU overlay returned invalid prefix mapping"
+                    )
+                retain(local_mapping)
+
+            plan = tuple(
+                _RemoteFillChunkLookupPlan(
+                    start=start,
+                    end=end,
+                    chunk_hash=key.chunk_hash,
+                    locations_by_group=(
+                        (
+                            "LocalCPUBackend"
+                            if index < local_count
+                            else "RemoteBackend"
+                        ),
+                        "RemoteBackend",
+                    ),
+                    page_by_group=(True, True),
+                )
+                for index, (start, end, key) in enumerate(chunks[:pair_count])
+            )
+            if pin:
+                assert lookup_id is not None
+                for location, keys in retained.items():
+                    self.lookup_pins[lookup_id][location].extend(keys)
+                self._remote_fill_lookup_plans[lookup_id] = _RemoteFillLookupPlan(
+                    plan
+                )
+            return plan[-1].end
+        except Exception:
+            release(dict(retained))
+            raise
+
     def _lookup_remote_fill_two_group_prefix(
         self,
         chunks: list[tuple[int, int, CacheEngineKey]],
@@ -2120,6 +2239,14 @@ class LMCacheEngine:
             ]
             for group in (0, 1)
         }
+        if self._persistent_direct_hbm_split_group_enabled():
+            return self._lookup_persistent_direct_hbm_prefix(
+                chunks,
+                group_keys,
+                search_range=search_range,
+                lookup_id=lookup_id,
+                pin=pin,
+            )
         retained: dict[str, list[CacheEngineKey]] = defaultdict(list)
         plan: list[_RemoteFillChunkLookupPlan] = []
 
@@ -2158,7 +2285,7 @@ class LMCacheEngine:
                         start=start,
                         end=end,
                         chunk_hash=key.chunk_hash,
-                        location=location,
+                        locations_by_group=(location, location),
                         page_by_group=(True, True),
                     )
                 )
@@ -2300,7 +2427,7 @@ class LMCacheEngine:
                         start=start,
                         end=end,
                         chunk_hash=key.chunk_hash,
-                        location=group0[0],
+                        locations_by_group=(group0[0], group0[0]),
                         page_by_group=(group0[2], group1[2]),
                     )
                 )
@@ -2367,11 +2494,19 @@ class LMCacheEngine:
 
         common_local_end = 0
         unexpected_remote = False
+        direct_groups = (
+            (0,)
+            if self._persistent_direct_hbm_split_group_enabled()
+            else (0, 1)
+        )
         if plan is not None:
             for chunk in plan.chunks:
                 if chunk.start >= required_store_end:
                     break
-                if chunk.location != "LocalCPUBackend":
+                if any(
+                    chunk.locations_by_group[group] != "LocalCPUBackend"
+                    for group in direct_groups
+                ):
                     unexpected_remote = True
                     break
                 common_local_end = min(chunk.end, required_store_end)
@@ -2498,7 +2633,12 @@ class LMCacheEngine:
                     f"retained paired lookup plan: req_id={req_id}, "
                     f"kv_group={kv_group}, start={start}, end={end}"
                 )
-            selected.append((chunk.location, chunk.page_by_group[kv_group]))
+            selected.append(
+                (
+                    chunk.locations_by_group[kv_group],
+                    chunk.page_by_group[kv_group],
+                )
+            )
         return selected
 
     def _remote_fill_retained_local_page_plan(
@@ -2517,7 +2657,7 @@ class LMCacheEngine:
                 "Remote-fill retained plan does not cover the required frontier"
             )
         if any(
-            chunk.location != "LocalCPUBackend"
+            chunk.locations_by_group[kv_group] != "LocalCPUBackend"
             or not chunk.page_by_group[kv_group]
             for chunk in chunks
         ):
@@ -2527,7 +2667,7 @@ class LMCacheEngine:
                 (int(chunk.start), int(chunk.end), chunk.chunk_hash)
                 for chunk in chunks
             ],
-            [chunk.location for chunk in chunks],
+            [chunk.locations_by_group[kv_group] for chunk in chunks],
         )
 
     def _remote_fill_recompute_result(
@@ -6863,7 +7003,10 @@ class LMCacheEngine:
                 request_configs=request_configs,
             )
 
-            if self._remote_fill_pair_lookup_enabled():
+            if (
+                self._remote_fill_pair_lookup_enabled()
+                or self._persistent_direct_hbm_split_group_enabled()
+            ):
                 chunks: list[tuple[int, int, CacheEngineKey]] = []
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
@@ -7490,6 +7633,13 @@ class LMCacheEngine:
             logger.info("storage_manager closed successfully")
         except Exception as e:
             logger.error(f"Error closing storage_manager: {e}")
+            strict_close = getattr(
+                self.storage_manager,
+                "requires_strict_external_close",
+                None,
+            )
+            if callable(strict_close) and strict_close():
+                raise
 
         try:
             if self.shared_cpu_cache_mapping is not None:
@@ -7998,7 +8148,15 @@ class LMCacheEngineBuilder:
 
     @classmethod
     def destroy(cls, instance_id: str) -> None:
-        """Close and delete the LMCacheEngine instance by the instance ID"""
+        """Close and deregister one engine only after successful teardown.
+
+        Args:
+            instance_id: Builder identity of the engine to destroy.
+
+        Raises:
+            Exception: If engine close fails. The builder retains the engine
+                and all same-ID registry entries so replacement is blocked.
+        """
         # TODO: unit test for this
         logger.info(f"Destroying LMCacheEngine instance: {instance_id}")
 
@@ -8018,6 +8176,10 @@ class LMCacheEngineBuilder:
                 logger.info("Cache engine closed successfully")
             except Exception as e:
                 logger.error(f"Error closing cache engine: {e}")
+                # A failed close can mean native code still owns registered
+                # CPU/HBM ranges. Keep every builder reference intact so a
+                # same-ID replacement cannot reuse that memory in-process.
+                raise
 
             try:
                 logger.info("Cleaning up instance dictionaries...")

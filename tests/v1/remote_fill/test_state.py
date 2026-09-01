@@ -3,6 +3,7 @@
 
 # Standard
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from unittest.mock import Mock
 
 # Third Party
@@ -38,6 +39,12 @@ def _arm_and_report(harness, reserve, reserve_response) -> None:
     harness.client.execute(harness.requests.report(reserve, reserve_response))
 
 
+def _select_group0_only(harness) -> None:
+    negotiation = replace(harness.negotiation, shared_group1=False)
+    harness.negotiation = negotiation
+    harness.state._negotiation = negotiation
+
+
 def test_open_conservatively_reports_zero_until_exact_keys_arrive(harness) -> None:
     """Keyless OPEN cannot claim a LocalCPU prefix or create a lease."""
 
@@ -62,6 +69,85 @@ def test_reservation_key_supports_multiple_chunks_per_group(harness) -> None:
         for descriptor in response.descriptors
     }
     assert selectors == {(group, chunk) for chunk in range(4) for group in (0, 1)}
+
+
+def test_paired_negotiation_rejects_group0_only_window_before_allocation(
+    harness,
+) -> None:
+    """Codec-valid Group-0 windows still require matching negotiation."""
+
+    harness.client.execute(harness.requests.open())
+    response = harness.client.execute(
+        harness.requests.reserve(harness.requests.pages(groups=(0,)))
+    )
+
+    assert response.code is ResultCode.RESERVATION_REJECTED
+    assert harness.lifecycle.prepare_calls == 0
+
+
+def test_group0_negotiation_rejects_paired_window_before_allocation(harness) -> None:
+    """A Group-0-only decoder never allocates an unexpected Group-1 page."""
+
+    _select_group0_only(harness)
+    assert (
+        harness.client.execute(
+            harness.requests.negotiate(shared_group1=False)
+        ).code
+        is ResultCode.OK
+    )
+    harness.client.execute(harness.requests.open())
+    response = harness.client.execute(harness.requests.reserve())
+
+    assert response.code is ResultCode.RESERVATION_REJECTED
+    assert harness.lifecycle.prepare_calls == 0
+
+
+def test_group0_commit_is_internal_local_and_public_persistent_only(harness) -> None:
+    """G0 publication stays distinguishable without weakening LOCAL_FULL."""
+
+    _select_group0_only(harness)
+    pages = harness.requests.pages(groups=(0,))
+    _, reserve, response = _open_and_reserve(harness, pages=pages)
+    _arm_and_report(harness, reserve, response)
+
+    finished = harness.client.execute(harness.requests.finish())
+    status = harness.client.execute(harness.requests.status())
+    metrics = harness.service.metrics_snapshot()
+
+    assert finished.transaction_state is TransactionState.GROUP0_LOCAL
+    assert finished.terminal_outcome is TerminalOutcome.PERSISTENT_ONLY
+    assert status.transaction_state is TransactionState.GROUP0_LOCAL
+    assert status.terminal_outcome is TerminalOutcome.PERSISTENT_ONLY
+    assert status.windows[0].state is WindowState.COMMITTED
+    assert harness.lifecycle.commit_calls == 1
+    assert harness.lifecycle.committed[0][0] == (pages[0].canonical_key,)
+    assert harness.lifecycle.released == []
+    assert metrics.published_bytes_total == response.descriptors[0].destination_length
+    assert metrics.terminal_local_full_total == 0
+    assert metrics.terminal_persistent_only_total == 1
+
+
+def test_group0_partial_tail_commits_with_exact_finish_metadata(harness) -> None:
+    """The one-group coverage validator preserves exact partial tails."""
+
+    _select_group0_only(harness)
+    page = msgspec.structs.replace(
+        harness.requests.pages(groups=(0,))[0],
+        chunk_end=512,
+        valid_tokens=512,
+    )
+    _, reserve, response = _open_and_reserve(harness, pages=(page,))
+    _arm_and_report(harness, reserve, response)
+
+    finished = harness.client.execute(
+        harness.requests.finish(
+            required_store_end=512,
+            final_partial_valid_tokens=512,
+        )
+    )
+
+    assert finished.transaction_state is TransactionState.GROUP0_LOCAL
+    assert finished.terminal_outcome is TerminalOutcome.PERSISTENT_ONLY
 
 
 def test_out_of_order_windows_finalize_deterministically(harness) -> None:
