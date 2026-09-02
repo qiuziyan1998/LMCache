@@ -1,7 +1,15 @@
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <future>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -56,6 +64,54 @@ static inline int set_mempolicy_sys(int mode, const unsigned long* nodemask,
 
 namespace {
 
+using SteadyClock = std::chrono::steady_clock;
+
+constexpr size_t kMaxFirstTouchThreads = 8;
+
+bool cold_start_perf_enabled() {
+  const char* value = std::getenv("LMCACHE_COLD_START_PERF");
+  if (value == nullptr) return false;
+  std::string normalized(value);
+  normalized.erase(0, normalized.find_first_not_of(" \t\r\n"));
+  const size_t end = normalized.find_last_not_of(" \t\r\n");
+  if (end == std::string::npos) return false;
+  normalized.erase(end + 1);
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return normalized != "0" && normalized != "false" && normalized != "no" &&
+         normalized != "off";
+}
+
+void log_shared_slab_perf(const char* event, size_t size, const char* role,
+                          size_t threads,
+                          const SteadyClock::time_point* started = nullptr,
+                          int status = 0) {
+  if (!cold_start_perf_enabled()) return;
+  const auto monotonic = SteadyClock::now();
+  const auto wall = std::chrono::system_clock::now();
+  const double monotonic_ms =
+      std::chrono::duration<double, std::milli>(monotonic.time_since_epoch())
+          .count();
+  const long long wall_time_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          wall.time_since_epoch())
+          .count();
+  const double elapsed_ms =
+      started == nullptr
+          ? 0.0
+          : std::chrono::duration<double, std::milli>(monotonic - *started)
+                .count();
+  std::fprintf(
+      stderr,
+      "[LMCACHE_COLD_PERF] {\"schema\":1,\"event\":\"%s\",\"pid\":%d,"
+      "\"monotonic_ms\":%.3f,\"wall_time_ns\":%lld,\"role\":\"%s\","
+      "\"bytes\":%zu,\"threads\":%zu,\"elapsed_ms\":%.3f,"
+      "\"status\":%d}\n",
+      event, getpid(), monotonic_ms, wall_time_ns, role, size, threads,
+      elapsed_ms, status);
+  std::fflush(stderr);
+}
+
 class ScopedInterleavePolicy {
  public:
   explicit ScopedInterleavePolicy(const std::vector<int>& nodes) {
@@ -92,18 +148,59 @@ class ScopedInterleavePolicy {
     if (active_) set_mempolicy_sys(MPOL_DEFAULT, nullptr, 0);
   }
 
-  void restore() {
-    if (!active_) return;
-    int rc = set_mempolicy_sys(MPOL_DEFAULT, nullptr, 0);
-    if (rc != 0)
-      throw std::runtime_error(std::string("restore mempolicy failed: ") +
-                               strerror(-rc));
-    active_ = false;
-  }
-
  private:
   bool active_ = false;
 };
+
+size_t first_touch_thread_count(size_t size, size_t page_size) {
+  const size_t page_count = (size - 1) / page_size + 1;
+  cpu_set_t affinity;
+  size_t cpu_count = 0;
+  if (sched_getaffinity(0, sizeof(affinity), &affinity) == 0)
+    cpu_count = CPU_COUNT(&affinity);
+  if (cpu_count == 0) cpu_count = std::thread::hardware_concurrency();
+  if (cpu_count == 0) cpu_count = 1;
+  return std::min({page_count, cpu_count, kMaxFirstTouchThreads});
+}
+
+void parallel_first_touch(void* ptr, size_t size,
+                          const std::vector<int>& interleave_nodes,
+                          size_t thread_count) {
+  const long raw_page_size = sysconf(_SC_PAGESIZE);
+  if (raw_page_size <= 0)
+    throw std::runtime_error("sysconf(_SC_PAGESIZE) failed");
+  const size_t page_size = static_cast<size_t>(raw_page_size);
+  const size_t page_count = (size - 1) / page_size + 1;
+  const size_t base_pages = page_count / thread_count;
+  const size_t extra_pages = page_count % thread_count;
+  std::vector<std::future<void>> workers;
+  workers.reserve(thread_count);
+  size_t begin_page = 0;
+  for (size_t index = 0; index < thread_count; ++index) {
+    const size_t range_pages = base_pages + (index < extra_pages ? 1 : 0);
+    const size_t end_page = begin_page + range_pages;
+    workers.emplace_back(std::async(
+        std::launch::async, [ptr, page_size, begin_page, end_page,
+                            &interleave_nodes]() {
+          ScopedInterleavePolicy numa_policy(interleave_nodes);
+          auto* bytes = static_cast<unsigned char*>(ptr);
+          for (size_t page = begin_page; page < end_page; ++page) {
+            volatile unsigned char* byte = bytes + page * page_size;
+            *byte = 0;
+          }
+        }));
+    begin_page = end_page;
+  }
+  std::exception_ptr first_error;
+  for (auto& worker : workers) {
+    try {
+      worker.get();
+    } catch (...) {
+      if (first_error == nullptr) first_error = std::current_exception();
+    }
+  }
+  if (first_error != nullptr) std::rethrow_exception(first_error);
+}
 
 }  // namespace
 
@@ -171,7 +268,6 @@ uintptr_t alloc_shm_pinned_ptr(
   if (shm_name.empty())
     throw std::runtime_error("alloc_shm_pinned_ptr requires a shm_name");
 
-  ScopedInterleavePolicy numa_policy(interleave_nodes);
   int fd = shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
   if (fd < 0)
     throw std::runtime_error(std::string("shm_open create failed for ") +
@@ -199,15 +295,28 @@ uintptr_t alloc_shm_pinned_ptr(
   }
 
   try {
-    first_touch(ptr, size);
-    numa_policy.restore();
+    const long raw_page_size = sysconf(_SC_PAGESIZE);
+    if (raw_page_size <= 0)
+      throw std::runtime_error("sysconf(_SC_PAGESIZE) failed");
+    const size_t touch_threads = first_touch_thread_count(
+        size, static_cast<size_t>(raw_page_size));
+    const auto first_touch_started = SteadyClock::now();
+    log_shared_slab_perf("shared_slab_first_touch_start", size, "owner",
+                         touch_threads);
+    parallel_first_touch(ptr, size, interleave_nodes, touch_threads);
+    log_shared_slab_perf("shared_slab_first_touch_complete", size, "owner",
+                         touch_threads, &first_touch_started);
   } catch (...) {
     munmap(ptr, size);
     shm_unlink(shm_name.c_str());
     throw;
   }
 
+  const auto register_started = SteadyClock::now();
+  log_shared_slab_perf("shared_slab_host_register_start", size, "owner", 1);
   cudaError_t st = cudaHostRegister(ptr, size, 0);
+  log_shared_slab_perf("shared_slab_host_register_complete", size, "owner", 1,
+                       &register_started, static_cast<int>(st));
   if (st != cudaSuccess) {
     munmap(ptr, size);
     shm_unlink(shm_name.c_str());
@@ -239,7 +348,11 @@ uintptr_t attach_shm_pinned_ptr(size_t size, const std::string& shm_name,
                              ": " + strerror(errno));
   }
 
+  const auto register_started = SteadyClock::now();
+  log_shared_slab_perf("shared_slab_host_register_start", size, "passive", 1);
   cudaError_t st = cudaHostRegister(ptr, size, 0);
+  log_shared_slab_perf("shared_slab_host_register_complete", size, "passive",
+                       1, &register_started, static_cast<int>(st));
   if (st != cudaSuccess) {
     munmap(ptr, size);
     throw std::runtime_error(std::string("cudaHostRegister attach failed for ") +
