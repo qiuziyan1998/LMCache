@@ -1084,6 +1084,7 @@ class LMCacheEngine:
     def _broadcast_shared_envelope(self, envelope: SharedHandleEnvelope) -> None:
         perf_enabled = cold_start_perf_enabled()
         started = cold_start_perf_now() if perf_enabled else None
+        thread_started = time.thread_time_ns() if perf_enabled else 0
         condition, _, _ = self._shared_envelope_mailbox()
         with condition:
             self.broadcast_object_fn(envelope.to_dict(), self.metadata.first_rank)
@@ -1100,11 +1101,15 @@ class LMCacheEngine:
                 batch_offsets=len(envelope.batch.offsets) if envelope.batch else 0,
                 status=envelope.status,
                 rank=self.metadata.worker_id,
+                thread_cpu_ms=round(
+                    (time.thread_time_ns() - thread_started) / 1e6, 3
+                ),
             )
 
     def _receive_shared_envelope(self) -> SharedHandleEnvelope:
         perf_enabled = cold_start_perf_enabled()
         started = cold_start_perf_now() if perf_enabled else None
+        thread_started = time.thread_time_ns() if perf_enabled else 0
         raw = self.broadcast_object_fn(None, self.metadata.first_rank)
         if not isinstance(raw, dict):
             raise ValueError(
@@ -1131,6 +1136,9 @@ class LMCacheEngine:
                 batch_offsets=len(envelope.batch.offsets) if envelope.batch else 0,
                 status=envelope.status,
                 rank=self.metadata.worker_id,
+                thread_cpu_ms=round(
+                    (time.thread_time_ns() - thread_started) / 1e6, 3
+                ),
             )
         return envelope
 
@@ -1179,6 +1187,12 @@ class LMCacheEngine:
         layer_id: int,
         kv_group: int,
     ) -> SharedHandleEnvelope:
+        perf_enabled = cold_start_perf_enabled()
+        matching_started = cold_start_perf_now() if perf_enabled else 0.0
+        matching_thread_started = time.thread_time_ns() if perf_enabled else 0
+        condition_wait_s = collective_receive_s = 0.0
+        receive_count = 0
+        outcome = "error"
         expected = (
             req_id,
             phase,
@@ -1200,15 +1214,31 @@ class LMCacheEngine:
                 with condition:
                     buffered = pending.pop(expected, None)
                     if buffered is not None:
+                        outcome = "buffered"
                         condition.notify_all()
                         return buffered
                     if self._shared_envelope_receive_active:
+                        wait_started = (
+                            cold_start_perf_now() if perf_enabled else 0.0
+                        )
                         condition.wait()
+                        if perf_enabled:
+                            condition_wait_s += (
+                                cold_start_perf_now() - wait_started
+                            )
                         continue
                     self._shared_envelope_receive_active = True
 
                 try:
+                    receive_started = (
+                        cold_start_perf_now() if perf_enabled else 0.0
+                    )
                     envelope = self._receive_shared_envelope()
+                    if perf_enabled:
+                        collective_receive_s += (
+                            cold_start_perf_now() - receive_started
+                        )
+                        receive_count += 1
                     if envelope.generation != self.shared_cpu_cache_generation:
                         raise ValueError(
                             "Shared CPU cache received a layerwise envelope from "
@@ -1225,6 +1255,7 @@ class LMCacheEngine:
                 with condition:
                     self._shared_envelope_receive_active = False
                     if identity == expected:
+                        outcome = "collective"
                         condition.notify_all()
                         return envelope
                     if identity in pending:
@@ -1245,6 +1276,35 @@ class LMCacheEngine:
                 else:
                     waiters.pop(expected)
                 condition.notify_all()
+            if perf_enabled:
+                elapsed_ms = (
+                    cold_start_perf_now() - matching_started
+                ) * 1000
+                if elapsed_ms >= 100.0:
+                    cold_start_perf_log(
+                        logger,
+                        "shared_handle_match_slow",
+                        started=matching_started,
+                        req_id=req_id,
+                        phase=phase,
+                        kv_group=kv_group,
+                        layer=layer_id,
+                        rank=self.metadata.worker_id,
+                        outcome=outcome,
+                        condition_wait_ms=round(condition_wait_s * 1000, 3),
+                        collective_receive_ms=round(
+                            collective_receive_s * 1000, 3
+                        ),
+                        receive_count=receive_count,
+                        thread_cpu_ms=round(
+                            (
+                                time.thread_time_ns()
+                                - matching_thread_started
+                            )
+                            / 1e6,
+                            3,
+                        ),
+                    )
 
     def _remote_fill_all_ranks_materialized(
         self,
