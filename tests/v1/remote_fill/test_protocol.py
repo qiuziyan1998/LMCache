@@ -316,7 +316,9 @@ def test_negotiation_binds_builtin_hash_seed(harness) -> None:
         token_hash_algorithm="builtin",
         python_hash_seed="7",
     )
-    assert harness.client.execute(mismatch).code is ResultCode.RESERVATION_REJECTED
+    response = harness.client.execute(mismatch)
+    assert response.code is ResultCode.RESERVATION_REJECTED
+    assert "python_hash_seed" in response.message
 
 
 def test_negotiation_binds_direct_group_shape(harness) -> None:
@@ -324,7 +326,9 @@ def test_negotiation_binds_direct_group_shape(harness) -> None:
 
     assert harness.client.execute(harness.requests.negotiate()).code is ResultCode.OK
     mismatch = harness.requests.negotiate(shared_group1=False)
-    assert harness.client.execute(mismatch).code is ResultCode.RESERVATION_REJECTED
+    response = harness.client.execute(mismatch)
+    assert response.code is ResultCode.RESERVATION_REJECTED
+    assert "shared_group1" in response.message
 
 
 def test_nonbuiltin_hash_rejects_python_seed(harness) -> None:

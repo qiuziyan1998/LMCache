@@ -85,6 +85,16 @@ def test_paired_negotiation_rejects_group0_only_window_before_allocation(
     assert harness.lifecycle.prepare_calls == 0
 
 
+def test_open_rejection_reports_the_mismatched_identity_field(harness) -> None:
+    """OPEN diagnostics identify the exact stale placement field."""
+
+    request = msgspec.structs.replace(harness.requests.open(), destination_dp_rank=1)
+    response = harness.client.execute(request)
+
+    assert response.code is ResultCode.RESERVATION_REJECTED
+    assert "destination_dp_rank" in response.message
+
+
 def test_group0_negotiation_rejects_paired_window_before_allocation(harness) -> None:
     """A Group-0-only decoder never allocates an unexpected Group-1 page."""
 

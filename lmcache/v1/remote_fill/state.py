@@ -4,7 +4,7 @@
 # Standard
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from threading import RLock
 from time import monotonic
 from typing import Any, Protocol
@@ -808,25 +808,36 @@ class RemoteFillStateCore:
             python_hash_seed=request.python_hash_seed,
         )
         if supplied != self._negotiation:
+            mismatches = ",".join(
+                item.name
+                for item in fields(NegotiationSpec)
+                if getattr(supplied, item.name) != getattr(self._negotiation, item.name)
+            )
             return self._response(
                 request,
                 ResultCode.RESERVATION_REJECTED,
-                "remote-fill layout negotiation failed",
+                f"remote-fill layout negotiation failed: fields={mismatches}",
             )
         return self._response(request, ResultCode.OK)
 
     def _open_locked(self, request: OpenRequest) -> RemoteFillResponse:
-        if (
-            request.cache_namespace_tag != self._negotiation.cache_namespace_tag
-            or request.layout_tag != self._negotiation.layout_tag
-            or request.model_artifact_id != self._negotiation.model_artifact_id
-            or request.destination_engine_id != self._negotiation.destination_engine_id
-            or request.destination_dp_rank != self._negotiation.destination_dp_rank
-        ):
+        identity_fields = (
+            "cache_namespace_tag",
+            "layout_tag",
+            "model_artifact_id",
+            "destination_engine_id",
+            "destination_dp_rank",
+        )
+        mismatches = [
+            name
+            for name in identity_fields
+            if getattr(request, name) != getattr(self._negotiation, name)
+        ]
+        if mismatches:
             return self._response(
                 request,
                 ResultCode.RESERVATION_REJECTED,
-                "open namespace or model artifact mismatch",
+                "remote-fill open identity failed: fields=" + ",".join(mismatches),
             )
         existing = self._transactions.get(request.common.transfer_id)
         if existing is not None:
