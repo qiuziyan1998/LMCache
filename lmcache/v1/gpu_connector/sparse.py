@@ -18,7 +18,7 @@ class PreparedSparseSourceLayer:
     """Stable CPU source and pointer table for one sparse cache layer."""
 
     tensors: tuple[torch.Tensor, ...]
-    chunk_ptrs_npu: torch.Tensor
+    chunk_ptrs_npu: Optional[torch.Tensor]
     memory_objs: tuple[MemoryObj, ...] = ()
 
 
@@ -30,6 +30,7 @@ class PreparedSparseSource:
     total_tokens: int
     chunk_token_counts: tuple[int, ...] = field(default_factory=tuple)
     pointer_device: Optional[torch.device] = None
+    chunk_ptr_table_npu: Optional[torch.Tensor] = None
 
 
 def build_prepared_sparse_source(
@@ -41,6 +42,7 @@ def build_prepared_sparse_source(
     chunk_token_counts: Optional[Sequence[int]] = None,
     expected_pointer_device: Optional[torch.device] = None,
     cached_memory_objs: Optional[Sequence[Sequence[MemoryObj]]] = None,
+    chunk_ptr_table_npu: Optional[torch.Tensor] = None,
 ) -> Optional[PreparedSparseSource]:
     """Seal a complete layer cache into immutable hot-path source metadata.
 
@@ -54,6 +56,8 @@ def build_prepared_sparse_source(
         cached_memory_objs: Optional pointer-first CPU chunk owners. Complete
             owner layers can replace ``cached_tensors`` without constructing
             per-chunk typed views.
+        chunk_ptr_table_npu: Optional contiguous ``[layers, chunks]`` pointer
+            table retained as one request-owned tensor.
 
     Returns:
         A prepared source, or ``None`` while bootstrap data is incomplete.
@@ -74,8 +78,25 @@ def build_prepared_sparse_source(
     )
     if not tensors_complete and not owners_complete:
         return None
-    if len(cached_chunk_ptrs_npu) != num_layers:
+    if chunk_ptr_table_npu is None and len(cached_chunk_ptrs_npu) != num_layers:
         return None
+
+    pointer_device: Optional[torch.device] = None
+    if chunk_ptr_table_npu is not None:
+        if not isinstance(chunk_ptr_table_npu, torch.Tensor):
+            raise TypeError("Prepared sparse pointer table must be a tensor.")
+        if (
+            chunk_ptr_table_npu.ndim != 2
+            or chunk_ptr_table_npu.dtype != torch.int64
+            or int(chunk_ptr_table_npu.shape[0]) != num_layers
+            or not chunk_ptr_table_npu.is_contiguous()
+        ):
+            raise ValueError(
+                "Prepared sparse pointer table must be contiguous int64 "
+                f"[layers, chunks]: shape={tuple(chunk_ptr_table_npu.shape)}, "
+                f"dtype={chunk_ptr_table_npu.dtype}, layers={num_layers}."
+            )
+        pointer_device = chunk_ptr_table_npu.device
 
     normalized_chunk_counts: tuple[int, ...] = ()
     if chunk_token_counts is not None:
@@ -103,7 +124,6 @@ def build_prepared_sparse_source(
             )
 
     layers: list[PreparedSparseSourceLayer] = []
-    pointer_device: Optional[torch.device] = None
     for layer_id in range(num_layers):
         layer_tensors = cached_tensors[layer_id] if tensors_complete else ()
         if isinstance(layer_tensors, torch.Tensor):
@@ -127,34 +147,47 @@ def build_prepared_sparse_source(
                 f"memory_objs={len(memory_objs)}"
             )
         chunk_count = chunk_counts.pop()
-        chunk_ptrs_npu = cached_chunk_ptrs_npu[layer_id]
-        if chunk_ptrs_npu is None:
+        chunk_ptrs_npu = (
+            None
+            if chunk_ptr_table_npu is not None
+            else cached_chunk_ptrs_npu[layer_id]
+        )
+        if chunk_ptr_table_npu is None and chunk_ptrs_npu is None:
             return None
         if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
             raise TypeError(
                 "Prepared sparse source contains a non-tensor entry: "
                 f"layer_id={layer_id}"
             )
-        if not isinstance(chunk_ptrs_npu, torch.Tensor):
+        if chunk_ptrs_npu is not None and not isinstance(
+            chunk_ptrs_npu, torch.Tensor
+        ):
             raise TypeError(
                 "Prepared sparse pointer cache must contain tensors: "
                 f"layer_id={layer_id}, type={type(chunk_ptrs_npu).__name__}"
             )
-        if chunk_ptrs_npu.ndim != 1 or chunk_ptrs_npu.dtype != torch.int64:
+        if chunk_ptrs_npu is not None and (
+            chunk_ptrs_npu.ndim != 1 or chunk_ptrs_npu.dtype != torch.int64
+        ):
             raise ValueError(
                 "Prepared sparse pointer cache must be a 1D int64 tensor: "
                 f"layer_id={layer_id}, shape={tuple(chunk_ptrs_npu.shape)}, "
                 f"dtype={chunk_ptrs_npu.dtype}"
             )
-        if not chunk_ptrs_npu.is_contiguous():
+        if chunk_ptrs_npu is not None and not chunk_ptrs_npu.is_contiguous():
             raise ValueError(
                 "Prepared sparse pointer cache must be contiguous: "
                 f"layer_id={layer_id}, stride={chunk_ptrs_npu.stride()}"
             )
-        if int(chunk_ptrs_npu.numel()) != chunk_count:
+        pointer_count = (
+            int(chunk_ptr_table_npu.shape[1])
+            if chunk_ptr_table_npu is not None
+            else int(chunk_ptrs_npu.numel())
+        )
+        if pointer_count != chunk_count:
             raise ValueError(
                 "Prepared sparse pointer coverage does not match CPU chunks: "
-                f"layer_id={layer_id}, pointers={chunk_ptrs_npu.numel()}, "
+                f"layer_id={layer_id}, pointers={pointer_count}, "
                 f"chunks={chunk_count}"
             )
         if normalized_chunk_counts and len(normalized_chunk_counts) != chunk_count:
@@ -163,9 +196,9 @@ def build_prepared_sparse_source(
                 f"layer_id={layer_id}, coverage={len(normalized_chunk_counts)}, "
                 f"chunks={chunk_count}"
             )
-        if pointer_device is None:
+        if pointer_device is None and chunk_ptrs_npu is not None:
             pointer_device = chunk_ptrs_npu.device
-        elif chunk_ptrs_npu.device != pointer_device:
+        elif chunk_ptrs_npu is not None and chunk_ptrs_npu.device != pointer_device:
             raise ValueError(
                 "Prepared sparse pointer tables must share one device: "
                 f"layer_id={layer_id}, device={chunk_ptrs_npu.device}, "
@@ -173,17 +206,18 @@ def build_prepared_sparse_source(
             )
         if (
             expected_pointer_device is not None
+            and pointer_device is not None
             and (
-                chunk_ptrs_npu.device.type != expected_pointer_device.type
+                pointer_device.type != expected_pointer_device.type
                 or (
                     expected_pointer_device.index is not None
-                    and chunk_ptrs_npu.device.index != expected_pointer_device.index
+                    and pointer_device.index != expected_pointer_device.index
                 )
             )
         ):
             raise ValueError(
                 "Prepared sparse pointer table is on the wrong device: "
-                f"layer_id={layer_id}, device={chunk_ptrs_npu.device}, "
+                f"layer_id={layer_id}, device={pointer_device}, "
                 f"expected={expected_pointer_device}"
             )
 
@@ -201,4 +235,5 @@ def build_prepared_sparse_source(
         total_tokens=int(total_tokens),
         chunk_token_counts=normalized_chunk_counts,
         pointer_device=pointer_device,
+        chunk_ptr_table_npu=chunk_ptr_table_npu,
     )

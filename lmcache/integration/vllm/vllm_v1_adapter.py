@@ -977,6 +977,7 @@ class WorkerRetrieveState:
     cached_tensors: list[list] = field(default_factory=list)
     cached_chunk_dev_ptrs: list[list[int]] = field(default_factory=list)
     cached_chunk_ptrs_npu: list[Optional[torch.Tensor]] = field(default_factory=list)
+    cached_chunk_ptr_table_npu: list[torch.Tensor] = field(default_factory=list)
     cached_shared_handles: list[list[Any]] = field(default_factory=list)
     cached_keys_indexer: list[list] = field(default_factory=list)
     cached_starts_indexer: list[int] = field(default_factory=list)
@@ -985,6 +986,9 @@ class WorkerRetrieveState:
     cached_tensors_indexer: list[list] = field(default_factory=list)
     cached_chunk_dev_ptrs_indexer: list[list[int]] = field(default_factory=list)
     cached_chunk_ptrs_npu_indexer: list[Optional[torch.Tensor]] = field(
+        default_factory=list
+    )
+    cached_chunk_ptr_table_npu_indexer: list[torch.Tensor] = field(
         default_factory=list
     )
     cached_shared_handles_indexer: list[list[Any]] = field(default_factory=list)
@@ -1029,6 +1033,7 @@ class WorkerRetrieveState:
                 "cached_tensors",
                 "cached_chunk_dev_ptrs",
                 "cached_chunk_ptrs_npu",
+                "cached_chunk_ptr_table_npu",
                 "cached_shared_handles",
             )
         }
@@ -1051,6 +1056,7 @@ class WorkerRetrieveState:
             or any(cache["cached_tensors"])
             or any(cache["cached_chunk_dev_ptrs"])
             or any(ptr is not None for ptr in cache["cached_chunk_ptrs_npu"])
+            or bool(cache["cached_chunk_ptr_table_npu"])
             or any(cache["cached_shared_handles"])
             or kv_group in self.prepared_sparse_sources
         )
@@ -2663,6 +2669,7 @@ class LMCacheConnectorV1Impl:
             len(state.cached_ends or []),
             id(state.cached_memory_objs),
             id(state.cached_chunk_ptrs_npu),
+            id(state.cached_chunk_ptr_table_npu),
         )
 
     def _validate_shared_worker_retrieve_state(
@@ -2808,6 +2815,7 @@ class LMCacheConnectorV1Impl:
             state.cached_memory_objs,
             state.cached_chunk_ptrs_npu,
             required_latent_chunks,
+            state.cached_chunk_ptr_table_npu,
         )
         if missing_latent_pointer_layers:
             raise RuntimeError(
@@ -3565,6 +3573,7 @@ class LMCacheConnectorV1Impl:
             memory_objs,
             chunk_ptrs,
             required_chunks,
+            [result.chunk_ptr_table] if result.chunk_ptr_table is not None else None,
         )
 
     def _drop_layerwise_save_storers(self, req_id: str) -> None:
@@ -4153,17 +4162,31 @@ class LMCacheConnectorV1Impl:
         )
 
     def _drop_worker_retrieve_state(
-        self, req_id: str, *, release_lookup_pins: bool = True
+        self,
+        req_id: str,
+        *,
+        release_lookup_pins: bool = True,
+        defer_dense_release: bool = False,
     ) -> None:
         engine = getattr(self, "lmcache_engine", None)
         state = None
         if hasattr(self, "_worker_retrieve_state"):
             state = self._worker_retrieve_state.get(req_id)
         if state is not None:
-            self._release_shared_worker_retrieve_state(state, engine)
+            if defer_dense_release and state.dense_load_readiness is not None:
+                retirements = getattr(self, "_dense_load_retirements", None)
+                if retirements is None:
+                    retirements = {}
+                    self._dense_load_retirements = retirements
+                retirements[id(state)] = state
+            else:
+                self._release_shared_worker_retrieve_state(state, engine)
             self._worker_retrieve_state.pop(req_id, None)
             self._mark_worker_retrieve_registry_changed()
-        elif engine is not None:
+        elif engine is not None and not any(
+            retired.req_id == req_id
+            for retired in getattr(self, "_dense_load_retirements", {}).values()
+        ):
             release_fn = getattr(engine, "release_shared_cpu_sparse_request", None)
             if callable(release_fn):
                 release_fn(req_id)
@@ -4176,7 +4199,46 @@ class LMCacheConnectorV1Impl:
             self._cold_perf_dense_load_started.pop(req_id, None)
             self._cold_perf_dense_load_completed.pop(req_id, None)
             self._drop_layerwise_save_storers(req_id)
-            self._drop_worker_retrieve_state(req_id)
+            self._drop_worker_retrieve_state(req_id, defer_dense_release=True)
+        self._drain_dense_load_retirements()
+
+    def _drain_dense_load_retirements(self, *, block: bool = False) -> None:
+        """Release detached load owners only after their exact fence completes."""
+        retirements = getattr(self, "_dense_load_retirements", None)
+        if not retirements:
+            return
+        engine = getattr(self, "lmcache_engine", None)
+        query = getattr(
+            getattr(engine, "gpu_connector", None),
+            "query_dense_load_readiness",
+            None,
+        )
+        for identity, state in tuple(retirements.items()):
+            if not block:
+                if getattr(state, "_dense_retirement_query_failed", False):
+                    continue
+                if callable(query):
+                    try:
+                        if not query(state.dense_load_readiness):
+                            continue
+                    except Exception:
+                        if not getattr(
+                            state, "_dense_retirement_query_failed", False
+                        ):
+                            logger.exception(
+                                "Dense-load retirement query failed; retaining "
+                                "owners: req_id=%s",
+                                state.req_id,
+                            )
+                            state._dense_retirement_query_failed = True
+                        continue
+            self._release_shared_worker_retrieve_state(
+                state, engine, dense_ready=not block and callable(query)
+            )
+            if retirements.get(identity) is state:
+                retirements.pop(identity)
+        if not retirements:
+            del self._dense_load_retirements
 
     def _request_may_store_in_wait_for_save(self, request: ReqMeta) -> bool:
         if self.kv_role == "kv_consumer":
@@ -4217,22 +4279,24 @@ class LMCacheConnectorV1Impl:
         engine: Optional[Any] = None,
         *,
         release_request: bool = True,
+        dense_ready: bool = False,
     ) -> None:
         """Drop worker bindings and release the engine-owned request lease."""
 
         req_id = state.req_id
         readiness = state.dense_load_readiness
         if readiness is not None:
-            synchronize = getattr(
-                getattr(engine, "gpu_connector", None),
-                "synchronize_dense_load_readiness",
-                None,
-            )
-            if not callable(synchronize):
-                raise RuntimeError(
-                    "NPU connector has no dense load readiness sync API"
+            if not dense_ready:
+                synchronize = getattr(
+                    getattr(engine, "gpu_connector", None),
+                    "synchronize_dense_load_readiness",
+                    None,
                 )
-            synchronize(readiness)
+                if not callable(synchronize):
+                    raise RuntimeError(
+                        "NPU connector has no dense load readiness sync API"
+                    )
+                synchronize(readiness)
             state.dense_load_readiness = None
             state.dense_load_readiness_consumed = False
         LMCacheConnectorV1Impl._release_dense_load_source_owners(
@@ -4250,6 +4314,7 @@ class LMCacheConnectorV1Impl:
                 "cached_tensors",
                 "cached_chunk_dev_ptrs",
                 "cached_chunk_ptrs_npu",
+                "cached_chunk_ptr_table_npu",
                 "cached_shared_handles",
             ):
                 cache[name].clear()
@@ -4276,6 +4341,8 @@ class LMCacheConnectorV1Impl:
         state.req_id = None
         if hasattr(state, "_dsa_cold_prune_protected"):
             delattr(state, "_dsa_cold_prune_protected")
+        if hasattr(state, "_dense_retirement_query_failed"):
+            delattr(state, "_dense_retirement_query_failed")
 
     @staticmethod
     def _release_dense_load_source_owners(
@@ -4423,7 +4490,18 @@ class LMCacheConnectorV1Impl:
         layers: list[list[Any]],
         chunk_ptrs: list[Optional[torch.Tensor]],
         required_chunks: int = 1,
+        packed_tables: Optional[list[torch.Tensor]] = None,
     ) -> list[int]:
+        if packed_tables:
+            table = packed_tables[0]
+            if (
+                len(packed_tables) == 1
+                and isinstance(table, torch.Tensor)
+                and table.ndim == 2
+                and int(table.shape[0]) == len(layers)
+                and int(table.shape[1]) >= required_chunks
+            ):
+                return []
         missing: list[int] = []
         for layer_id, layer_entries in enumerate(layers or []):
             if not layer_entries:
@@ -4452,6 +4530,7 @@ class LMCacheConnectorV1Impl:
             state.cached_memory_objs,
             state.cached_chunk_ptrs_npu,
             required_latent_chunks,
+            state.cached_chunk_ptr_table_npu,
         )
         if missing_latent_layers:
             raise RuntimeError(
@@ -4493,6 +4572,7 @@ class LMCacheConnectorV1Impl:
                 state.cached_memory_objs_indexer,
                 state.cached_chunk_ptrs_npu_indexer,
                 required_index_chunks,
+                state.cached_chunk_ptr_table_npu_indexer,
             )
             if missing_index_layers:
                 raise RuntimeError(
@@ -4524,6 +4604,9 @@ class LMCacheConnectorV1Impl:
                 state.cached_chunk_dev_ptrs
             ),
             "cached_chunk_ptrs_npu": list(state.cached_chunk_ptrs_npu),
+            "cached_chunk_ptr_table_npu": list(
+                state.cached_chunk_ptr_table_npu
+            ),
             "cached_shared_handles": self._copy_layer_cache(
                 state.cached_shared_handles
             ),
@@ -4543,6 +4626,9 @@ class LMCacheConnectorV1Impl:
             ),
             "cached_chunk_ptrs_npu_indexer": list(
                 state.cached_chunk_ptrs_npu_indexer
+            ),
+            "cached_chunk_ptr_table_npu_indexer": list(
+                state.cached_chunk_ptr_table_npu_indexer
             ),
             "cached_shared_handles_indexer": self._copy_layer_cache(
                 state.cached_shared_handles_indexer
@@ -4703,6 +4789,7 @@ class LMCacheConnectorV1Impl:
                 layers,
                 cache["cached_chunk_ptrs_npu"],
                 required_chunks,
+                cache["cached_chunk_ptr_table_npu"],
             )
             if missing_pointer_layers:
                 raise RuntimeError(
@@ -4863,6 +4950,11 @@ class LMCacheConnectorV1Impl:
             for layer_id, pointers in enumerate(cache["cached_chunk_ptrs_npu"]):
                 if isinstance(pointers, torch.Tensor):
                     cache["cached_chunk_ptrs_npu"][layer_id] = pointers[:keep]
+            if cache["cached_chunk_ptr_table_npu"]:
+                table = cache["cached_chunk_ptr_table_npu"][0]
+                cache["cached_chunk_ptr_table_npu"][:] = [
+                    table[:, :keep].contiguous()
+                ]
         state.prepared_sparse_sources.clear()
         state.token_count = token_count
         if state.metadata_token_ids:
@@ -4978,6 +5070,7 @@ class LMCacheConnectorV1Impl:
         request.cached_tensors = state.cached_tensors
         request.cached_chunk_dev_ptrs = state.cached_chunk_dev_ptrs
         request.cached_chunk_ptrs_npu = state.cached_chunk_ptrs_npu
+        request.cached_chunk_ptr_table_npu = state.cached_chunk_ptr_table_npu
         request.cached_shared_handles = state.cached_shared_handles
         request.cached_keys_indexer = state.cached_keys_indexer
         request.cached_starts_indexer = state.cached_starts_indexer
@@ -4986,6 +5079,9 @@ class LMCacheConnectorV1Impl:
         request.cached_tensors_indexer = state.cached_tensors_indexer
         request.cached_chunk_dev_ptrs_indexer = state.cached_chunk_dev_ptrs_indexer
         request.cached_chunk_ptrs_npu_indexer = state.cached_chunk_ptrs_npu_indexer
+        request.cached_chunk_ptr_table_npu_indexer = (
+            state.cached_chunk_ptr_table_npu_indexer
+        )
         request.cached_shared_handles_indexer = state.cached_shared_handles_indexer
 
     def _worker_retrieve_state_invalidation_reason(
@@ -5275,8 +5371,13 @@ class LMCacheConnectorV1Impl:
         src_chunk_dev_ptrs: list[list[int]],
         src_chunk_ptrs_npu: list[Optional[torch.Tensor]],
         src_shared_handles: list[list[Any]],
+        dst_chunk_ptr_table_npu: Optional[list[torch.Tensor]] = None,
+        src_chunk_ptr_table_npu: Optional[torch.Tensor] = None,
         require_pointer_cache: bool = False,
     ) -> int:
+        supports_packed_destination = dst_chunk_ptr_table_npu is not None
+        if dst_chunk_ptr_table_npu is None:
+            dst_chunk_ptr_table_npu = []
         if not src_starts or not src_ends:
             return 0
 
@@ -5347,6 +5448,35 @@ class LMCacheConnectorV1Impl:
             return selected_by_layer
 
         selected_ptrs_by_layer = select_layer_ptr_tensors()
+        selected_ptr_table = None
+        if src_chunk_ptr_table_npu is not None:
+            if src_chunk_ptr_table_npu.ndim != 2:
+                raise ValueError("Sparse packed pointer source must be 2D.")
+            chunk_count = int(src_chunk_ptr_table_npu.shape[1])
+            if all(chunk_idx < chunk_count for chunk_idx in append_indices):
+                if append_indices == list(range(len(append_indices))):
+                    selected_ptr_table = src_chunk_ptr_table_npu[
+                        :, : len(append_indices)
+                    ]
+                elif append_indices[-1] - append_indices[0] + 1 == len(
+                    append_indices
+                ):
+                    selected_ptr_table = src_chunk_ptr_table_npu[
+                        :, append_indices[0] : append_indices[-1] + 1
+                    ]
+                if selected_ptr_table is not None:
+                    selected_ptr_table = selected_ptr_table.contiguous()
+        if (
+            selected_ptr_table is not None
+            and (
+                not supports_packed_destination
+                or existing_chunks and not dst_chunk_ptr_table_npu
+            )
+        ):
+            # Mixed-version/fallback state keeps the legacy representation;
+            # the normal packed path never constructs per-layer views.
+            selected_ptrs_by_layer = list(selected_ptr_table.unbind(0))
+            selected_ptr_table = None
         source_layer_count = max(
             len(src_memory_objs or []),
             len(src_tensors or []),
@@ -5365,14 +5495,36 @@ class LMCacheConnectorV1Impl:
             return 0
 
         def can_append_layer_ptr_tensors() -> bool:
+            if selected_ptr_table is not None:
+                return (
+                    selected_ptr_table.ndim == 2
+                    and int(selected_ptr_table.shape[0]) == source_layer_count
+                    and (
+                        not existing_chunks
+                        or bool(dst_chunk_ptr_table_npu)
+                        and int(dst_chunk_ptr_table_npu[0].shape[1])
+                        == existing_chunks
+                    )
+                )
             if (
                 selected_ptrs_by_layer is None
                 or len(selected_ptrs_by_layer) != source_layer_count
             ):
                 return False
+            packed_prefix = (
+                dst_chunk_ptr_table_npu[0] if dst_chunk_ptr_table_npu else None
+            )
+            if packed_prefix is not None and (
+                packed_prefix.ndim != 2
+                or int(packed_prefix.shape[0]) != source_layer_count
+                or int(packed_prefix.shape[1]) != existing_chunks
+            ):
+                return False
             for layer_id in range(len(selected_ptrs_by_layer)):
                 existing = (
-                    dst_chunk_ptrs_npu[layer_id]
+                    packed_prefix[layer_id]
+                    if packed_prefix is not None
+                    else dst_chunk_ptrs_npu[layer_id]
                     if layer_id < len(dst_chunk_ptrs_npu)
                     else None
                 )
@@ -5412,6 +5564,10 @@ class LMCacheConnectorV1Impl:
             for layer_id, ptrs in enumerate(dst_chunk_ptrs_npu or []):
                 if isinstance(ptrs, torch.Tensor):
                     dst_chunk_ptrs_npu[layer_id] = ptrs[:replace_at]
+            if dst_chunk_ptr_table_npu:
+                dst_chunk_ptr_table_npu[:] = [
+                    dst_chunk_ptr_table_npu[0][:, :replace_at].contiguous()
+                ]
 
         assert len(dst_starts) == cached_prefix_chunks
         for chunk_idx in append_indices:
@@ -5457,23 +5613,42 @@ class LMCacheConnectorV1Impl:
         def append_layer_ptr_tensors() -> bool:
             if not can_append_ptrs:
                 return False
+            if selected_ptr_table is not None:
+                dst_chunk_ptr_table_npu[:] = [
+                    selected_ptr_table
+                    if not dst_chunk_ptr_table_npu
+                    else torch.cat(
+                        (dst_chunk_ptr_table_npu[0], selected_ptr_table), dim=1
+                    )
+                ]
+                dst_chunk_ptrs_npu[:] = [None] * source_layer_count
+                return True
             if not dst_chunk_ptrs_npu:
                 dst_chunk_ptrs_npu.extend(
-                    None for _ in range(len(src_chunk_ptrs_npu))
+                    None for _ in range(source_layer_count)
                 )
-            while len(dst_chunk_ptrs_npu) < len(src_chunk_ptrs_npu):
+            while len(dst_chunk_ptrs_npu) < source_layer_count:
                 dst_chunk_ptrs_npu.append(None)
 
+            packed_prefix = (
+                dst_chunk_ptr_table_npu[0] if dst_chunk_ptr_table_npu else None
+            )
             for layer_id, selected in enumerate(selected_ptrs_by_layer):
-                existing = dst_chunk_ptrs_npu[layer_id]
+                existing = (
+                    packed_prefix[layer_id]
+                    if packed_prefix is not None
+                    else dst_chunk_ptrs_npu[layer_id]
+                )
                 dst_chunk_ptrs_npu[layer_id] = (
                     selected
                     if existing is None
                     else torch.cat((existing, selected))
                 )
+            dst_chunk_ptr_table_npu.clear()
             return True
 
         if not append_layer_ptr_tensors():
+            dst_chunk_ptr_table_npu.clear()
             if dst_chunk_ptrs_npu:
                 dst_chunk_ptrs_npu.clear()
             if src_chunk_ptrs_npu and not dst_chunk_ptrs_npu:
@@ -5508,6 +5683,7 @@ class LMCacheConnectorV1Impl:
             dst_tensors=cache["cached_tensors"],
             dst_chunk_dev_ptrs=cache["cached_chunk_dev_ptrs"],
             dst_chunk_ptrs_npu=cache["cached_chunk_ptrs_npu"],
+            dst_chunk_ptr_table_npu=cache["cached_chunk_ptr_table_npu"],
             dst_shared_handles=cache["cached_shared_handles"],
             src_starts=result.starts,
             src_ends=result.ends,
@@ -5516,6 +5692,7 @@ class LMCacheConnectorV1Impl:
             src_tensors=result.tensors,
             src_chunk_dev_ptrs=result.chunk_dev_ptrs,
             src_chunk_ptrs_npu=result.chunk_ptrs,
+            src_chunk_ptr_table_npu=result.chunk_ptr_table,
             src_shared_handles=[],
             require_pointer_cache=require_pointer_cache,
         )
@@ -5778,6 +5955,9 @@ class LMCacheConnectorV1Impl:
             expected_pointer_device = getattr(self, "device", None)
             if expected_pointer_device is not None:
                 expected_pointer_device = torch.device(expected_pointer_device)
+            packed_tables = cache["cached_chunk_ptr_table_npu"]
+            if len(packed_tables) > 1:
+                raise RuntimeError("Sparse pointer cache has multiple packed tables.")
             source = build_prepared_sparse_source(
                 cache["cached_tensors"],
                 cache["cached_chunk_ptrs_npu"],
@@ -5786,6 +5966,7 @@ class LMCacheConnectorV1Impl:
                 chunk_token_counts=chunk_token_counts,
                 expected_pointer_device=expected_pointer_device,
                 cached_memory_objs=cache["cached_memory_objs"],
+                chunk_ptr_table_npu=(packed_tables[0] if packed_tables else None),
             )
             if source is not None:
                 prepared[kv_group] = source
@@ -6136,6 +6317,15 @@ class LMCacheConnectorV1Impl:
         state.dense_load_readiness_consumed = True
 
     def _submit_dsa_cold_compact_load(self, request: ReqMeta) -> None:
+        self._drain_dense_load_retirements()
+        retirements = getattr(self, "_dense_load_retirements", None)
+        if retirements and any(
+            state.req_id == request.req_id for state in retirements.values()
+        ):
+            raise RuntimeError(
+                "Cold compact request ID was reused before its prior dense "
+                f"load owners retired: req_id={request.req_id}"
+            )
         futures = getattr(self, "_dsa_cold_load_futures", None)
         if futures is None:
             futures = {}
@@ -9618,6 +9808,7 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        self._drain_dense_load_retirements()
         perf_enabled = cold_start_perf_enabled()
         finished_started = cold_start_perf_now() if perf_enabled else 0.0
         finished_thread_started = time.thread_time_ns() if perf_enabled else 0
@@ -9716,6 +9907,7 @@ class LMCacheConnectorV1Impl:
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=False)
             self._synchronize_dsa_cold_dense_load()
+        self._drain_dense_load_retirements(block=True)
         self._manager.stop_services()
 
     ###################

@@ -252,14 +252,75 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return self.__class__.__name__
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
-        with self.cpu_lock:
-            if key not in self.hot_cache:
-                return False
-            if pin:
+        diagnose = cold_start_perf_enabled()
+        started = time.perf_counter() if diagnose else 0.0
+        thread_started = time.thread_time_ns() if diagnose else 0
+        hash_started = started
+        hash_thread_started = thread_started
+        if diagnose:
+            hash(key)
+            hash_ms = (time.perf_counter() - hash_started) * 1000
+            hash_thread_ms = (
+                time.thread_time_ns() - hash_thread_started
+            ) / 1_000_000
+        else:
+            hash_ms = hash_thread_ms = 0.0
+
+        lock_started = time.perf_counter() if diagnose else 0.0
+        lock_thread_started = time.thread_time_ns() if diagnose else 0
+        self.cpu_lock.acquire()
+        if diagnose:
+            lock_wait_ms = (time.perf_counter() - lock_started) * 1000
+            lock_wait_thread_ms = (
+                time.thread_time_ns() - lock_thread_started
+            ) / 1_000_000
+        else:
+            lock_wait_ms = lock_wait_thread_ms = 0.0
+        try:
+            membership_started = time.perf_counter() if diagnose else 0.0
+            membership_thread_started = time.thread_time_ns() if diagnose else 0
+            present = key in self.hot_cache
+            if diagnose:
+                membership_ms = (time.perf_counter() - membership_started) * 1000
+                membership_thread_ms = (
+                    time.thread_time_ns() - membership_thread_started
+                ) / 1_000_000
+            else:
+                membership_ms = membership_thread_ms = 0.0
+            pin_started = time.perf_counter() if diagnose else 0.0
+            if present and pin:
                 self.hot_cache[key].pin()
                 # vllm lookup sets pin to True
                 self.keys_in_request.append(key)
-            return True
+            pin_ms = (
+                (time.perf_counter() - pin_started) * 1000 if diagnose else 0.0
+            )
+            cache_entries = len(self.hot_cache) if diagnose else 0
+        finally:
+            self.cpu_lock.release()
+
+        elapsed_ms = (time.perf_counter() - started) * 1000 if diagnose else 0.0
+        if elapsed_ms >= 100.0:
+            cold_start_perf_log(
+                logger,
+                "local_cpu_contains_slow",
+                elapsed_ms=round(elapsed_ms, 3),
+                thread_cpu_ms=round(
+                    (time.thread_time_ns() - thread_started) / 1_000_000, 3
+                ),
+                hash_ms=round(hash_ms, 3),
+                hash_thread_cpu_ms=round(hash_thread_ms, 3),
+                lock_wait_ms=round(lock_wait_ms, 3),
+                lock_wait_thread_cpu_ms=round(lock_wait_thread_ms, 3),
+                membership_ms=round(membership_ms, 3),
+                membership_thread_cpu_ms=round(membership_thread_ms, 3),
+                pin_ms=round(pin_ms, 3),
+                cache_entries=cache_entries,
+                present=present,
+                pin=pin,
+                kv_group=key.kv_group,
+            )
+        return present
 
     def batched_contains(
         self, keys: List[CacheEngineKey], pin: bool = False

@@ -75,6 +75,38 @@ def test_build_prepared_sparse_source_accepts_memory_obj_owners() -> None:
     assert source.layers[1].chunk_ptrs_npu is pointer_tables[1]
 
 
+def test_build_prepared_sparse_source_retains_one_packed_pointer_table() -> None:
+    owners = [
+        [MagicMock(spec=MemoryObj), MagicMock(spec=MemoryObj)] for _ in range(2)
+    ]
+    pointer_table = torch.tensor([[101, 102], [201, 202]], dtype=torch.int64)
+
+    source = build_prepared_sparse_source(
+        [],
+        [None, None],
+        num_layers=2,
+        total_tokens=6,
+        chunk_token_counts=(4, 2),
+        cached_memory_objs=owners,
+        chunk_ptr_table_npu=pointer_table,
+    )
+
+    assert source is not None
+    assert source.chunk_ptr_table_npu is pointer_table
+    assert all(layer.chunk_ptrs_npu is None for layer in source.layers)
+
+
+def test_build_prepared_sparse_source_rejects_bad_packed_pointer_shape() -> None:
+    with pytest.raises(ValueError, match=r"\[layers, chunks\]"):
+        build_prepared_sparse_source(
+            [[torch.zeros(4)], [torch.zeros(4)]],
+            [None, None],
+            num_layers=2,
+            total_tokens=4,
+            chunk_ptr_table_npu=torch.tensor([101, 201], dtype=torch.int64),
+        )
+
+
 def test_build_prepared_sparse_source_rejects_owner_pointer_mismatch() -> None:
     with pytest.raises(ValueError, match="pointer coverage"):
         build_prepared_sparse_source(

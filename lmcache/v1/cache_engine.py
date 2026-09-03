@@ -148,6 +148,7 @@ class LayerwiseStoreResult:
     # successfully stored for every layer. Zero means the store was skipped or
     # incomplete and must not be used to release serving-engine KV blocks.
     committed_end: int = 0
+    chunk_ptr_table: Optional[torch.Tensor] = None
 
     def has_cache(self) -> bool:
         """Return whether the completed store produced reusable cache data."""

@@ -2063,6 +2063,7 @@ class TestWorkerRetrieveState:
     def test_compact_finish_reports_sending_after_exact_readiness_cleanup(self):
         readiness = object()
         connector = SimpleNamespace(
+            query_dense_load_readiness=MagicMock(return_value=True),
             synchronize_dense_load_readiness=MagicMock()
         )
         engine = SimpleNamespace(
@@ -2083,32 +2084,111 @@ class TestWorkerRetrieveState:
             "compact"
         }
 
-        connector.synchronize_dense_load_readiness.assert_called_once_with(readiness)
+        connector.synchronize_dense_load_readiness.assert_not_called()
         assert impl._worker_retrieve_state == {}
+        assert not hasattr(impl, "_dense_load_retirements")
 
-    def test_compact_finish_sync_failure_retains_state_and_reports_nothing(self):
+    def test_compact_finish_defers_incomplete_readiness_without_blocking(self):
         readiness = object()
         impl = _make_impl()
+        owner = MagicMock(is_pinned=True)
+        owner.is_valid.return_value = True
         state = WorkerRetrieveState(
             req_id="compact",
             dense_load_readiness=readiness,
+            dense_load_source_owners=(owner,),
         )
         state._dsa_cold_prune_protected = True
         impl._worker_retrieve_state = {"compact": state}
         impl._manager = SimpleNamespace(
             lmcache_engine=SimpleNamespace(
                 gpu_connector=SimpleNamespace(
-                    synchronize_dense_load_readiness=MagicMock(
-                        side_effect=RuntimeError("sync failed")
-                    )
-                )
+                    query_dense_load_readiness=MagicMock(return_value=False),
+                    synchronize_dense_load_readiness=MagicMock(),
+                ),
+                release_shared_cpu_sparse_request=MagicMock(),
             )
         )
 
-        with pytest.raises(RuntimeError, match="sync failed"):
-            impl._finalize_worker_requests_after_store({"compact"})
+        assert impl._finalize_worker_requests_after_store({"compact"}) == {
+            "compact"
+        }
 
-        assert impl._worker_retrieve_state["compact"] is state
+        connector = impl.lmcache_engine.gpu_connector
+        connector.synchronize_dense_load_readiness.assert_not_called()
+        owner.ref_count_down.assert_not_called()
+        assert impl._worker_retrieve_state == {}
+        assert impl._dense_load_retirements == {id(state): state}
+
+        connector.query_dense_load_readiness.return_value = True
+        impl._drain_dense_load_retirements()
+
+        connector.synchronize_dense_load_readiness.assert_not_called()
+        owner.unpin.assert_called_once_with()
+        owner.ref_count_down.assert_called_once_with()
+        impl.lmcache_engine.release_shared_cpu_sparse_request.assert_called_once_with(
+            "compact"
+        )
+        assert not hasattr(impl, "_dense_load_retirements")
+
+        impl._drain_dense_load_retirements()
+        owner.ref_count_down.assert_called_once_with()
+
+    def test_dense_retirement_query_failure_retains_owners_until_shutdown(self):
+        readiness = object()
+        connector = SimpleNamespace(
+            query_dense_load_readiness=MagicMock(side_effect=RuntimeError("query")),
+            synchronize_dense_load_readiness=MagicMock(),
+        )
+        engine = SimpleNamespace(
+            gpu_connector=connector,
+            release_shared_cpu_sparse_request=MagicMock(),
+        )
+        impl = _make_impl()
+        impl._manager = SimpleNamespace(lmcache_engine=engine)
+        state = WorkerRetrieveState(req_id="compact", dense_load_readiness=readiness)
+        impl._dense_load_retirements = {id(state): state}
+
+        impl._drain_dense_load_retirements()
+        assert impl._dense_load_retirements == {id(state): state}
+        connector.synchronize_dense_load_readiness.assert_not_called()
+
+        impl._drain_dense_load_retirements()
+        connector.query_dense_load_readiness.assert_called_once_with(readiness)
+
+        impl._drain_dense_load_retirements(block=True)
+        connector.synchronize_dense_load_readiness.assert_called_once_with(readiness)
+        assert not hasattr(impl, "_dense_load_retirements")
+
+    def test_dense_retirement_without_query_uses_legacy_synchronization(self):
+        readiness = object()
+        connector = SimpleNamespace(synchronize_dense_load_readiness=MagicMock())
+        impl = _make_impl()
+        impl._manager = SimpleNamespace(
+            lmcache_engine=SimpleNamespace(gpu_connector=connector)
+        )
+        state = WorkerRetrieveState(req_id="compact", dense_load_readiness=readiness)
+        impl._dense_load_retirements = {id(state): state}
+
+        impl._drain_dense_load_retirements()
+
+        connector.synchronize_dense_load_readiness.assert_called_once_with(readiness)
+        assert not hasattr(impl, "_dense_load_retirements")
+
+    def test_cold_load_rejects_request_id_with_pending_retirement(self):
+        readiness = object()
+        connector = SimpleNamespace(
+            query_dense_load_readiness=MagicMock(return_value=False)
+        )
+        impl = _make_impl()
+        impl._manager = SimpleNamespace(
+            lmcache_engine=SimpleNamespace(gpu_connector=connector)
+        )
+        state = WorkerRetrieveState(req_id="reused", dense_load_readiness=readiness)
+        impl._dense_load_retirements = {id(state): state}
+
+        with pytest.raises(RuntimeError, match="request ID was reused"):
+            impl._submit_dsa_cold_compact_load(SimpleNamespace(req_id="reused"))
 
     def test_get_finished_releases_worker_state_after_save(self):
         impl = _make_impl()
@@ -5202,6 +5282,71 @@ class TestWorkerRetrieveState:
         assert len(starts) == 48
         assert len(memory_objs[0]) == 48
         assert chunk_ptrs[0].tolist() == list(range(48))
+
+    @pytest.mark.parametrize("packed_prefix", [False, True])
+    def test_store_merge_preserves_mixed_pointer_representation(
+        self, packed_prefix: bool
+    ):
+        starts, ends = [0], [256]
+        rows = [None] if packed_prefix else [torch.tensor([11])]
+        packed = [torch.tensor([[11]])] if packed_prefix else []
+
+        merged = LMCacheConnectorV1Impl._merge_cache_group_by_ranges(
+            dst_starts=starts,
+            dst_ends=ends,
+            dst_keys=[["prefix-key"]],
+            dst_memory_objs=[["prefix"]],
+            dst_tensors=[],
+            dst_chunk_dev_ptrs=[[11]],
+            dst_chunk_ptrs_npu=rows,
+            dst_chunk_ptr_table_npu=packed,
+            dst_shared_handles=[[]],
+            src_starts=[256],
+            src_ends=[512],
+            src_keys=[["suffix-key"]],
+            src_memory_objs=[["suffix"]],
+            src_tensors=[],
+            src_chunk_dev_ptrs=[[22]],
+            src_chunk_ptrs_npu=(
+                [torch.tensor([22])] if packed_prefix else [None]
+            ),
+            src_chunk_ptr_table_npu=(
+                None if packed_prefix else torch.tensor([[22]])
+            ),
+            src_shared_handles=[],
+            require_pointer_cache=True,
+        )
+
+        assert merged == 1
+        assert rows[0].tolist() == [11, 22]
+        assert packed == []
+
+    def test_store_merge_packed_source_supports_legacy_destination(self):
+        rows = []
+
+        merged = LMCacheConnectorV1Impl._merge_cache_group_by_ranges(
+            dst_starts=[],
+            dst_ends=[],
+            dst_keys=[],
+            dst_memory_objs=[],
+            dst_tensors=[],
+            dst_chunk_dev_ptrs=[],
+            dst_chunk_ptrs_npu=rows,
+            dst_shared_handles=[],
+            src_starts=[0],
+            src_ends=[256],
+            src_keys=[["key"]],
+            src_memory_objs=[["owner"]],
+            src_tensors=[],
+            src_chunk_dev_ptrs=[[22]],
+            src_chunk_ptrs_npu=[None],
+            src_chunk_ptr_table_npu=torch.tensor([[22]]),
+            src_shared_handles=[],
+            require_pointer_cache=True,
+        )
+
+        assert merged == 1
+        assert rows[0].tolist() == [22]
 
     def test_store_merge_rejects_suffix_without_prefix_owners(self):
         starts = [chunk * 256 for chunk in range(32)]
