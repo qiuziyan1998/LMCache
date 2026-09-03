@@ -74,6 +74,25 @@ def test_cold_compact_drain_waits_for_both_dependencies() -> None:
     assert "request" in impl._dsa_cold_load_futures
 
 
+def test_cold_compact_drain_waits_for_deferred_npu_metadata() -> None:
+    impl = _make_impl()
+    readiness = SimpleNamespace(query=MagicMock(return_value=False))
+    latent_future: Future = Future()
+    indexer_future: Future = Future()
+    latent_future.set_result(
+        WorkerRetrieveState(req_id="request", dense_load_readiness=readiness)
+    )
+    indexer_future.set_result(None)
+    request = SimpleNamespace(load_spec=SimpleNamespace(dsa_cold_load_generation=1))
+    impl._dsa_cold_load_futures = {
+        "request": (1, latent_future, request, set(), 0.0, indexer_future)
+    }
+
+    assert impl._drain_dsa_cold_load_futures() is None
+    readiness.query.assert_called_once_with()
+    assert "request" in impl._dsa_cold_load_futures
+
+
 def test_capture_barrier_waits_for_indexer_after_latent_failure() -> None:
     impl = _make_impl()
     latent_future = MagicMock()
@@ -123,6 +142,9 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
 
     record = MagicMock(return_value=readiness)
     synchronize = MagicMock()
+    stage = MagicMock(
+        side_effect=lambda tensor, **_kwargs: tensor.to(dtype=torch.long)
+    )
     impl._sparse_retrieve_kwargs = MagicMock(
         side_effect=AssertionError("dense load built sparse retrieve metadata")
     )
@@ -130,6 +152,7 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
         gpu_connector=SimpleNamespace(
             record_dense_load_readiness=record,
             synchronize_dense_load_readiness=synchronize,
+            stage_dense_load_tensor=stage,
         ),
         supports_dense_sparse_cache_retention=lambda: True,
         retrieve_layer=MagicMock(side_effect=dense_retrieve),
@@ -167,6 +190,7 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
     npu.set_device.assert_called_once_with(3)
     record.assert_not_called()
     synchronize.assert_called_once_with(readiness)
+    stage.assert_called_once_with(plan["indexer_slots_cpu"], dtype=torch.long)
     impl.lmcache_engine.retrieve_layer.assert_called_once()
     impl.lmcache_engine.retrieve_layer_head_token_wise.assert_not_called()
     impl._sparse_retrieve_kwargs.assert_not_called()
@@ -1909,6 +1933,46 @@ class TestWorkerRetrieveState:
         assert owner.released == 1
         assert plan["indexer_source_owners"] == ()
         assert state.dense_load_source_owners == ()
+
+    def test_direct_cold_record_failure_fences_deferred_pointer_copy(self):
+        impl = _make_impl()
+        impl.num_layers = 1
+        impl._num_layers_for_group = lambda _group: 1
+        impl._record_dsa_cold_dense_load_readiness = MagicMock(
+            side_effect=RuntimeError("record failed")
+        )
+        impl._synchronize_dsa_cold_dense_load = MagicMock()
+        impl._release_unadopted_shared_request_objects = MagicMock()
+        impl._release_shared_worker_retrieve_state = MagicMock()
+        impl.lmcache_engine = SimpleNamespace(gpu_connector=SimpleNamespace())
+        request = SimpleNamespace(
+            req_id="req-1",
+            load_spec=SimpleNamespace(
+                lmcache_cached_tokens=1,
+                dsa_group1_direct_hbm=True,
+            ),
+        )
+        plan = {
+            "request": request,
+            "token_count": 1,
+            "tokens": [1],
+            "token_mask": torch.ones(1, dtype=torch.bool),
+            "planned_at": 0.0,
+            "plan_started": 0.0,
+            "latent_shared_ready": Future(),
+        }
+        dependency = Future()
+        dependency.set_result((None, None, 0.0, 0.0))
+
+        with pytest.raises(RuntimeError, match="record failed"):
+            impl._run_dsa_cold_compact_load(
+                plan,
+                None,
+                dependency,
+                live_state=WorkerRetrieveState(req_id="req-1"),
+            )
+
+        impl._synchronize_dsa_cold_dense_load.assert_called_once_with()
 
     def test_cold_compact_sync_failure_preserves_every_owner_on_error_state(self):
         owner = object()

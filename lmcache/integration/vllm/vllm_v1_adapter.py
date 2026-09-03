@@ -6633,10 +6633,20 @@ class LMCacheConnectorV1Impl:
                 queue_ms,
             )
         slot_submit_started = stage_start()
-        indexer_slots = indexer_slots_cpu.to(
-            device=self.device,
-            dtype=torch.long,
+        stage_tensor = getattr(
+            self.lmcache_engine.gpu_connector,
+            "stage_dense_load_tensor",
+            None,
         )
+        if callable(stage_tensor):
+            indexer_slots = stage_tensor(
+                indexer_slots_cpu, dtype=torch.long
+            )
+        else:
+            indexer_slots = indexer_slots_cpu.to(
+                device=self.device,
+                dtype=torch.long,
+            )
         finish_stage("slot_mapping_submit_ms", slot_submit_started)
         retrieve_state = WorkerRetrieveState(req_id=request.req_id)
         supports_dense_retention = getattr(
@@ -6936,6 +6946,7 @@ class LMCacheConnectorV1Impl:
                     ) * 1000
                 retrieve_kwargs["materialize_only"] = True
                 retrieve_kwargs["shared_cpu_phase"] = "dsa_cold_compact_latent"
+                retrieve_kwargs["_defer_sparse_pointer_copy"] = True
                 phase_started = cold_start_perf_now() if perf_enabled else 0.0
                 latent_retriever = (
                     self.lmcache_engine.retrieve_layer_head_token_wise(
@@ -7010,12 +7021,12 @@ class LMCacheConnectorV1Impl:
                     raise RuntimeError(
                         "Direct Group-1 load returned an unexpected CPU-source fence"
                     )
-            else:
-                self._record_dsa_cold_dense_load_readiness(
-                    state,
-                    indexer_readiness,
-                    tuple(plan.get("indexer_source_owners", ())),
-                )
+            # Group-0 pointer tables and the CPU-staged Group-1 fallback use
+            # this same load stream. One final event covers both submissions.
+            self._record_dsa_cold_dense_load_readiness(
+                state,
+                additional_owners=tuple(plan.get("indexer_source_owners", ())),
+            )
 
             seal_started = cold_start_perf_now()
             state.indexer_npu_resident = True
@@ -7080,8 +7091,17 @@ class LMCacheConnectorV1Impl:
             }
             combined_owners = tuple(owners_by_id.values())
             try:
-                if indexer_readiness is not None:
+                if state.dense_load_readiness is not None:
+                    self._synchronize_dsa_cold_dense_readiness(
+                        state.dense_load_readiness
+                    )
+                elif indexer_readiness is not None:
                     self._synchronize_dsa_cold_dense_readiness(indexer_readiness)
+                else:
+                    # The final event may have failed to record after the
+                    # pointer-table copy was submitted. Fence its load stream
+                    # before releasing the table or its request-owned pages.
+                    self._synchronize_dsa_cold_dense_load()
             except BaseException:
                 # The transfer may still be writing. Preserve every owner on
                 # the surfaced state so the scheduler can retain the blocks
@@ -9446,6 +9466,12 @@ class LMCacheConnectorV1Impl:
             try:
                 assert request.load_spec is not None
                 state = future.result()
+                readiness = state.dense_load_readiness
+                query = getattr(readiness, "query", None)
+                # Keep the request parked without synchronizing the model
+                # thread while its small metadata copies are still pending.
+                if callable(query) and not query():
+                    continue
                 actual_generation = getattr(
                     request.load_spec, "dsa_cold_load_generation", None
                 )
