@@ -2126,6 +2126,26 @@ class TestWorkerRetrieveState:
             call({"req-1"}),
         ]
 
+    def test_get_finished_skips_timing_clocks_when_diagnostics_are_disabled(
+        self, monkeypatch
+    ) -> None:
+        impl = _make_impl()
+        impl._wait_for_save_done = True
+        impl._finalize_worker_requests_after_store = MagicMock(return_value=set())
+        monkeypatch.setattr(adapter_mod, "cold_start_perf_enabled", lambda: False)
+
+        def fail_clock() -> None:
+            raise AssertionError("disabled diagnostics read a timing clock")
+
+        monkeypatch.setattr(adapter_mod, "cold_start_perf_now", fail_clock)
+        monkeypatch.setattr(
+            adapter_mod,
+            "time",
+            SimpleNamespace(thread_time_ns=fail_clock),
+        )
+
+        assert impl.get_finished(set()) == (None, None)
+
     def test_get_finished_keeps_active_aborted_cold_load_owned_by_drain(self):
         impl = _make_impl()
         impl._wait_for_save_done = True

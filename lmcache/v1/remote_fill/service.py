@@ -60,13 +60,13 @@ class RemoteFillService:
         decode_ms = capacity_ms = dispatch_ms = 0.0
 
         def complete(response: bytes) -> bytes:
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            thread_cpu_ms = (
-                (time.thread_time_ns() - thread_started) / 1_000_000
-                if diagnose
-                else 0.0
-            )
-            if diagnose and transfer_id:
+            if not diagnose:
+                return response
+            completed = time.perf_counter()
+            elapsed_ms = (completed - started) * 1000
+            encode_ms = (completed - phase_started) * 1000
+            thread_cpu_ms = (time.thread_time_ns() - thread_started) / 1_000_000
+            if transfer_id:
                 if (
                     transfer_id not in self._perf_transfers
                     and len(self._perf_transfers)
@@ -95,7 +95,7 @@ class RemoteFillService:
                             operation_counts=ops,
                         )
                     self._perf_transfers.pop(transfer_id, None)
-            if diagnose and elapsed_ms >= 100.0:
+            if elapsed_ms >= 100.0:
                 cold_start_perf_log(
                     logger,
                     "remote_fill_decoder_control_slow",
@@ -108,9 +108,7 @@ class RemoteFillService:
                     decode_ms=round(decode_ms, 3),
                     capacity_ms=round(capacity_ms, 3),
                     dispatch_ms=round(dispatch_ms, 3),
-                    encode_ms=round(
-                        (time.perf_counter() - phase_started) * 1000, 3
-                    ),
+                    encode_ms=round(encode_ms, 3),
                 )
             return response
 

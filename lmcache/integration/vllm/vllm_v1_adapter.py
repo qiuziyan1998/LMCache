@@ -9619,7 +9619,7 @@ class LMCacheConnectorV1Impl:
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
         perf_enabled = cold_start_perf_enabled()
-        finished_started = cold_start_perf_now()
+        finished_started = cold_start_perf_now() if perf_enabled else 0.0
         finished_thread_started = time.thread_time_ns() if perf_enabled else 0
         aborted_cold: set[str] = set()
         live_pending = getattr(self, "_dsa_live_split_pending", None)
@@ -9660,20 +9660,26 @@ class LMCacheConnectorV1Impl:
                 self._finished_req_ids_waiting_for_save.update(waiting_req_ids)
                 releasable_req_ids -= waiting_req_ids
 
-        store_finalize_started = cold_start_perf_now()
+        store_finalize_started = cold_start_perf_now() if perf_enabled else 0.0
         finished_sending = self._finalize_worker_requests_after_store(
             releasable_req_ids
         )
         store_finalize_ms = (
-            cold_start_perf_now() - store_finalize_started
-        ) * 1000
+            (cold_start_perf_now() - store_finalize_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
         finished_sending.update(self._late_finished_sending)
         self._late_finished_sending.clear()
-        load_drain_started = cold_start_perf_now()
+        load_drain_started = cold_start_perf_now() if perf_enabled else 0.0
         finished_recving = self._drain_dsa_cold_load_futures()
-        load_drain_ms = (cold_start_perf_now() - load_drain_started) * 1000
-        elapsed_ms = (cold_start_perf_now() - finished_started) * 1000
-        if perf_enabled and elapsed_ms >= 100.0:
+        if perf_enabled:
+            completed = cold_start_perf_now()
+            load_drain_ms = (completed - load_drain_started) * 1000
+            elapsed_ms = (completed - finished_started) * 1000
+        else:
+            load_drain_ms = elapsed_ms = 0.0
+        if elapsed_ms >= 100.0:
             cold_start_perf_log(
                 logger,
                 "decoder_connector_get_finished_slow",

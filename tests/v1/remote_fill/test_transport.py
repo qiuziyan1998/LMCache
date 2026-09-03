@@ -2,12 +2,14 @@
 """Tests for adapting the existing LMCache RPC transport."""
 
 # Standard
+from types import SimpleNamespace
 from typing import Any
 
 # Third Party
 import pytest
 
 # First Party
+from lmcache.v1.remote_fill import service as service_module
 from lmcache.v1.remote_fill import (
     AbortRequest,
     ArmWindowRequest,
@@ -223,3 +225,22 @@ def test_rpc_server_helper_rejects_malformed_envelope(harness) -> None:
     assert rpc.response is not None
     response = decode_response(rpc.response, harness.state.limits)
     assert response.code is ResultCode.INVALID_MESSAGE
+
+
+def test_service_diagnostics_disabled_do_not_read_timing_clocks(
+    harness, monkeypatch
+) -> None:
+    """Disabled diagnostics add no timing work to the RPC service path."""
+
+    monkeypatch.setattr(service_module, "cold_start_perf_enabled", lambda: False)
+
+    def fail_clock() -> None:
+        raise AssertionError("disabled diagnostics read a timing clock")
+
+    monkeypatch.setattr(
+        service_module,
+        "time",
+        SimpleNamespace(perf_counter=fail_clock, thread_time_ns=fail_clock),
+    )
+
+    assert harness.client.execute(harness.requests.open()).code is ResultCode.ACCEPTED
