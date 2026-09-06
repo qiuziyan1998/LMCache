@@ -671,6 +671,33 @@ def test_dynamic_connector_forwards_kv_cache_config(monkeypatch) -> None:
     assert captured["impl"][1]["kv_cache_config"] is kv_cache_config
 
 
+def test_dynamic_worker_without_backend_keeps_only_resident_indexer_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, vllm_config, _ = _patch_connector_startup(
+        monkeypatch,
+        dsa_two_groups=True,
+        model_num_layers=101,
+    )
+    monkeypatch.setattr(KVConnectorBase_V1, "__init__", lambda self, **kwargs: None)
+    monkeypatch.setattr(
+        vllm_utils,
+        "calculate_local_rank_and_world_size",
+        lambda _config: (0, 1),
+    )
+
+    connector = connector_module.LMCacheConnectorV1Dynamic(
+        vllm_config,
+        KVConnectorRole.WORKER,
+        _kv_cache_config(79, 22),
+    )
+
+    assert connector.supports_dsa_index_lmcache is True
+    assert connector.supports_layerwise_prefill_eager_callbacks is False
+    assert connector.supports_layerwise_prefill_transfer_window is False
+    assert connector.supports_layerwise_prefill_p_node is False
+
+
 def test_dynamic_connector_forwards_layerwise_prefill_contract(monkeypatch) -> None:
     calls = []
     engine = SimpleNamespace(

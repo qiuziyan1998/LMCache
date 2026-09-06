@@ -5,6 +5,7 @@
 from concurrent.futures import Future
 from types import SimpleNamespace
 from typing import Any, Optional
+from unittest.mock import Mock
 
 # Third Party
 import pytest
@@ -428,20 +429,42 @@ def test_multi_request_callback_counts_host_resources_once() -> None:
     assert backend.events == ["submit-save-0", "finish-0"]
 
 
-def test_no_backend_fails_closed_on_capabilities_and_callbacks() -> None:
+@pytest.mark.parametrize("backend_present", [False, True])
+def test_unsupported_backend_fails_closed_without_protocol_mutation(
+    backend_present: bool,
+) -> None:
     cache = _topology_cache()
-    coordinator = LayerwisePrefillWindowCoordinator(cache, None)
+    backend = (
+        RecordingBackend(supports_sync=False, supports_window=False)
+        if backend_present
+        else None
+    )
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
 
-    # The synchronous Stage 3 contract works eagerly without a backend;
-    # only the asynchronous transfer window stays fail closed.
-    assert coordinator.supports_sync_callbacks is True
+    assert coordinator.supports_sync_callbacks is False
+    # Full-resident INDEXER support is independent of P-node callbacks.
     assert coordinator.persists_indexer_group is True
     assert coordinator.supports_transfer_window is False
 
-    with pytest.raises(RuntimeError, match="without a transfer backend"):
-        coordinator.submit_save(_callback(cache, 0)[0], _kv_layer())
-    with pytest.raises(RuntimeError, match="no data plane"):
-        coordinator.save(_callback(cache, 0)[0], _kv_layer())
+    for metadata in _callback(cache, 0):
+        for callback, args in (
+            (coordinator.wait_for_load, (metadata,)),
+            (coordinator.save, (metadata, _kv_layer())),
+            (coordinator.submit_save, (metadata, _kv_layer())),
+            (coordinator.submit_load, (metadata,)),
+            (coordinator.finish_save, (metadata,)),
+        ):
+            with pytest.raises(RuntimeError, match="row-aware.*backend"):
+                callback(*args)
+            assert coordinator.has_request("req-1") is False
+            assert coordinator.request_persist_done("req-1") is False
+            assert coordinator.pending_jobs() == 0
+            assert coordinator.pending_bytes() == 0
+
+    with pytest.raises(RuntimeError, match="unknown request"):
+        coordinator.wait_for_request_persist_done("req-1")
+    if backend is not None:
+        assert backend.events == []
 
 
 def test_sync_contract_saves_one_row_to_persist_done() -> None:
@@ -459,52 +482,49 @@ def test_sync_contract_saves_one_row_to_persist_done() -> None:
     assert arena.jobs[(0, 0)].phase is LayerwisePrefillSavePhase.PERSIST_DONE
     assert backend.events == ["sync-save-0"]
 
-
-def test_sync_contract_eager_store_replaces_missing_backend() -> None:
-    cache = _topology_cache()
-    coordinator = LayerwisePrefillWindowCoordinator(cache, None)
-    stored: list[tuple[str, tuple[Any, ...]]] = []
-
-    def eager_store(layer_name, kv_layer, attn_metadata):
-        stored.append((layer_name, tuple(kv_layer)))
-
-    metadata = _callback(cache, 0)[0]
-    kv_layer = _kv_layer()
-    coordinator.save(metadata, kv_layer, None, eager_store=eager_store)
-
-    arena = coordinator._arenas["req-1"]
-    assert arena.jobs[(0, 0)].phase is LayerwisePrefillSavePhase.PERSIST_DONE
-    assert stored == [(metadata.row.layer_name, tuple(kv_layer))]
-
-    # Out-of-order rows still fail closed on the eager path.
     with pytest.raises(RuntimeError, match="per-group row order"):
-        coordinator.save(metadata, kv_layer, None, eager_store=eager_store)
+        coordinator.save(metadata, _kv_layer())
+    assert backend.events == ["sync-save-0"]
+
+
+@pytest.mark.parametrize("backend_present", [False, True])
+def test_sync_persistence_requires_row_aware_backend(
+    backend_present: bool,
+) -> None:
+    cache = _topology_cache((1, 1))
+    backend = RecordingBackend(supports_window=False) if backend_present else None
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+
+    for metadata in _callback(cache, 0):
+        if backend is None:
+            with pytest.raises(RuntimeError, match="row-aware load/save backend"):
+                coordinator.save(metadata, _kv_layer())
+            assert coordinator.has_request("req-1") is False
+            assert coordinator.request_persist_done("req-1") is False
+        else:
+            coordinator.save(metadata, _kv_layer())
+
+    assert coordinator.pending_jobs() == 0
+    assert coordinator.pending_bytes() == 0
+    assert coordinator.request_persist_done("req-1") is backend_present
+    if backend is not None:
+        assert backend.events == ["sync-save-0", "sync-save-1"]
 
 
 def test_sync_contract_repeats_rows_for_chunked_prefill() -> None:
     cache = _topology_cache()
-    coordinator = LayerwisePrefillWindowCoordinator(cache, None)
-    stored = []
-
-    def eager_store(layer_name, kv_layer, attn_metadata):
-        stored.append(layer_name)
+    backend = RecordingBackend(supports_window=False)
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
 
     for _ in range(2):
         for execution_ordinal in cache.execution_to_entry:
             for metadata in _callback(cache, execution_ordinal):
                 coordinator.wait_for_load(metadata)
-                coordinator.save(
-                    metadata,
-                    _kv_layer(),
-                    None,
-                    eager_store=eager_store,
-                )
+                coordinator.save(metadata, _kv_layer())
         assert coordinator.request_persist_done("req-1") is True
 
-    arena = coordinator._arenas["req-1"]
-    assert arena.save_cursors == {0: 79, 1: 22}
-    assert len(arena.jobs) == 101
-    assert len(stored) == 2 * (79 + 22)
+    assert backend.events.count("sync-save-0") == 2 * 79
+    assert backend.events.count("sync-save-1") == 2 * 22
 
 
 def test_transfer_window_repeats_rows_after_previous_chunk_persists() -> None:
@@ -567,31 +587,37 @@ def test_connector_capabilities_and_delegation(monkeypatch) -> None:
     assert impl.layerwise_prefill_request_persist_done("req-1") is False
 
 
-def test_connector_without_backend_fails_closed(monkeypatch) -> None:
+def test_connector_without_backend_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     impl = _window_connector(monkeypatch, None)
 
-    # The eager Stage 3 protocol is available through the adapter's own
-    # per-layer store; only the asynchronous window needs a backend.
-    assert impl.supports_layerwise_prefill_eager_callbacks is True
+    assert impl.supports_layerwise_prefill_eager_callbacks is False
     assert impl.supports_dsa_index_lmcache is True
     assert impl.supports_layerwise_prefill_transfer_window is False
 
     cache = impl._dsa_kv_topology_cache
-    stored: list[str] = []
-    monkeypatch.setattr(
-        impl,
-        "save_kv_layer",
-        lambda layer_name, kv_layer, attn_metadata, **_kwargs: stored.append(
-            layer_name
-        ),
-    )
+    legacy_saver = Mock(side_effect=AssertionError("legacy saver must not run"))
+    legacy_waiter = Mock(side_effect=AssertionError("legacy load wait must not run"))
+    monkeypatch.setattr(impl, "save_kv_layer", legacy_saver)
+    monkeypatch.setattr(impl, "wait_for_layer_load", legacy_waiter)
     metadata = _callback(cache, 0)[0]
-    impl.save_layerwise_prefill_kv_layer(metadata, _kv_layer())
-    assert stored == [metadata.row.layer_name]
-    assert impl.layerwise_prefill_request_persist_done("req-1") is False
 
-    with pytest.raises(RuntimeError, match="transfer window"):
-        impl.submit_layerwise_prefill_save(_callback(cache, 0)[0], _kv_layer())
+    for callback, args in (
+        (impl.wait_for_layerwise_prefill_load, (metadata,)),
+        (impl.save_layerwise_prefill_kv_layer, (metadata, _kv_layer())),
+        (impl.submit_layerwise_prefill_save, (metadata, _kv_layer())),
+        (impl.submit_layerwise_prefill_load, (metadata,)),
+        (impl.finish_layerwise_prefill_save, (metadata,)),
+    ):
+        with pytest.raises(RuntimeError, match="backend"):
+            callback(*args)
+        assert impl.layerwise_prefill_request_persist_done("req-1") is False
+
+    with pytest.raises(RuntimeError, match="unknown request"):
+        impl.wait_for_layerwise_prefill_request_persist_done("req-1")
+    legacy_saver.assert_not_called()
+    legacy_waiter.assert_not_called()
 
 
 def test_dsa_long_request_admission_gates_sparse_decode() -> None:
@@ -630,7 +656,11 @@ def test_dsa_long_request_admission_gates_sparse_decode() -> None:
         impl._dsa_long_request_admission_check(tracker)
 
 
-def test_connector_logs_p_node_observability(monkeypatch) -> None:
+@pytest.mark.parametrize("backend_present", [False, True])
+def test_connector_logs_p_node_observability(
+    monkeypatch: pytest.MonkeyPatch,
+    backend_present: bool,
+) -> None:
     _config, vllm_config, _observed = _patch_connector_startup(
         monkeypatch,
         dsa_two_groups=True,
@@ -648,11 +678,29 @@ def test_connector_logs_p_node_observability(monkeypatch) -> None:
         max_local_cpu_size=120.0,
         extra_config={"global_segment_size": 137_438_953_472},
     )
+    if backend_present:
+        monkeypatch.setattr(
+            LMCacheConnectorV1Impl,
+            "lmcache_engine",
+            property(
+                lambda self: SimpleNamespace(
+                    layerwise_prefill_window_backend=RecordingBackend()
+                )
+            ),
+        )
     logged = []
+    warnings = []
     monkeypatch.setattr(
         adapter_module.logger,
         "info",
         lambda message, *args, **_kwargs: logged.append(
+            message % args if args else message
+        ),
+    )
+    monkeypatch.setattr(
+        adapter_module.logger,
+        "warning",
+        lambda message, *args, **_kwargs: warnings.append(
             message % args if args else message
         ),
     )
@@ -665,4 +713,20 @@ def test_connector_logs_p_node_observability(monkeypatch) -> None:
     )
     assert "cpu_cache_bytes=128849018880" in message
     assert "mooncake_segment_bytes=137438953472" in message
-    assert "connector_transfer_window=False" in message
+    assert f"connector_transfer_window={backend_present}" in message
+    assert f"connector_sync_callbacks={backend_present}" in message
+    if backend_present:
+        assert warnings == []
+    else:
+        diagnostic = " ".join(warnings)
+        assert "Layerwise-prefill P mode is unavailable" in diagnostic
+        assert "row-aware load/save backend unavailable" in diagnostic
+        assert (
+            "If enabling P mode, disable VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE"
+            in diagnostic
+        )
+        assert "set it to false or unset it" in diagnostic
+        assert "full-resident fallback" in diagnostic
+        assert "cannot start" not in diagnostic
+        assert "override" not in diagnostic
+        assert "138" not in diagnostic

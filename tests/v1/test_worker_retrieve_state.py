@@ -2,6 +2,7 @@
 """Tests for worker-local sparse decode retrieve state cache."""
 
 # Standard
+from collections.abc import Generator
 from contextlib import contextmanager
 import inspect
 from types import SimpleNamespace
@@ -3802,6 +3803,153 @@ class TestWorkerRetrieveState:
         impl._promote_layerwise_store_result(request, result)
 
         assert request.req_id not in impl._worker_retrieve_state
+
+    @pytest.mark.parametrize("kv_group", [0, 1])
+    def test_store_completion_preserves_active_dense_retention_target(
+        self, kv_group: int
+    ) -> None:
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
+        engine = _make_shared_engine(rank0=False)
+        engine.num_layers = 1
+        engine.storage_manager = None
+        engine.gpu_connector = SimpleNamespace(
+            supports_dense_sparse_cache_retention=lambda: True
+        )
+        impl.lmcache_engine = engine
+        request, result = _make_store_request(
+            impl,
+            token_count=256,
+            start=0,
+            end=256,
+            key="stored",
+            tensor="stored-tensor",
+        )
+        request.is_last_prefill = True
+        result.kv_group = kv_group
+        result.committed_end = 256
+        impl._prefill_save_completed_groups = {}
+        state = WorkerRetrieveState(
+            req_id=request.req_id,
+            dense_prefix_seed=True,
+            metadata_warm=True,
+            token_count=256,
+        )
+        impl._worker_retrieve_state[request.req_id] = state
+        caches = state.cache_kwargs(kv_group, dsa_two_groups=True)
+        dense_tensor = torch.ones(256)
+        dense_obj = SimpleNamespace(tensor=dense_tensor, ref_count_down=MagicMock())
+        dense_pointer = dense_tensor.data_ptr()
+        pointer_row = torch.tensor([dense_pointer], dtype=torch.long)
+        caches["cached_chunk_dev_ptrs"].append([dense_pointer])
+        caches["cached_chunk_ptrs_npu"].append(pointer_row)
+        dense_handle = object()
+
+        def dense_retriever() -> Generator[None, None, None]:
+            yield
+            assert engine._adopt_dense_shared_retrieve_cache(
+                req_id=request.req_id,
+                starts=[0],
+                ends=[256],
+                keys_layer_major=[["dense-key"]],
+                memory_objs=[[dense_obj]],
+                handles=[[dense_handle]],
+                kv_group=kv_group,
+                kwargs={"_retain_shared_dense_cache": True, **caches},
+            )
+
+        retriever = dense_retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+        # Retrieval and store metadata can be distinct objects for the same ID.
+        impl._layerwise_requests = [ReqMeta(req_id=request.req_id, token_ids=[])]
+        impl._layerwise_retriever_is_sparse = [False]
+
+        def storer() -> Generator[LayerwiseStoreResult, None, None]:
+            yield result
+
+        completed, stored_result = impl._finalize_layerwise_storer(storer())
+        assert completed and stored_result is result
+        impl._consume_completed_layerwise_store(
+            request, kv_group, completed, stored_result
+        )
+
+        assert impl._prefill_save_completed_groups == {
+            impl._layerwise_save_storer_key(request, kv_group): 256
+        }
+        assert impl._worker_retrieve_state[request.req_id] is state
+        for name, values in caches.items():
+            assert state.cache_kwargs(kv_group, dsa_two_groups=True)[name] is values
+            if name not in ("cached_chunk_dev_ptrs", "cached_chunk_ptrs_npu"):
+                assert values == []
+        assert caches["cached_chunk_dev_ptrs"] == [[dense_pointer]]
+        assert caches["cached_chunk_ptrs_npu"][0] is pointer_row
+        assert pointer_row.tolist() == [dense_pointer]
+        dense_obj.ref_count_down.assert_not_called()
+
+        impl._drain_layerwise_retrievers()
+
+        assert caches["cached_memory_objs"][0][0] is dense_obj
+        assert caches["cached_shared_handles"] == [[dense_handle]]
+        assert caches["cached_keys"] == [["dense-key"]]
+        assert caches["cached_starts"] == [0]
+        assert caches["cached_ends"] == [256]
+        assert caches["cached_chunk_dev_ptrs"] == [[dense_pointer]]
+        assert caches["cached_chunk_ptrs_npu"][0] is pointer_row
+        assert pointer_row.tolist() == [dense_pointer]
+        assert dense_obj.tensor is dense_tensor
+        assert torch.equal(dense_tensor, torch.ones(256))
+        dense_obj.ref_count_down.assert_not_called()
+        assert impl._layerwise_requests == []
+        assert impl._layerwise_retriever_is_sparse == []
+
+    @pytest.mark.parametrize("active_load", ["sparse", "other_dense", "post_drain"])
+    def test_store_promotion_allowed_without_matching_active_dense_retriever(
+        self, active_load: str
+    ) -> None:
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl._latent_kvcaches = [object()]
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=False,
+            storage_manager=None,
+            store_location="LocalCPUBackend",
+        )
+        request, result = _make_store_request(
+            impl,
+            token_count=256,
+            start=0,
+            end=256,
+            key="stored",
+            tensor="stored-tensor",
+        )
+
+        def retriever() -> Generator[None, None, None]:
+            yield
+
+        active_retriever = retriever()
+        next(active_retriever)
+        impl.layerwise_retrievers = [(active_retriever, None)]
+        impl._layerwise_requests = [
+            ReqMeta(
+                req_id="other" if active_load == "other_dense" else request.req_id,
+                token_ids=[],
+                is_sparse_decode=active_load == "sparse",
+            )
+        ]
+        impl._layerwise_retriever_is_sparse = [active_load == "sparse"]
+        if active_load == "post_drain":
+            impl._drain_layerwise_retrievers()
+
+        impl._consume_completed_layerwise_store(request, 0, True, result)
+
+        state = impl._worker_retrieve_state[request.req_id]
+        assert state.cached_keys == [["stored"]]
+        assert state.cached_tensors == [["stored-tensor"]]
+        assert state.token_count == 256
+        impl._drain_layerwise_retrievers()
 
     def test_store_seed_merges_chunked_prefill_hot_cache(self):
         impl = _make_impl()

@@ -215,10 +215,10 @@ class LayerwisePrefillWindowCoordinator:
     PERSIST_DONE).
 
     Device-side submission and real completion events are delegated to a
-    backend supplied by the engine (the NPU implementation lives in
-    LMCache-Ascend). Without a backend the synchronous eager path delegates
-    to the adapter's per-layer store while the asynchronous window remains
-    disabled.
+    row-aware backend supplied by the engine. Without that backend, both
+    synchronous callbacks and the asynchronous window fail closed: legacy
+    per-layer stores cannot safely persist shared banks or restore a
+    prefill chunk's own prefix.
     """
 
     def __init__(
@@ -269,7 +269,7 @@ class LayerwisePrefillWindowCoordinator:
 
     @property
     def supports_sync_callbacks(self) -> bool:
-        return self._backend is None or (
+        return self._backend is not None and (
             getattr(self._backend, "supports_sync_callbacks", False) is True
         )
 
@@ -488,6 +488,10 @@ class LayerwisePrefillWindowCoordinator:
     def wait_for_load(self, metadata: Any) -> None:
         """Wait until the metadata's rows are ready for eager execution."""
 
+        if not (self.supports_sync_callbacks or self.supports_transfer_window):
+            raise RuntimeError(
+                "Layerwise-prefill load wait requires a row-aware load/save backend."
+            )
         self._validate_metadata(metadata)
         generations = self._metadata_request_generations(metadata)
         row = metadata.row
@@ -507,10 +511,6 @@ class LayerwisePrefillWindowCoordinator:
                     in arena.pending_load_rows.get(row.kv_group, set())
                 )
         if must_wait:
-            if self._backend is None:
-                raise RuntimeError(
-                    "Layerwise-prefill load wait requires a transfer backend."
-                )
             self._backend.wait_for_load(metadata)
         with self._lock:
             for request_id, generation in generations:
@@ -528,6 +528,11 @@ class LayerwisePrefillWindowCoordinator:
     ) -> None:
         """Pre-HCOM phase: enqueue one canonical row D2H save."""
 
+        if not self.supports_transfer_window:
+            raise RuntimeError(
+                "Layerwise-prefill save submission requires a row-aware backend "
+                "with transfer-window support."
+            )
         self._validate_metadata(metadata)
         generations = self._metadata_request_generations(metadata)
         row = metadata.row
@@ -552,11 +557,6 @@ class LayerwisePrefillWindowCoordinator:
                     )
                 arenas.append(arena)
             self._enforce_pending_bounds(extra_bytes)
-            if self._backend is None:
-                raise RuntimeError(
-                    "Layerwise-prefill save submitted without a transfer "
-                    "backend."
-                )
             self._backend.submit_save(metadata, kv_layer, attn_metadata)
             for index, arena in enumerate(arenas):
                 arena.jobs[(row.kv_group, row.row_ordinal)] = (
@@ -572,6 +572,11 @@ class LayerwisePrefillWindowCoordinator:
     def finish_save(self, metadata: Any) -> None:
         """Post-HCOM phase: publish one submitted row save."""
 
+        if not self.supports_transfer_window:
+            raise RuntimeError(
+                "Layerwise-prefill save completion requires a row-aware backend "
+                "with transfer-window support."
+            )
         self._validate_metadata(metadata)
         generations = self._metadata_request_generations(metadata)
         row = metadata.row
@@ -601,14 +606,8 @@ class LayerwisePrefillWindowCoordinator:
             if not submitted:
                 # Duplicate completion for an already-published row is
                 # idempotent; the backend still cleans its own resources.
-                if self._backend is not None:
-                    self._backend.finish_save(metadata)
+                self._backend.finish_save(metadata)
                 return
-            if self._backend is None:
-                raise RuntimeError(
-                    "Layerwise-prefill finish submitted without a transfer "
-                    "backend."
-                )
             future = self._backend.finish_save(metadata)
             for arena, job in zip(arenas, jobs, strict=True):
                 if job.phase is not LayerwisePrefillSavePhase.SAVE_SUBMITTED:
@@ -625,17 +624,18 @@ class LayerwisePrefillWindowCoordinator:
         metadata: Any,
         kv_layer: Any,
         attn_metadata: Any = None,
-        *,
-        eager_store: Any = None,
     ) -> None:
-        """Synchronous Stage 3 contract: save one row in one call."""
+        """Synchronously persist one row through a row-aware backend.
 
-        self._validate_metadata(metadata)
-        if self._backend is None and not callable(eager_store):
+        Unsupported saves raise before changing protocol state.
+        """
+
+        if not self.supports_sync_callbacks:
             raise RuntimeError(
-                "Layerwise-prefill sync save has no data plane: no transfer "
-                "backend and no eager store."
+                "Layerwise-prefill sync save requires a row-aware load/save "
+                "backend with synchronous callback support."
             )
+        self._validate_metadata(metadata)
         generations = self._metadata_request_generations(metadata)
         row = metadata.row
         with self._lock:
@@ -657,10 +657,7 @@ class LayerwisePrefillWindowCoordinator:
                         f"{expected}, got {row.row_ordinal}."
                     )
                 arenas.append(arena)
-            if self._backend is not None:
-                self._backend.sync_save(metadata, kv_layer, attn_metadata)
-            else:
-                eager_store(row.layer_name, kv_layer, attn_metadata)
+            self._backend.sync_save(metadata, kv_layer, attn_metadata)
             for index, arena in enumerate(arenas):
                 arena.jobs[(row.kv_group, row.row_ordinal)] = (
                     _LayerwisePrefillWindowJob(
@@ -673,6 +670,11 @@ class LayerwisePrefillWindowCoordinator:
     def submit_load(self, metadata: Any) -> None:
         """Pre-HCOM phase: enqueue the next row loads for present groups."""
 
+        if not self.supports_transfer_window:
+            raise RuntimeError(
+                "Layerwise-prefill load submission requires a row-aware backend "
+                "with transfer-window support."
+            )
         self._validate_metadata(metadata)
         generations = self._metadata_request_generations(metadata)
         execution = metadata.execution
@@ -703,7 +705,7 @@ class LayerwisePrefillWindowCoordinator:
                         next_row
                     )
                     submissions.append((kv_group, next_row))
-        if submissions and self._backend is not None:
+        if submissions:
             self._backend.submit_load(metadata)
 
     def poll_completed_persists(self) -> None:
@@ -6293,6 +6295,18 @@ class LMCacheConnectorV1Impl:
         ):
             return
 
+        # Suspended dense retrievers own the empty retention targets and may
+        # still install their original objects and pointers when drained.
+        if any(
+            active_request.req_id == request.req_id and not is_sparse
+            for active_request, is_sparse in zip(
+                getattr(self, "_layerwise_requests", ()),
+                getattr(self, "_layerwise_retriever_is_sparse", ()),
+                strict=True,
+            )
+        ):
+            return
+
         if (
             self._is_decode_window_save_request(request)
             and self._decode_window_save_uses_shared_cpu()
@@ -9011,12 +9025,7 @@ class LMCacheConnectorV1Impl:
                 "The active transfer backend does not support synchronous "
                 "layerwise-prefill saves."
             )
-        window.save(
-            metadata,
-            kv_layer,
-            attn_metadata,
-            eager_store=self.save_kv_layer,
-        )
+        window.save(metadata, kv_layer, attn_metadata)
 
     def submit_layerwise_prefill_save(
         self,
@@ -10695,12 +10704,10 @@ class LMCacheConnectorV1Impl:
         """Create the Stage 4 transfer-window protocol coordinator.
 
         Worker roles with a frozen DSA topology always receive the protocol
-        coordinator. The synchronous Stage 3 contract (eager callbacks)
-        works without a backend by delegating the row store to the
-        adapter's per-layer eager save path; device-side asynchronous
-        submission additionally requires a backend exposed by the engine
-        as ``layerwise_prefill_window_backend`` and stays fail closed
-        without one.
+        coordinator. Both synchronous callbacks and asynchronous submission
+        require a row-aware backend exposed by the engine as
+        ``layerwise_prefill_window_backend`` and stay fail closed without
+        one. Full-resident INDEXER persistence is independent of this gate.
         """
 
         topology_cache = getattr(self, "_dsa_kv_topology_cache", None)
@@ -10739,6 +10746,16 @@ class LMCacheConnectorV1Impl:
             window.supports_sync_callbacks,
             window.persists_indexer_group,
         )
+        if not window.supports_sync_callbacks:
+            logger.warning(
+                "Layerwise-prefill P mode is unavailable: row-aware load/save "
+                "backend unavailable. A real layerwise_prefill_window_backend "
+                "is required to persist shared banks and restore each prefill "
+                "chunk's own prefix; the legacy per-layer saver is not a safe "
+                "fallback. If enabling P mode, disable "
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE "
+                "(set it to false or unset it) for full-resident fallback."
+            )
         return window
 
     def _poll_layerwise_prefill_window(self) -> None:
