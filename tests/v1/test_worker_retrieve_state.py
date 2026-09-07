@@ -51,6 +51,145 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     return impl
 
 
+@pytest.mark.parametrize("tokens", [0, 1, 4, 5, 8, 10, 12])
+def test_cold_indexer_blocks_match_full_cpu_mapping(
+    tokens: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slots = adapter_mod._build_slot_mapping([17, 3, 17], 4, tokens)
+    expected = set((slots // 4).tolist())
+    original = torch.Tensor.tolist
+    converted_sizes = []
+
+    def counted_tolist(tensor: torch.Tensor) -> list[int]:
+        converted_sizes.append(tensor.numel())
+        return original(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", counted_tolist)
+    assert adapter_mod._cold_indexer_block_ids(slots, 4) == expected
+    assert converted_sizes == [(tokens + 3) // 4]
+
+
+@pytest.mark.parametrize(
+    "slots", [[0, 1], torch.empty(2, device="meta"), torch.empty(1, 2)]
+)
+def test_cold_indexer_blocks_reject_non_cpu_prefix_inputs(
+    slots: torch.Tensor | list[int],
+) -> None:
+    with pytest.raises(ValueError, match="CPU tensor"):
+        adapter_mod._cold_indexer_block_ids(slots, 4)
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_cold_publication_reuses_only_explicitly_sealed_sources(reuse: bool) -> None:
+    impl = _make_impl()
+    source = PreparedSparseSource(layers=(), total_tokens=4)
+    state = WorkerRetrieveState(
+        req_id="request", token_count=4, prepared_sparse_sources={0: source}
+    )
+    request = SimpleNamespace(
+        req_id="request", token_ids=[1, 2, 3, 4], sparse_warm_ref=False
+    )
+    impl._refresh_prepared_sparse_sources = MagicMock()
+    impl._record_shared_worker_retrieve_state = MagicMock()
+    impl._publish_worker_retrieve_state(
+        state,
+        request,
+        location=None,
+        metadata_warm=True,
+        token_count=4,
+        reuse_prepared_sources=reuse,
+    )
+    assert impl._refresh_prepared_sparse_sources.call_count == int(not reuse)
+    assert state.prepared_sparse_sources[0] is source
+    assert impl._worker_retrieve_state["request"] is state
+    request.token_ids.append(5)
+    assert state.metadata_token_ids == [1, 2, 3, 4]
+
+
+def test_cold_publication_rejects_sealed_source_at_wrong_frontier() -> None:
+    impl = _make_impl()
+    impl.lmcache_engine = None
+    state = WorkerRetrieveState(
+        req_id="request",
+        token_count=4,
+        prepared_sparse_sources={0: PreparedSparseSource(layers=(), total_tokens=3)},
+    )
+    request = SimpleNamespace(req_id="request", token_ids=[1, 2, 3, 4])
+    impl._release_unadopted_shared_request_objects = MagicMock()
+    impl._release_shared_worker_retrieve_state = MagicMock()
+    with pytest.raises(RuntimeError, match="sealed sources"):
+        impl._publish_worker_retrieve_state(
+            state,
+            request,
+            location=None,
+            metadata_warm=True,
+            token_count=4,
+            reuse_prepared_sources=True,
+        )
+    assert "request" not in impl._worker_retrieve_state
+    impl._release_unadopted_shared_request_objects.assert_called_once_with(
+        state, request
+    )
+
+
+@pytest.mark.parametrize("perf_enabled", [False, True])
+def test_cold_submit_and_publish_preserve_async_handoff(
+    perf_enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = _make_impl()
+    impl._block_size = 4
+    impl.lmcache_engine = None
+    impl._kvcaches_for_group = lambda group: []
+    indexer, latent = Future(), Future()
+    executor = SimpleNamespace(submit=MagicMock(side_effect=[indexer, latent]))
+    impl._get_dsa_cold_load_executor = lambda: executor
+    impl._record_shared_worker_retrieve_state = MagicMock()
+    impl._refresh_prepared_sparse_sources = MagicMock(
+        side_effect=AssertionError("completed cold source was rebuilt")
+    )
+    clock = MagicMock(
+        return_value=1.0,
+        side_effect=None if perf_enabled else AssertionError("disabled perf clock"),
+    )
+    monkeypatch.setattr(adapter_mod, "cold_start_perf_enabled", lambda: perf_enabled)
+    monkeypatch.setattr(adapter_mod, "cold_start_perf_now", clock)
+    monkeypatch.setattr(adapter_mod, "time", SimpleNamespace(thread_time_ns=clock))
+    monkeypatch.setattr(adapter_mod, "cold_start_perf_log", MagicMock())
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(current_device=lambda: 0), raising=False
+    )
+    request = SimpleNamespace(
+        req_id="request",
+        token_ids=[1, 2, 3, 4, 5],
+        sparse_warm_ref=False,
+        indexer_slot_mapping=[adapter_mod._build_slot_mapping([7, 2], 4, 5)],
+        load_spec=SimpleNamespace(dsa_cold_load_generation=1, lmcache_cached_tokens=5),
+    )
+    impl._submit_dsa_cold_compact_load(request)
+    assert impl._dsa_cold_load_futures["request"][3] == {7, 2}
+    assert impl._drain_dsa_cold_load_futures() is None
+    source = PreparedSparseSource(layers=(), total_tokens=5)
+    readiness = SimpleNamespace(
+        query=MagicMock(return_value=False),
+        synchronize=MagicMock(side_effect=AssertionError("host synchronization")),
+    )
+    state = WorkerRetrieveState(
+        req_id="request",
+        prepared_sparse_sources={0: source},
+        dense_load_readiness=readiness,
+    )
+    latent.set_result(state)
+    indexer.set_result(None)
+    assert impl._drain_dsa_cold_load_futures() is None
+    assert "request" not in impl._worker_retrieve_state
+    readiness.query.return_value = True
+    assert impl._drain_dsa_cold_load_futures() == {"request"}
+    assert impl._worker_retrieve_state["request"].prepared_sparse_sources[0] is source
+    assert not getattr(impl, "_dsa_cold_load_futures", None)
+    assert adapter_mod.cold_start_perf_log.call_count == (3 if perf_enabled else 0)
+
+
 def test_cold_compact_executor_is_bounded_to_two_io_jobs() -> None:
     impl = _make_impl()
     executor = impl._get_dsa_cold_load_executor()
@@ -440,8 +579,18 @@ def test_cold_compact_prefetch_failure_releases_and_uses_dense_path() -> None:
     prefetch_owner.ref_count_down.assert_called_once_with()
 
 
-def test_cold_compact_direct_group1_bypasses_gate_and_layer_generator() -> None:
+@pytest.mark.parametrize("perf_enabled", [False, True])
+def test_cold_compact_direct_group1_bypasses_gate_and_layer_generator(
+    perf_enabled: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     impl = _make_impl()
+    clock = MagicMock(
+        return_value=1.0,
+        side_effect=None if perf_enabled else AssertionError("disabled perf clock"),
+    )
+    monkeypatch.setattr(adapter_mod, "cold_start_perf_enabled", lambda: perf_enabled)
+    monkeypatch.setattr(adapter_mod, "cold_start_perf_now", clock)
+    monkeypatch.setattr(adapter_mod, "time", SimpleNamespace(thread_time_ns=clock))
     direct_load = MagicMock()
     retrieve = MagicMock(
         side_effect=AssertionError("direct Group-1 load entered layer generator")
@@ -455,7 +604,10 @@ def test_cold_compact_direct_group1_bypasses_gate_and_layer_generator() -> None:
     )
     gate = Future()
     token_mask = torch.ones(4, dtype=torch.bool)
-    request = SimpleNamespace(req_id="request", request_configs={"x": 1})
+    request = SimpleNamespace(
+        req_id="request", request_configs={"x": 1},
+        load_spec=SimpleNamespace(dsa_group1_direct_hbm=True),
+    )
     plan = {
         "request": request,
         "tokens": [1, 2, 3, 4],
@@ -463,7 +615,7 @@ def test_cold_compact_direct_group1_bypasses_gate_and_layer_generator() -> None:
         "token_count": 4,
         "indexer_slots_cpu": torch.arange(4),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.cold_start_perf_now(),
+        "planned_at": 0.0,
         "latent_shared_ready": gate,
         "group1_direct_hbm": True,
     }

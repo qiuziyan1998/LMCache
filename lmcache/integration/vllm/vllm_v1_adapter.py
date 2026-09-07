@@ -459,6 +459,22 @@ def _build_slot_mapping(
     return slots[:num_tokens]
 
 
+def _cold_indexer_block_ids(slots: torch.Tensor, block_size: int) -> set[int]:
+    """Recover blocks from the CPU prefix mapping made by _build_slot_mapping.
+
+    This cold-only mapping starts at logical token zero and contains contiguous
+    offsets within each block. Sampling precedes arithmetic and tolist, so both
+    operate on block count, including a partial final block, rather than tokens.
+    """
+    if (
+        not isinstance(slots, torch.Tensor)
+        or slots.device.type != "cpu"
+        or slots.ndim != 1
+    ):
+        raise ValueError("Cold indexer slots must be a one-dimensional CPU tensor")
+    return set((slots[::block_size] // block_size).tolist())
+
+
 def _build_slot_mapping_window(
     block_ids: list[int],
     block_size: int,
@@ -5860,6 +5876,7 @@ class LMCacheConnectorV1Impl:
                 chunk_token_counts=chunk_token_counts,
                 expected_pointer_device=expected_pointer_device,
                 cached_memory_objs=cache["cached_memory_objs"],
+                chunk_size=getattr(self, "_lmcache_chunk_size", None),
             )
             if source is not None:
                 prepared[kv_group] = source
@@ -5910,6 +5927,7 @@ class LMCacheConnectorV1Impl:
         location: Optional[str],
         metadata_warm: bool,
         token_count: int,
+        reuse_prepared_sources: bool = False,
     ) -> None:
         if not hasattr(self, "_worker_retrieve_state"):
             return
@@ -5926,14 +5944,25 @@ class LMCacheConnectorV1Impl:
         state.metadata_warm = metadata_warm or state.metadata_warm
         state.token_count = token_count
         try:
-            self._refresh_prepared_sparse_sources(state, token_count)
+            if reuse_prepared_sources:
+                # Only the completed cold worker hands off an unchanged sealed
+                # state. Generic store/metadata publication must still rebuild.
+                sources = state.prepared_sparse_sources
+                if 0 not in sources or any(
+                    source.total_tokens != token_count for source in sources.values()
+                ):
+                    raise RuntimeError(
+                        "Cold publication requires sealed sources at the load frontier"
+                    )
+            else:
+                self._refresh_prepared_sparse_sources(state, token_count)
             self._record_shared_worker_retrieve_state(
                 state,
                 request,
                 previous_token_count,
             )
             if not request.sparse_warm_ref and len(request.token_ids) >= token_count:
-                state.metadata_token_ids = list(request.token_ids[:token_count])
+                state.metadata_token_ids = request.token_ids[:token_count]
         except Exception:
             self._release_unadopted_shared_request_objects(state, request)
             preserve_previous_lease = (
@@ -6238,20 +6267,22 @@ class LMCacheConnectorV1Impl:
                 f"active_generation={existing[0]}, generation={generation}"
             )
         perf_enabled = cold_start_perf_enabled()
-        plan_started = cold_start_perf_now()
+        plan_started = cold_start_perf_now() if perf_enabled else 0.0
         plan_thread_started = time.thread_time_ns() if perf_enabled else 0
-        block_ids_started = cold_start_perf_now()
+        block_ids_started = cold_start_perf_now() if perf_enabled else 0.0
         indexer_slots = request.indexer_slot_mapping[0]
-        indexer_block_ids = set(
-            (indexer_slots // self._block_size).tolist()
-        )
-        block_ids_ms = (cold_start_perf_now() - block_ids_started) * 1000
-        device_started = cold_start_perf_now()
+        indexer_block_ids = _cold_indexer_block_ids(indexer_slots, self._block_size)
+        block_ids_ms = (
+            (cold_start_perf_now() if perf_enabled else 0.0) - block_ids_started
+        ) * 1000
+        device_started = cold_start_perf_now() if perf_enabled else 0.0
         npu_device_id = (
             int(torch.npu.current_device()) if hasattr(torch, "npu") else None
         )
-        device_ms = (cold_start_perf_now() - device_started) * 1000
-        build_started = cold_start_perf_now()
+        device_ms = (
+            (cold_start_perf_now() if perf_enabled else 0.0) - device_started
+        ) * 1000
+        build_started = cold_start_perf_now() if perf_enabled else 0.0
         token_count = getattr(request.load_spec, "lmcache_cached_tokens", 0)
         plan = {
             "request": request,
@@ -6261,21 +6292,24 @@ class LMCacheConnectorV1Impl:
             "indexer_slots_cpu": request.indexer_slot_mapping[0],
             "latent_kvcaches": self._kvcaches_for_group(0),
             "indexer_kvcaches": self._kvcaches_for_group(1),
-            "planned_at": cold_start_perf_now(),
+            "planned_at": (cold_start_perf_now() if perf_enabled else 0.0),
             "plan_started": plan_started,
             "latent_shared_ready": Future(),
         }
-        build_ms = (cold_start_perf_now() - build_started) * 1000
-        submitted_at = cold_start_perf_now()
-        cold_start_perf_log(
-            logger,
-            "worker_load_start",
-            req_id=request.req_id,
-            tokens=token_count,
-            mode="dsa_cold_compact",
-        )
+        build_ms = (
+            (cold_start_perf_now() if perf_enabled else 0.0) - build_started
+        ) * 1000
+        submitted_at = cold_start_perf_now() if perf_enabled else 0.0
+        if perf_enabled:
+            cold_start_perf_log(
+                logger,
+                "worker_load_start",
+                req_id=request.req_id,
+                tokens=token_count,
+                mode="dsa_cold_compact",
+            )
         executor = self._get_dsa_cold_load_executor()
-        executor_submit_started = cold_start_perf_now()
+        executor_submit_started = cold_start_perf_now() if perf_enabled else 0.0
         indexer_future = executor.submit(
             self._run_dsa_cold_indexer_load,
             plan,
@@ -6322,25 +6356,26 @@ class LMCacheConnectorV1Impl:
             indexer_future,
         )
         executor_submit_ms = (
-            cold_start_perf_now() - executor_submit_started
+            (cold_start_perf_now() if perf_enabled else 0.0) - executor_submit_started
         ) * 1000
-        cold_start_perf_log(
-            logger,
-            "cold_compact_plan_submit",
-            started=plan_started,
-            req_id=request.req_id,
-            tokens=token_count,
-            jobs=2,
-            block_ids_ms=round(block_ids_ms, 3),
-            device_query_ms=round(device_ms, 3),
-            plan_build_ms=round(build_ms, 3),
-            executor_submit_ms=round(executor_submit_ms, 3),
-            thread_cpu_ms=(
-                round((time.thread_time_ns() - plan_thread_started) / 1e6, 3)
-                if perf_enabled
-                else None
-            ),
-        )
+        if perf_enabled:
+            cold_start_perf_log(
+                logger,
+                "cold_compact_plan_submit",
+                started=plan_started,
+                req_id=request.req_id,
+                tokens=token_count,
+                jobs=2,
+                block_ids_ms=round(block_ids_ms, 3),
+                device_query_ms=round(device_ms, 3),
+                plan_build_ms=round(build_ms, 3),
+                executor_submit_ms=round(executor_submit_ms, 3),
+                thread_cpu_ms=(
+                    round((time.thread_time_ns() - plan_thread_started) / 1e6, 3)
+                    if perf_enabled
+                    else None
+                ),
+            )
 
     def _try_prepare_dsa_live_split(self, request: ReqMeta) -> bool:
         """Reserve cold groups until live import succeeds or falls back."""
@@ -6677,7 +6712,7 @@ class LMCacheConnectorV1Impl:
             torch.npu.set_device(npu_device_id)
         finish_stage("producer_setup_ms", producer_setup_started)
         assert self.lmcache_engine is not None
-        started = cold_start_perf_now()
+        started = cold_start_perf_now() if perf_breakdown is not None else 0.0
         queue_ms = (started - plan["planned_at"]) * 1000
         request = plan["request"]
         indexer_slots_cpu = plan["indexer_slots_cpu"]
@@ -6715,7 +6750,8 @@ class LMCacheConnectorV1Impl:
             return (
                 plan["token_mask"],
                 None,
-                cold_start_perf_now() - started,
+                (cold_start_perf_now() if perf_breakdown is not None else 0.0)
+                - started,
                 queue_ms,
             )
         slot_submit_started = stage_start()
@@ -6879,7 +6915,12 @@ class LMCacheConnectorV1Impl:
             perf_breakdown["thread_cpu_ms"] = round(
                 (time.thread_time_ns() - thread_started) / 1e6, 3
             )
-        return result, readiness, cold_start_perf_now() - started, queue_ms
+        return (
+            result,
+            readiness,
+            (cold_start_perf_now() if perf_breakdown is not None else 0.0) - started,
+            queue_ms,
+        )
 
     def synchronize_staged_sfa_capture_unsafe_loads(self) -> None:
         """Finish legacy background NPU loads before serving-time graph capture.
@@ -6977,8 +7018,8 @@ class LMCacheConnectorV1Impl:
         tokens = plan["tokens"]
         token_mask = plan["token_mask"]
         state = live_state or WorkerRetrieveState(req_id=request.req_id)
-        started = cold_start_perf_now()
         perf_enabled = cold_start_perf_enabled()
+        started = cold_start_perf_now() if perf_enabled else 0.0
         indexer_readiness = None
         predecessor_wait_ms = 0.0
         latent_materialize_ms = 0.0
@@ -7092,7 +7133,7 @@ class LMCacheConnectorV1Impl:
             latent_shared_ready = plan["latent_shared_ready"]
             if not latent_shared_ready.done():
                 latent_shared_ready.set_result(None)
-            dependency_wait_started = cold_start_perf_now()
+            dependency_wait_started = cold_start_perf_now() if perf_enabled else 0.0
             (
                 _,
                 indexer_readiness,
@@ -7100,7 +7141,8 @@ class LMCacheConnectorV1Impl:
                 indexer_queue_ms,
             ) = indexer_future.result()
             dependency_wait_ms = (
-                cold_start_perf_now() - dependency_wait_started
+                (cold_start_perf_now() if perf_enabled else 0.0)
+                - dependency_wait_started
             ) * 1000
             if request.load_spec.dsa_group1_direct_hbm:
                 if indexer_readiness is not None:
@@ -7114,7 +7156,7 @@ class LMCacheConnectorV1Impl:
                 additional_owners=tuple(plan.get("indexer_source_owners", ())),
             )
 
-            seal_started = cold_start_perf_now()
+            seal_started = cold_start_perf_now() if perf_enabled else 0.0
             state.indexer_npu_resident = True
             state.location = retrieve_location
             state.metadata_warm = state.has_cache()
@@ -7124,37 +7166,38 @@ class LMCacheConnectorV1Impl:
                 latent_seal_ms = (cold_start_perf_now() - seal_started) * 1000
             if state.prepared_sparse_sources.get(0) is None:
                 raise RuntimeError("Cold compact latent source was not sealed")
-            completed_at = cold_start_perf_now()
+            completed_at = cold_start_perf_now() if perf_enabled else 0.0
             state._dsa_cold_load_completed_at = completed_at
-            cold_start_perf_log(
-                logger,
-                "cold_compact_retrieve_complete",
-                started=started,
-                req_id=request.req_id,
-                tokens=token_count,
-                plan_ms=round(
-                    (plan["planned_at"] - plan["plan_started"]) * 1000, 3
-                ),
-                remote_ms=round(indexer_remote_s * 1000, 3),
-                queue_ms=round(indexer_queue_ms, 3),
-                event_wait_ms=round(dependency_wait_ms, 3),
-                indexer_wait_ms=round(dependency_wait_ms, 3),
-                predecessor_wait_ms=round(predecessor_wait_ms, 3),
-                latent_materialize_ms=round(latent_materialize_ms, 3),
-                latent_materialize_thread_cpu_ms=round(
-                    latent_materialize_thread_cpu_ms, 3
-                ),
-                latent_kwargs_ms=round(latent_kwargs_ms, 3),
-                latent_generator_create_ms=round(latent_generator_create_ms, 3),
-                latent_first_yield_ms=round(latent_first_yield_ms, 3),
-                latent_send_sum_ms=round(latent_send_sum_ms, 3),
-                latent_send_max_ms=round(latent_send_max_ms, 3),
-                latent_send_max_layer=latent_send_max_layer,
-                latent_result_check_ms=round(latent_result_check_ms, 3),
-                latent_seal_ms=round(latent_seal_ms, 3),
-                seal_ms=round((completed_at - seal_started) * 1000, 3),
-                **plan.get("indexer_perf", {}),
-            )
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "cold_compact_retrieve_complete",
+                    started=started,
+                    req_id=request.req_id,
+                    tokens=token_count,
+                    plan_ms=round(
+                        (plan["planned_at"] - plan["plan_started"]) * 1000, 3
+                    ),
+                    remote_ms=round(indexer_remote_s * 1000, 3),
+                    queue_ms=round(indexer_queue_ms, 3),
+                    event_wait_ms=round(dependency_wait_ms, 3),
+                    indexer_wait_ms=round(dependency_wait_ms, 3),
+                    predecessor_wait_ms=round(predecessor_wait_ms, 3),
+                    latent_materialize_ms=round(latent_materialize_ms, 3),
+                    latent_materialize_thread_cpu_ms=round(
+                        latent_materialize_thread_cpu_ms, 3
+                    ),
+                    latent_kwargs_ms=round(latent_kwargs_ms, 3),
+                    latent_generator_create_ms=round(latent_generator_create_ms, 3),
+                    latent_first_yield_ms=round(latent_first_yield_ms, 3),
+                    latent_send_sum_ms=round(latent_send_sum_ms, 3),
+                    latent_send_max_ms=round(latent_send_max_ms, 3),
+                    latent_send_max_layer=latent_send_max_layer,
+                    latent_result_check_ms=round(latent_result_check_ms, 3),
+                    latent_seal_ms=round(latent_seal_ms, 3),
+                    seal_ms=round((completed_at - seal_started) * 1000, 3),
+                    **plan.get("indexer_perf", {}),
+                )
             return state
         except BaseException as exc:
             latent_shared_ready = plan["latent_shared_ready"]
@@ -9534,6 +9577,7 @@ class LMCacheConnectorV1Impl:
         futures = getattr(self, "_dsa_cold_load_futures", None)
         if not futures:
             return None
+        perf_enabled = cold_start_perf_enabled()
         finished: set[str] = set()
         for req_id, entry in list(futures.items()):
             (
@@ -9567,12 +9611,14 @@ class LMCacheConnectorV1Impl:
                         f"req_id={req_id}, expected={generation}, "
                         f"actual={actual_generation}"
                     )
+                publish_started = cold_start_perf_now() if perf_enabled else 0.0
                 completed_at = getattr(
-                    state, "_dsa_cold_load_completed_at", cold_start_perf_now()
+                    state,
+                    "_dsa_cold_load_completed_at",
+                    publish_started,
                 )
-                publish_started = cold_start_perf_now()
                 publish_thread_started = (
-                    time.thread_time_ns() if cold_start_perf_enabled() else 0
+                    time.thread_time_ns() if perf_enabled else 0
                 )
                 if was_aborted:
                     self._release_unadopted_shared_request_objects(state, request)
@@ -9587,6 +9633,7 @@ class LMCacheConnectorV1Impl:
                         location=state.location,
                         metadata_warm=True,
                         token_count=request.load_spec.lmcache_cached_tokens,
+                        reuse_prepared_sources=True,
                     )
                     # Completion reports from different TP workers may be
                     # accumulated across multiple forwards. Preserve this
@@ -9594,32 +9641,33 @@ class LMCacheConnectorV1Impl:
                     # the other workers; explicit finish/abort remains the
                     # authoritative cleanup path.
                     state._dsa_cold_prune_protected = True
-                published_at = cold_start_perf_now()
-                cold_start_perf_log(
-                    logger,
-                    "worker_load_complete",
-                    started=submitted_at,
-                    req_id=req_id,
-                    tokens=request.load_spec.lmcache_cached_tokens,
-                    mode="dsa_cold_compact",
-                    background_ms=round((completed_at - submitted_at) * 1000, 3),
-                    scheduler_poll_ms=round(
-                        (publish_started - completed_at) * 1000, 3
-                    ),
-                    publish_ms=round((published_at - publish_started) * 1000, 3),
-                    publish_thread_cpu_ms=(
-                        round(
-                            (time.thread_time_ns() - publish_thread_started) / 1e6,
-                            3,
-                        )
-                        if publish_thread_started
-                        else None
-                    ),
-                    final_unhidden_ms=round(
-                        (published_at - completed_at) * 1000, 3
-                    ),
-                )
-                if cold_start_perf_enabled():
+                published_at = cold_start_perf_now() if perf_enabled else 0.0
+                if perf_enabled:
+                    cold_start_perf_log(
+                        logger,
+                        "worker_load_complete",
+                        started=submitted_at,
+                        req_id=req_id,
+                        tokens=request.load_spec.lmcache_cached_tokens,
+                        mode="dsa_cold_compact",
+                        background_ms=round((completed_at - submitted_at) * 1000, 3),
+                        scheduler_poll_ms=round(
+                            (publish_started - completed_at) * 1000, 3
+                        ),
+                        publish_ms=round((published_at - publish_started) * 1000, 3),
+                        publish_thread_cpu_ms=(
+                            round(
+                                (time.thread_time_ns() - publish_thread_started) / 1e6,
+                                3,
+                            )
+                            if publish_thread_started
+                            else None
+                        ),
+                        final_unhidden_ms=round(
+                            (published_at - completed_at) * 1000, 3
+                        ),
+                    )
+                if perf_enabled:
                     logger.info(
                         "[DSA_COLD_COMPACT] request=%s generation=%d "
                         "status=%s tokens=%d indexer_blocks=%d elapsed_ms=%.3f",
@@ -9682,7 +9730,8 @@ class LMCacheConnectorV1Impl:
                     req_id,
                     generation,
                     len(indexer_block_ids),
-                    (cold_start_perf_now() - submitted_at) * 1000,
+                    ((cold_start_perf_now() if perf_enabled else 0.0) - submitted_at)
+                    * 1000,
                 )
             futures.pop(req_id, None)
             if was_aborted:
@@ -10239,9 +10288,7 @@ class LMCacheConnectorV1Impl:
                 f"{required_indexer_blocks}, allocated_blocks="
                 f"{len(indexer_block_ids)}"
             )
-        token_ids = list(
-            request.all_token_ids[: load_spec.lmcache_cached_tokens]
-        )
+        token_ids = request.all_token_ids[: load_spec.lmcache_cached_tokens]
         if len(token_ids) != load_spec.lmcache_cached_tokens:
             raise ValueError(
                 "Cold compact metadata does not cover the complete cache hit: "

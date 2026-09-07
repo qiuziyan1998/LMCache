@@ -216,6 +216,38 @@ def test_shared_cpu_request_lease_append_alignment_failure_is_atomic() -> None:
     ]
 
 
+def test_shared_lease_releases_shared_pages_and_tails_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, suffix, tail = (_LeaseMemoryObj() for _ in range(3))
+    lease = SharedCPURequestLease("req", 1, False)
+    lease.replace_groups({0: [[page], [page]], 1: [[page]]}, retain=False)
+    lease.append_groups({0: [[page, suffix], [page, suffix]]}, {0: 1})
+    lease.append_groups({2: [[tail], [page]]}, {})
+    assert lease.object_ids() == {id(page), id(suffix), id(tail)}
+
+    def no_rescan(_groups: dict) -> None:
+        pytest.fail("completion rescanned layer/chunk ownership")
+
+    monkeypatch.setattr(lease, "_unique_objects", no_rescan)
+    lease.close()
+    lease.close()
+    assert [obj.ref_count for obj in (page, suffix, tail)] == [0, 0, 0]
+    assert lease.object_ids() == set()
+
+
+def test_shared_lease_keeps_owner_until_last_group_is_removed() -> None:
+    page = _LeaseMemoryObj()
+    lease = SharedCPURequestLease("req", 1, False, groups={0: [[page]], 1: [[page]]})
+    lease.replace_groups({0: []}, retain=False)
+    assert page.ref_count == 1
+    assert lease.object_ids() == {id(page)}
+    lease.replace_groups({1: []}, retain=False)
+    assert page.ref_count == 0
+    lease.close()
+    assert page.ref_count == 0
+
+
 def test_shared_cpu_engine_registers_request_suffix_without_replacement() -> None:
     old_view = _LeaseMemoryObj()
     new_view = _LeaseMemoryObj()

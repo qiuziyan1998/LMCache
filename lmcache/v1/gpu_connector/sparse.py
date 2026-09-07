@@ -30,6 +30,8 @@ class PreparedSparseSource:
     total_tokens: int
     chunk_token_counts: tuple[int, ...] = field(default_factory=tuple)
     pointer_device: Optional[torch.device] = None
+    # Only the validating builder sets this. dataclasses.replace resets it.
+    validated_chunk_size: Optional[int] = field(default=None, init=False)
 
 
 def build_prepared_sparse_source(
@@ -41,6 +43,7 @@ def build_prepared_sparse_source(
     chunk_token_counts: Optional[Sequence[int]] = None,
     expected_pointer_device: Optional[torch.device] = None,
     cached_memory_objs: Optional[Sequence[Sequence[MemoryObj]]] = None,
+    chunk_size: Optional[int] = None,
 ) -> Optional[PreparedSparseSource]:
     """Seal a complete layer cache into immutable hot-path source metadata.
 
@@ -54,6 +57,7 @@ def build_prepared_sparse_source(
         cached_memory_objs: Optional pointer-first CPU chunk owners. Complete
             owner layers can replace ``cached_tensors`` without constructing
             per-chunk typed views.
+        chunk_size: Optional configured chunk size to validate once at sealing.
 
     Returns:
         A prepared source, or ``None`` while bootstrap data is incomplete.
@@ -68,6 +72,8 @@ def build_prepared_sparse_source(
     """
     if num_layers <= 0 or total_tokens <= 0:
         return None
+    if chunk_size is not None and chunk_size <= 0:
+        raise ValueError("Prepared sparse chunk size must be positive.")
     tensors_complete = len(cached_tensors) == num_layers
     owners_complete = (
         cached_memory_objs is not None and len(cached_memory_objs) == num_layers
@@ -100,6 +106,22 @@ def build_prepared_sparse_source(
             raise ValueError(
                 "Prepared sparse chunks require full non-tail chunks and one "
                 "optional final partial chunk."
+            )
+        # Uniformity was checked above; only the full-chunk and tail bounds
+        # remain. The immutable result can reuse this validation during decode.
+        if (
+            normalized_chunk_counts
+            and chunk_size is not None
+            and (
+                (
+                    len(normalized_chunk_counts) > 1
+                    and normalized_chunk_counts[0] != chunk_size
+                )
+                or normalized_chunk_counts[-1] > chunk_size
+            )
+        ):
+            raise ValueError(
+                "Prepared sparse chunk coverage exceeds the configured chunk layout."
             )
 
     layers: list[PreparedSparseSourceLayer] = []
@@ -193,9 +215,11 @@ def build_prepared_sparse_source(
         )
 
     layer_tuple = tuple(layers)
-    return PreparedSparseSource(
+    source = PreparedSparseSource(
         layers=layer_tuple,
         total_tokens=int(total_tokens),
         chunk_token_counts=normalized_chunk_counts,
         pointer_device=pointer_device,
     )
+    object.__setattr__(source, "validated_chunk_size", chunk_size)
+    return source

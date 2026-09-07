@@ -59,6 +59,14 @@ class SharedCPURequestLease:
     is_rank0: bool
     active: bool = False
     groups: dict[int, list[list[MemoryObj]]] = field(default_factory=dict)
+    _owned_objects: dict[int, MemoryObj] = field(
+        default_factory=dict, init=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        self._owned_objects = {
+            id(obj): obj for obj in self._unique_objects(self.groups)
+        }
 
     @staticmethod
     def _unique_objects(
@@ -119,16 +127,15 @@ class SharedCPURequestLease:
             else:
                 replacement.pop(kv_group, None)
 
-        old_objects = self._unique_objects(self.groups)
-        old_ids = {id(memory_obj) for memory_obj in old_objects}
+        old_objects = self._owned_objects
         new_objects = self._unique_objects(replacement)
-        new_ids = {id(memory_obj) for memory_obj in new_objects}
+        new_owned = {id(memory_obj): memory_obj for memory_obj in new_objects}
 
         retained: list[MemoryObj] = []
         if retain:
             try:
                 for memory_obj in new_objects:
-                    if id(memory_obj) in old_ids:
+                    if id(memory_obj) in old_objects:
                         continue
                     memory_obj.ref_count_up()
                     try:
@@ -149,8 +156,11 @@ class SharedCPURequestLease:
                 raise
 
         self.groups = replacement
+        self._owned_objects = new_owned
         self._release(
-            memory_obj for memory_obj in old_objects if id(memory_obj) not in new_ids
+            memory_obj
+            for identity, memory_obj in old_objects.items()
+            if identity not in new_owned
         )
 
     def append_groups(
@@ -194,10 +204,16 @@ class SharedCPURequestLease:
         for current, suffix in updates:
             for layer, layer_suffix in zip(current, suffix, strict=True):
                 layer.extend(layer_suffix)
+                self._owned_objects.update((id(obj), obj) for obj in layer_suffix)
         for kv_group, suffix in additions:
             self.groups[kv_group] = suffix
+            self._owned_objects.update(
+                (id(obj), obj) for layer in suffix for obj in layer
+            )
 
     def object_ids(self, kv_group: Optional[int] = None) -> set[int]:
+        if kv_group is None:
+            return set(self._owned_objects)
         groups = (
             self.groups.values()
             if kv_group is None
@@ -211,10 +227,11 @@ class SharedCPURequestLease:
         }
 
     def close(self) -> None:
-        objects = self._unique_objects(self.groups)
+        objects = self._owned_objects
+        self._owned_objects = {}
         self.groups.clear()
         self.active = False
-        self._release(objects)
+        self._release(objects.values())
 
 
 def _dtype_to_str(dtype: Optional[torch.dtype]) -> Optional[str]:
