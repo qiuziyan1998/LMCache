@@ -1953,6 +1953,7 @@ class LMCacheConnectorV1Impl:
         self._indexer_layer_names: list[str] = []
         self._latent_kvcaches: list[torch.Tensor] = []
         self._indexer_kvcaches: list[torch.Tensor] = []
+        self._sparse_destination_binding: Any = None
         self._block_size = vllm_config.cache_config.block_size
         hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
         if hf_config is None:
@@ -2348,18 +2349,26 @@ class LMCacheConnectorV1Impl:
             manager.kv_layer_groups = normalized_groups
 
     def _refresh_kvcaches_list(self) -> None:
-        self._latent_layer_names = []
-        self._indexer_layer_names = []
-        self._latent_kvcaches = []
-        self._indexer_kvcaches = []
+        latent_names, indexer_names = [], []
+        latent_caches, indexer_caches = [], []
         dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
         for layer_name, kv_cache in self.kv_caches.items():
             if dsa_two_groups and "indexer" in layer_name:
-                self._indexer_layer_names.append(layer_name)
-                self._indexer_kvcaches.append(kv_cache)
+                indexer_names.append(layer_name)
+                indexer_caches.append(kv_cache)
             else:
-                self._latent_layer_names.append(layer_name)
-                self._latent_kvcaches.append(kv_cache)
+                latent_names.append(layer_name)
+                latent_caches.append(kv_cache)
+        if getattr(self, "_sparse_destination_binding", None) is not None:
+            if latent_names != self._latent_layer_names:
+                raise RuntimeError(
+                    "Sealed sparse destination layers changed; restart worker"
+                )
+            self.lmcache_engine.gpu_connector.seal_sparse_destination_layout(latent_caches)
+            latent_caches = self._latent_kvcaches
+        self._latent_layer_names = latent_names
+        self._indexer_layer_names = indexer_names
+        self._latent_kvcaches, self._indexer_kvcaches = latent_caches, indexer_caches
         # Backward-compatible flat list = latent group (the default group).
         self._kvcaches_list = self._latent_kvcaches
         worker_has_caches = (
@@ -3125,6 +3134,8 @@ class LMCacheConnectorV1Impl:
                 continue
 
             if layer_name not in self.kv_caches:
+                if getattr(self, "_sparse_destination_binding", None) is not None:
+                    raise RuntimeError("Cannot extend sealed KV caches; restart worker")
                 self.kv_caches[layer_name] = attn_layer.kv_cache[
                     forward_context.virtual_engine
                 ]
@@ -6060,6 +6071,7 @@ class LMCacheConnectorV1Impl:
         shared_cpu_enabled: bool,
         shared_cpu_preflight_state: Optional[dict[str, Any]],
         metadata_only: bool = False,
+        registered_destination_layout: Any = None,
     ) -> tuple[
         dict[str, Any],
         Optional[dict[str, Any]],
@@ -6095,6 +6107,10 @@ class LMCacheConnectorV1Impl:
                 "lmcache_cached_tokens": prepared_token_count,
                 "prepared_sparse_source": prepared_source,
             }
+            if kv_group == 0 and registered_destination_layout is not None:
+                retrieve_kwargs["registered_destination_layout"] = (
+                    registered_destination_layout
+                )
         else:
             if (
                 shared_cpu_enabled
@@ -6152,6 +6168,8 @@ class LMCacheConnectorV1Impl:
         logger.info("Registering KV caches")
         # TODO(chunxiaozheng): `_init_kv_caches_from_forward_context` is
         #  not called, we should consider removing it.
+        if getattr(self, "_sparse_destination_binding", None) is not None:
+            raise RuntimeError("Cannot replace sealed KV caches; restart worker")
         assert len(self.kv_caches) == 0 and len(kv_caches) > 0
         self.kv_caches = kv_caches
         self._refresh_kvcaches_list()
@@ -6164,6 +6182,31 @@ class LMCacheConnectorV1Impl:
         )
         if callable(preflight):
             preflight(self._kvcaches_for_group(1))
+
+    def seal_sparse_destination_layout(self) -> None:
+        """Register fixed Group-0 buffers after successful final staged capture.
+
+        Unsupported configurations/connectors retain per-call validation. Raises
+        RuntimeError if a previously sealed destination has changed.
+        """
+        config = self.config
+        if not (
+            self._role == KVConnectorRole.WORKER
+            and self.use_layerwise
+            and self.enable_sparse_attention
+            and getattr(config, "dsa_two_groups", False)
+            and getattr(config, "enable_remote_lmcache_store", False)
+            and getattr(config, "pd_role", None) == "receiver"
+            and getattr(config, "dsa_group1_load_mode", None) == "persistent_direct_hbm"
+            and not getattr(self._vllm_config.model_config, "enable_sleep_mode", False)
+            and self.kv_caches
+        ):
+            return
+        seal = getattr(
+            self.lmcache_engine.gpu_connector, "seal_sparse_destination_layout", None
+        )
+        if callable(seal):
+            self._sparse_destination_binding = seal(self._latent_kvcaches)
 
     def _get_dsa_cold_load_executor(self) -> ThreadPoolExecutor:
         executor = getattr(self, "_dsa_cold_load_executor", None)
@@ -7601,6 +7644,9 @@ class LMCacheConnectorV1Impl:
                         dsa_two_groups=dsa_two_groups,
                         shared_cpu_enabled=shared_cpu_enabled,
                         shared_cpu_preflight_state=shared_cpu_preflight_state,
+                        registered_destination_layout=getattr(
+                            self, "_sparse_destination_binding", None
+                        ),
                     )
                     if latent_prepared is None and getattr(
                         request.load_spec,
