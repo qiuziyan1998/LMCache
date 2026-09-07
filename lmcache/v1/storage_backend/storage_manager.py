@@ -444,6 +444,116 @@ class StorageManager:
 
         return required_futures
 
+    def batched_put_sync_required(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        *,
+        required_backends: Sequence[str] = (),
+    ) -> None:
+        """Synchronously publish a row without allocator copies or silent misses.
+
+        Write to active backends sharing this manager's allocator. Every named
+        required backend must exist, be enabled, and require put completion;
+        RemoteBackend must have a connected batched-put connector. Missing or
+        malformed completion futures fail closed, including for other backends
+        advertising completion. Local synchronous backends may return None.
+
+        Consumes one caller reference per input occurrence on EVERY exit,
+        including validation/submission errors. All returned futures are drained
+        before references are consumed or an error is raised. Callers retaining
+        a manifest must lend a separate reference. This does not change the
+        best-effort contract of generic ``batched_put``.
+        """
+        futures: list[Future] = []
+        error: Optional[BaseException] = None
+        try:
+            if len(keys) != len(memory_objs):
+                raise ValueError("Strict row put requires matching keys and objects")
+            if not keys:
+                return
+            if self.allocator_backend is None:
+                raise RuntimeError("Strict row put requires an allocator backend")
+            required = set(required_backends)
+            with self._freeze_lock, self._bypass_lock:
+                unavailable = required - self.storage_backends.keys()
+                unavailable.update(required & self._bypassed_backends)
+                if self._freeze:
+                    unavailable.update(required - {"LocalCPUBackend"})
+                if unavailable:
+                    raise RuntimeError(
+                        "Required row storage backend missing, bypassed or frozen: "
+                        f"{sorted(unavailable)}"
+                    )
+                targets = [
+                    (name, backend)
+                    for name, backend in self.storage_backends.items()
+                    if name not in self._bypassed_backends
+                    and (not self._freeze or name == "LocalCPUBackend")
+                ]
+            if not targets:
+                raise RuntimeError("Strict row put has no active storage backend")
+            for name, backend in targets:
+                if backend.get_allocator_backend() is not self.allocator_backend:
+                    raise RuntimeError(
+                        f"Strict row put requires the same allocator: {name}"
+                    )
+                if name in required:
+                    if name == "RemoteBackend":
+                        connection = getattr(backend, "connection", None)
+                        if connection is None:
+                            raise RuntimeError("Required RemoteBackend is disconnected")
+                        # The single-key path may return dummy futures for skips.
+                        if connection.support_batched_put() is not True:
+                            raise RuntimeError(
+                                "Required RemoteBackend needs batched put support"
+                            )
+                    if backend.requires_put_completion() is not True:
+                        raise RuntimeError(
+                            f"Required backend lacks put completion: {name}"
+                        )
+            for name, backend in targets:
+                with self._freeze_lock, self._bypass_lock:
+                    if (
+                        name in self._bypassed_backends
+                        or (self._freeze and name != "LocalCPUBackend")
+                        or self.storage_backends.get(name) is not backend
+                    ):
+                        raise RuntimeError(f"Row storage backend changed: {name}")
+                    completion = backend.requires_put_completion()
+                    if name in required and completion is not True:
+                        raise RuntimeError(f"Required backend lost completion: {name}")
+                    submitted = backend.batched_submit_put_task(keys, memory_objs)
+                # Preserve all valid returned futures even if a sibling entry is
+                # malformed. No failure may free buffers while another put runs.
+                batch = submitted if isinstance(submitted, (list, tuple)) else []
+                if isinstance(submitted, Future):
+                    futures.append(submitted)
+                futures.extend(future for future in batch if isinstance(future, Future))
+                if (
+                    (completion or name in required)
+                    and not batch
+                    or any(not isinstance(future, Future) for future in batch)
+                    or (
+                        submitted is not None
+                        and not isinstance(submitted, (list, tuple))
+                    )
+                ):
+                    raise RuntimeError(f"Missing or invalid row put futures: {name}")
+        except BaseException as exc:
+            error = exc
+        finally:
+            for future in futures:
+                try:
+                    if future.result() is False:
+                        raise RuntimeError("Row storage put returned failure")
+                except BaseException as exc:
+                    error = error or exc
+            for obj in memory_objs:
+                obj.ref_count_down()
+        if error is not None:
+            raise error
+
     def batched_put_external_pages(
         self,
         keys: Sequence[CacheEngineKey],

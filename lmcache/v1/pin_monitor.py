@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from contextlib import nullcontext
-from typing import TYPE_CHECKING, Optional, Sequence
+from contextlib import contextmanager, nullcontext
+from typing import TYPE_CHECKING, Iterator, Optional, Sequence
 import threading
 import time
 
@@ -49,6 +49,10 @@ class PinMonitor(PeriodicThread):
             int, tuple["MemoryObj", float]
         ] = {}  # {obj_id: (memory_obj, register_time)}
         self._objects_lock = threading.Lock()
+        # Separate from the lock taken by MemoryObj.pin/unpin callbacks. Never
+        # hold _objects_lock across those callbacks (object -> monitor ordering).
+        self._lease_lock = threading.RLock()
+        self._protected_pins: dict[int, int] = {}
         self._check_interval = config.pin_check_interval_sec
         self._pin_timeout_sec = config.pin_timeout_sec
 
@@ -118,6 +122,57 @@ class PinMonitor(PeriodicThread):
                     obj_id,
                 )
 
+    @contextmanager
+    def protect_pins(self) -> Iterator[list["MemoryObj"]]:
+        """Adopt newly acquired pins as balanced request-lifetime leases.
+
+        Within the scope, acquire pins normally and append each owned pin's
+        MemoryObj to the yielded list (one occurrence per pin). Timeout sweeps
+        cannot race acquisition/adoption. On scope exit, including exceptions,
+        listed pins are exempt from timeout until ``release_pin_lease``. The
+        caller must also retain its own MemoryObj reference. This adds no pins.
+
+        This scope can wrap a prefetched resolver which acquires pins and rolls
+        back on error: append only the successfully returned objects. Keep
+        blocking storage I/O outside the scope so timeout reclamation can run.
+        Ordinary
+        pin/unpin callbacks remain usable while the scope holds the lease lock.
+        """
+        with self._lease_lock:
+            pins: list["MemoryObj"] = []
+            try:
+                yield pins
+            finally:
+                with self._objects_lock:
+                    for obj in pins:
+                        obj_id = id(obj)
+                        self._protected_pins[obj_id] = (
+                            self._protected_pins.get(obj_id, 0) + 1
+                        )
+
+    def release_pin_lease(self, memory_obj: "MemoryObj") -> None:
+        """Release exactly one adopted pin, or raise ValueError if none is owned.
+
+        The last release restores normal timeout monitoring for any remaining
+        ordinary pins, starting a fresh timeout. Lease cleanup and a previously
+        selected timeout candidate are serialized without holding the callback
+        lock across ``unpin``.
+        """
+        obj_id = id(memory_obj)
+        with self._lease_lock:
+            with self._objects_lock:
+                count = self._protected_pins.get(obj_id, 0)
+                if not count:
+                    raise ValueError("MemoryObj has no protected pin lease")
+            memory_obj.unpin()
+            with self._objects_lock:
+                if count > 1:
+                    self._protected_pins[obj_id] = count - 1
+                else:
+                    del self._protected_pins[obj_id]
+                    if obj_id in self._pinned_objects:
+                        self._pinned_objects[obj_id] = (memory_obj, time.time())
+
     def _check_timeouts(self) -> tuple[int, int, int]:
         """Check all registered pinned objects for timeout.
 
@@ -133,7 +188,7 @@ class PinMonitor(PeriodicThread):
                 self._pinned_objects.items()
             ):
                 # Check if object is still pinned and has exceeded timeout
-                if memory_obj.meta.pin_count > 0:
+                if memory_obj.meta.pin_count > 0 and obj_id not in self._protected_pins:
                     elapsed_time = current_time - register_time
                     if elapsed_time > self._pin_timeout_sec:
                         timeout_objects.append((memory_obj, elapsed_time))
@@ -142,8 +197,8 @@ class PinMonitor(PeriodicThread):
         force_unpin_success_count = 0
         for memory_obj, elapsed_time in timeout_objects:
             try:
-                self._force_unpin_timeout_object(memory_obj, elapsed_time)
-                force_unpin_success_count += 1
+                if self._force_unpin_timeout_object(memory_obj, elapsed_time):
+                    force_unpin_success_count += 1
             except Exception as e:
                 logger.error(
                     "Error forcing unpin for timeout object %s: %s", id(memory_obj), e
@@ -167,30 +222,36 @@ class PinMonitor(PeriodicThread):
 
         return pinned_count, len(timeout_objects), force_unpin_success_count
 
-    def _force_unpin_timeout_object(self, memory_obj: "MemoryObj", elapsed_time: float):
-        """Force unpin a timeout object and log the event."""
-        # Get current pin_count without holding the lock for unpin calls
-        # Use nullcontext if memory_obj doesn't have a lock attribute
-        obj_lock = getattr(memory_obj, "lock", None) or nullcontext()
-        with obj_lock:
-            current_pin_count = memory_obj.meta.pin_count
-            if current_pin_count <= 0:
-                return
-
-            logger.warning(
-                "Pin timeout detected for MemoryObj %s. "
-                "Pin count: %s, Elapsed time: %.2fs. Forcing unpin to 0.",
-                memory_obj.meta.address,
-                current_pin_count,
-                elapsed_time,
-            )
-
-        # Update forced unpin statistics
-        LMCStatsMonitor.GetOrCreate().update_forced_unpin_count(1)
-
-        # Call unpin() while pin_count > 0 to properly release resources
-        while memory_obj.meta.pin_count > 0:
-            memory_obj.unpin()
+    def _force_unpin_timeout_object(
+        self, memory_obj: "MemoryObj", elapsed_time: float
+    ) -> bool:
+        """Recheck a candidate against lease grants/releases before expiring it."""
+        with self._lease_lock:
+            with self._objects_lock:
+                obj_id = id(memory_obj)
+                entry = self._pinned_objects.get(obj_id)
+                if (
+                    obj_id in self._protected_pins
+                    or entry is None
+                    or time.time() - entry[1] <= self._pin_timeout_sec
+                ):
+                    return False
+            obj_lock = getattr(memory_obj, "lock", None) or nullcontext()
+            with obj_lock:
+                current_pin_count = memory_obj.meta.pin_count
+                if current_pin_count <= 0:
+                    return False
+                logger.warning(
+                    "Pin timeout detected for MemoryObj %s. "
+                    "Pin count: %s, Elapsed time: %.2fs. Forcing unpin to 0.",
+                    memory_obj.meta.address,
+                    current_pin_count,
+                    elapsed_time,
+                )
+            LMCStatsMonitor.GetOrCreate().update_forced_unpin_count(1)
+            while memory_obj.meta.pin_count > 0:
+                memory_obj.unpin()
+            return True
 
     def _execute(self) -> ThreadRunSummary:
         """

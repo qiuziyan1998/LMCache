@@ -26,7 +26,9 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
 )
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import layerwise_prefill_p_node_enabled
 from vllm.v1.request import RequestStatus
 from vllm.version import __version__ as VLLM_VERSION
 import torch
@@ -35,6 +37,7 @@ import torch
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
 from lmcache import utils
+from lmcache.integration.vllm.layerwise_prefill import LayerwisePrefillRequest
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
@@ -2205,6 +2208,9 @@ class ReqMeta:
 @dataclass
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
+    layerwise_prefill_finished: set[str] = field(default_factory=set)
+    # None selects the ordinary path; an empty list is a P step without work.
+    layerwise_prefill_requests: Optional[list[LayerwisePrefillRequest]] = None
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -2227,6 +2233,7 @@ class LMCacheConnectorV1Impl:
         self._parent = parent
         self._vllm_config = vllm_config
         self._role = role
+        self._layerwise_prefill_p_node = layerwise_prefill_p_node_enabled()
         self.device = vllm_config.device_config.device
         self.kv_role = vllm_config.kv_transfer_config.kv_role
 
@@ -2651,6 +2658,9 @@ class LMCacheConnectorV1Impl:
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
             self._unfinished_requests: dict[str, "Request"] = {}
+            self._layerwise_prefill_scheduler_requests: dict[
+                str, LayerwisePrefillRequest
+            ] = {}
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
@@ -7036,6 +7046,62 @@ class LMCacheConnectorV1Impl:
         attn_metadata = forward_context.attn_metadata
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
+        if getattr(self, "_layerwise_prefill_p_node", False):
+            if metadata.layerwise_prefill_requests is None:
+                raise RuntimeError(
+                    "P-node forward lost its bank-aware request bindings"
+                )
+            if not metadata.layerwise_prefill_requests:
+                return
+            if attn_metadata is None:
+                raise RuntimeError("P-node row restore requires a model forward")
+            if not self.kv_caches:
+                self._init_kv_caches_from_forward_context(forward_context)
+            backend = self._layerwise_prefill_backend
+            if backend is None or not callable(getattr(backend, "bind_step", None)):
+                raise RuntimeError("P-node requires a bound synchronous row backend")
+            window = self._layerwise_prefill_window_or_raise("bind")
+            for req_id in metadata.layerwise_prefill_finished:
+                if window.has_request(req_id):
+                    window.release_request(req_id)
+            for request in metadata.requests:
+                if request.resumed_from_preemption and window.has_request(
+                    request.req_id
+                ):
+                    window.wait_for_request_persist_done(request.req_id)
+                    window.release_request(request.req_id)
+            # Scheduler new/cached ordering can differ from the worker batch.
+            # The canonical callbacks are emitted in actual input-batch order.
+            callbacks = next(
+                (
+                    item.layerwise_prefill_callback_metadata
+                    for item in attn_metadata.values()
+                    if getattr(item, "layerwise_prefill_callback_metadata", ())
+                ),
+                (),
+            )
+            if not callbacks:
+                raise RuntimeError("P-node forward has no canonical row callbacks")
+            bindings = {
+                req.request_id: req for req in metadata.layerwise_prefill_requests
+            }
+            generations = callbacks[0].request_generations
+            if (
+                {req_id for req_id, _ in generations} != set(bindings)
+                or len(generations) != len(bindings)
+                or any(
+                    req_id not in bindings
+                    or bindings[req_id].allocation_generation != generation
+                    for req_id, generation in generations
+                )
+            ):
+                raise RuntimeError(
+                    "P-node callback request identities differ from scheduler bindings"
+                )
+            backend.bind_step(
+                [bindings[req_id] for req_id, _ in generations], self.kv_caches
+            )
+            return
         if getattr(metadata, "dsa_cold_compact_load_pending", False):
             cold_requests = [
                 request
@@ -9126,6 +9192,30 @@ class LMCacheConnectorV1Impl:
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
+        if getattr(self, "_layerwise_prefill_p_node", False):
+            bindings = connector_metadata.layerwise_prefill_requests
+            if bindings is None:
+                raise RuntimeError("P-node finalization lost its request bindings")
+            if not bindings:
+                return
+            self._layerwise_prefill_backend.finish_step()
+            window = self._layerwise_prefill_window_or_raise("persistence barrier")
+            for request in connector_metadata.requests:
+                window.wait_for_request_persist_done(request.req_id)
+                for group in (0, 1):
+                    self._record_prefill_save_group_completed(
+                        request,
+                        group,
+                        LayerwiseStoreResult(
+                            request_id=request.req_id,
+                            kv_group=group,
+                            committed_end=len(request.token_ids),
+                        ),
+                    )
+                self._mark_prefill_committed(request)
+                self._maybe_lookup_unpin_for_request(request)
+            return
+
         if self.kv_role == "kv_consumer":
             assert self.lmcache_engine is not None, (
                 "LMCacheEngine must be initialized to unpin requests."
@@ -9397,6 +9487,15 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        if getattr(self, "_layerwise_prefill_p_node", False):
+            metadata = self._parent._get_connector_metadata()
+            if metadata is not None and metadata.layerwise_prefill_requests is not None:
+                # The old generation was retired before bind_step; this ID now
+                # belongs to the incoming generation, not the finished one.
+                replacements = metadata.layerwise_prefill_finished.intersection(
+                    req.request_id for req in metadata.layerwise_prefill_requests
+                )
+                finished_req_ids = finished_req_ids - replacements
         cold_futures = getattr(self, "_dsa_cold_load_futures", None)
         if cold_futures and finished_req_ids:
             aborted_cold = finished_req_ids.intersection(cold_futures)
@@ -9458,7 +9557,8 @@ class LMCacheConnectorV1Impl:
             getattr(cache_config, "enable_prefix_caching", False)
         )
         return bool(
-            not prefix_caching
+            not getattr(self, "_layerwise_prefill_p_node", False)
+            and not prefix_caching
             and self.config.enable_dsa_cold_compact_load
             and self.config.enable_sparse_attention
             and self.config.dsa_two_groups
@@ -9585,14 +9685,10 @@ class LMCacheConnectorV1Impl:
             else 0.0,
         )
 
-        # When prompt length is divisible by the block size and all
-        # blocks are cached, we need to recompute the last token.
-        # This will be removed in the future if vLLM's scheduler provides
-        # a better support for this case.
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
-
-        # In, full-prompt-hit case, we need to recompute the last token
-        if num_external_hit_tokens == request.num_tokens:
+        if self._should_recompute_external_hit_boundary(
+            num_external_hit_tokens, request.num_tokens
+        ):
             need_to_allocate -= 1
 
         # Check if hit tokens meet the minimum for retrieve
@@ -9801,13 +9897,11 @@ class LMCacheConnectorV1Impl:
             self.load_specs[request.request_id].can_load = False
             return
 
-        recalc_last = (
-            1
-            if (
-                self.load_specs[request.request_id].lmcache_cached_tokens
-                == request.num_tokens
+        recalc_last = int(
+            self._should_recompute_external_hit_boundary(
+                self.load_specs[request.request_id].lmcache_cached_tokens,
+                request.num_tokens,
             )
-            else 0
         )
         assert (
             num_external_tokens
@@ -9821,7 +9915,7 @@ class LMCacheConnectorV1Impl:
             f"{self.load_specs[request.request_id].vllm_cached_tokens} "
             "(tokens in vllm) - "
             f"{recalc_last} "
-            "(full lmcache hits subtracts last token to recalculate logits)"
+            "(recompute last token for full hits or layerwise-prefill MTP hits)"
             f" for request {request.request_id}"
         )
 
@@ -10224,6 +10318,9 @@ class LMCacheConnectorV1Impl:
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
+
+        if getattr(self, "_layerwise_prefill_p_node", False):
+            return self._build_layerwise_prefill_meta(scheduler_output)
 
         force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
 
@@ -10737,6 +10834,233 @@ class LMCacheConnectorV1Impl:
             return self.lmcache_engine.get_kv_events()
         return []
 
+    def _should_recompute_external_hit_boundary(
+        self, hit: int, num_tokens: int
+    ) -> bool:
+        # Full hits need logits; P+MTP also shifts input one token ahead, so
+        # the last matched KV depends on a token outside the prefix hash.
+        return hit > 0 and (
+            hit == num_tokens
+            or (
+                getattr(self, "_layerwise_prefill_p_node", False)
+                and self._vllm_config.speculative_config is not None
+                and self._vllm_config.speculative_config.method
+                in ("deepseek_mtp", "mtp")
+            )
+        )
+
+    def _build_layerwise_prefill_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> LMCacheConnectorMetadata:
+        """Bind every P chunk to its scheduler snapshot and complete bank tables.
+
+        Invalid or stale allocation metadata raises before publishing any new
+        request state. No legacy tracker, save policy, or slot mapping is used.
+        """
+        incoming_ids = {req.req_id for req in scheduler_output.scheduled_new_reqs}
+        for req_id in scheduler_output.finished_req_ids:
+            self._layerwise_prefill_scheduler_requests.pop(req_id, None)
+            if req_id not in incoming_ids:
+                self._unfinished_requests.pop(req_id, None)
+                self.load_specs.pop(req_id, None)
+                self._requests_priority.pop(req_id, None)
+
+        cached = scheduler_output.scheduled_cached_reqs
+        count = len(cached.req_ids)
+        if any(
+            values is None or len(values) != count
+            for values in (
+                cached.new_block_ids,
+                cached.num_computed_tokens,
+                cached.num_output_tokens,
+                cached.new_block_ids_by_bank,
+                cached.new_block_allocation_modes,
+                cached.allocation_generations,
+            )
+            if count or values is not None
+        ) or len(cached.new_token_ids) not in (0, count):
+            raise ValueError(
+                "Layerwise-prefill cached metadata arrays differ in length"
+            )
+        if not cached.resumed_req_ids.issubset(cached.req_ids):
+            raise ValueError("Layerwise-prefill resume IDs are absent from cached data")
+
+        new_requests = {req.req_id: req for req in scheduler_output.scheduled_new_reqs}
+        req_ids = [req.req_id for req in scheduler_output.scheduled_new_reqs]
+        req_ids.extend(cached.req_ids)
+        if len(set(req_ids)) != len(req_ids) or set(req_ids) != set(
+            scheduler_output.num_scheduled_tokens
+        ):
+            raise ValueError("Layerwise-prefill scheduled request IDs are inconsistent")
+
+        bindings: list[LayerwisePrefillRequest] = []
+        meta = LMCacheConnectorMetadata(
+            layerwise_prefill_requests=bindings,
+            layerwise_prefill_finished=set(scheduler_output.finished_req_ids),
+        )
+        source: Union["NewRequestData", "Request"]
+        for index, req_id in enumerate(req_ids):
+            previous = self._layerwise_prefill_scheduler_requests.get(req_id)
+            new_request = new_requests.get(req_id)
+            resumed = req_id in cached.resumed_req_ids
+            if new_request is not None:
+                if previous is not None:
+                    raise ValueError("Layerwise-prefill new request is already active")
+                source = new_request
+                start = new_request.num_computed_tokens
+                primary = new_request.block_ids
+                bank_delta = new_request.block_ids_by_bank
+                mode = new_request.block_allocation_mode
+                generation = new_request.allocation_generation
+            else:
+                i = index - len(new_requests)
+                request = self._unfinished_requests.get(req_id)
+                if request is None or previous is None:
+                    raise ValueError(
+                        f"Layerwise-prefill cached request {req_id!r} has no state"
+                    )
+                source = request
+                if cached.num_output_tokens[i] != 0:
+                    raise ValueError("Layerwise-prefill cannot bind decode tokens")
+                start = cached.num_computed_tokens[i]
+                primary = cached.new_block_ids[i]
+                assert cached.new_block_ids_by_bank is not None
+                assert cached.new_block_allocation_modes is not None
+                assert cached.allocation_generations is not None
+                bank_delta = cached.new_block_ids_by_bank[i]
+                mode = cached.new_block_allocation_modes[i]
+                generation = cached.allocation_generations[i]
+
+            if (
+                not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or not 0 < generation < 1 << 64
+            ):
+                raise ValueError(
+                    "Layerwise-prefill requires a positive uint64 generation"
+                )
+            if previous is not None:
+                if (resumed and generation <= previous.allocation_generation) or (
+                    not resumed and generation != previous.allocation_generation
+                ):
+                    raise ValueError("Layerwise-prefill allocation generation is stale")
+                if not resumed and start != previous.compute_end:
+                    raise ValueError("Layerwise-prefill continuation has a token gap")
+
+            # An empty allocation has no mode in vLLM, but still has a generation.
+            if bank_delta is None:
+                if (
+                    previous is None
+                    or resumed
+                    or primary is not None
+                    or mode is not None
+                ):
+                    raise ValueError("Layerwise-prefill is missing PREFILL_CHILD banks")
+                banks = previous.block_ids_by_bank
+            else:
+                if mode != DSABlockAllocationMode.PREFILL_CHILD or primary is None:
+                    raise ValueError(
+                        "Layerwise-prefill requires PREFILL_CHILD allocation"
+                    )
+                banks = tuple(
+                    tuple(tuple(group) for group in bank) for bank in bank_delta
+                )
+                if len(banks) != 2 or any(len(bank) != 2 for bank in banks):
+                    raise ValueError(
+                        "Layerwise-prefill requires two banks of two groups"
+                    )
+                if banks[0] != tuple(tuple(group) for group in primary):
+                    raise ValueError(
+                        "Layerwise-prefill primary blocks differ from bank 0"
+                    )
+                if any(len(banks[0][g]) != len(banks[1][g]) for g in range(2)):
+                    raise ValueError("Layerwise-prefill bank group lengths differ")
+                if previous is not None and not resumed:
+                    banks = tuple(
+                        tuple(
+                            old_group + delta_group
+                            for old_group, delta_group in zip(
+                                old_bank, bank, strict=True
+                            )
+                        )
+                        for old_bank, bank in zip(
+                            previous.block_ids_by_bank, banks, strict=True
+                        )
+                    )
+            for group in range(2):
+                physical_ids = banks[0][group] + banks[1][group]
+                if any(type(block) is not int for block in physical_ids) or len(
+                    set(physical_ids)
+                ) != len(physical_ids):
+                    raise ValueError(
+                        "Layerwise-prefill banks alias or have invalid blocks"
+                    )
+
+            prompt = source.prompt_token_ids
+            if prompt is None:
+                raise ValueError("Layerwise-prefill requires prompt token IDs")
+            scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            if (
+                type(start) is not int
+                or type(scheduled) is not int
+                or scheduled <= 0
+                or not 0 <= start < len(prompt)
+            ):
+                raise ValueError("Layerwise-prefill requires a positive prompt range")
+            end = min(start + scheduled, len(prompt))
+            load_spec = self.load_specs.get(req_id)
+            if previous is not None and not resumed:
+                load_spec = None
+            restore_end = start
+            if load_spec is not None and load_spec.can_load:
+                hit = load_spec.lmcache_cached_tokens
+                if not 0 <= load_spec.vllm_cached_tokens <= hit <= len(prompt):
+                    raise ValueError(
+                        "Layerwise-prefill external hit exceeds the prompt"
+                    )
+                expected_start = hit - self._should_recompute_external_hit_boundary(
+                    hit, len(prompt)
+                )
+                if start != expected_start:
+                    raise ValueError(
+                        "Layerwise-prefill external hit mismatches compute start"
+                    )
+                restore_end = max(start, hit)
+            token_end = max(end, restore_end)
+            mm_hashes, mm_positions = extract_mm_features(source)
+            token_ids = tuple(
+                _apply_mm_hashes(prompt[:token_end], mm_hashes, mm_positions)
+            )
+            binding = LayerwisePrefillRequest(
+                request_id=req_id,
+                allocation_generation=generation,
+                token_ids=token_ids,
+                compute_start=start,
+                compute_end=end,
+                restore_end=restore_end,
+                block_ids_by_bank=banks,
+                block_size=self._block_size,
+                request_configs=extract_request_configs(source.sampling_params),
+            )
+            bindings.append(binding)
+            meta.add_request(
+                ReqMeta(
+                    req_id=req_id,
+                    token_ids=list(token_ids),
+                    save_spec=SaveSpec(start, True, True, True),
+                    load_spec=load_spec,
+                    is_last_prefill=end == len(prompt),
+                    request_configs=binding.request_configs,
+                    resumed_from_preemption=resumed,
+                )
+            )
+
+        for binding in bindings:
+            self._layerwise_prefill_scheduler_requests[binding.request_id] = binding
+            self.load_specs.pop(binding.request_id, None)
+            self._requests_priority.pop(binding.request_id, None)
+        return meta
+
     def _build_layerwise_prefill_window(
         self,
     ) -> Optional[LayerwisePrefillWindowCoordinator]:
@@ -10754,6 +11078,7 @@ class LMCacheConnectorV1Impl:
             return None
         engine = getattr(self, "lmcache_engine", None)
         backend = getattr(engine, "layerwise_prefill_window_backend", None)
+        self._layerwise_prefill_backend = backend
         window = LayerwisePrefillWindowCoordinator(topology_cache, backend)
         config = getattr(self, "config", None)
         cpu_cache_bytes = int(

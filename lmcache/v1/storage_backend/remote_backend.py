@@ -308,6 +308,10 @@ class RemoteBackend(StorageBackendInterface):
         """
         Submit batched put tasks to store KV caches to remote storage.
 
+        For batched connectors, serialization or scheduling failures release
+        serializer-owned objects and propagate to the caller. After scheduling,
+        the connector owns cleanup.
+
         :param on_complete_callback: Optional callback invoked once per key
             after that key's write completes (not once per batch).
         """
@@ -324,10 +328,14 @@ class RemoteBackend(StorageBackendInterface):
             for memory_obj in memory_objs:
                 memory_obj.ref_count_up()
 
-            compressed_memory_objs = []
+            compressed_memory_objs: List[MemoryObj] = []
             try:
                 for memory_obj in memory_objs:
                     compressed_memory_objs.append(self.serializer.serialize(memory_obj))
+            except BaseException:
+                for compressed_memory_obj in compressed_memory_objs:
+                    compressed_memory_obj.ref_count_down()
+                raise
             finally:
                 # Always decrement reference counts for all objects,
                 # regardless of whether serialization succeeded or failed
@@ -346,10 +354,19 @@ class RemoteBackend(StorageBackendInterface):
                                 f"on_complete_callback failed for key {key}: {e}"
                             )
 
-            future = asyncio.run_coroutine_threadsafe(
-                self.connection.batched_put(keys, compressed_memory_objs),  # type: ignore
-                self.loop,
-            )
+            put_coroutine = None
+            try:
+                put_coroutine = self.connection.batched_put(
+                    keys, compressed_memory_objs  # type: ignore
+                )
+                future = asyncio.run_coroutine_threadsafe(put_coroutine, self.loop)
+            except BaseException:
+                # No handoff: closing an unstarted coroutine does not run its cleanup.
+                if put_coroutine is not None:
+                    put_coroutine.close()
+                for compressed_memory_obj in compressed_memory_objs:
+                    compressed_memory_obj.ref_count_down()
+                raise
             future.add_done_callback(batched_done_callback)
             return [future] if self.requires_put_completion() else None
         else:
