@@ -186,6 +186,7 @@ class _LayerwisePrefillWindowJob:
     # callback carries them so multi-request batches do not over-count.
     bytes: int = 0
     primary: bool = False
+    request_generations: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass
@@ -236,6 +237,7 @@ class LayerwisePrefillWindowCoordinator:
         self._stale_arenas: dict[
             tuple[str, int], _LayerwisePrefillRequestArena
         ] = {}
+        self._released_generations: dict[str, int] = {}
         self._max_pending_jobs = (
             max_pending_jobs
             if max_pending_jobs is not None
@@ -347,17 +349,21 @@ class LayerwisePrefillWindowCoordinator:
                 "request generation."
             )
         validated = []
+        request_ids = set()
         for request_id, generation in generations:
             if (
                 not isinstance(request_id, str)
                 or not request_id
                 or not isinstance(generation, int)
                 or isinstance(generation, bool)
+                or generation <= 0
+                or request_id in request_ids
             ):
                 raise ValueError(
                     "Layerwise-prefill callback generations must contain "
-                    "non-empty request IDs and integer generations."
+                    "unique non-empty request IDs and positive integer generations."
                 )
+            request_ids.add(request_id)
             validated.append((request_id, generation))
         return tuple(validated)
 
@@ -366,6 +372,7 @@ class LayerwisePrefillWindowCoordinator:
         request_id: str,
         generation: int,
     ) -> _LayerwisePrefillRequestArena:
+        self._validate_active_generations(((request_id, generation),))
         arena = self._arenas.get(request_id)
         if arena is not None and arena.allocation_generation == generation:
             return arena
@@ -417,6 +424,8 @@ class LayerwisePrefillWindowCoordinator:
         self,
         arena: _LayerwisePrefillRequestArena,
         row: Any,
+        *,
+        reset: bool = True,
     ) -> int:
         """Reset one completed group cursor for the next prefill chunk."""
 
@@ -455,12 +464,31 @@ class LayerwisePrefillWindowCoordinator:
                 f"pending group-{kv_group} loads."
             )
 
+        if not reset:
+            return 0
         for row_ordinal in range(cardinality):
             del arena.jobs[(kv_group, row_ordinal)]
         arena.save_cursors[kv_group] = 0
         arena.load_submitted_through[kv_group] = 0
         arena.pending_load_rows.pop(kv_group, None)
         return 0
+
+    def _validate_save_batch(
+        self, generations: tuple[tuple[str, int], ...], row: Any
+    ) -> None:
+        """Check all cursors before replacing arenas or resetting chunk state."""
+        self._validate_active_generations(generations)
+        for request_id, generation in generations:
+            arena = self._arenas.get(request_id)
+            if arena is None or arena.allocation_generation != generation:
+                arena = _LayerwisePrefillRequestArena(request_id, generation)
+            expected = self._prepare_save_cursor(arena, row, reset=False)
+            if row.row_ordinal != expected:
+                raise RuntimeError(
+                    "Layerwise-prefill saves must arrive in per-group row "
+                    f"order: group={row.kv_group}, expected row "
+                    f"{expected}, got {row.row_ordinal}."
+                )
 
     def _settle_job(
         self,
@@ -496,29 +524,15 @@ class LayerwisePrefillWindowCoordinator:
         generations = self._metadata_request_generations(metadata)
         row = metadata.row
         with self._lock:
-            arenas = []
-            must_wait = False
-            for request_id, generation in generations:
-                arena = self._resolve_arena(request_id, generation)
-                if arena is None:
-                    # The wait is the first callback of a request; it creates
-                    # the arena that all later saves of this generation use.
-                    arena = self._arena_for(request_id, generation)
-                arenas.append(arena)
-                must_wait = must_wait or (
-                    not arena.stale
-                    and row.row_ordinal
-                    in arena.pending_load_rows.get(row.kv_group, set())
-                )
-        if must_wait:
+            self._validate_active_generations(generations)
+            # A missing pending-load entry does not prove there is no prefix:
+            # sync callbacks and each chunk's row zero need the backend too.
             self._backend.wait_for_load(metadata)
-        with self._lock:
             for request_id, generation in generations:
-                arena = self._resolve_arena(request_id, generation)
-                if arena is not None and not arena.stale:
-                    arena.pending_load_rows.setdefault(
-                        row.kv_group, set()
-                    ).discard(row.row_ordinal)
+                arena = self._arena_for(request_id, generation)
+                arena.pending_load_rows.setdefault(
+                    row.kv_group, set()
+                ).discard(row.row_ordinal)
 
     def submit_save(
         self,
@@ -538,31 +552,17 @@ class LayerwisePrefillWindowCoordinator:
         row = metadata.row
         extra_bytes = self._kv_layer_bytes(kv_layer)
         with self._lock:
-            arenas = []
-            for request_id, generation in generations:
-                arena = self._resolve_arena(request_id, generation)
-                if arena is not None and arena.stale:
-                    raise RuntimeError(
-                        "Refusing a layerwise-prefill save for the superseded "
-                        f"generation {request_id!r}/{generation}."
-                    )
-                if arena is None:
-                    arena = self._arena_for(request_id, generation)
-                expected = self._prepare_save_cursor(arena, row)
-                if row.row_ordinal != expected:
-                    raise RuntimeError(
-                        "Layerwise-prefill saves must arrive in per-group row "
-                        f"order: group={row.kv_group}, expected row "
-                        f"{expected}, got {row.row_ordinal}."
-                    )
-                arenas.append(arena)
+            self._validate_save_batch(generations, row)
             self._enforce_pending_bounds(extra_bytes)
             self._backend.submit_save(metadata, kv_layer, attn_metadata)
-            for index, arena in enumerate(arenas):
+            for index, (request_id, generation) in enumerate(generations):
+                arena = self._arena_for(request_id, generation)
+                self._prepare_save_cursor(arena, row)
                 arena.jobs[(row.kv_group, row.row_ordinal)] = (
                     _LayerwisePrefillWindowJob(
                         bytes=extra_bytes if index == 0 else 0,
                         primary=index == 0,
+                        request_generations=generations,
                     )
                 )
                 arena.save_cursors[row.kv_group] = row.row_ordinal + 1
@@ -581,6 +581,35 @@ class LayerwisePrefillWindowCoordinator:
         generations = self._metadata_request_generations(metadata)
         row = metadata.row
         with self._lock:
+            if any(
+                generation <= self._released_generations.get(request_id, 0)
+                or (
+                    request_id in self._arenas
+                    and generation < self._arenas[request_id].allocation_generation
+                )
+                for request_id, generation in generations
+            ):
+                # Retire only a known, exact old submit. The backend must keep
+                # any newer submission and its physical bank event intact.
+                stale_jobs = [
+                    arena.jobs.get((row.kv_group, row.row_ordinal))
+                    if (arena := self._resolve_arena(req, gen)) is not None
+                    else None
+                    for req, gen in generations
+                ]
+                if stale_jobs and all(
+                    job is not None
+                    and job.request_generations == generations
+                    and job.phase is LayerwisePrefillSavePhase.SAVE_SUBMITTED
+                    for job in stale_jobs
+                ):
+                    self._backend.finish_save(metadata)
+                    for req, gen in generations:
+                        arena = self._resolve_arena(req, gen)
+                        assert arena is not None
+                        job = arena.jobs.pop((row.kv_group, row.row_ordinal))
+                        arena.pending_bytes -= job.bytes
+                return
             arenas = []
             jobs = []
             for request_id, generation in generations:
@@ -596,6 +625,10 @@ class LayerwisePrefillWindowCoordinator:
                         "Layerwise-prefill finish arrived before its submit: "
                         f"group={row.kv_group}, row={row.row_ordinal}."
                     )
+                if job.request_generations != generations:
+                    raise RuntimeError(
+                        "Layerwise-prefill finish identity differs from its submit."
+                    )
                 arenas.append(arena)
                 jobs.append(job)
             submitted = [
@@ -604,9 +637,7 @@ class LayerwisePrefillWindowCoordinator:
                 if job.phase is LayerwisePrefillSavePhase.SAVE_SUBMITTED
             ]
             if not submitted:
-                # Duplicate completion for an already-published row is
-                # idempotent; the backend still cleans its own resources.
-                self._backend.finish_save(metadata)
+                # The backend already published this row; never publish twice.
                 return
             future = self._backend.finish_save(metadata)
             for arena, job in zip(arenas, jobs, strict=True):
@@ -639,30 +670,16 @@ class LayerwisePrefillWindowCoordinator:
         generations = self._metadata_request_generations(metadata)
         row = metadata.row
         with self._lock:
-            arenas = []
-            for request_id, generation in generations:
-                arena = self._resolve_arena(request_id, generation)
-                if arena is not None and arena.stale:
-                    raise RuntimeError(
-                        "Refusing a layerwise-prefill save for the superseded "
-                        f"generation {request_id!r}/{generation}."
-                    )
-                if arena is None:
-                    arena = self._arena_for(request_id, generation)
-                expected = self._prepare_save_cursor(arena, row)
-                if row.row_ordinal != expected:
-                    raise RuntimeError(
-                        "Layerwise-prefill saves must arrive in per-group row "
-                        f"order: group={row.kv_group}, expected row "
-                        f"{expected}, got {row.row_ordinal}."
-                    )
-                arenas.append(arena)
+            self._validate_save_batch(generations, row)
             self._backend.sync_save(metadata, kv_layer, attn_metadata)
-            for index, arena in enumerate(arenas):
+            for index, (request_id, generation) in enumerate(generations):
+                arena = self._arena_for(request_id, generation)
+                self._prepare_save_cursor(arena, row)
                 arena.jobs[(row.kv_group, row.row_ordinal)] = (
                     _LayerwisePrefillWindowJob(
                         phase=LayerwisePrefillSavePhase.PERSIST_DONE,
                         primary=index == 0,
+                        request_generations=generations,
                     )
                 )
                 arena.save_cursors[row.kv_group] = row.row_ordinal + 1
@@ -679,14 +696,10 @@ class LayerwisePrefillWindowCoordinator:
         generations = self._metadata_request_generations(metadata)
         execution = metadata.execution
         with self._lock:
-            submissions: list[tuple[int, int]] = []
+            self._validate_active_generations(generations, allow_new=False)
+            submissions = []
             for request_id, generation in generations:
-                arena = self._resolve_arena(request_id, generation)
-                if arena is None or arena.stale:
-                    raise RuntimeError(
-                        "Layerwise-prefill load submit for an inactive request "
-                        f"generation: {request_id!r}/{generation}."
-                    )
+                arena = self._arenas[request_id]
                 for kv_group in self._expected_groups(execution):
                     row = (
                         execution.latent
@@ -700,13 +713,12 @@ class LayerwisePrefillWindowCoordinator:
                         continue
                     if next_row < arena.load_submitted_through.get(kv_group, 0):
                         continue
+                    submissions.append((arena, kv_group, next_row))
+            if submissions:
+                self._backend.submit_load(metadata)
+                for arena, kv_group, next_row in submissions:
                     arena.load_submitted_through[kv_group] = next_row + 1
-                    arena.pending_load_rows.setdefault(kv_group, set()).add(
-                        next_row
-                    )
-                    submissions.append((kv_group, next_row))
-        if submissions:
-            self._backend.submit_load(metadata)
+                    arena.pending_load_rows.setdefault(kv_group, set()).add(next_row)
 
     def poll_completed_persists(self) -> None:
         """Settle persistence futures that already completed (non-blocking)."""
@@ -721,18 +733,20 @@ class LayerwisePrefillWindowCoordinator:
             return request_id in self._arenas
 
     def release_request(self, request_id: str) -> None:
-        """Drop every arena (current and stale) owned by one request."""
+        """Drop request arenas, retaining a tombstone against old callbacks."""
 
         with self._lock:
-            self._arenas.pop(request_id, None)
+            arena = self._arenas.pop(request_id, None)
+            if arena is not None:
+                self._released_generations[request_id] = arena.allocation_generation
             for key in [
                 key for key in self._stale_arenas if key[0] == request_id
             ]:
                 del self._stale_arenas[key]
-        if self._backend is not None:
-            abort = getattr(self._backend, "abort_request", None)
-            if callable(abort):
-                abort(request_id)
+            if self._backend is not None:
+                abort = getattr(self._backend, "abort_request", None)
+                if callable(abort):
+                    abort(request_id)
 
     def request_persist_done(self, request_id: str) -> bool:
         """Whether every required row of a request reached PERSIST_DONE."""
@@ -797,6 +811,31 @@ class LayerwisePrefillWindowCoordinator:
                 ):
                     return False
         return True
+
+    def _validate_active_generations(
+        self,
+        generations: tuple[tuple[str, int], ...],
+        *,
+        allow_new: bool = True,
+    ) -> None:
+        """Validate the whole batch before any arena or cursor mutation."""
+
+        for request_id, generation in generations:
+            arena = self._arenas.get(request_id)
+            if generation <= self._released_generations.get(request_id, 0) or (
+                arena is not None and generation < arena.allocation_generation
+            ):
+                raise RuntimeError(
+                    "Refusing a layerwise-prefill callback for the superseded or "
+                    f"released generation {request_id!r}/{generation}."
+                )
+            if not allow_new and (
+                arena is None or generation != arena.allocation_generation
+            ):
+                raise RuntimeError(
+                    "Layerwise-prefill load submit for an inactive request "
+                    f"generation: {request_id!r}/{generation}."
+                )
 
 
 def _mtp_dw_diag_enabled() -> bool:

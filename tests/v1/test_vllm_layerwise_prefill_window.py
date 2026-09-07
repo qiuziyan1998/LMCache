@@ -95,6 +95,8 @@ def _callback(
     cache: _DSAKVTopologyCache,
     execution_ordinal: int,
     generation: int = 7,
+    *,
+    request_generations: Optional[tuple[tuple[str, int], ...]] = None,
 ) -> Any:
     entry = cache.execution_to_entry[execution_ordinal]
     latent_row = entry.latent
@@ -118,7 +120,9 @@ def _callback(
     execution = DSAExecutionRow(entry.execution_ordinal, latent, indexer)
     return LayerwisePrefillCallbackMetadata.for_execution(
         execution,
-        (("req-1", generation),),
+        request_generations
+        if request_generations is not None
+        else (("req-1", generation),),
     )
 
 
@@ -227,7 +231,7 @@ def test_duplicate_finish_is_idempotent() -> None:
     coordinator.finish_save(metadata)
     coordinator.finish_save(metadata)
 
-    assert backend.events.count("finish-0") == 2
+    assert backend.events.count("finish-0") == 1
     arena = coordinator._arenas["req-1"]
     assert arena.jobs[(0, 0)].phase is LayerwisePrefillSavePhase.PERSIST_DONE
 
@@ -241,6 +245,8 @@ def test_delayed_persistence_future_blocks_request_completion() -> None:
 
     coordinator.submit_save(metadata, _kv_layer())
     coordinator.finish_save(metadata)
+    coordinator.finish_save(metadata)
+    assert backend.events.count("finish-0") == 1
 
     arena = coordinator._arenas["req-1"]
     assert arena.jobs[(0, 0)].phase is LayerwisePrefillSavePhase.SOURCE_DONE
@@ -248,6 +254,8 @@ def test_delayed_persistence_future_blocks_request_completion() -> None:
 
     future.set_result(None)
     coordinator.poll_completed_persists()
+    coordinator.finish_save(metadata)
+    assert backend.events.count("finish-0") == 1
     assert arena.jobs[(0, 0)].phase is LayerwisePrefillSavePhase.PERSIST_DONE
 
 
@@ -341,8 +349,9 @@ def test_release_drops_arenas_and_aborts_backend() -> None:
 
     assert coordinator.has_request("req-1") is False
     assert backend.aborted == ["req-1"]
-    with pytest.raises(RuntimeError, match="unknown request"):
-        coordinator.finish_save(_callback(cache, 0)[0])
+    events = backend.events.copy()
+    coordinator.finish_save(_callback(cache, 0)[0])
+    assert backend.events == events
 
 
 def test_blocking_barrier_waits_for_outstanding_futures() -> None:
@@ -525,6 +534,8 @@ def test_sync_contract_repeats_rows_for_chunked_prefill() -> None:
 
     assert backend.events.count("sync-save-0") == 2 * 79
     assert backend.events.count("sync-save-1") == 2 * 22
+    assert backend.events.count("wait-0") == 2 * 79
+    assert backend.events.count("wait-1") == 2 * 22
 
 
 def test_transfer_window_repeats_rows_after_previous_chunk_persists() -> None:
@@ -539,6 +550,167 @@ def test_transfer_window_repeats_rows_after_previous_chunk_persists() -> None:
     assert coordinator.request_persist_done("req-1") is True
     assert backend.events.count("submit-save-0") == 2 * 79
     assert backend.events.count("submit-save-1") == 2 * 22
+    assert backend.events.count("wait-0") == 2 * 79
+    assert backend.events.count("wait-1") == 2 * 22
+
+
+@pytest.mark.parametrize(
+    "callback", ["wait_for_load", "save", "submit_save", "submit_load"]
+)
+@pytest.mark.parametrize("mixed", [False, True])
+def test_lower_generation_batch_is_rejected_atomically(
+    callback: str,
+    mixed: bool,
+) -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    current = _callback(cache, 0, generation=9)[0]
+    coordinator.wait_for_load(current)
+    generations = (("req-1", 8),)
+    if mixed:
+        generations = (("fresh", 10), *generations)
+    stale = _callback(cache, 0, request_generations=generations)[0]
+    events = backend.events.copy()
+
+    args = (stale, _kv_layer()) if callback in ("save", "submit_save") else (stale,)
+    with pytest.raises(RuntimeError, match="superseded|inactive"):
+        getattr(coordinator, callback)(*args)
+    assert backend.events == events
+    assert coordinator.has_request("fresh") is False
+    # The unseen lower generation must not replace the active arena.
+    coordinator.save(current, _kv_layer())
+
+
+@pytest.mark.parametrize("callback", ["wait_for_load", "save", "submit_save"])
+def test_invalid_batch_does_not_supersede_an_earlier_member(callback: str) -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    current = _callback(cache, 0, request_generations=(("req-1", 9), ("req-2", 9)))[0]
+    coordinator.wait_for_load(current)
+    mixed = _callback(cache, 0, request_generations=(("req-1", 10), ("req-2", 8)))[0]
+    events = backend.events.copy()
+    args = (mixed, _kv_layer()) if callback != "wait_for_load" else (mixed,)
+
+    with pytest.raises(RuntimeError, match="superseded"):
+        getattr(coordinator, callback)(*args)
+    assert backend.events == events
+    coordinator.save(current, _kv_layer())
+
+
+def test_failed_bootstrap_wait_does_not_create_an_arena(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    wait = Mock(side_effect=[RuntimeError("missing restored prefix"), None])
+    monkeypatch.setattr(backend, "wait_for_load", wait)
+    metadata = _callback(cache, 0)[0]
+
+    with pytest.raises(RuntimeError, match="missing restored prefix"):
+        coordinator.wait_for_load(metadata)
+    assert coordinator.has_request("req-1") is False
+    coordinator.wait_for_load(metadata)
+    assert wait.call_count == 2
+    assert coordinator.has_request("req-1") is True
+
+
+def test_failed_load_submit_can_be_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    submit = Mock(side_effect=[RuntimeError("load failed"), None])
+    monkeypatch.setattr(backend, "submit_load", submit)
+    metadata = _callback(cache, 0)[0]
+    coordinator.wait_for_load(metadata)
+
+    with pytest.raises(RuntimeError, match="load failed"):
+        coordinator.submit_load(metadata)
+    coordinator.submit_load(metadata)
+    assert submit.call_count == 2
+
+
+def test_release_blocks_old_and_equal_generations_but_allows_newer() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    coordinator.wait_for_load(_callback(cache, 0, generation=9)[0])
+    coordinator.release_request("req-1")
+    coordinator.release_request("req-1")
+    events = backend.events.copy()
+
+    for generation in (8, 9):
+        old = _callback(cache, 0, generation=generation)[0]
+        with pytest.raises(RuntimeError, match="released"):
+            coordinator.wait_for_load(old)
+        with pytest.raises(RuntimeError, match="released"):
+            coordinator.submit_save(old, _kv_layer())
+        coordinator.finish_save(old)
+    assert backend.events == events
+    assert coordinator.has_request("req-1") is False
+    new = _callback(cache, 0, generation=10)[0]
+    coordinator.wait_for_load(new)
+    coordinator.submit_save(new, _kv_layer())
+    coordinator.finish_save(new)
+    assert coordinator.pending_jobs() == 0
+
+
+def test_finish_requires_exact_batch_and_never_activates_a_generation() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    metadata = _callback(cache, 0, request_generations=(("req-1", 7), ("req-2", 7)))[0]
+    coordinator.submit_save(metadata, _kv_layer())
+    subset = _callback(cache, 0)[0]
+
+    with pytest.raises(RuntimeError, match="identity"):
+        coordinator.finish_save(subset)
+    unknown = _callback(cache, 0, request_generations=(("fresh", 8),))[0]
+    with pytest.raises(RuntimeError, match="unknown request"):
+        coordinator.finish_save(unknown)
+    assert coordinator.has_request("fresh") is False
+    coordinator.finish_save(metadata)
+    assert backend.events == ["submit-save-0", "finish-0"]
+
+
+@pytest.mark.parametrize("window", [False, True])
+@pytest.mark.parametrize("failure", ["later_cursor", "backend", "rollover"])
+def test_save_failure_preserves_arena_generation_and_chunk_state(
+    monkeypatch: pytest.MonkeyPatch, window: bool, failure: str
+) -> None:
+    cache = _topology_cache((1, 1) if failure == "rollover" else (2, 1))
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    generations = (("req-1", 7), ("req-2", 7))
+    metadata = _callback(cache, 0, request_generations=generations)[0]
+    save = coordinator.submit_save if window else coordinator.save
+    save(metadata, _kv_layer())
+    if window:
+        coordinator.finish_save(metadata)
+    arenas = dict(coordinator._arenas)
+    jobs = {req: dict(arena.jobs) for req, arena in arenas.items()}
+    cursors = {req: dict(arena.save_cursors) for req, arena in arenas.items()}
+
+    if failure != "later_cursor":
+        monkeypatch.setattr(
+            backend, "submit_save" if window else "sync_save",
+            Mock(side_effect=RuntimeError("submission failed")),
+        )
+    if failure == "later_cursor":
+        generations = (("req-1", 9), ("req-2", 7))
+    elif failure == "backend":
+        generations = (("req-1", 9), ("req-2", 9))
+    metadata = _callback(cache, 0, request_generations=generations)[0]
+    with pytest.raises(RuntimeError, match="per-group row order|submission failed"):
+        save(metadata, _kv_layer())
+    for req, arena in arenas.items():
+        assert coordinator._arenas[req] is arena
+        assert arena.allocation_generation == 7
+        assert arena.jobs == jobs[req]
+        assert arena.save_cursors == cursors[req]
+    assert coordinator._stale_arenas == {}
 
 
 def _window_connector(
