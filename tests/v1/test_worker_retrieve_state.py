@@ -4,9 +4,9 @@
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
+import inspect
 
 # Third Party
 import pytest
@@ -2107,6 +2107,7 @@ class TestWorkerRetrieveState:
                     synchronize_dense_load_readiness=MagicMock(),
                 ),
                 release_shared_cpu_sparse_request=MagicMock(),
+                lookup_unpin=MagicMock(),
             )
         )
 
@@ -2160,7 +2161,7 @@ class TestWorkerRetrieveState:
         connector.synchronize_dense_load_readiness.assert_called_once_with(readiness)
         assert not hasattr(impl, "_dense_load_retirements")
 
-    def test_dense_retirement_without_query_uses_legacy_synchronization(self):
+    def test_dense_retirement_without_query_retains_owners_without_blocking(self):
         readiness = object()
         connector = SimpleNamespace(synchronize_dense_load_readiness=MagicMock())
         impl = _make_impl()
@@ -2171,6 +2172,11 @@ class TestWorkerRetrieveState:
         impl._dense_load_retirements = {id(state): state}
 
         impl._drain_dense_load_retirements()
+
+        connector.synchronize_dense_load_readiness.assert_not_called()
+        assert impl._dense_load_retirements == {id(state): state}
+
+        impl._drain_dense_load_retirements(block=True)
 
         connector.synchronize_dense_load_readiness.assert_called_once_with(readiness)
         assert not hasattr(impl, "_dense_load_retirements")
@@ -2189,6 +2195,57 @@ class TestWorkerRetrieveState:
 
         with pytest.raises(RuntimeError, match="request ID was reused"):
             impl._submit_dsa_cold_compact_load(SimpleNamespace(req_id="reused"))
+
+        connector.query_dense_load_readiness.assert_called_once_with(readiness)
+
+    @pytest.mark.parametrize("retiring_same_id", [False, True])
+    def test_cold_submit_only_polls_retirement_of_reused_request(
+        self, retiring_same_id
+    ):
+        readiness = object()
+        connector = SimpleNamespace(
+            query_dense_load_readiness=MagicMock(return_value=True),
+            synchronize_dense_load_readiness=MagicMock(),
+        )
+        engine = SimpleNamespace(
+            gpu_connector=connector,
+            release_shared_cpu_sparse_request=MagicMock(),
+        )
+        impl = _make_impl()
+        impl._manager = SimpleNamespace(lmcache_engine=engine)
+        other = WorkerRetrieveState(req_id="other", dense_load_readiness=object())
+        impl._dense_load_retirements = {id(other): other}
+        if retiring_same_id:
+            state = WorkerRetrieveState(
+                req_id="request", dense_load_readiness=readiness
+            )
+            impl._dense_load_retirements[id(state)] = state
+        # An already submitted generation makes this a retry, with no new IO.
+        impl._dsa_cold_load_futures = {"request": (1,)}
+        request = SimpleNamespace(
+            req_id="request",
+            load_spec=SimpleNamespace(dsa_cold_load_generation=1),
+        )
+
+        impl._submit_dsa_cold_compact_load(request)
+
+        assert impl._dense_load_retirements == {id(other): other}
+        connector.synchronize_dense_load_readiness.assert_not_called()
+        if retiring_same_id:
+            connector.query_dense_load_readiness.assert_called_once_with(readiness)
+            engine.release_shared_cpu_sparse_request.assert_called_once_with("request")
+        else:
+            connector.query_dense_load_readiness.assert_not_called()
+            engine.release_shared_cpu_sparse_request.assert_not_called()
+
+    def test_get_finished_polls_retirements_once(self):
+        impl = _make_impl()
+        impl._drain_dense_load_retirements = MagicMock()
+        impl._drain_dsa_cold_load_futures = MagicMock(return_value=None)
+
+        assert impl.get_finished(set()) == (None, None)
+
+        impl._drain_dense_load_retirements.assert_called_once_with()
 
     def test_get_finished_releases_worker_state_after_save(self):
         impl = _make_impl()
@@ -3196,6 +3253,7 @@ class TestWorkerRetrieveState:
             adapter_mod.RETRIEVE_STATS_INTERVAL_SECONDS_ENV,
             "10",
         )
+        monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
         timestamps = iter((100.0, 105.0, 111.0, 112.0))
         monkeypatch.setattr(
             adapter_mod.time,
@@ -3212,17 +3270,17 @@ class TestWorkerRetrieveState:
         impl, _, _ = make_worker_connector([], use_layerwise=True)
         impl._record_sparse_retrieve_stats(
             torch.zeros((2, 4), dtype=torch.int32),
-            torch.tensor([3, 4], dtype=torch.int32),
+            [3, 4],
             row_count=2,
         )
         impl._record_sparse_retrieve_stats(
             torch.zeros(4, dtype=torch.int32),
-            torch.tensor(5, dtype=torch.int32),
+            5,
             row_count=1,
         )
         impl._record_sparse_retrieve_stats(
             torch.zeros((2, 4), dtype=torch.int32),
-            torch.tensor([2, 6], dtype=torch.int32),
+            [2, 6],
             row_count=2,
         )
 
@@ -3234,13 +3292,30 @@ class TestWorkerRetrieveState:
 
         impl._record_sparse_retrieve_stats(
             torch.zeros(4, dtype=torch.int32),
-            torch.tensor(4, dtype=torch.int32),
+            4,
             row_count=1,
         )
         assert len(log_records) == 1
         assert impl._retrieve_stats_request_count == 1
         assert impl._retrieve_stats_row_count == 1
         assert impl._retrieve_stats_token_count == 4
+
+    def test_retrieve_stats_omit_tensor_counts_without_readback(self, monkeypatch):
+        monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
+        monkeypatch.setenv(adapter_mod.RETRIEVE_STATS_INTERVAL_SECONDS_ENV, "10")
+        impl, _, _ = make_worker_connector([], use_layerwise=True)
+        # Meta tensors cannot be read back; even CPU tensors must be omitted
+        # rather than introducing reduction/copy work into this diagnostic.
+        counts = torch.empty(2, device="meta", dtype=torch.int32)
+        impl._record_sparse_retrieve_stats(None, counts, row_count=2)
+        assert impl._retrieve_stats_request_count == 0
+
+    def test_retrieve_stats_cold_perf_off_overrides_interval(self, monkeypatch):
+        monkeypatch.setenv("LMCACHE_COLD_START_PERF", "0")
+        monkeypatch.setenv(adapter_mod.RETRIEVE_STATS_INTERVAL_SECONDS_ENV, "10")
+        impl, _, _ = make_worker_connector([], use_layerwise=True)
+        impl._record_sparse_retrieve_stats(None, object(), row_count=2)
+        assert impl._retrieve_stats_request_count == 0
 
     def test_retrieve_stats_default_off_does_not_read_counts(self, monkeypatch):
         monkeypatch.delenv(
@@ -5282,71 +5357,6 @@ class TestWorkerRetrieveState:
         assert len(starts) == 48
         assert len(memory_objs[0]) == 48
         assert chunk_ptrs[0].tolist() == list(range(48))
-
-    @pytest.mark.parametrize("packed_prefix", [False, True])
-    def test_store_merge_preserves_mixed_pointer_representation(
-        self, packed_prefix: bool
-    ):
-        starts, ends = [0], [256]
-        rows = [None] if packed_prefix else [torch.tensor([11])]
-        packed = [torch.tensor([[11]])] if packed_prefix else []
-
-        merged = LMCacheConnectorV1Impl._merge_cache_group_by_ranges(
-            dst_starts=starts,
-            dst_ends=ends,
-            dst_keys=[["prefix-key"]],
-            dst_memory_objs=[["prefix"]],
-            dst_tensors=[],
-            dst_chunk_dev_ptrs=[[11]],
-            dst_chunk_ptrs_npu=rows,
-            dst_chunk_ptr_table_npu=packed,
-            dst_shared_handles=[[]],
-            src_starts=[256],
-            src_ends=[512],
-            src_keys=[["suffix-key"]],
-            src_memory_objs=[["suffix"]],
-            src_tensors=[],
-            src_chunk_dev_ptrs=[[22]],
-            src_chunk_ptrs_npu=(
-                [torch.tensor([22])] if packed_prefix else [None]
-            ),
-            src_chunk_ptr_table_npu=(
-                None if packed_prefix else torch.tensor([[22]])
-            ),
-            src_shared_handles=[],
-            require_pointer_cache=True,
-        )
-
-        assert merged == 1
-        assert rows[0].tolist() == [11, 22]
-        assert packed == []
-
-    def test_store_merge_packed_source_supports_legacy_destination(self):
-        rows = []
-
-        merged = LMCacheConnectorV1Impl._merge_cache_group_by_ranges(
-            dst_starts=[],
-            dst_ends=[],
-            dst_keys=[],
-            dst_memory_objs=[],
-            dst_tensors=[],
-            dst_chunk_dev_ptrs=[],
-            dst_chunk_ptrs_npu=rows,
-            dst_shared_handles=[],
-            src_starts=[0],
-            src_ends=[256],
-            src_keys=[["key"]],
-            src_memory_objs=[["owner"]],
-            src_tensors=[],
-            src_chunk_dev_ptrs=[[22]],
-            src_chunk_ptrs_npu=[None],
-            src_chunk_ptr_table_npu=torch.tensor([[22]]),
-            src_shared_handles=[],
-            require_pointer_cache=True,
-        )
-
-        assert merged == 1
-        assert rows[0].tolist() == [22]
 
     def test_store_merge_rejects_suffix_without_prefix_owners(self):
         starts = [chunk * 256 for chunk in range(32)]

@@ -2,7 +2,6 @@
 # Standard
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-import sys
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -14,9 +13,10 @@ from typing import (
     Sequence,
     Union,
 )
+from weakref import ReferenceType, ref
+import sys
 import threading
 import time
-from weakref import ReferenceType, ref
 
 # Third Party
 import torch
@@ -252,79 +252,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return self.__class__.__name__
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
-        diagnose = cold_start_perf_enabled()
-        started = time.perf_counter() if diagnose else 0.0
-        thread_started = time.thread_time_ns() if diagnose else 0
-        hash_started = started
-        hash_thread_started = thread_started
-        if diagnose:
-            hash(key)
-            hash_ms = (time.perf_counter() - hash_started) * 1000
-            hash_thread_ms = (
-                time.thread_time_ns() - hash_thread_started
-            ) / 1_000_000
-        else:
-            hash_ms = hash_thread_ms = 0.0
-
-        lock_started = time.perf_counter() if diagnose else 0.0
-        lock_thread_started = time.thread_time_ns() if diagnose else 0
-        self.cpu_lock.acquire()
-        if diagnose:
-            lock_wait_ms = (time.perf_counter() - lock_started) * 1000
-            lock_wait_thread_ms = (
-                time.thread_time_ns() - lock_thread_started
-            ) / 1_000_000
-        else:
-            lock_wait_ms = lock_wait_thread_ms = 0.0
-        try:
-            membership_started = time.perf_counter() if diagnose else 0.0
-            membership_thread_started = time.thread_time_ns() if diagnose else 0
-            present = key in self.hot_cache
-            if diagnose:
-                membership_ms = (time.perf_counter() - membership_started) * 1000
-                membership_thread_ms = (
-                    time.thread_time_ns() - membership_thread_started
-                ) / 1_000_000
-            else:
-                membership_ms = membership_thread_ms = 0.0
-            pin_started = time.perf_counter() if diagnose else 0.0
-            if present and pin:
+        with self.cpu_lock:
+            if key not in self.hot_cache:
+                return False
+            if pin:
                 self.hot_cache[key].pin()
                 # vllm lookup sets pin to True
                 self.keys_in_request.append(key)
-            pin_ms = (
-                (time.perf_counter() - pin_started) * 1000 if diagnose else 0.0
-            )
-            cache_entries = len(self.hot_cache) if diagnose else 0
-        finally:
-            self.cpu_lock.release()
+            return True
 
-        elapsed_ms = (time.perf_counter() - started) * 1000 if diagnose else 0.0
-        if elapsed_ms >= 100.0:
-            cold_start_perf_log(
-                logger,
-                "local_cpu_contains_slow",
-                elapsed_ms=round(elapsed_ms, 3),
-                thread_cpu_ms=round(
-                    (time.thread_time_ns() - thread_started) / 1_000_000, 3
-                ),
-                hash_ms=round(hash_ms, 3),
-                hash_thread_cpu_ms=round(hash_thread_ms, 3),
-                lock_wait_ms=round(lock_wait_ms, 3),
-                lock_wait_thread_cpu_ms=round(lock_wait_thread_ms, 3),
-                membership_ms=round(membership_ms, 3),
-                membership_thread_cpu_ms=round(membership_thread_ms, 3),
-                pin_ms=round(pin_ms, 3),
-                cache_entries=cache_entries,
-                present=present,
-                pin=pin,
-                kv_group=key.kv_group,
-            )
-        return present
-
-    def batched_contains(
-        self, keys: List[CacheEngineKey], pin: bool = False
-    ) -> int:
+    def batched_contains(self, keys: List[CacheEngineKey], pin: bool = False) -> int:
         hits: list[CacheEngineKey] = []
         with self.cpu_lock:
             for key in keys:
@@ -532,9 +469,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 try:
                     on_complete_callback(key)
                 except Exception as e:
-                    logger.warning(
-                        f"on_complete_callback failed for key {key}: {e}"
-                    )
+                    logger.warning(f"on_complete_callback failed for key {key}: {e}")
 
     def batched_submit_layer_pages(
         self,
@@ -684,9 +619,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         required_keys = [
             key
-            for pair in zip(
-                required_group0_keys, required_group1_keys, strict=True
-            )
+            for pair in zip(required_group0_keys, required_group1_keys, strict=True)
             for key in pair
         ]
         return self._commit_external_prefix_if_absent(
@@ -1192,8 +1125,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             shm_interleave_nodes = (
                 NUMADetector.get_shared_cpu_interleave_nodes(config)
                 if (
-                    shared_cpu_cache
-                    and config.get_extra_config_value("shm_name", None)
+                    shared_cpu_cache and config.get_extra_config_value("shm_name", None)
                 )
                 else None
             )
@@ -1529,9 +1461,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         eviction: bool = True,
     ) -> Optional[list[LayerPageMemoryObj]]:
         """Allocate exact-size layer pages, evicting entries when required."""
-        allocate = getattr(
-            self.memory_allocator, "batched_allocate_layer_pages", None
-        )
+        allocate = getattr(self.memory_allocator, "batched_allocate_layer_pages", None)
         if not callable(allocate):
             return None
         allocation_args = (shapes, dtypes, batch_size, num_layers, fmt)
@@ -1752,9 +1682,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         for memory_obj in removed:
             memory_obj.ref_count_down()
-        free_after = (
-            self.get_allocator_capacity_bytes()[0] if removed else free_before
-        )
+        free_after = self.get_allocator_capacity_bytes()[0] if removed else free_before
         sufficient = free_after >= target_free_bytes
         self.stats_monitor.update_local_cpu_evict_metrics(evicted_keys)
         if not sufficient:
@@ -1906,9 +1834,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 ) from admission_error
             raise
 
-        return LayerPageBatchPutResult(
-            tuple(inserted_keys), tuple(existing_keys)
-        )
+        return LayerPageBatchPutResult(tuple(inserted_keys), tuple(existing_keys))
 
     def _arm_external_retention_trace_locked(
         self,
@@ -2168,9 +2094,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if isinstance(self.hot_cache.get(key), LayerPageMemoryObj)
             or not isinstance(key, LayerCacheEngineKey)
             else [
-                item
-                for item in key.split_layers(num_layers)
-                if item in self.hot_cache
+                item for item in key.split_layers(num_layers) if item in self.hot_cache
             ]
         )
         objects = []

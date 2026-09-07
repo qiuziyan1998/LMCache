@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from typing import Any
 import os
 import threading
-import time
 import traceback
 
 # Third Party
@@ -110,8 +109,7 @@ class ZmqReqRepClientTransport(RpcClientTransport):
                     pass
 
             logger.info(
-                "Recreating socket: timestamp=%s socket_index=%s "
-                "rank=%s endpoint=%s",
+                "Recreating socket: timestamp=%s socket_index=%s rank=%s endpoint=%s",
                 _utc_timestamp(),
                 rank_idx,
                 params.rank,
@@ -142,8 +140,6 @@ class ZmqReqRepClientTransport(RpcClientTransport):
                 if callable(set_option):
                     set_option(zmq.RCVTIMEO, effective_timeout)
                     set_option(zmq.SNDTIMEO, effective_timeout)
-            started_at = _utc_timestamp()
-            started = time.perf_counter()
             encoded = [self.encoder.encode(m) for m in msg]
             results: list[bytes] = []
             failed_socket_idx = -1
@@ -171,14 +167,12 @@ class ZmqReqRepClientTransport(RpcClientTransport):
                 )
                 logger.exception(
                     "%s for rank %s; recreating all sockets: failed_at=%s "
-                    "started_at=%s elapsed_ms=%.3f phase=%s socket_index=%s "
+                    "phase=%s socket_index=%s "
                     "endpoint=%s timeout_ms=%s world_size=%s sent=%s received=%s "
                     "pid=%s thread=%s caller=%s error=%s",
                     failure,
                     params.rank if params is not None else "unknown",
                     _utc_timestamp(),
-                    started_at,
-                    (time.perf_counter() - started) * 1000,
                     phase,
                     failed_socket_idx,
                     params.socket_path if params is not None else "unknown",
@@ -292,10 +286,7 @@ class ZmqRouterServerTransport(RpcServerTransport):
         if len(raw_frames) < 3:
             logger.warning("Malformed request received: not enough frames.")
             return (identity, [])
-        if (
-            self.max_frame_count is not None
-            and len(raw_frames) > self.max_frame_count
-        ):
+        if self.max_frame_count is not None and len(raw_frames) > self.max_frame_count:
             logger.warning("Malformed request received: too many frames.")
             return (identity, [])
         if self.max_frame_bytes is not None and any(

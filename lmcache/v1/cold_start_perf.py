@@ -6,11 +6,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
+from typing import Any
 import json
 import os
 import socket
 import time
-from typing import Any
 
 COLD_START_PERF_ENV = "LMCACHE_COLD_START_PERF"
 _FALSE_VALUES = {"", "0", "false", "no", "off"}
@@ -37,6 +37,23 @@ def cold_start_perf_enabled() -> bool:
     )
 
 
+def cold_start_perf_detailed_enabled() -> bool:
+    """Enable per-layer CPU diagnostics only for explicit detail/device modes.
+
+    Ordinary values such as ``1`` retain coarse host logs. This function only
+    reads configuration; it does not inspect tensors or call a device runtime.
+    """
+    return os.environ.get(COLD_START_PERF_ENV, "0").strip().lower() in (
+        "detail",
+        "device",
+    )
+
+
+def _non_json_field(_value: Any) -> str:
+    # Do not stringify arbitrary objects: a Tensor repr may read device memory.
+    return "<non-JSON value>"
+
+
 def cold_start_perf_now() -> float:
     return time.perf_counter()
 
@@ -44,6 +61,9 @@ def cold_start_perf_now() -> float:
 @contextmanager
 def cold_start_perf_scope(**fields: Any) -> Iterator[None]:
     """Attach correlation fields to nested cold-perf events in this task."""
+    if not cold_start_perf_enabled():
+        yield
+        return
     current = _PERF_CONTEXT.get() or {}
     token = _PERF_CONTEXT.set({**current, **fields})
     try:
@@ -76,5 +96,5 @@ def cold_start_perf_log(
     }
     logger.info(
         "[LMCACHE_COLD_PERF] %s",
-        json.dumps(payload, default=str, separators=(",", ":")),
+        json.dumps(payload, default=_non_json_field, separators=(",", ":")),
     )

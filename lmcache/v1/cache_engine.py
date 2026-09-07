@@ -60,11 +60,11 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
-from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (  # noqa: E501
-    MemoryAllocatorInterface,
+    CuFileMemoryAllocator,  # noqa: E501
     LayerPageMemoryObj,
     LayerPageSource,
+    MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
     MemoryObjMetadata,
@@ -75,8 +75,8 @@ from lmcache.v1.memory_management import (  # noqa: E501
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
     mooncake_layer_pages_enabled,
-    mooncake_page_layout_enabled,
     mooncake_page_key,
+    mooncake_page_layout_enabled,
     mooncake_valid_tokens,
 )
 from lmcache.v1.pin_monitor import PinMonitor
@@ -87,8 +87,8 @@ from lmcache.v1.sampled_lookup import (
     first_last_layer_keys,
 )
 from lmcache.v1.shared_cpu_cache import (
-    SharedCPURequestLease,
     SharedChunkHandle,
+    SharedCPURequestLease,
     SharedHandleBatch,
     SharedHandleEnvelope,
     SharedSlabMapping,
@@ -148,7 +148,6 @@ class LayerwiseStoreResult:
     # successfully stored for every layer. Zero means the store was skipped or
     # incomplete and must not be used to release serving-engine KV blocks.
     committed_end: int = 0
-    chunk_ptr_table: Optional[torch.Tensor] = None
 
     def has_cache(self) -> bool:
         """Return whether the completed store produced reusable cache data."""
@@ -5893,22 +5892,22 @@ class LMCacheEngine:
             store_stats,
             tot_token_num,
         )
-        tot_time = store_stats.time_to_store()
-
-        logger.info(
-            "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
-            "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
-            "offload_time: %.4f ms, put_time: %.4f ms",
-            req_id,
-            kv_group,
-            tot_token_num,
-            num_to_store_tokens,
-            tot_kv_size / 1024**3,
-            tot_time * 1000,
-            tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
-            (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
-            store_stats.put_time * 1000,
-        )
+        if cold_start_perf_enabled():
+            tot_time = store_stats.time_to_store()
+            logger.info(
+                "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
+                "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
+                "offload_time: %.4f ms, put_time: %.4f ms",
+                req_id,
+                kv_group,
+                tot_token_num,
+                num_to_store_tokens,
+                tot_kv_size / 1024**3,
+                tot_time * 1000,
+                tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+                (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
+                store_stats.put_time * 1000,
+            )
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -6118,7 +6117,8 @@ class LMCacheEngine:
             assert_layerwise_gpu_connector(self.gpu_connector)
 
             try:
-                t_start = time.perf_counter()
+                store_perf_enabled = cold_start_perf_enabled()
+                t_start = time.perf_counter() if store_perf_enabled else 0.0
                 mem_obj_generator = self.gpu_connector.batched_from_gpu(
                     memory_objs, starts, ends, **kwargs
                 )
@@ -6136,18 +6136,19 @@ class LMCacheEngine:
                     for mem_obj in memory_objs[layer_id]:
                         pending_store_release.pop(id(mem_obj), None)
 
-                tot_time = time.perf_counter() - t_start
-                logger.info(
-                    "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
-                    "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
-                    req_id,
-                    kv_group,
-                    tot_token_num,
-                    len(tokens),
-                    tot_kv_size / 1024**3,
-                    tot_time * 1000,
-                    tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
-                )
+                if store_perf_enabled:
+                    tot_time = time.perf_counter() - t_start
+                    logger.info(
+                        "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
+                        "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
+                        req_id,
+                        kv_group,
+                        tot_token_num,
+                        len(tokens),
+                        tot_kv_size / 1024**3,
+                        tot_time * 1000,
+                        tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+                    )
             finally:
                 if mem_obj_generator is not None:
                     close_fn = getattr(mem_obj_generator, "close", None)
@@ -6291,7 +6292,6 @@ class LMCacheEngine:
             retrieve_stats,
             retrieved_tokens,
         )
-        onload_time = retrieve_stats.time_to_retrieve()
         # The retrieved may be larger than the need_to_load
         # Example (page_size=16, chunk_size=256):
         #
@@ -6306,19 +6306,21 @@ class LMCacheEngine:
         # retrieved: 256 tokens
         if not self._is_passive():
             kv_group = kwargs.get("kv_group", 0)
-            logger.info(
-                "[req_id=%s kv_group=%s] Retrieved %d out of %d required tokens "
-                "(from %d total tokens). size: %.4f gb, "
-                "cost %.4f ms, throughput: %.4f GB/s;",
-                req_id,
-                kv_group,
-                retrieved_tokens,
-                num_required_tokens,
-                len(tokens),
-                tot_kv_size / 1024**3,
-                onload_time * 1000,
-                tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
-            )
+            if cold_start_perf_enabled():
+                onload_time = retrieve_stats.time_to_retrieve()
+                logger.info(
+                    "[req_id=%s kv_group=%s] Retrieved %d out of %d required tokens "
+                    "(from %d total tokens). size: %.4f gb, "
+                    "cost %.4f ms, throughput: %.4f GB/s;",
+                    req_id,
+                    kv_group,
+                    retrieved_tokens,
+                    num_required_tokens,
+                    len(tokens),
+                    tot_kv_size / 1024**3,
+                    onload_time * 1000,
+                    tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
+                )
         return ret_mask
 
     @_lmcache_nvtx_annotate

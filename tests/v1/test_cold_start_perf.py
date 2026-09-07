@@ -12,6 +12,20 @@ from lmcache.v1.cold_start_perf import (
 )
 
 
+def test_perf_serialization_does_not_stringify_caller_objects(monkeypatch):
+    class NoReadback:
+        def __str__(self):
+            raise AssertionError("diagnostics must not stringify device data")
+
+        __repr__ = __str__
+
+    monkeypatch.setenv(COLD_START_PERF_ENV, "1")
+    logger = _Logger()
+    cold_start_perf_log(logger, "safe", values=[NoReadback()])
+    payload = json.loads(logger.records[0][1])
+    assert payload["values"] == ["<non-JSON value>"]
+
+
 class _Logger:
     def __init__(self):
         self.records = []
