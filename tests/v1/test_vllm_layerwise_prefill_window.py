@@ -799,6 +799,144 @@ def test_connector_capabilities_and_delegation(monkeypatch) -> None:
     assert impl.layerwise_prefill_request_persist_done("req-1") is False
 
 
+@pytest.mark.parametrize("faulty_property", ["backend", "engine"])
+def test_p_worker_startup_preserves_property_attribute_error(
+    monkeypatch: pytest.MonkeyPatch, faulty_property: str
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    _, vllm_config, observed = _patch_connector_startup(
+        monkeypatch, dsa_two_groups=True, model_num_layers=79
+    )
+    monkeypatch.setattr(
+        adapter_module.VllmServiceFactory, "get_or_create_metadata", Mock()
+    )
+    error = AttributeError("original startup construction failure")
+
+    class Engine:
+        @property
+        def layerwise_prefill_window_backend(self) -> RecordingBackend:
+            raise error
+
+    engine_getter = Mock(return_value=Engine())
+    if faulty_property == "engine":
+        engine_getter.side_effect = error
+    monkeypatch.setattr(
+        LMCacheConnectorV1Impl, "lmcache_engine", property(engine_getter)
+    )
+    create_window = Mock(wraps=LayerwisePrefillWindowCoordinator)
+    monkeypatch.setattr(
+        adapter_module, "LayerwisePrefillWindowCoordinator", create_window
+    )
+
+    with pytest.raises(AttributeError, match=str(error)) as exc_info:
+        LMCacheConnectorV1Impl(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            SimpleNamespace(),
+            kv_cache_config=_kv_cache_config(79, 22),
+        )
+
+    assert exc_info.value is error
+    create_window.assert_not_called()
+    assert observed == ["manager", "services"]
+
+
+@pytest.mark.parametrize("p_node", [False, True])
+def test_worker_startup_missing_backend_is_optional_only_when_feature_off(
+    monkeypatch: pytest.MonkeyPatch, p_node: bool
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", str(p_node).lower())
+    _, vllm_config, _ = _patch_connector_startup(
+        monkeypatch, dsa_two_groups=True, model_num_layers=79
+    )
+    monkeypatch.setattr(
+        adapter_module.VllmServiceFactory, "get_or_create_metadata", Mock()
+    )
+    monkeypatch.setattr(
+        LMCacheConnectorV1Impl,
+        "lmcache_engine",
+        property(lambda self: SimpleNamespace()),
+    )
+
+    if p_node:
+        with pytest.raises(AttributeError, match="layerwise_prefill_window_backend"):
+            LMCacheConnectorV1Impl(
+                vllm_config,
+                KVConnectorRole.WORKER,
+                SimpleNamespace(),
+                kv_cache_config=_kv_cache_config(79, 22),
+            )
+    else:
+        impl = LMCacheConnectorV1Impl(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            SimpleNamespace(),
+            kv_cache_config=_kv_cache_config(79, 22),
+        )
+        assert impl.supports_layerwise_prefill_eager_callbacks is False
+        assert impl.supports_layerwise_prefill_transfer_window is False
+        assert impl.supports_dsa_index_lmcache is True
+
+
+def test_p_worker_startup_with_sync_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    _, vllm_config, observed = _patch_connector_startup(
+        monkeypatch, dsa_two_groups=True, model_num_layers=79
+    )
+    monkeypatch.setattr(
+        adapter_module.VllmServiceFactory, "get_or_create_metadata", Mock()
+    )
+    backend = RecordingBackend(supports_window=False)
+    monkeypatch.setattr(
+        LMCacheConnectorV1Impl,
+        "lmcache_engine",
+        property(
+            lambda self: SimpleNamespace(layerwise_prefill_window_backend=backend)
+        ),
+    )
+
+    impl = LMCacheConnectorV1Impl(
+        vllm_config,
+        KVConnectorRole.WORKER,
+        SimpleNamespace(),
+        kv_cache_config=_kv_cache_config(79, 22),
+    )
+
+    assert impl.supports_layerwise_prefill_eager_callbacks is True
+    assert impl.supports_layerwise_prefill_transfer_window is False
+    assert impl.supports_dsa_index_lmcache is True
+    assert observed == ["manager", "services", "layerwise", "metrics"]
+
+
+def test_p_scheduler_startup_does_not_access_backend_property(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    _, vllm_config, observed = _patch_connector_startup(
+        monkeypatch, dsa_two_groups=True, model_num_layers=79
+    )
+    backend_getter = Mock(side_effect=AssertionError("scheduler accessed backend"))
+
+    class Engine:
+        layerwise_prefill_window_backend = property(backend_getter)
+
+    monkeypatch.setattr(
+        LMCacheConnectorV1Impl, "lmcache_engine", property(lambda self: Engine())
+    )
+
+    impl = LMCacheConnectorV1Impl(
+        vllm_config,
+        KVConnectorRole.SCHEDULER,
+        SimpleNamespace(),
+        kv_cache_config=_kv_cache_config(79, 22),
+    )
+
+    backend_getter.assert_not_called()
+    assert impl.supports_layerwise_prefill_eager_callbacks is False
+    assert impl.supports_layerwise_prefill_transfer_window is False
+    assert observed == ["manager", "services", "layerwise", "metrics"]
+
+
 def test_connector_without_backend_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

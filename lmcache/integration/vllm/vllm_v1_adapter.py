@@ -11175,8 +11175,12 @@ class LMCacheConnectorV1Impl:
         topology_cache = getattr(self, "_dsa_kv_topology_cache", None)
         if topology_cache is None or self._role == KVConnectorRole.SCHEDULER:
             return None
-        engine = getattr(self, "lmcache_engine", None)
-        backend = getattr(engine, "layerwise_prefill_window_backend", None)
+        if getattr(self, "_layerwise_prefill_p_node", False):
+            # P mode requires this backend; preserve property construction errors.
+            backend = self.lmcache_engine.layerwise_prefill_window_backend
+        else:
+            engine = getattr(self, "lmcache_engine", None)
+            backend = getattr(engine, "layerwise_prefill_window_backend", None)
         self._layerwise_prefill_backend = backend
         window = LayerwisePrefillWindowCoordinator(topology_cache, backend)
         config = getattr(self, "config", None)
