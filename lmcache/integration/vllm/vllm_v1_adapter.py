@@ -6868,6 +6868,106 @@ class LMCacheConnectorV1Impl:
             raise
 
     @_lmcache_nvtx_annotate
+    def prepare_sparse_graph_step(
+        self, target_layer_names: tuple[str, ...], *, allow_empty: bool = False
+    ) -> Optional[PreparedSparseSource]:
+        """Resolve a singleton target forward before device graph replay.
+
+        Args:
+            target_layer_names: Ordered latent layers covered by the target graph.
+            allow_empty: The runner verified a zero committed frontier.
+
+        Returns:
+            A request-owned source, or None for an authorized no-offload step.
+
+        Raises:
+            RuntimeError: The request, source, or layer layout is unsupported.
+
+        Bootstrap advances metadata and loads the top-k-independent index cache
+        using empty latent selections. Warm steps do not advance target-layer
+        generators. Any draft suffix keeps its normal layerwise retrieval.
+        The caller must finish device work before releasing request ownership.
+        """
+        requests = tuple(self._layerwise_requests)
+        target_count = len(target_layer_names)
+        if not self.lmcache_engine.is_healthy():
+            raise RuntimeError("Full SFA graph cannot use an unhealthy LMCache engine")
+        if not requests and not self.layerwise_retrievers and allow_empty:
+            return None
+        if (
+            len(requests) != 1
+            or not requests[0].is_sparse_decode
+            or not self._is_dsa_two_groups()
+            or not 0 < target_count <= self.num_layers
+            or tuple(self._latent_layer_names[:target_count]) != target_layer_names
+            or self.current_layer != 0
+            or not getattr(self.lmcache_engine, "enable_shared_cpu_cache", False)
+        ):
+            raise RuntimeError(
+                "Full SFA graph requires one shared-CPU sparse request and an "
+                "ordered target-layer prefix; no layerwise fallback was taken."
+            )
+        request = requests[0]
+        assert request.load_spec is not None
+        frontier = int(request.load_spec.lmcache_cached_tokens)
+        state = self._worker_retrieve_state.get(request.req_id)
+        source = None if state is None else state.prepared_sparse_sources.get(0)
+        needs_bootstrap = (
+            source is None
+            or source.total_tokens < frontier
+            or not state.shared_request_active
+            or not state.indexer_npu_resident
+            or state.indexer_npu_materialization_pending
+            or self.layerwise_retrievers[0][1] is not None
+        )
+        if needs_bootstrap:
+            # Empty explicit payload: prepare/pin CPU sources, but never load
+            # latent history before the model has computed its real top-k.
+            empty = torch.zeros((1, 1), dtype=torch.int64, device=self.device)
+            slots = torch.full_like(empty, -1)
+            counts = torch.zeros((1,), dtype=torch.int64, device=self.device)
+            for layer_name in tuple(self._latent_layer_names):
+                self.wait_for_layer_load(
+                    layer_name,
+                    selected_tokens=empty,
+                    request_ids=[request.req_id],
+                    target_slot_mapping=slots,
+                    selected_token_counts=counts,
+                )
+            state = self._worker_retrieve_state.get(request.req_id)
+            source = None if state is None else state.prepared_sparse_sources.get(0)
+        if (
+            source is None
+            or source.total_tokens < frontier
+            or not state.shared_request_active
+            or not state.indexer_npu_resident
+            or len(source.layers) != self.num_layers
+        ):
+            raise RuntimeError("Full SFA graph source/index cache preparation failed")
+
+        self._drain_layerwise_retrievers()
+        self.current_layer = target_count
+        if target_count < self.num_layers:
+            suffix = self.lmcache_engine.retrieve_layer_head_token_wise(
+                [],
+                None,
+                kvcaches=self._kvcaches_for_group(0),
+                slot_mapping=state.slot_mapping,
+                kv_group=0,
+                sync=True,
+                prepared_sparse_source=source,
+                prepared_start_layer=target_count,
+                ret_mask=state.decode_ret_mask,
+            )
+            next(suffix)
+            self.layerwise_retrievers.append((suffix, None))
+            self._layerwise_requests.append(request)
+            self._layerwise_retriever_is_sparse.append(True)
+            self._layerwise_sparse_req_ids.append(request.req_id)
+            self._layerwise_sparse_shared_ordered.append(False)
+        return source
+
+    @_lmcache_nvtx_annotate
     def wait_for_layer_load(
         self,
         layer_name: str,
