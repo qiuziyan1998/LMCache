@@ -3,9 +3,11 @@
 
 # Standard
 from concurrent.futures import Future, TimeoutError
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 import asyncio
+import json
 import sys
 import threading
 
@@ -59,6 +61,10 @@ def _make_mooncake_connector(
 
         def close(self):
             calls.append(("close",))
+
+        @staticmethod
+        def get_hostname():
+            return "store-host"
 
         @staticmethod
         def batch_get_into_multi_buffers(keys, ptrs, sizes):
@@ -159,6 +165,74 @@ def test_external_page_only_mooncake_has_no_local_cpu_slab(monkeypatch) -> None:
         loop.close()
 
     assert not any(call[0] in {"register", "unregister"} for call in calls)
+    setup = next(call for call in calls if call[0] == "setup")
+    assert setup[1][2:4] == (0, 0)
+
+
+@pytest.mark.parametrize("external_page_only", [False, True])
+@pytest.mark.parametrize("config_from_file", [False, True])
+@pytest.mark.parametrize("reuse_engine", [False, True])
+def test_mooncake_reader_storage_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    external_page_only: bool,
+    config_from_file: bool,
+    reuse_engine: bool,
+) -> None:
+    """Readers use caller-owned buffers; storage clients keep their capacity."""
+    calls = []
+    extra_config = {
+        "local_hostname": "configured-host",
+        "metadata_server": "metadata",
+        "master_server_address": "master",
+        "protocol": "ascend",
+        "global_segment_size": 100_000_000_000,
+        "local_buffer_size": 1_073_741_824,
+        "mooncake_page_first_multi_buffer": True,
+        "mooncake_layer_merged_page_objects": True,
+        "save_chunk_meta": False,
+    }
+    config_path = tmp_path / "mooncake.json"
+    if config_from_file:
+        config_path.write_text(json.dumps(extra_config), encoding="utf-8")
+        monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(config_path))
+    else:
+        monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
+    native_engine = object()
+    monkeypatch.setattr(
+        mooncake_connector,
+        "_shared_vllm_mooncake_transport",
+        lambda: (SimpleNamespace(), "shared-host:12345", native_engine, object()),
+    )
+    connector, loop = _make_mooncake_connector(
+        monkeypatch,
+        extra_config,
+        calls,
+        external_page_only=external_page_only,
+        remote_fill_enabled=reuse_engine,
+    )
+    try:
+        setup = next(call for call in calls if call[0] == "setup")
+        expected_sizes = (
+            (0, 0) if external_page_only else (100_000_000_000, 1_073_741_824)
+        )
+        assert setup[1][2:4] == expected_sizes
+        assert (
+            connector.config.global_segment_size,
+            connector.config.local_buffer_size,
+        ) == expected_sizes
+        if reuse_engine:
+            assert setup[1][0] == "shared-host:12345"
+            assert setup[1][7] is native_engine
+        else:
+            assert len(setup[1]) == 7
+        if config_from_file:
+            assert json.loads(config_path.read_text(encoding="utf-8")) == extra_config
+    finally:
+        try:
+            asyncio.run(connector.close())
+        finally:
+            loop.close()
 
 
 def test_mooncake_closes_store_when_post_setup_validation_fails(

@@ -603,6 +603,11 @@ class MooncakestoreConnector(RemoteConnector):
                 )
             else:
                 raise ValueError("MOONCAKE_CONFIG_PATH/lmcache_config must be provided")
+            if self._external_page_only:
+                # Readers transfer into caller-owned registered buffers. Keep
+                # writer storage and staging pools out of this reader's setup.
+                self.config.global_segment_size = 0
+                self.config.local_buffer_size = 0
             self._external_native_hard_timeout_seconds = max(
                 float(self.config.transfer_timeout),
                 float(engine_config.remote_fill_native_hard_timeout_ms) / 1000.0,
