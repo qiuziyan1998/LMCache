@@ -2,7 +2,7 @@
 # Standard
 from collections import deque
 from collections.abc import Iterable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
@@ -235,6 +235,9 @@ class LayerwisePrefillWindowCoordinator:
     ):
         self._topology = topology_cache
         self._backend = backend
+        self._accepts_validation_errors = (
+            getattr(backend, "accepts_coordinator_validation_errors", False) is True
+        )
         self._lock = threading.RLock()
         self._arenas: dict[str, _LayerwisePrefillRequestArena] = {}
         self._stale_arenas: dict[
@@ -302,6 +305,58 @@ class LayerwisePrefillWindowCoordinator:
     def pending_bytes(self) -> int:
         with self._lock:
             return sum(arena.pending_bytes for arena in self._arenas.values())
+
+    def bind_step(
+        self,
+        requests: list[LayerwisePrefillRequest],
+        kv_caches: dict[str, Any],
+        *,
+        validation_error: Optional[Exception] = None,
+    ) -> None:
+        """Start a synchronous step, invalidating the preceding completion state.
+
+        Only the backend with collective coordinator-error handling supports
+        explicit binding. A failed bind cannot expose the previous step's
+        PERSIST_DONE as completion of a continuation.
+        """
+        if not self._accepts_validation_errors:
+            raise RuntimeError("Step binding requires collective validation support")
+        with self._lock:
+            error = None
+            try:
+                if validation_error is not None:
+                    raise validation_error
+                self._drain_completed_futures()
+                generations = tuple(
+                    (req.request_id, req.allocation_generation) for req in requests
+                )
+                self._validate_active_generations(generations)
+                for request_id, _ in generations:
+                    arena = self._arenas.get(request_id)
+                    if arena is not None and not self._request_persist_done_unlocked(
+                        arena
+                    ):
+                        raise RuntimeError("Previous synchronous step is not persisted")
+            except Exception as exc:
+                error = exc
+            # Invalidate before entering the backend: even a failed new bind
+            # must not leave an observable old success for these requests.
+            if not isinstance(requests, list):
+                error = error or ValueError("Expected a list of P request bindings")
+                requests = []
+            for req in requests:
+                if not isinstance(req, LayerwisePrefillRequest) or not isinstance(
+                    req.request_id, str
+                ):
+                    error = error or ValueError("Invalid P request binding identity")
+                    continue
+                arena = self._arenas.get(req.request_id)
+                if arena is not None:
+                    arena.jobs.clear()
+                    arena.save_cursors.clear()
+                    arena.pending_load_rows.clear()
+                    arena.load_submitted_through.clear()
+            self._backend.bind_step(requests, kv_caches, validation_error=error)
 
     def _expected_groups(self, execution: Any) -> tuple[int, ...]:
         return (0,) if execution.indexer is None else (0, 1)
@@ -493,6 +548,28 @@ class LayerwisePrefillWindowCoordinator:
                     f"{expected}, got {row.row_ordinal}."
                 )
 
+    def _validate_callback_batch(
+        self, metadata: Any, *, save: bool
+    ) -> tuple[tuple[tuple[str, int], ...], dict[str, Any]]:
+        generations = ()
+        error = None
+        try:
+            self._validate_metadata(metadata)
+            generations = self._metadata_request_generations(metadata)
+            if save:
+                self._validate_save_batch(generations, metadata.row)
+            else:
+                self._validate_active_generations(generations)
+        except Exception as exc:
+            error = exc
+        if self._accepts_validation_errors:
+            # Reuse the backend's existing pre-transfer ACK on every rank.
+            # A local rejection must not strand peers inside that collective.
+            return generations, {"validation_error": error}
+        if error is not None:
+            raise error
+        return generations, {}
+
     def _settle_job(
         self,
         arena: _LayerwisePrefillRequestArena,
@@ -523,14 +600,14 @@ class LayerwisePrefillWindowCoordinator:
             raise RuntimeError(
                 "Layerwise-prefill load wait requires a row-aware load/save backend."
             )
-        self._validate_metadata(metadata)
-        generations = self._metadata_request_generations(metadata)
-        row = metadata.row
         with self._lock:
-            self._validate_active_generations(generations)
+            generations, validation = self._validate_callback_batch(
+                metadata, save=False
+            )
             # A missing pending-load entry does not prove there is no prefix:
             # sync callbacks and each chunk's row zero need the backend too.
-            self._backend.wait_for_load(metadata)
+            self._backend.wait_for_load(metadata, **validation)
+            row = metadata.row
             for request_id, generation in generations:
                 arena = self._arena_for(request_id, generation)
                 arena.pending_load_rows.setdefault(
@@ -659,8 +736,11 @@ class LayerwisePrefillWindowCoordinator:
         kv_layer: Any,
         attn_metadata: Any = None,
     ) -> None:
-        """Synchronously persist one row through a row-aware backend.
+        """Synchronously fence a row's source through a row-aware backend.
 
+        None means persistence also finished. A returned Future defers
+        PERSIST_DONE until complete-group page publication, without blocking
+        the early row callback on rows that have not executed yet.
         Unsupported saves raise before changing protocol state.
         """
 
@@ -669,20 +749,27 @@ class LayerwisePrefillWindowCoordinator:
                 "Layerwise-prefill sync save requires a row-aware load/save "
                 "backend with synchronous callback support."
             )
-        self._validate_metadata(metadata)
-        generations = self._metadata_request_generations(metadata)
-        row = metadata.row
         with self._lock:
-            self._validate_save_batch(generations, row)
-            self._backend.sync_save(metadata, kv_layer, attn_metadata)
+            generations, validation = self._validate_callback_batch(metadata, save=True)
+            future = self._backend.sync_save(
+                metadata, kv_layer, attn_metadata, **validation
+            )
+            if future is not None and not isinstance(future, Future):
+                raise TypeError("Synchronous row save must return a Future or None")
+            row = metadata.row
             for index, (request_id, generation) in enumerate(generations):
                 arena = self._arena_for(request_id, generation)
                 self._prepare_save_cursor(arena, row)
                 arena.jobs[(row.kv_group, row.row_ordinal)] = (
                     _LayerwisePrefillWindowJob(
-                        phase=LayerwisePrefillSavePhase.PERSIST_DONE,
+                        phase=(
+                            LayerwisePrefillSavePhase.PERSIST_DONE
+                            if future is None
+                            else LayerwisePrefillSavePhase.SOURCE_DONE
+                        ),
                         primary=index == 0,
                         request_generations=generations,
+                        persist_future=future,
                     )
                 )
                 arena.save_cursors[row.kv_group] = row.row_ordinal + 1
@@ -739,6 +826,10 @@ class LayerwisePrefillWindowCoordinator:
         """Drop request arenas, retaining a tombstone against old callbacks."""
 
         with self._lock:
+            if self._backend is not None:
+                abort = getattr(self._backend, "abort_request", None)
+                if callable(abort):
+                    abort(request_id)
             arena = self._arenas.pop(request_id, None)
             if arena is not None:
                 self._released_generations[request_id] = arena.allocation_generation
@@ -746,10 +837,6 @@ class LayerwisePrefillWindowCoordinator:
                 key for key in self._stale_arenas if key[0] == request_id
             ]:
                 del self._stale_arenas[key]
-            if self._backend is not None:
-                abort = getattr(self._backend, "abort_request", None)
-                if callable(abort):
-                    abort(request_id)
 
     def request_persist_done(self, request_id: str) -> bool:
         """Whether every required row of a request reached PERSIST_DONE."""
@@ -4378,6 +4465,13 @@ class LMCacheConnectorV1Impl:
         saved_expected = dict(expected or {})
         for request in requests:
             self._drop_layerwise_save_storers(request.req_id)
+            if getattr(self, "_layerwise_prefill_p_node", False):
+                # Sources are fenced by synchronous callbacks. A failed remote
+                # commit needs cleanup, not a successful persistence barrier.
+                # The backend still refuses release after an uncertain fence.
+                self._layerwise_prefill_window_or_raise("abort").release_request(
+                    request.req_id
+                )
         if expected is not None:
             expected.update(saved_expected)
 
@@ -7047,59 +7141,64 @@ class LMCacheConnectorV1Impl:
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
         if getattr(self, "_layerwise_prefill_p_node", False):
-            if metadata.layerwise_prefill_requests is None:
-                raise RuntimeError(
-                    "P-node forward lost its bank-aware request bindings"
-                )
-            if not metadata.layerwise_prefill_requests:
+            if metadata.layerwise_prefill_requests == []:
                 return
-            if attn_metadata is None:
-                raise RuntimeError("P-node row restore requires a model forward")
-            if not self.kv_caches:
-                self._init_kv_caches_from_forward_context(forward_context)
-            backend = self._layerwise_prefill_backend
-            if backend is None or not callable(getattr(backend, "bind_step", None)):
-                raise RuntimeError("P-node requires a bound synchronous row backend")
             window = self._layerwise_prefill_window_or_raise("bind")
-            for req_id in metadata.layerwise_prefill_finished:
-                if window.has_request(req_id):
-                    window.release_request(req_id)
-            for request in metadata.requests:
-                if request.resumed_from_preemption and window.has_request(
-                    request.req_id
+            ordered = metadata.layerwise_prefill_requests or []
+            error = None
+            try:
+                if metadata.layerwise_prefill_requests is None:
+                    raise RuntimeError(
+                        "P-node forward lost its bank-aware request bindings"
+                    )
+                if attn_metadata is None:
+                    raise RuntimeError("P-node row restore requires a model forward")
+                if not self.kv_caches:
+                    self._init_kv_caches_from_forward_context(forward_context)
+                for req_id in metadata.layerwise_prefill_finished:
+                    if window.has_request(req_id):
+                        window.release_request(req_id)
+                for request in metadata.requests:
+                    if request.resumed_from_preemption and window.has_request(
+                        request.req_id
+                    ):
+                        window.poll_completed_persists()
+                        if not window.request_persist_done(request.req_id):
+                            raise RuntimeError("Cannot resume an unfinished P step")
+                        window.wait_for_request_persist_done(request.req_id)
+                        window.release_request(request.req_id)
+                # Scheduler order can differ from actual worker callback order.
+                callbacks = next(
+                    (
+                        item.layerwise_prefill_callback_metadata
+                        for item in attn_metadata.values()
+                        if getattr(item, "layerwise_prefill_callback_metadata", ())
+                    ),
+                    (),
+                )
+                if not callbacks:
+                    raise RuntimeError("P-node forward has no canonical row callbacks")
+                bindings = {req.request_id: req for req in ordered}
+                generations = callbacks[0].request_generations
+                if (
+                    {req_id for req_id, _ in generations} != set(bindings)
+                    or len(generations) != len(bindings)
+                    or len(bindings) != len(ordered)
+                    or any(
+                        req_id not in bindings
+                        or bindings[req_id].allocation_generation != generation
+                        for req_id, generation in generations
+                    )
                 ):
-                    window.wait_for_request_persist_done(request.req_id)
-                    window.release_request(request.req_id)
-            # Scheduler new/cached ordering can differ from the worker batch.
-            # The canonical callbacks are emitted in actual input-batch order.
-            callbacks = next(
-                (
-                    item.layerwise_prefill_callback_metadata
-                    for item in attn_metadata.values()
-                    if getattr(item, "layerwise_prefill_callback_metadata", ())
-                ),
-                (),
-            )
-            if not callbacks:
-                raise RuntimeError("P-node forward has no canonical row callbacks")
-            bindings = {
-                req.request_id: req for req in metadata.layerwise_prefill_requests
-            }
-            generations = callbacks[0].request_generations
-            if (
-                {req_id for req_id, _ in generations} != set(bindings)
-                or len(generations) != len(bindings)
-                or any(
-                    req_id not in bindings
-                    or bindings[req_id].allocation_generation != generation
-                    for req_id, generation in generations
-                )
-            ):
-                raise RuntimeError(
-                    "P-node callback request identities differ from scheduler bindings"
-                )
-            backend.bind_step(
-                [bindings[req_id] for req_id, _ in generations], self.kv_caches
+                    raise RuntimeError(
+                        "P-node callback request identities differ from "
+                        "scheduler bindings"
+                    )
+                ordered = [bindings[req_id] for req_id, _ in generations]
+            except Exception as exc:
+                error = exc
+            window.bind_step(
+                ordered, self.kv_caches, validation_error=error
             )
             return
         if getattr(metadata, "dsa_cold_compact_load_pending", False):
@@ -11142,7 +11241,12 @@ class LMCacheConnectorV1Impl:
         if window is None:
             return
         if window.has_request(req_id):
-            window.wait_for_request_persist_done(req_id)
+            try:
+                window.wait_for_request_persist_done(req_id)
+            except Exception:
+                if getattr(self, "_layerwise_prefill_p_node", False):
+                    window.release_request(req_id)
+                raise
         window.release_request(req_id)
 
     def _dsa_long_request_admission_check(

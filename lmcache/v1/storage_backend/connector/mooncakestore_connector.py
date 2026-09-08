@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from contextvars import copy_context
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any, Callable, List, Optional, cast, no_type_check
 import asyncio
 import json
@@ -31,6 +33,46 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.system_detection import NUMADetector
 
 logger = init_logger(__name__)
+
+
+async def _run_blocking_get(func: Callable[..., Any], *args: Any) -> Any:
+    """Drain uncancellable native writes before callers release their buffers."""
+    # Unlike a to_thread Task, this future is not cancelled by an all-task drain.
+    transfer = asyncio.get_running_loop().run_in_executor(
+        None, copy_context().run, func, *args
+    )
+    try:
+        return await asyncio.shield(transfer)
+    except asyncio.CancelledError:
+        # Repeated cancellation must not cancel the future tracking the thread.
+        while not transfer.done():
+            try:
+                await asyncio.shield(transfer)
+            except (asyncio.CancelledError, Exception):
+                pass
+        if not transfer.cancelled():
+            transfer.exception()
+        raise
+
+
+def _track_get(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Keep a read registered through native completion and coroutine cleanup."""
+
+    @wraps(func)
+    async def tracked(
+        self: "MooncakestoreConnector", *args: Any, **kwargs: Any
+    ) -> Any:
+        if self._closing:
+            raise RuntimeError("Mooncake connector is closing")
+        completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._inflight_gets.add(completion)
+        try:
+            return await func(self, *args, **kwargs)
+        finally:
+            self._inflight_gets.discard(completion)
+            completion.set_result(None)
+
+    return tracked
 
 
 @dataclass
@@ -290,6 +332,10 @@ class MooncakestoreConnector(RemoteConnector):
         self._external_buffers: dict[int, int] = {}
         self._external_put_lock = asyncio.Lock()
         self._inflight_put_tasks: set[asyncio.Task[Any]] = set()
+        self._inflight_gets: set[asyncio.Future[None]] = set()
+        self._closing = False
+        self._closed = False
+        self._close_lock = asyncio.Lock()
         # Initialize ReplicateConfig
         self.replica_config = ReplicateConfig()
         self.replica_config.replica_num = 1
@@ -895,12 +941,18 @@ class MooncakestoreConnector(RemoteConnector):
         )
         return bool(result)
 
+    @_track_get
     async def batched_get(
         self, keys: List[CacheEngineKey]
     ) -> List[Optional[MemoryObj]]:
         """
         Batch get operation - the only supported get method.
-        Uses batch_get_into (with metadata) or batch_get_buffer (without metadata).
+        Uses zero-copy reads with local metadata or batch_get_buffer with remote
+        metadata.
+
+        Returns one owned object or None per key. Cancellation of zero-copy reads
+        waits for native writes to finish, releases unreturned objects, and raises
+        CancelledError even if the native read fails while draining.
         """
         if not keys:
             return []
@@ -990,7 +1042,7 @@ class MooncakestoreConnector(RemoteConnector):
             if not submitted_groups:
                 return results
             transfer_started = cold_start_perf_now() if perf_enabled else 0.0
-            statuses = await asyncio.to_thread(
+            statuses = await _run_blocking_get(
                 self.store.batch_get_into_multi_buffers,
                 [page_key for page_key, _, _ in submitted_groups],
                 all_buffer_ptrs,
@@ -1035,6 +1087,9 @@ class MooncakestoreConnector(RemoteConnector):
                     memory_objs[position] = None
 
             return results
+        except asyncio.CancelledError:
+            result_status = "cancelled"
+            raise
         except Exception as exc:
             result_status = "error"
             logger.error("Mooncake page-first get failed: %s", exc)
@@ -1062,6 +1117,7 @@ class MooncakestoreConnector(RemoteConnector):
                     status=result_status,
                 )
 
+    @_track_get
     async def batched_get_layer_pages(
         self, keys: List[CacheEngineKey]
     ) -> list[LayerPageMemoryObj]:
@@ -1138,19 +1194,13 @@ class MooncakestoreConnector(RemoteConnector):
             else 0.0
         )
         transfer_started = cold_start_perf_now() if perf_enabled else 0.0
-        transfer = asyncio.create_task(
-            asyncio.to_thread(
-                self.store.batch_get_into_multi_buffers,
-                page_keys,
-                ptrs,
-                sizes,
-            )
-        )
         transfer_ms: float | None = None
         publish_ms = 0.0
         status = "error"
         try:
-            statuses = await asyncio.shield(transfer)
+            statuses = await _run_blocking_get(
+                self.store.batch_get_into_multi_buffers, page_keys, ptrs, sizes
+            )
             transfer_ms = (
                 (cold_start_perf_now() - transfer_started) * 1000
                 if perf_enabled
@@ -1174,12 +1224,9 @@ class MooncakestoreConnector(RemoteConnector):
             return pages
         except asyncio.CancelledError:
             status = "cancelled"
-            try:
-                await transfer
-            finally:
-                for page in pages:
-                    if page.is_valid():
-                        page.ref_count_down()
+            for page in pages:
+                if page.is_valid():
+                    page.ref_count_down()
             raise
         except Exception:
             for page in pages:
@@ -1238,7 +1285,7 @@ class MooncakestoreConnector(RemoteConnector):
             return await self._batch_get_into_legacy(keys)
 
         page_keys = [page_key for page_key, _ in complete_groups]
-        page_exists = await asyncio.to_thread(
+        page_exists = await _run_blocking_get(
             self.store.batch_is_exist,
             page_keys,
         )
@@ -1280,9 +1327,16 @@ class MooncakestoreConnector(RemoteConnector):
 
         if legacy_indices:
             legacy_indices = sorted(set(legacy_indices))
-            legacy_results = await self._batch_get_into_legacy(
-                [keys[index] for index in legacy_indices]
-            )
+            try:
+                legacy_results = await self._batch_get_into_legacy(
+                    [keys[index] for index in legacy_indices]
+                )
+            except BaseException:
+                # Page results have not been handed to the caller yet.
+                for memory_obj in results:
+                    if memory_obj is not None:
+                        memory_obj.ref_count_down()
+                raise
             for index, memory_obj in zip(
                 legacy_indices, legacy_results, strict=False
             ):
@@ -1362,7 +1416,7 @@ class MooncakestoreConnector(RemoteConnector):
             # Single RPC call for multiple chunks
             logger.debug(f"Calling batch_get_into with {len(key_strs)} keys")
             transfer_started = cold_start_perf_now() if perf_enabled else 0.0
-            bytes_read_list = await asyncio.to_thread(
+            bytes_read_list = await _run_blocking_get(
                 self.store.batch_get_into, key_strs, buffer_ptrs, buffer_sizes
             )
             transfer_ms = (
@@ -1421,6 +1475,11 @@ class MooncakestoreConnector(RemoteConnector):
                 )
             return results
 
+        except asyncio.CancelledError:
+            for memory_obj in memory_objs:
+                if memory_obj is not None and memory_obj.is_valid():
+                    memory_obj.ref_count_down()
+            raise
         except Exception as exc:
             logger.error(f"batch_get_into threw exception: {str(exc)}")
             # Release any buffers we successfully allocated
@@ -1454,7 +1513,7 @@ class MooncakestoreConnector(RemoteConnector):
         key_strs = [key.to_string() for key in keys]
 
         try:
-            buffers = await asyncio.to_thread(self.store.batch_get_buffer, key_strs)
+            buffers = await _run_blocking_get(self.store.batch_get_buffer, key_strs)
         except Exception as e:
             logger.error(f"batch_get_buffer failed: {str(e)}")
             return [None] * len(keys)
@@ -1542,6 +1601,78 @@ class MooncakestoreConnector(RemoteConnector):
 
     def requires_put_completion(self) -> bool:
         return True
+
+    def supports_page_first(self) -> bool:
+        """Report enabled raw page I/O, including the effective Mooncake config."""
+        return (
+            self._page_first_multi_buffer is True
+            and not self.save_chunk_meta
+            and all(
+                callable(getattr(self.store, name, None))
+                for name in (
+                    "batch_get_into_multi_buffers",
+                    "batch_put_from_multi_buffers",
+                    "batch_is_exist",
+                )
+            )
+        )
+
+    def validate_page_first_layout(
+        self,
+        group: int,
+        num_layers: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+    ) -> None:
+        """Require the live raw page ABI to match a 256-token BF16 packed row.
+
+        Check the same cardinality and raw metadata used by page puts and gets,
+        without invoking the store. Flat stacked-plane shapes must match exactly:
+        equal byte counts do not make legacy/token-major shapes interchangeable.
+        Raise ValueError before source transfer if any layout field differs.
+        """
+        if (
+            not self.supports_page_first()
+            or type(group) is not int
+            or group < 0
+            or type(num_layers) is not int
+            or num_layers <= 0
+            or len(shape) != 1
+            or shape[0] <= 0
+            or dtype != torch.bfloat16
+            or fmt not in (
+                MemoryFormat.KV_MLA_LATENT_FMT,
+                MemoryFormat.KV_DSA_INDEX_FMT,
+            )
+            or self.local_cpu_backend.metadata.chunk_size != 256
+        ):
+            raise ValueError("Page-first layout requires 256-token BF16 packed rows")
+        key = CacheEngineKey(
+            self.local_cpu_backend.metadata.model_name,
+            1,
+            0,
+            0,
+            dtype,
+            kv_group=group,
+        )
+        layers = self._page_num_layers_for(key)
+        shapes, dtypes, raw_fmt, token_bytes = self._metadata_for_raw_key(key)
+        row_bytes = shape[0] * torch.empty((), dtype=dtype).element_size()
+        if (
+            layers != num_layers
+            or shapes != [shape]
+            or dtypes != [dtype]
+            or raw_fmt != fmt
+            or token_bytes <= 0
+            or token_bytes * 256 != row_bytes
+        ):
+            raise ValueError(
+                f"Page-first layout mismatch: group={group}, "
+                f"device=({num_layers}, {shape}, {dtype}, {fmt}, {row_bytes}), "
+                f"remote=({layers}, {shapes}, {dtypes}, {raw_fmt}, "
+                f"{token_bytes * 256})"
+            )
 
     async def _run_blocking_put(
         self,
@@ -1957,17 +2088,27 @@ class MooncakestoreConnector(RemoteConnector):
     async def list(self) -> List[str]:
         pass
 
-    async def close(self):
-        if self._inflight_put_tasks:
-            await asyncio.gather(
-                *tuple(self._inflight_put_tasks), return_exceptions=True
-            )
+    async def close(self) -> None:
+        """Drain reads and puts before deregistration; cancellation leaves them live."""
+        self._closing = True
+        async with self._close_lock:
+            if self._closed:
+                return
+            if self._inflight_gets:
+                await asyncio.shield(asyncio.gather(*tuple(self._inflight_gets)))
+            if self._inflight_put_tasks:
+                await asyncio.shield(
+                    asyncio.gather(
+                        *tuple(self._inflight_put_tasks), return_exceptions=True
+                    )
+                )
 
-        # Unregister buffer before closing the store
-        self._unregister_cpu_buffer()
-        for ptr in tuple(self._external_buffers):
-            self.store.unregister_buffer(ptr)
-        self._external_buffers.clear()
+            # Unregister buffer only after every native user has exited.
+            self._unregister_cpu_buffer()
+            for ptr in tuple(self._external_buffers):
+                self.store.unregister_buffer(ptr)
+            self._external_buffers.clear()
 
-        self.store.close()
-        logger.info("Closed the mooncake store connection")
+            self.store.close()
+            self._closed = True
+            logger.info("Closed the mooncake store connection")

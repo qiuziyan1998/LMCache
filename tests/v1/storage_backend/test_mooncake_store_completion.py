@@ -2,10 +2,13 @@
 """Mooncake-specific remote store completion semantics."""
 
 # Standard
-from concurrent.futures import Future, TimeoutError
+from collections import OrderedDict
+from collections.abc import Coroutine, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from types import SimpleNamespace
 from unittest.mock import Mock
 import asyncio
+import ctypes
 import threading
 
 # Third Party
@@ -18,7 +21,7 @@ from lmcache.v1.kv_layer_groups import (
     KVLayerGroupInfo,
     KVLayerGroupsManager,
 )
-from lmcache.v1.memory_management import MemoryFormat, TensorMemoryAllocator
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj, TensorMemoryAllocator
 from lmcache.v1.storage_backend.connector import (
     mooncakestore_connector as mooncake_connector,
 )
@@ -28,7 +31,9 @@ from lmcache.v1.storage_backend.connector.instrumented_connector import (
 from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
     MooncakestoreConnector,
 )
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+from lmcache.v1.storage_backend.storage_manager import StorageManager
 
 
 class _MemoryObj:
@@ -130,11 +135,14 @@ def _configure_page_cardinality(
 def _make_remote_backend(requires_completion: bool) -> RemoteBackend:
     backend = object.__new__(RemoteBackend)
     backend.connection = _Connection(requires_completion)
+    backend.local_cpu_backend = None
     backend.loop = object()
     backend.serializer = _Serializer()
     backend._mla_worker_id_as0_mode = False
     backend.put_tasks = set()
     backend.lock = threading.Lock()
+    backend._inflight_gets = set()
+    backend._closing = False
     return backend
 
 
@@ -168,7 +176,7 @@ def test_layer_page_timeout_releases_late_result(monkeypatch) -> None:
         return late
 
     monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
-    backend = object.__new__(RemoteBackend)
+    backend = _make_remote_backend(True)
     backend.connection = _Connection()
     backend.loop = object()
     backend.config = SimpleNamespace(blocking_timeout_secs=0.01)
@@ -489,6 +497,559 @@ def test_mooncake_page_get_scatter_returns_layer_objects() -> None:
     assert [memory_obj.ref_count for memory_obj in allocated] == [1, 1, 0, 0]
 
 
+class _BlockingGetStore:
+    def __init__(self, allocations: list[MemoryObj]) -> None:
+        self.allocations = allocations
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.block = False
+        self.block_pages = True
+        self.outcome = "success"
+        self.owned_at_exit: list[bool] = []
+
+    @staticmethod
+    def batch_is_exist(keys: list[str]) -> list[int]:
+        return [1] * len(keys)
+
+    def batch_get_into_multi_buffers(
+        self, keys: list[str], ptrs: list[list[int]], sizes: list[list[int]]
+    ) -> list[int]:
+        block = self.block and self.block_pages
+        self._read(
+            [ptr for page in ptrs for ptr in page],
+            [size for page in sizes for size in page],
+            block,
+        )
+        return [-1 if block and self.outcome == "miss" else sum(page) for page in sizes]
+
+    def batch_get_into(
+        self, keys: list[str], ptrs: list[int], sizes: list[int]
+    ) -> list[int]:
+        block = self.block and not self.block_pages
+        self._read(ptrs, sizes, block)
+        return [-1 if block and self.outcome == "miss" else size for size in sizes]
+
+    def _read(self, ptrs: list[int], sizes: list[int], block: bool) -> None:
+        destinations = [obj for obj in self.allocations if obj.data_ptr in ptrs]
+        assert len(destinations) == len(ptrs)
+        if block:
+            self.entered.set()
+            assert self.release.wait(5), "native read was not released"
+        owned = all(obj.is_valid() and obj.get_ref_count() == 1 for obj in destinations)
+        self.owned_at_exit.append(owned)
+        assert owned, "native write outlived destination ownership"
+        for ptr, size in zip(ptrs, sizes, strict=True):
+            ctypes.memset(ptr, 7, size)
+        if block and self.outcome == "error":
+            raise RuntimeError("late native read failure")
+        if block and self.outcome == "cancel":
+            raise asyncio.CancelledError
+
+
+@pytest.fixture
+def page_get_connector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[MooncakestoreConnector]:
+    """Exercise public reads with real allocator ownership and a native double."""
+    allocator = TensorMemoryAllocator(torch.zeros(32768, dtype=torch.uint8))
+    allocations: list[MemoryObj] = []
+    releases: list[Mock] = []
+
+    def allocate(
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        batch_size: int,
+        fmt: MemoryFormat,
+        **kwargs: object,
+    ) -> list[MemoryObj]:
+        objects = allocator.batched_allocate_address_backed(
+            shapes, dtypes, batch_size, fmt
+        )
+        assert objects is not None
+        for obj in objects:
+            release = Mock(wraps=obj.ref_count_down)
+            monkeypatch.setattr(obj, "ref_count_down", release)
+            releases.append(release)
+        allocations.extend(objects)
+        return list(objects)
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector.meta_shapes = [torch.Size([8])]
+    connector.meta_dtypes = [torch.float16]
+    connector.meta_fmt = MemoryFormat.KV_MLA_LATENT_FMT
+    connector.single_token_size = 4
+    monkeypatch.setattr(connector, "_page_first_multi_buffer", True, raising=False)
+    monkeypatch.setattr(connector, "_dsa_raw_token_dims", {}, raising=False)
+    connector.__dict__.update(
+        _inflight_gets=set(),
+        _inflight_put_tasks=set(),
+        _closing=False,
+        _closed=False,
+        _close_lock=asyncio.Lock(),
+        _external_buffers={},
+    )
+    connector.registered_buffer_ptr = allocator.buffer.data_ptr()
+    connector.local_cpu_backend = SimpleNamespace(
+        memory_allocator=allocator,
+        batched_allocate=allocate,
+        allocations=allocations,
+        releases=releases,
+    )
+    _configure_page_cardinality(connector, 2)
+    connector.store = _BlockingGetStore(allocations)
+    connector.store.unregister_buffer = Mock(return_value=0)
+    connector.store.close = Mock()
+    try:
+        yield connector
+    finally:
+        connector.store.release.set()
+        for obj in allocations:
+            if obj.is_valid():
+                obj.ref_count_down()
+
+
+@pytest.mark.parametrize("mode", ["pages", "legacy", "mixed"])
+@pytest.mark.parametrize("outcome", ["success", "miss", "error", "cancel"])
+@pytest.mark.parametrize("cancel_count", [1, 2])
+def test_mooncake_get_cancellation_drains_native_writes(
+    page_get_connector: MooncakestoreConnector,
+    mode: str,
+    outcome: str,
+    cancel_count: int,
+) -> None:
+    """Cancellation owns current buffers, not results of earlier public reads."""
+    connector = page_get_connector
+    backend = connector.local_cpu_backend
+    store = connector.store
+    keys = [_layer_key(1, layer) for layer in range(2)]
+    if mode == "legacy":
+        keys = keys[:1]
+    elif mode == "mixed":
+        keys.append(_layer_key(2, 0))
+    store.block_pages = mode == "pages"
+
+    async def run() -> None:
+        earlier = await connector.batched_get([_layer_key(3, 0), _layer_key(3, 1)])
+        assert all(obj is not None and obj.get_ref_count() == 1 for obj in earlier)
+        store.block = True
+        store.outcome = outcome
+        task = asyncio.create_task(connector.batched_get(keys))
+        try:
+            assert await asyncio.to_thread(store.entered.wait, 5)
+            assert len(backend.allocations) == len(earlier) + len(keys)
+            allocated_bytes = backend.memory_allocator.total_allocated_size
+            for _ in range(cancel_count):
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done()
+                assert backend.memory_allocator.total_allocated_size == allocated_bytes
+                assert all(obj.get_ref_count() == 1 for obj in backend.allocations)
+                assert all(release.call_count == 0 for release in backend.releases)
+        finally:
+            store.release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 5)
+        assert all(store.owned_at_exit)
+        assert [obj.get_ref_count() for obj in backend.allocations] == (
+            [1, 1] + [0] * len(keys)
+        )
+        assert [release.call_count for release in backend.releases] == (
+            [0, 0] + [1] * len(keys)
+        )
+        for obj in earlier:
+            assert obj is not None
+            obj.ref_count_down()
+        assert backend.memory_allocator.total_allocated_size == 0
+        assert all(release.call_count == 1 for release in backend.releases)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["pages", "legacy", "mixed"])
+@pytest.mark.parametrize("outcome", ["success", "miss", "error", "cancel"])
+def test_remote_get_timeout_releases_late_native_results(
+    page_get_connector: MooncakestoreConnector, mode: str, outcome: str
+) -> None:
+    """A blocking timeout returns misses while native writes retain their buffers."""
+    connector = page_get_connector
+    local = connector.local_cpu_backend
+    store = connector.store
+    store.block = True
+    store.block_pages = mode == "pages"
+    store.outcome = outcome
+    keys = [_layer_key(1, layer) for layer in range(2)]
+    if mode == "legacy":
+        keys = keys[:1]
+    elif mode == "mixed":
+        keys.append(_layer_key(2, 0))
+    backend = _make_remote_backend(True)
+    backend.connection = InstrumentedRemoteConnector(connector)
+    backend.local_cpu_backend = local
+    backend.config = SimpleNamespace(blocking_timeout_secs=0.05)
+    backend.stats_monitor = Mock()
+    backend.stats_monitor.get_current_retrieve_stats.return_value = None
+    backend.deserializer = Mock()
+    backend.__dict__.update(_mla_worker_id_as0_mode=False, _get_blocking_failed_count=0)
+
+    async def run() -> None:
+        backend.loop = asyncio.get_running_loop()
+        task = asyncio.create_task(
+            asyncio.to_thread(backend.batched_get_blocking, keys)
+        )
+        try:
+            assert await asyncio.to_thread(store.entered.wait, 5)
+            assert await asyncio.wait_for(task, 5) == [None] * len(keys)
+            assert backend.get_blocking_failed_count == 1
+            assert local.memory_allocator.total_allocated_size > 0
+            assert all(obj.get_ref_count() == 1 for obj in local.allocations)
+            assert all(release.call_count == 0 for release in local.releases)
+            backend.deserializer.deserialize.assert_not_called()
+        finally:
+            store.release.set()
+
+        async def wait_for_cleanup() -> None:
+            while local.memory_allocator.total_allocated_size:
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(wait_for_cleanup(), 5)
+        assert all(store.owned_at_exit)
+        assert all(obj.get_ref_count() == 0 for obj in local.allocations)
+        assert all(release.call_count == 1 for release in local.releases)
+
+    asyncio.run(run())
+
+
+def test_remote_get_timeout_releases_result_racing_with_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registering cleanup after the future completes must still release results."""
+    memory_obj = _MemoryObj()
+    future: Future = Future()
+    result = future.result
+
+    def timeout(timeout: float | None = None) -> list[_MemoryObj | None]:
+        if timeout is not None:
+            future.set_result([memory_obj, None])
+            raise TimeoutError
+        return result()
+
+    monkeypatch.setattr(future, "result", timeout)
+    cancel = Mock(wraps=future.cancel)
+    monkeypatch.setattr(future, "cancel", cancel)
+
+    def submit(coroutine: Coroutine, loop: object) -> Future:
+        coroutine.close()
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+    backend = _make_remote_backend(True)
+    backend.connection = SimpleNamespace(
+        support_batched_get=lambda: True,
+        batched_get=lambda keys: asyncio.sleep(0),
+    )
+    backend.local_cpu_backend = object()
+    backend.config = SimpleNamespace(blocking_timeout_secs=0.01)
+    backend.stats_monitor = Mock()
+    backend.stats_monitor.get_current_retrieve_stats.return_value = None
+    backend.deserializer = Mock()
+    monkeypatch.setattr(backend, "_get_blocking_failed_count", 0, raising=False)
+
+    assert backend.batched_get_blocking([_key(1), _key(2)]) == [None, None]
+    cancel.assert_not_called()
+    backend.deserializer.deserialize.assert_not_called()
+    assert memory_obj.ref_count == 0
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_mooncake_close_drains_cancelled_reads_before_unregister(
+    page_get_connector: MooncakestoreConnector, legacy: bool
+) -> None:
+    """Cancelling close must leave the read, registration and allocator live."""
+    connector = page_get_connector
+    local = connector.local_cpu_backend
+    store = connector.store
+    store.block = True
+    store.block_pages = not legacy
+    keys = [_layer_key(1, layer) for layer in range(1 if legacy else 2)]
+
+    async def run() -> None:
+        read = asyncio.create_task(connector.batched_get(keys))
+        close = None
+        try:
+            assert await asyncio.to_thread(store.entered.wait, 5)
+            # Executor-backed reads must survive even an all-task cancellation.
+            for task in asyncio.all_tasks():
+                if task is not asyncio.current_task():
+                    task.cancel()
+            close = asyncio.create_task(connector.close())
+            await asyncio.sleep(0)
+            assert not close.done()
+            with pytest.raises(RuntimeError, match="closing"):
+                await connector.batched_get(keys)
+            close.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await close
+            read.cancel()
+            await asyncio.sleep(0)
+            assert not read.done()
+            store.unregister_buffer.assert_not_called()
+            store.close.assert_not_called()
+            assert all(release.call_count == 0 for release in local.releases)
+        finally:
+            store.release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(read, 5)
+            if close is not None:
+                await asyncio.gather(close, return_exceptions=True)
+        await connector.close()
+        await connector.close()
+        assert all(store.owned_at_exit)
+        assert local.memory_allocator.total_allocated_size == 0
+        assert all(release.call_count == 1 for release in local.releases)
+        store.unregister_buffer.assert_called_once()
+        store.close.assert_called_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["pages", "legacy", "mixed"])
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+@pytest.mark.parametrize("recreate", [False, True])
+def test_timeout_then_storage_close_drains_before_allocator(
+    page_get_connector: MooncakestoreConnector,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    outcome: str,
+    recreate: bool,
+) -> None:
+    """Global close and backend recreation cannot invalidate a native destination."""
+    connector = page_get_connector
+    local = connector.local_cpu_backend
+    store = connector.store
+    store.block = True
+    store.block_pages = mode == "pages"
+    store.outcome = outcome
+    keys = [_layer_key(1, layer) for layer in range(2)]
+    if mode == "legacy":
+        keys = keys[:1]
+    elif mode == "mixed":
+        keys.append(_layer_key(2, 0))
+    events: list[str] = []
+    cpu = object.__new__(LocalCPUBackend)
+    cpu.memory_allocator = local.memory_allocator
+    cpu.batched_msg_sender = None
+    cpu.clear = Mock()
+
+    def unregister(ptr: int) -> int:
+        assert all(store.owned_at_exit)
+        assert all(release.call_count == 1 for release in local.releases)
+        events.append("unregister")
+        return 0
+
+    def close_allocator() -> None:
+        assert local.memory_allocator.total_allocated_size == 0
+        assert all(release.call_count == 1 for release in local.releases)
+        assert events[-1] == ("replacement" if recreate else "transport")
+        events.append("allocator")
+
+    store.unregister_buffer.side_effect = unregister
+    store.close.side_effect = lambda: events.append("transport")
+    monkeypatch.setattr(
+        local.memory_allocator, "close", Mock(side_effect=close_allocator)
+    )
+    remote = _make_remote_backend(True)
+    remote.connection = InstrumentedRemoteConnector(connector)
+    remote.local_cpu_backend = cpu
+    remote.config = SimpleNamespace(blocking_timeout_secs=0.05)
+    remote.stats_monitor = Mock()
+    remote.stats_monitor.get_current_retrieve_stats.return_value = None
+    remote.deserializer = Mock()
+    monkeypatch.setattr(remote, "_get_blocking_failed_count", 0, raising=False)
+    closing = threading.Event()
+    remote_close = remote.close
+
+    def close_remote() -> None:
+        closing.set()
+        remote_close()
+
+    monkeypatch.setattr(remote, "close", close_remote)
+    manager = object.__new__(StorageManager)
+    manager.manager_lock = threading.Lock()
+    manager.storage_backends = OrderedDict(LocalCPUBackend=cpu, RemoteBackend=remote)
+    manager.config = SimpleNamespace(local_cpu=True)
+    manager.metadata = SimpleNamespace(role="scheduler")
+    manager.lmcache_worker = None
+    manager.loop = asyncio.new_event_loop()
+    manager.thread = threading.Thread(target=manager.loop.run_forever)
+    remote.loop = manager.loop
+    replacement = Mock(spec=RemoteBackend)
+    replacement.close.side_effect = lambda: events.append("replacement")
+    create = Mock(return_value=OrderedDict(RemoteBackend=replacement))
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.storage_manager.CreateStorageBackends", create
+    )
+    manager.thread.start()
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            try:
+                assert remote.batched_get_blocking(keys) == [None] * len(keys)
+                assert store.entered.wait(5)
+                for operation in (manager.close_backend, manager.recreate_backend):
+                    with pytest.raises(
+                        RuntimeError,
+                        match="LocalCPUBackend: dependent backends.*RemoteBackend",
+                    ):
+                        operation("LocalCPUBackend")
+                    assert manager.storage_backends["LocalCPUBackend"] is cpu
+                    assert manager.storage_backends["RemoteBackend"] is remote
+                    local.memory_allocator.close.assert_not_called()
+                    create.assert_not_called()
+                if recreate:
+                    recreated = executor.submit(
+                        manager.recreate_backend, "RemoteBackend"
+                    )
+                    assert closing.wait(5)
+                closed = executor.submit(manager.close)
+                assert closing.wait(5)
+                assert not closed.done()
+                acquired = manager.manager_lock.acquire(blocking=False)
+                if acquired:
+                    manager.manager_lock.release()
+                assert not acquired
+                store.unregister_buffer.assert_not_called()
+                store.close.assert_not_called()
+                local.memory_allocator.close.assert_not_called()
+                assert all(release.call_count == 0 for release in local.releases)
+                count = len(local.allocations)
+                assert remote.batched_get_blocking(keys) == [None] * len(keys)
+                assert len(local.allocations) == count
+                if recreate:
+                    create.assert_not_called()
+            finally:
+                store.release.set()
+            if recreate:
+                recreated.result(timeout=5)
+            closed.result(timeout=5)
+        assert all(store.owned_at_exit)
+        assert events == ["unregister", "transport"] + (
+            ["replacement"] if recreate else []
+        ) + ["allocator"]
+        local.memory_allocator.close.assert_called_once()
+        store.unregister_buffer.assert_called_once()
+        store.close.assert_called_once()
+        assert all(release.call_count == 1 for release in local.releases)
+        assert not manager.thread.is_alive()
+        assert manager.storage_backends == {}
+        with pytest.raises(KeyError):
+            manager.recreate_backend("RemoteBackend")
+    finally:
+        store.release.set()
+        if manager.loop.is_running():
+            manager.loop.call_soon_threadsafe(manager.loop.stop)
+        manager.thread.join(timeout=5)
+        manager.loop.close()
+
+
+def test_storage_close_keeps_allocator_and_loop_live_on_remote_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsafe remote drain cannot be silently followed by allocator teardown."""
+    remote = _make_remote_backend(True)
+    remote.loop = Mock()
+    remote.loop.is_running.return_value = True
+    remote.connection = SimpleNamespace(close=lambda: asyncio.sleep(0))
+    failed: Future = Future()
+    failed.set_exception(RuntimeError("unsafe drain"))
+
+    def submit(coroutine: Coroutine, loop: object) -> Future:
+        coroutine.close()
+        return failed
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+    cpu = Mock(spec=LocalCPUBackend)
+    manager = object.__new__(StorageManager)
+    manager.manager_lock = threading.Lock()
+    manager.storage_backends = OrderedDict(LocalCPUBackend=cpu, RemoteBackend=remote)
+    manager.loop = remote.loop
+    manager.thread = Mock()
+
+    with pytest.raises(RuntimeError, match="unsafe drain"):
+        manager.close()
+    cpu.close.assert_not_called()
+    manager.loop.stop.assert_not_called()
+    manager.loop.call_soon_threadsafe.assert_not_called()
+    manager.thread.join.assert_not_called()
+    assert list(manager.storage_backends) == ["LocalCPUBackend", "RemoteBackend"]
+
+
+def test_remote_close_propagates_late_result_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed late-result release remains a barrier to allocator shutdown."""
+    monkeypatch.setattr(RemoteBackend, "_read_cleanups", {})
+    memory_obj = _MemoryObj()
+    release = Mock(side_effect=RuntimeError("release failed"))
+    monkeypatch.setattr(memory_obj, "ref_count_down", release)
+    late: Future = Future()
+
+    def submit(coroutine: Coroutine, loop: object) -> Future:
+        coroutine.close()
+        return late
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+    remote = _make_remote_backend(True)
+    remote.connection = SimpleNamespace(
+        support_batched_get=lambda: True,
+        batched_get=lambda keys: asyncio.sleep(0),
+        close=Mock(),
+    )
+    cpu = Mock(spec=LocalCPUBackend)
+    remote.local_cpu_backend = cpu
+    remote.config = SimpleNamespace(blocking_timeout_secs=0.001)
+    remote.stats_monitor = Mock()
+    remote.stats_monitor.get_current_retrieve_stats.return_value = None
+    remote.deserializer = Mock()
+    monkeypatch.setattr(remote, "_get_blocking_failed_count", 0, raising=False)
+    assert remote.batched_get_blocking([_key(1)]) == [None]
+
+    # A pending cleanup barrier also protects a CPU whose owner is no longer listed.
+    manager = object.__new__(StorageManager)
+    manager.manager_lock = threading.Lock()
+    manager.storage_backends = OrderedDict(LocalCPUBackend=cpu)
+    for operation in (manager.close_backend, manager.recreate_backend):
+        with pytest.raises(RuntimeError, match="outstanding remote read cleanup"):
+            operation("LocalCPUBackend")
+        cpu.close.assert_not_called()
+        assert manager.storage_backends["LocalCPUBackend"] is cpu
+    late.set_result([memory_obj])
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="release failed"):
+            remote.close()
+    remote.connection.close.assert_not_called()
+    release.assert_called_once()
+
+    manager = object.__new__(StorageManager)
+    manager.manager_lock = threading.Lock()
+    manager.storage_backends = OrderedDict(LocalCPUBackend=cpu, RemoteBackend=remote)
+    manager.config = SimpleNamespace(local_cpu=True)
+    manager.loop = Mock()
+    manager.thread = Mock()
+    # This existing best-effort API swallows the failed remote close and removes it.
+    assert manager.close_backend("RemoteBackend")
+    assert list(manager.storage_backends) == ["LocalCPUBackend"]
+    for operation in (manager.close_backend, manager.recreate_backend):
+        with pytest.raises(RuntimeError, match="outstanding remote read cleanup"):
+            operation("LocalCPUBackend")
+        cpu.close.assert_not_called()
+        assert manager.storage_backends["LocalCPUBackend"] is cpu
+    with pytest.raises(RuntimeError, match="release failed"):
+        manager.close()
+    cpu.close.assert_not_called()
+    manager.loop.call_soon_threadsafe.assert_not_called()
+
+
 def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -514,6 +1075,7 @@ def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
             self.submitted = (keys, pages)
 
     connector = object.__new__(MooncakestoreConnector)
+    connector.__dict__.update(_inflight_gets=set(), _closing=False)
     connector._layer_merged_pages = True
     connector._page_first_multi_buffer = True
     connector.local_cpu_backend = _Backend()

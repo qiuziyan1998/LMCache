@@ -450,14 +450,19 @@ class StorageManager:
         memory_objs: List[MemoryObj],
         *,
         required_backends: Sequence[str] = (),
+        location: Optional[str] = None,
     ) -> None:
-        """Synchronously publish a row without allocator copies or silent misses.
+        """Synchronously publish buffers without allocator copies or silent misses.
 
         Write to active backends sharing this manager's allocator. Every named
         required backend must exist, be enabled, and require put completion;
         RemoteBackend must have a connected batched-put connector. Missing or
         malformed completion futures fail closed, including for other backends
         advertising completion. Local synchronous backends may return None.
+
+        If ``location`` is supplied, write only to that active backend. It must
+        exist and cannot exclude any ``required_backends``. This lets page
+        assembly stage rows locally without premature remote layer-key writes.
 
         Consumes one caller reference per input occurrence on EVERY exit,
         including validation/submission errors. All returned futures are drained
@@ -475,11 +480,14 @@ class StorageManager:
             if self.allocator_backend is None:
                 raise RuntimeError("Strict row put requires an allocator backend")
             required = set(required_backends)
+            if location is not None and required - {location}:
+                raise ValueError("Strict put location excludes required backends")
+            selected = required | ({location} if location is not None else set())
             with self._freeze_lock, self._bypass_lock:
-                unavailable = required - self.storage_backends.keys()
-                unavailable.update(required & self._bypassed_backends)
+                unavailable = selected - self.storage_backends.keys()
+                unavailable.update(selected & self._bypassed_backends)
                 if self._freeze:
-                    unavailable.update(required - {"LocalCPUBackend"})
+                    unavailable.update(selected - {"LocalCPUBackend"})
                 if unavailable:
                     raise RuntimeError(
                         "Required row storage backend missing, bypassed or frozen: "
@@ -490,6 +498,7 @@ class StorageManager:
                     for name, backend in self.storage_backends.items()
                     if name not in self._bypassed_backends
                     and (not self._freeze or name == "LocalCPUBackend")
+                    and (location is None or name == location)
                 ]
             if not targets:
                 raise RuntimeError("Strict row put has no active storage backend")
@@ -1458,6 +1467,10 @@ class StorageManager:
         Returns:
             True if the backend was found and closed, False
             otherwise.
+
+        Raises:
+            RuntimeError: If an allocator still has dependent backends or
+                outstanding remote read cleanup.
         """
         with self.manager_lock:
             backend = self.storage_backends.get(backend_name)
@@ -1467,6 +1480,19 @@ class StorageManager:
                     backend_name,
                 )
                 return False
+
+            if isinstance(backend, AllocatorBackendInterface):
+                dependents = [
+                    name
+                    for name, other in self.storage_backends.items()
+                    if other is not backend and other.get_allocator_backend() is backend
+                ]
+                if dependents:
+                    raise RuntimeError(
+                        f"Cannot close allocator {backend_name}: dependent backends "
+                        f"still exist: {dependents}"
+                    )
+                RemoteBackend.drain_reads_for_allocator(backend, wait=False)
 
             try:
                 logger.info("Closing backend: %s", backend_name)
@@ -1546,11 +1572,26 @@ class StorageManager:
 
         Raises:
             KeyError: If *backend_name* does not exist.
+            RuntimeError: If an allocator still has dependent backends or
+                outstanding remote read cleanup.
         """
         with self.manager_lock:
             backend = self.storage_backends.get(backend_name)
             if backend is None:
                 raise KeyError("Backend %s not found" % backend_name)
+
+            if isinstance(backend, AllocatorBackendInterface):
+                dependents = [
+                    name
+                    for name, other in self.storage_backends.items()
+                    if other is not backend and other.get_allocator_backend() is backend
+                ]
+                if dependents:
+                    raise RuntimeError(
+                        f"Cannot recreate allocator {backend_name}: dependent backends "
+                        f"still exist: {dependents}"
+                    )
+                RemoteBackend.drain_reads_for_allocator(backend, wait=False)
 
             # --- close ---
             try:
@@ -1592,40 +1633,60 @@ class StorageManager:
 
             return created
 
-    def close(self):
+    def close(self) -> None:
+        """Close transport users before allocators; leave resources live on failure."""
         logger.info("Closing StorageManager...")
 
-        # Close all backends
-        for name, backend in self.storage_backends.items():
+        # Serialize against backend recreation and keep shared CPU memory until last.
+        with self.manager_lock:
+            backends = sorted(
+                self.storage_backends.items(),
+                key=lambda item: (
+                    isinstance(item[1], AllocatorBackendInterface),
+                    item[0] == "LocalCPUBackend",
+                ),
+            )
+            for name, backend in backends:
+                try:
+                    logger.info(f"Closing storage backend: {name}")
+                    if isinstance(backend, AllocatorBackendInterface):
+                        RemoteBackend.drain_reads_for_allocator(backend)
+                    backend.close()
+                    logger.info(f"Storage backend {name} closed successfully")
+                except BaseException:
+                    # An unsafe drain must not be followed by freeing its slab.
+                    logger.exception(
+                        "Error closing backend %s; stopping teardown", name
+                    )
+                    raise
+
+            self.storage_backends.clear()
+            self.non_allocator_backends = []
+            self.local_cpu_backend = None
+            self.allocator_backend = None
+
+            # Stop event loop only after all native users and their cleanup finish.
             try:
-                logger.info(f"Closing storage backend: {name}")
-                backend.close()
-                logger.info(f"Storage backend {name} closed successfully")
+                if self.loop.is_running():
+                    logger.info("Stopping event loop...")
+                    self.loop.call_soon_threadsafe(self.loop.stop)
+                    logger.info("Event loop stop signaled")
             except Exception as e:
-                logger.error(f"Error closing backend {name}: {e}")
+                logger.error(f"Error stopping event loop: {e}")
 
-        # Stop event loop
-        try:
-            if self.loop.is_running():
-                logger.info("Stopping event loop...")
-                self.loop.call_soon_threadsafe(self.loop.stop)
-                logger.info("Event loop stop signaled")
-        except Exception as e:
-            logger.error(f"Error stopping event loop: {e}")
-
-        # Wait for thread with timeout
-        if self.thread.is_alive():
-            logger.info("Waiting for storage manager thread to finish...")
-            self.thread.join(timeout=10.0)
-
+            # Wait for thread with timeout
             if self.thread.is_alive():
-                logger.warning(
-                    "Storage manager thread did not terminate within 10s timeout. "
-                    "Proceeding with shutdown anyway."
-                )
+                logger.info("Waiting for storage manager thread to finish...")
+                self.thread.join(timeout=10.0)
+
+                if self.thread.is_alive():
+                    logger.warning(
+                        "Storage manager thread did not terminate within 10s timeout. "
+                        "Proceeding with shutdown anyway."
+                    )
+                else:
+                    logger.info("Storage manager thread terminated successfully")
             else:
-                logger.info("Storage manager thread terminated successfully")
-        else:
-            logger.info("Storage manager thread already stopped")
+                logger.info("Storage manager thread already stopped")
 
         logger.info("Storage manager closed.")

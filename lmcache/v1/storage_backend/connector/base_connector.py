@@ -285,6 +285,26 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         """Whether callers must wait for remote persistence."""
         return False
 
+    def supports_page_first(self) -> bool:
+        """Whether complete-group raw page writes and scatter reads are enabled."""
+        return False
+
+    def validate_page_first_layout(
+        self,
+        group: int,
+        num_layers: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+    ) -> None:
+        """Validate a complete 256-token BF16 plane-major row ABI without I/O.
+
+        ``group`` and ``num_layers`` describe the initialized device group;
+        ``shape``, ``dtype`` and ``fmt`` describe one full CPU row buffer.
+        Raise ValueError for unsupported layouts or mismatched remote metadata.
+        """
+        raise ValueError("Connector does not support page-first layout validation")
+
     async def batched_put(
         self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
     ):

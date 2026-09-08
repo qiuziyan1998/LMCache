@@ -84,8 +84,11 @@ class RecordingBackend:
         self.events.append(f"finish-{metadata.row.kv_group}")
         return self.persist_futures.get(metadata.row)
 
-    def sync_save(self, metadata: Any, kv_layer: Any, attn_metadata: Any) -> None:
+    def sync_save(
+        self, metadata: Any, kv_layer: Any, attn_metadata: Any
+    ) -> Optional[Future]:
         self.events.append(f"sync-save-{metadata.row.kv_group}")
+        return self.persist_futures.get(metadata.row)
 
     def abort_request(self, request_id: str) -> None:
         self.aborted.append(request_id)
@@ -494,6 +497,43 @@ def test_sync_contract_saves_one_row_to_persist_done() -> None:
     with pytest.raises(RuntimeError, match="per-group row order"):
         coordinator.save(metadata, _kv_layer())
     assert backend.events == ["sync-save-0"]
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_sync_source_completion_waits_for_shared_page_commit(failure: bool) -> None:
+    cache = _topology_cache()
+    future = Future()
+    backend = RecordingBackend(supports_window=False)
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    for execution in cache.execution_to_entry:
+        for metadata in _callback(cache, execution):
+            backend.persist_futures[metadata.row] = future
+            coordinator.save(metadata, _kv_layer())
+    assert not coordinator.request_persist_done("req-1")
+    assert coordinator.pending_jobs() == 101
+    assert coordinator.pending_bytes() == 0  # CPU manifests, not live NPU sources.
+    if failure:
+        future.set_exception(RuntimeError("page commit failed"))
+        with pytest.raises(RuntimeError, match="page commit failed"):
+            coordinator.wait_for_request_persist_done("req-1")
+        assert not coordinator.request_persist_done("req-1")
+    else:
+        future.set_result(None)
+        coordinator.wait_for_request_persist_done("req-1")
+        assert coordinator.request_persist_done("req-1")
+        assert coordinator.pending_jobs() == 0
+    coordinator.release_request("req-1")
+    assert not coordinator.request_persist_done("req-1")
+
+
+def test_sync_rejects_invalid_persistence_result() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend(supports_window=False)
+    backend.sync_save = Mock(return_value=True)
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    with pytest.raises(TypeError, match="Future or None"):
+        coordinator.save(_callback(cache, 0)[0], _kv_layer())
+    assert not coordinator.has_request("req-1")
 
 
 @pytest.mark.parametrize("backend_present", [False, True])

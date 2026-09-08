@@ -3,11 +3,14 @@
 from typing import Any, List, Optional
 import time
 
+# Third Party
+import torch
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryObj
+from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryFormat, MemoryObj
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 
 logger = init_logger(__name__)
@@ -96,6 +99,21 @@ class InstrumentedRemoteConnector(RemoteConnector):
 
     def requires_put_completion(self) -> bool:
         return self._connector.requires_put_completion()
+
+    def supports_page_first(self) -> bool:
+        """Report the effective wrapped connector's page storage capability."""
+        return self._connector.supports_page_first()
+
+    def validate_page_first_layout(
+        self,
+        group: int,
+        num_layers: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+    ) -> None:
+        """Delegate full-row ABI validation; propagate mismatches without I/O."""
+        self._connector.validate_page_first_layout(group, num_layers, shape, dtype, fmt)
 
     def support_batched_get(self) -> bool:
         return self._connector.support_batched_get()

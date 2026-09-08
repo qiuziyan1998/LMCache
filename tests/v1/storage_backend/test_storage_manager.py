@@ -20,6 +20,10 @@ Key scenarios tested:
 """
 
 # Standard
+from concurrent.futures import Future
+from threading import Lock
+from types import SimpleNamespace
+from unittest.mock import Mock
 import asyncio
 
 # Third Party
@@ -47,6 +51,75 @@ class MockMemoryObj:
 
     def __repr__(self):
         return f"MockMemoryObj(id={self.obj_id}, ref_count={self.ref_count})"
+
+
+@pytest.mark.parametrize(
+    "target,failure",
+    [
+        ("LocalCPUBackend", None),
+        ("RemoteBackend", None),
+        ("LocalCPUBackend", "missing"),
+        ("RemoteBackend", "missing"),
+        ("LocalCPUBackend", "bypassed"),
+        ("RemoteBackend", "bypassed"),
+        ("RemoteBackend", "frozen"),
+        ("LocalCPUBackend", "excluded_required"),
+        ("RemoteBackend", "no_future"),
+    ],
+)
+def test_strict_put_location_never_writes_other_tiers_or_silently_skips(
+    target: str, failure: str | None
+) -> None:
+    manager = object.__new__(StorageManager)
+    manager._bypass_lock = Lock()
+    manager._freeze_lock = Lock()
+    manager._bypassed_backends = set()
+    manager._freeze = failure == "frozen"
+    local = Mock()
+    remote = Mock()
+    manager.allocator_backend = local
+    manager.storage_backends = {"LocalCPUBackend": local, "RemoteBackend": remote}
+    for backend in (local, remote):
+        backend.get_allocator_backend.return_value = local
+    local.requires_put_completion.return_value = False
+    local.batched_submit_put_task.return_value = None
+    remote.requires_put_completion.return_value = True
+    remote.connection = SimpleNamespace(support_batched_put=lambda: True)
+    completed = Future()
+    completed.set_result(None)
+    remote.batched_submit_put_task.return_value = (
+        None if failure == "no_future" else [completed]
+    )
+    if failure == "missing":
+        del manager.storage_backends[target]
+    if failure == "bypassed":
+        manager._bypassed_backends.add(target)
+    required = (
+        ("RemoteBackend",)
+        if target == "RemoteBackend" or failure == "excluded_required"
+        else ()
+    )
+    obj = MockMemoryObj(0)
+
+    def put() -> None:
+        manager.batched_put_sync_required(
+            ["key"], [obj], required_backends=required, location=target
+        )
+
+    if failure is None:
+        put()
+    else:
+        with pytest.raises((RuntimeError, ValueError)):
+            put()
+    assert obj.ref_count == 0
+    selected, other = (
+        (local, remote) if target == "LocalCPUBackend" else (remote, local)
+    )
+    other.batched_submit_put_task.assert_not_called()
+    if failure is None or failure == "no_future":
+        selected.batched_submit_put_task.assert_called_once_with(["key"], [obj])
+    else:
+        selected.batched_submit_put_task.assert_not_called()
 
 
 class MockAsyncLookupServer:

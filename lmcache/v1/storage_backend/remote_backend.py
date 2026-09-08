@@ -24,6 +24,10 @@ logger = init_logger(__name__)
 
 
 class RemoteBackend(StorageBackendInterface):
+    # Backend removal/recreation must not discard an unresolved allocator barrier.
+    _read_cleanup_lock = threading.Lock()
+    _read_cleanups: dict[Future, Optional[LocalCPUBackend]] = {}
+
     def __init__(
         self,
         config: LMCacheEngineConfig,
@@ -35,6 +39,8 @@ class RemoteBackend(StorageBackendInterface):
         super().__init__(dst_device=dst_device)
         self.put_tasks: Set[CacheEngineKey] = set()
         self.lock = threading.Lock()
+        self._inflight_gets: set[Future] = set()
+        self._closing = False
 
         assert config.remote_url is not None
 
@@ -126,6 +132,8 @@ class RemoteBackend(StorageBackendInterface):
 
     def init_connection(self):
         # Initialize connection
+        if self._closing:
+            return
         if self.connection is not None:
             return
         if (time.time() - self.failure_time) < self.min_reconnect_interval:
@@ -480,6 +488,11 @@ class RemoteBackend(StorageBackendInterface):
         self,
         keys: List[CacheEngineKey],
     ) -> List[Optional[MemoryObj]]:
+        """Return one owned object or None per key in keys.
+
+        Batched connector timeouts return misses immediately; the in-flight read
+        keeps ownership until completion, when any late results are released.
+        """
         # Check if local_cpu_backend is available (required for memory allocation)
         if self.local_cpu_backend is None:
             logger.warning(
@@ -499,17 +512,15 @@ class RemoteBackend(StorageBackendInterface):
         t1 = time.perf_counter()
         # batched get
         if self.connection.support_batched_get():
-            future = asyncio.run_coroutine_threadsafe(
-                self.connection.batched_get(keys), self.loop
-            )
             try:
-                memory_objs = future.result(self.config.blocking_timeout_secs)
+                memory_objs = self._batched_get_with_timeout(
+                    self.connection.batched_get, keys
+                )
             except Exception as e:
                 if isinstance(e, TimeoutError):
                     logger.warning(
-                        "batched get blocking timeout, trigger cancel the future task"
+                        "batched get blocking timeout, releasing results on completion"
                     )
-                    future.cancel()
                 else:
                     logger.warning(
                         f"Error occurred in batched_get_blocking: {e}, "
@@ -597,27 +608,7 @@ class RemoteBackend(StorageBackendInterface):
         retrieve = getattr(self.connection, "batched_get_layer_pages", None)
         if not callable(retrieve):
             raise RuntimeError("Remote connector does not support layer pages")
-        future = asyncio.run_coroutine_threadsafe(retrieve(keys), self.loop)
-        try:
-            return future.result(self.config.blocking_timeout_secs)
-        except TimeoutError:
-            def release_late_result(done: Future) -> None:
-                try:
-                    pages = done.result()
-                except BaseException:
-                    return
-                for page in pages:
-                    try:
-                        if page.is_valid():
-                            page.ref_count_down()
-                    except Exception:
-                        logger.exception("Failed to release a late layer-page result")
-
-            future.add_done_callback(release_late_result)
-            raise
-        except BaseException:
-            future.cancel()
-            raise
+        return self._batched_get_with_timeout(retrieve, keys)
 
     async def support_batched_async_contains(self) -> bool:
         return (
@@ -727,13 +718,100 @@ class RemoteBackend(StorageBackendInterface):
         )
         return self.local_cpu_backend
 
-    def close(self):
-        try:
-            assert self.connection is not None
-            future = asyncio.run_coroutine_threadsafe(
-                self.connection.close(), self.loop
+    def close(self) -> None:
+        """Drain abandoned read results before closing; propagate unsafe failures."""
+        with self.lock:
+            self._closing = True
+            pending = tuple(self._inflight_gets)
+        for completion in pending:
+            completion.result()
+        if self.connection is None:
+            return
+        if not self.loop.is_running():
+            raise RuntimeError("Cannot safely close remote backend: event loop stopped")
+        future = asyncio.run_coroutine_threadsafe(self.connection.close(), self.loop)
+        future.result()
+        self.connection = None
+        logger.info("Remote backend closed.")
+
+    @classmethod
+    def drain_reads_for_allocator(
+        cls, allocator: StorageBackendInterface, *, wait: bool = True
+    ) -> None:
+        """Wait for read cleanup, including retired backends; propagate failures.
+
+        Call after closing transport backends and before closing their allocator.
+        With wait=False, raise RuntimeError if any cleanup barrier remains instead
+        of waiting, so direct allocator removal/recreation fails closed promptly.
+        """
+        with cls._read_cleanup_lock:
+            pending = [
+                completion
+                for completion, owner in cls._read_cleanups.items()
+                if owner is allocator
+            ]
+        if pending and not wait:
+            raise RuntimeError(
+                f"Cannot close or recreate allocator {allocator}: "
+                "outstanding remote read cleanup"
             )
-            future.result()
-            logger.info("Remote backend closed.")
-        except Exception as e:
-            logger.warning(f"Error occurred when closing remote connection: {e}")
+        for completion in pending:
+            completion.result()
+
+    def _batched_get_with_timeout(
+        self, retrieve: Callable[..., Any], keys: List[CacheEngineKey]
+    ) -> Any:
+        # Register before submission so close cannot miss a pending timeout handoff.
+        completion: Future = Future()
+        with self.lock:
+            if self._closing:
+                raise RuntimeError("Remote backend is closing")
+            self._inflight_gets.add(completion)
+            with self._read_cleanup_lock:
+                self._read_cleanups[completion] = self.local_cpu_backend
+
+        def finish() -> None:
+            completion.set_result(None)
+            with self.lock:
+                self._inflight_gets.discard(completion)
+            with self._read_cleanup_lock:
+                self._read_cleanups.pop(completion, None)
+
+        late = False
+        try:
+            coroutine = retrieve(keys)
+            try:
+                future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+            except BaseException:
+                coroutine.close()
+                raise
+            try:
+                return future.result(self.config.blocking_timeout_secs)
+            except TimeoutError:
+                late = True
+
+                def release_late_result(done: Future) -> None:
+                    try:
+                        results = done.result()
+                    except BaseException:
+                        finish()
+                        return
+                    error = None
+                    for memory_obj in results:
+                        if memory_obj is not None:
+                            try:
+                                memory_obj.ref_count_down()
+                            except Exception as exc:
+                                logger.exception("Failed to release a late get result")
+                                error = exc
+                    if error is not None:
+                        # Retain the failure so close cannot tear down the allocator.
+                        completion.set_exception(error)
+                    else:
+                        finish()
+
+                future.add_done_callback(release_late_result)
+                raise
+        finally:
+            if not late:
+                finish()
