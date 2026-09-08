@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from concurrent.futures import Future, TimeoutError
+from concurrent.futures import CancelledError, Future, TimeoutError
 from enum import Enum
 from typing import Any, Callable, List, Optional, Sequence, Set, cast
 import asyncio
@@ -32,6 +32,16 @@ logger = init_logger(__name__)
 def _bounded_external_timeout_secs(*timeouts: float) -> float:
     deadline = max(0.0, *timeouts)
     return deadline + min(1.0, max(0.01, deadline * 0.01))
+
+
+def _completed_future_error(future: Future) -> BaseException | None:
+    """Inspect a done future without retaining callback frames in its error."""
+    try:
+        return future.exception()
+    except CancelledError:
+        # Return an unraised error; forwarding the caught one would retain
+        # this frame and the cancelled future. Success needs only one check.
+        return CancelledError()
 
 
 class _ExternalPageReaderState(Enum):
@@ -295,14 +305,13 @@ class RemoteBackend(StorageBackendInterface):
         )
         return future
 
-    def put_callback(self, future: Future, key: CacheEngineKey):
+    def put_callback(self, future: Future, key: CacheEngineKey) -> None:
         with self.lock:
             self.put_tasks.discard(key)
-        try:
-            future.result()
-        except Exception as e:
+        error = _completed_future_error(future)
+        if error is not None:
             self._put_failed_count += 1
-            logger.error(f"Put task failed for key {key}: {e}")
+            logger.error(f"Put task failed for key {key}: {error}")
 
     def submit_put_task(
         self,
@@ -376,14 +385,12 @@ class RemoteBackend(StorageBackendInterface):
 
         def put_done_callback(f: Future) -> None:
             self.put_callback(f, key)
-            try:
-                result = f.result()
-            except BaseException as error:
-                if not completion.done():
+            error = _completed_future_error(f)
+            if not completion.done():
+                if error is not None:
                     completion.set_exception(error)
-            else:
-                if not completion.done():
-                    completion.set_result(result)
+                else:
+                    completion.set_result(f.result())
             with self.lock:
                 if self._single_put_futures.get(key) is completion:
                     self._single_put_futures.pop(key, None)
@@ -503,14 +510,13 @@ class RemoteBackend(StorageBackendInterface):
                     memory_obj.ref_count_down()
 
             def batched_done_callback(f: Future) -> None:
-                try:
-                    result = f.result()
-                except BaseException as error:
-                    self._finish_batched_completion(keys, completion, error)
-                else:
-                    self._finish_batched_completion(
-                        keys, completion, None, result=result
-                    )
+                error = _completed_future_error(f)
+                self._finish_batched_completion(
+                    keys,
+                    completion,
+                    error,
+                    result=f.result() if error is None else None,
+                )
 
             coroutine = self.connection.batched_put(keys, compressed_memory_objs)  # type: ignore
             try:
@@ -867,10 +873,12 @@ class RemoteBackend(StorageBackendInterface):
             return future.result(self.config.blocking_timeout_secs)
         except TimeoutError:
             def release_late_result(done: Future) -> None:
-                try:
-                    pages = done.result()
-                except BaseException:
+                # The timeout caller is gone. Inspect a terminal failure without
+                # re-raising it into this callback and its Future invocation
+                # frames, which would keep the future alive without cyclic GC.
+                if done.cancelled() or done.exception() is not None:
                     return
+                pages = done.result()
                 for page in pages:
                     try:
                         if page.is_valid():
@@ -883,6 +891,10 @@ class RemoteBackend(StorageBackendInterface):
         except BaseException:
             future.cancel()
             raise
+        finally:
+            # Break Future -> exception -> this frame -> Future without
+            # discarding the traceback that the caller needs for diagnostics.
+            del future
 
     async def support_batched_async_contains(self) -> bool:
         return (

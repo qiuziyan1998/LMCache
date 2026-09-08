@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import json
 import os
 import time
+import traceback
 
 # Third Party
 from vllm.config import (
@@ -96,6 +97,31 @@ RETRIEVE_STATS_INTERVAL_SECONDS_ENV = (
     "VLLM_ASCEND_LMCACHE_RETRIEVE_STATS_INTERVAL_SECONDS"
 )
 LayerwiseSaveKey = tuple[str, str, int, int, int]
+
+
+def _clear_terminal_load_tracebacks(
+    error: BaseException, completed_futures: tuple[Future, ...] = ()
+) -> None:
+    """Drop frame owners after a load failure has been logged and retired."""
+    pending = [error]
+    for future in completed_futures:
+        if not future.cancelled():
+            completed_error = future.exception()
+            if completed_error is not None:
+                pending.append(completed_error)
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+        tb = current.__traceback__
+        current.__traceback__ = None
+        if tb is not None:
+            traceback.clear_frames(tb)
 
 
 def _has_live_group1_source_for_dp(
@@ -7077,7 +7103,9 @@ class LMCacheConnectorV1Impl:
                     cold_start_perf_now() if perf_enabled else 0.0
                 )
                 try:
-                    previous_latent_future.result()
+                    # Only wait for ordering. Re-raising a stored failure would
+                    # attach this new request's frame to the predecessor.
+                    previous_latent_future.exception()
                 except BaseException:
                     # The predecessor's failure must not reorder or poison this
                     # request's fixed group-0 collective publication slot.
@@ -9779,6 +9807,12 @@ class LMCacheConnectorV1Impl:
                     ((cold_start_perf_now() if perf_enabled else 0.0) - submitted_at)
                     * 1000,
                 )
+                # Both workers are terminal and request owners have either
+                # retired or moved to the existing readiness retirement queue.
+                # Failed futures otherwise retain their request/plan frames in
+                # cycles until Python's cyclic collector runs. Preserve the
+                # traceback for the log above, then drop those frame owners.
+                _clear_terminal_load_tracebacks(exc, (future, indexer_future))
             futures.pop(req_id, None)
             if was_aborted:
                 assert aborted_ids is not None

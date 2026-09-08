@@ -59,15 +59,31 @@ logger = init_logger(__name__)
 
 async def _drain_native_task(task: asyncio.Future[Any]) -> None:
     """Keep native transfer buffers alive through coroutine cancellation."""
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            continue
-        except Exception:
-            break
-    if not task.cancelled():
-        task.exception()
+    try:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not task.cancelled():
+            task.exception()
+    finally:
+        del task
+
+
+async def _await_native_task(task: asyncio.Future[Any], *, timeout: float) -> Any:
+    """Wait without cancellation or a failed wait_for Future/traceback cycle."""
+    try:
+        # wait_for propagates the task error through its own future.result()
+        # frame on Python 3.11. That frame retains the failed future with GC
+        # disabled. wait() only reports readiness; inspect the result here.
+        if not task.done() and not (await asyncio.wait((task,), timeout=timeout))[0]:
+            raise asyncio.TimeoutError()
+        return task.result()
+    finally:
+        del task
 
 
 async def _wait_external_native_until_hard_deadline(
@@ -78,16 +94,32 @@ async def _wait_external_native_until_hard_deadline(
 ) -> Any:
     """Wait for an uncancellable external DMA without exceeding its hard bound."""
 
-    remaining = max(0.0, deadline - perf_counter())
     try:
-        return await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+        while True:
+            remaining = max(0.0, deadline - perf_counter())
+            try:
+                return await _await_native_task(task, timeout=remaining)
+            except asyncio.CancelledError as error:
+                # A second caller cancellation cannot prove that native DMA
+                # stopped. Keep the original deadline while draining it.
+                if task.cancelled():
+                    raise NativeExternalPageTransferUnknownError(
+                        operation, task
+                    ) from error
     except asyncio.TimeoutError as error:
+        if task.done() and not task.cancelled():
+            # A native TimeoutError is a known terminal result, unlike our
+            # deadline expiring while DMA may still be active.
+            return task.result()
         logger.critical(
             "Mooncake external-page %s exceeded its native hard deadline; "
             "memory remains retained and paired restart is required",
             operation,
         )
         raise NativeExternalPageTransferUnknownError(operation, task) from error
+    finally:
+        # A failed task stores this traceback; do not retain the task in it.
+        del task
 
 
 def _shared_vllm_mooncake_transport() -> tuple[Any, str, Any, Any]:
@@ -1558,6 +1590,7 @@ class MooncakestoreConnector(RemoteConnector):
         completed_pages = 0
         result_status = "empty"
 
+        native_read: asyncio.Task[Any] | None = None
         try:
             if not submitted_groups:
                 return results
@@ -1612,13 +1645,15 @@ class MooncakestoreConnector(RemoteConnector):
             return results
         except asyncio.CancelledError:
             result_status = "cancelled"
-            await _drain_native_task(native_read)
+            if native_read is not None:
+                await _drain_native_task(native_read)
             raise
         except Exception as exc:
             result_status = "error"
             logger.error("Mooncake page-first get failed: %s", exc)
             return results
         finally:
+            del native_read
             for memory_obj in memory_objs:
                 if memory_obj is not None and memory_obj.is_valid():
                     memory_obj.ref_count_down()
@@ -1715,27 +1750,33 @@ class MooncakestoreConnector(RemoteConnector):
                 )
             return []
 
-        setup_started = cold_start_perf_now() if perf_enabled else 0.0
-        sizes = [[page.layer_size] * self._page_num_layers for page in pages]
-        ptrs = [
-            [page.layer_data_ptr(layer) for layer in range(self._page_num_layers)]
-            for page in pages
-        ]
-        expected = [sum(page_sizes) for page_sizes in sizes]
-        buffer_setup_ms = (
-            (cold_start_perf_now() - setup_started) * 1000
-            if perf_enabled
-            else 0.0
-        )
-        transfer_started = cold_start_perf_now() if perf_enabled else 0.0
-        transfer = asyncio.create_task(
-            asyncio.to_thread(
-                self.store.batch_get_into_multi_buffers,
-                page_keys,
-                ptrs,
-                sizes,
+        try:
+            setup_started = cold_start_perf_now() if perf_enabled else 0.0
+            sizes = [[page.layer_size] * self._page_num_layers for page in pages]
+            ptrs = [
+                [page.layer_data_ptr(layer) for layer in range(self._page_num_layers)]
+                for page in pages
+            ]
+            expected = [sum(page_sizes) for page_sizes in sizes]
+            buffer_setup_ms = (
+                (cold_start_perf_now() - setup_started) * 1000 if perf_enabled else 0.0
             )
-        )
+            transfer_started = cold_start_perf_now() if perf_enabled else 0.0
+            transfer = asyncio.create_task(
+                asyncio.to_thread(
+                    self.store.batch_get_into_multi_buffers,
+                    page_keys,
+                    ptrs,
+                    sizes,
+                )
+            )
+        except BaseException:
+            # No native work was submitted. Release allocator references even
+            # when pointer preparation fails and cyclic GC is disabled.
+            for page in pages:
+                if page.is_valid():
+                    page.ref_count_down()
+            raise
         transfer_ms: float | None = None
         publish_ms = 0.0
         status = "error"
@@ -1765,7 +1806,14 @@ class MooncakestoreConnector(RemoteConnector):
         except asyncio.CancelledError:
             status = "cancelled"
             try:
-                await transfer
+                # Repeated caller cancellation must not cancel the to_thread
+                # task: its native call can still be writing to these pages.
+                while not transfer.done():
+                    try:
+                        await asyncio.shield(transfer)
+                    except asyncio.CancelledError:
+                        continue
+                transfer.result()
             finally:
                 for page in pages:
                     if page.is_valid():
@@ -1777,6 +1825,9 @@ class MooncakestoreConnector(RemoteConnector):
                     page.ref_count_down()
             raise
         finally:
+            # Native failure stores this coroutine's frame in the task error.
+            # Break that cycle independently of cyclic GC or caller cleanup.
+            del transfer
             if perf_enabled:
                 if transfer_ms is None:
                     transfer_ms = (cold_start_perf_now() - transfer_started) * 1000
@@ -1948,6 +1999,7 @@ class MooncakestoreConnector(RemoteConnector):
                 )
             return [None] * len(keys)
 
+        native_read: asyncio.Task[Any] | None = None
         try:
             # Single RPC call for multiple chunks
             logger.debug(f"Calling batch_get_into with {len(key_strs)} keys")
@@ -2023,7 +2075,8 @@ class MooncakestoreConnector(RemoteConnector):
             return results
 
         except asyncio.CancelledError:
-            await _drain_native_task(native_read)
+            if native_read is not None:
+                await _drain_native_task(native_read)
             for i in valid_idx:
                 if memory_objs[i] is not None:
                     memory_objs[i].ref_count_down()
@@ -2051,6 +2104,8 @@ class MooncakestoreConnector(RemoteConnector):
                     error=type(exc).__name__,
                 )
             return [None] * len(keys)
+        finally:
+            del native_read
 
     async def _batch_get_buffer(
         self, keys: List[CacheEngineKey]
@@ -2174,14 +2229,16 @@ class MooncakestoreConnector(RemoteConnector):
 
         task.add_done_callback(release_buffers)
         try:
-            return await asyncio.wait_for(
-                asyncio.shield(task), timeout=self.config.transfer_timeout
+            return await _await_native_task(
+                task, timeout=self.config.transfer_timeout
             )
         except asyncio.TimeoutError as e:
             raise TimeoutError(
                 f"Mooncake {operation} timed out after "
                 f"{self.config.transfer_timeout}s"
             ) from e
+        finally:
+            del task
 
     @staticmethod
     def _check_put_status(operation: str, status: Any) -> None:
@@ -2496,8 +2553,8 @@ class MooncakestoreConnector(RemoteConnector):
             self._inflight_put_tasks.add(task)
             task.add_done_callback(self._inflight_put_tasks.discard)
             try:
-                placement, wait_ms, transfer_ms = await asyncio.wait_for(
-                    asyncio.shield(task), timeout=self.config.transfer_timeout
+                placement, wait_ms, transfer_ms = await _await_native_task(
+                    task, timeout=self.config.transfer_timeout
                 )
             except asyncio.CancelledError:
                 try:
@@ -2531,6 +2588,8 @@ class MooncakestoreConnector(RemoteConnector):
                     raise TimeoutError(
                         "Mooncake direct page put failed after timing out"
                     ) from native_error
+            finally:
+                del task
         (
             statuses,
             preferred_segments,
@@ -2654,8 +2713,8 @@ class MooncakestoreConnector(RemoteConnector):
             self._inflight_put_tasks.add(task)
             task.add_done_callback(self._inflight_put_tasks.discard)
             try:
-                statuses, transfer_ms, thread_cpu_ms = await asyncio.wait_for(
-                    asyncio.shield(task), timeout=self.config.transfer_timeout
+                statuses, transfer_ms, thread_cpu_ms = await _await_native_task(
+                    task, timeout=self.config.transfer_timeout
                 )
             except asyncio.CancelledError:
                 # The native read is not cancellable and still owns the destination
@@ -2690,6 +2749,8 @@ class MooncakestoreConnector(RemoteConnector):
                 raise TimeoutError(
                     "Mooncake direct page load timed out"
                 ) from None
+            finally:
+                del task
 
         if statuses is None or len(statuses) != len(page_keys):
             raise RuntimeError(
