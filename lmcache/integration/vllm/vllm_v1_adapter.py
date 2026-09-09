@@ -37,6 +37,7 @@ import torch
 from lmcache import utils
 from lmcache.integration.vllm.cold_load import (
     ColdIndexerResult,
+    ColdLoadCoordinator,
     ColdLoadEntry,
     ColdLoadPlan,
 )
@@ -4229,10 +4230,10 @@ class LMCacheConnectorV1Impl:
             state = self._worker_retrieve_state.get(req_id)
         if state is not None:
             if defer_dense_release and state.dense_load_readiness is not None:
-                retirements = getattr(self, "_dense_load_retirements", None)
+                retirements = getattr(getattr(self, "_cold_load_coordinator", None), "retirements", None)
                 if retirements is None:
                     retirements = {}
-                    self._dense_load_retirements = retirements
+                    self._get_cold_load_coordinator().retirements = retirements
                 retirements[id(state)] = state
             else:
                 self._release_shared_worker_retrieve_state(state, engine)
@@ -4240,7 +4241,7 @@ class LMCacheConnectorV1Impl:
             self._mark_worker_retrieve_registry_changed()
         elif engine is not None and not any(
             retired.req_id == req_id
-            for retired in getattr(self, "_dense_load_retirements", {}).values()
+            for retired in (getattr(getattr(self, "_cold_load_coordinator", None), "retirements", None) or {}).values()
         ):
             release_fn = getattr(engine, "release_shared_cpu_sparse_request", None)
             if callable(release_fn):
@@ -4262,49 +4263,15 @@ class LMCacheConnectorV1Impl:
     def _drain_dense_load_retirements(
         self, *, block: bool = False, req_id: Optional[str] = None
     ) -> None:
-        """Poll exact fences during serving; blocking is reserved for shutdown.
-
-        A missing or failed query retains ownership rather than falling back to
-        a host wait on the model thread.
-        """
-        retirements = getattr(self, "_dense_load_retirements", None)
-        if not retirements:
+        coordinator = getattr(self, "_cold_load_coordinator", None)
+        if coordinator is None or not coordinator.retirements:
             return
-        engine = getattr(self, "lmcache_engine", None)
-        query = getattr(
-            getattr(engine, "gpu_connector", None),
-            "query_dense_load_readiness",
-            None,
+        coordinator.drain_retirements(
+            getattr(self, "lmcache_engine", None),
+            self._release_shared_worker_retrieve_state,
+            block=block,
+            req_id=req_id,
         )
-        for identity, state in tuple(retirements.items()):
-            if req_id is not None and state.req_id != req_id:
-                continue
-            if not block:
-                if getattr(state, "_dense_retirement_query_failed", False):
-                    continue
-                try:
-                    if not callable(query):
-                        raise RuntimeError(
-                            "NPU connector has no nonblocking dense-load "
-                            "readiness query API"
-                        )
-                    if not query(state.dense_load_readiness):
-                        continue
-                except Exception:
-                    logger.exception(
-                        "Dense-load retirement query failed; retaining "
-                        "owners: req_id=%s",
-                        state.req_id,
-                    )
-                    state._dense_retirement_query_failed = True
-                    continue
-            self._release_shared_worker_retrieve_state(
-                state, engine, dense_ready=not block
-            )
-            if retirements.get(identity) is state:
-                retirements.pop(identity)
-        if not retirements:
-            del self._dense_load_retirements
 
     def _request_may_store_in_wait_for_save(self, request: ReqMeta) -> bool:
         if self.kv_role == "kv_consumer":
@@ -6240,14 +6207,7 @@ class LMCacheConnectorV1Impl:
             self._sparse_destination_binding = seal(self._latent_kvcaches)
 
     def _get_dsa_cold_load_executor(self) -> ThreadPoolExecutor:
-        executor = getattr(self, "_dsa_cold_load_executor", None)
-        if executor is None:
-            executor = ThreadPoolExecutor(
-                max_workers=2,
-                thread_name_prefix="lmcache-dsa-cold",
-            )
-            self._dsa_cold_load_executor = executor
-        return executor
+        return self._get_cold_load_coordinator().get_executor()
 
     def _synchronize_dsa_cold_dense_load(self, stream: Any = None) -> None:
         assert self.lmcache_engine is not None
@@ -6313,7 +6273,8 @@ class LMCacheConnectorV1Impl:
         state.dense_load_readiness_consumed = True
 
     def _submit_dsa_cold_compact_load(self, request: ReqMeta) -> None:
-        retirements = getattr(self, "_dense_load_retirements", None)
+        coordinator = getattr(self, "_cold_load_coordinator", None)
+        retirements = coordinator.retirements if coordinator is not None else None
         if retirements and any(
             state.req_id == request.req_id for state in retirements.values()
         ):
@@ -6325,12 +6286,9 @@ class LMCacheConnectorV1Impl:
                     "Cold compact request ID was reused before its prior dense "
                     f"load owners retired: req_id={request.req_id}"
                 )
-        futures: Optional[dict[str, ColdLoadEntry]] = getattr(
-            self, "_dsa_cold_load_futures", None
-        )
-        if futures is None:
-            futures = {}
-            self._dsa_cold_load_futures = futures
+        if coordinator is None:
+            coordinator = self._get_cold_load_coordinator()
+        futures = coordinator.futures
         assert request.load_spec is not None
         generation = request.load_spec.dsa_cold_load_generation
         existing = futures.get(request.req_id)
@@ -6345,20 +6303,21 @@ class LMCacheConnectorV1Impl:
         perf_enabled = serving_perf_enabled()
         plan_started = serving_perf_now() if perf_enabled else 0.0
         plan_thread_started = time.thread_time_ns() if perf_enabled else 0
-        block_ids_started = serving_perf_now() if perf_enabled else 0.0
+        if perf_enabled:
+            block_ids_started = serving_perf_now()
         indexer_slots = request.indexer_slot_mapping[0]
         indexer_block_ids = _cold_indexer_block_ids(indexer_slots, self._block_size)
-        block_ids_ms = (
-            (serving_perf_now() if perf_enabled else 0.0) - block_ids_started
-        ) * 1000
-        device_started = serving_perf_now() if perf_enabled else 0.0
+        if perf_enabled:
+            block_ids_ms = (serving_perf_now() - block_ids_started) * 1000
+        if perf_enabled:
+            device_started = serving_perf_now()
         npu_device_id = (
             int(torch.npu.current_device()) if hasattr(torch, "npu") else None
         )
-        device_ms = (
-            (serving_perf_now() if perf_enabled else 0.0) - device_started
-        ) * 1000
-        build_started = serving_perf_now() if perf_enabled else 0.0
+        if perf_enabled:
+            device_ms = (serving_perf_now() - device_started) * 1000
+        if perf_enabled:
+            build_started = serving_perf_now()
         token_count = getattr(request.load_spec, "lmcache_cached_tokens", 0)
         plan: ColdLoadPlan = {
             "request": request,
@@ -6372,9 +6331,8 @@ class LMCacheConnectorV1Impl:
             "plan_started": plan_started,
             "latent_shared_ready": Future(),
         }
-        build_ms = (
-            (serving_perf_now() if perf_enabled else 0.0) - build_started
-        ) * 1000
+        if perf_enabled:
+            build_ms = (serving_perf_now() - build_started) * 1000
         submitted_at = serving_perf_now() if perf_enabled else 0.0
         if perf_enabled:
             serving_perf_log(
@@ -6385,55 +6343,14 @@ class LMCacheConnectorV1Impl:
                 mode="dsa_cold_compact",
             )
         executor = self._get_dsa_cold_load_executor()
-        executor_submit_started = serving_perf_now() if perf_enabled else 0.0
-        indexer_future = executor.submit(
-            self._run_dsa_cold_indexer_load,
-            plan,
-            npu_device_id,
+        if perf_enabled:
+            executor_submit_started = serving_perf_now()
+        coordinator.submit_pair(
+            plan, generation, indexer_block_ids, submitted_at, npu_device_id,
+            executor, self._run_dsa_cold_indexer_load, self._run_dsa_cold_compact_load,
         )
-        previous_latent_future = getattr(
-            self, "_dsa_cold_last_latent_future", None
-        )
-        try:
-            latent_future = executor.submit(
-                self._run_dsa_cold_compact_load,
-                plan,
-                npu_device_id,
-                indexer_future,
-                previous_latent_future,
-            )
-        except BaseException as submit_error:
-            # The staged Group-1 path waits on this gate before it can finish.
-            # Resolve it before draining the already-submitted sibling, or a
-            # failed second submit deadlocks this exception path forever.
-            latent_shared_ready = plan["latent_shared_ready"]
-            if not latent_shared_ready.done():
-                latent_shared_ready.set_exception(submit_error)
-            # Indexer work may already target the allocated blocks. Fence it
-            # before unwinding so those blocks cannot be reused.
-            try:
-                indexer_future.result()
-            except BaseException as indexer_error:
-                requires_restart = getattr(
-                    self.lmcache_engine,
-                    "remote_fill_requires_paired_restart",
-                    None,
-                )
-                if callable(requires_restart) and requires_restart():
-                    raise indexer_error
-            raise submit_error
-        self._dsa_cold_last_latent_future = latent_future
-        futures[request.req_id] = (
-            generation,
-            latent_future,
-            request,
-            indexer_block_ids,
-            submitted_at,
-            indexer_future,
-        )
-        executor_submit_ms = (
-            (serving_perf_now() if perf_enabled else 0.0) - executor_submit_started
-        ) * 1000
+        if perf_enabled:
+            executor_submit_ms = (serving_perf_now() - executor_submit_started) * 1000
         if perf_enabled:
             serving_perf_log(
                 logger,
@@ -6456,9 +6373,8 @@ class LMCacheConnectorV1Impl:
     def _try_prepare_dsa_live_split(self, request: ReqMeta) -> bool:
         """Reserve cold groups until live import succeeds or falls back."""
         pending = getattr(self, "_dsa_live_split_pending", None)
-        futures: Optional[dict[str, ColdLoadEntry]] = getattr(
-            self, "_dsa_cold_load_futures", None
-        )
+        coordinator = getattr(self, "_cold_load_coordinator", None)
+        futures = coordinator.futures if coordinator is not None else None
         if (
             pending is not None and request.req_id in pending
         ) or (
@@ -6497,12 +6413,13 @@ class LMCacheConnectorV1Impl:
         indexer_blocks = set(
             (request.indexer_slot_mapping[0] // self._block_size).tolist()
         )
-        if futures is None:
-            futures = self._dsa_cold_load_futures = {}
+        if coordinator is None:
+            coordinator = self._get_cold_load_coordinator()
+        futures = coordinator.futures
         npu_device_id = (
             int(torch.npu.current_device()) if hasattr(torch, "npu") else None
         )
-        previous = getattr(self, "_dsa_cold_last_latent_future", None)
+        previous = coordinator.last_latent_future
         latent_gate: Future = Future()
         completion: Future = Future()
 
@@ -6534,7 +6451,7 @@ class LMCacheConnectorV1Impl:
             task.add_done_callback(finish_latent)
 
         latent_gate.add_done_callback(start_latent)
-        self._dsa_cold_last_latent_future = completion
+        coordinator.last_latent_future = completion
         futures[request.req_id] = (
             generation,
             completion,
@@ -7015,7 +6932,7 @@ class LMCacheConnectorV1Impl:
         for those unrelated request futures here.
         """
         futures: Optional[dict[str, ColdLoadEntry]] = getattr(
-            self, "_dsa_cold_load_futures", None
+            getattr(self, "_cold_load_coordinator", None), "futures", None
         )
         if not futures:
             return
@@ -9668,190 +9585,172 @@ class LMCacheConnectorV1Impl:
                     continue
                 raise
 
+    def _get_cold_load_coordinator(self) -> ColdLoadCoordinator:
+        coordinator = getattr(self, "_cold_load_coordinator", None)
+        if coordinator is None:
+            coordinator = ColdLoadCoordinator(
+                self._publish_completed_cold_load,
+                self._fail_completed_cold_load,
+                self._cold_requires_paired_restart,
+            )
+            self._cold_load_coordinator = coordinator
+            executor_provider = self._get_dsa_cold_load_executor
+            if getattr(executor_provider, "__func__", None) is (
+                LMCacheConnectorV1Impl._get_dsa_cold_load_executor
+            ):
+                self._get_dsa_cold_load_executor = coordinator.get_executor
+            # Bind once at first admission, avoiding a forwarding call and
+            # weak-hook resolution on every unfinished completion poll.
+            poll = self._drain_dsa_cold_load_futures
+            if getattr(poll, "__func__", None) is (
+                LMCacheConnectorV1Impl._drain_dsa_cold_load_futures
+            ):
+                self._drain_dsa_cold_load_futures = coordinator.poll
+        return coordinator
+
     def _drain_dsa_cold_load_futures(self) -> Optional[set[str]]:
-        futures: Optional[dict[str, ColdLoadEntry]] = getattr(
-            self, "_dsa_cold_load_futures", None
+        # Normal instances bind poll once; retain direct-base and super calls.
+        coordinator = getattr(self, "_cold_load_coordinator", None)
+        return None if coordinator is None else coordinator.poll()
+
+    def _publish_completed_cold_load(
+        self,
+        req_id: str,
+        entry: ColdLoadEntry,
+        state: Any,
+        was_aborted: bool,
+        perf_enabled: bool,
+    ) -> None:
+        generation, future, request, indexer_block_ids, submitted_at, indexer_future = entry
+        publish_started = serving_perf_now() if perf_enabled else 0.0
+        completed_at = getattr(
+            state,
+            "_dsa_cold_load_completed_at",
+            publish_started,
         )
-        if not futures:
-            return None
-        perf_enabled = serving_perf_enabled()
-        finished: set[str] = set()
-        for req_id, entry in list(futures.items()):
-            (
-                generation,
-                future,
+        publish_thread_started = time.thread_time_ns() if perf_enabled else 0
+        if was_aborted:
+            self._release_unadopted_shared_request_objects(state, request)
+            self._release_shared_worker_retrieve_state(state, self.lmcache_engine)
+            self._release_request_lookup_pins(req_id)
+        else:
+            self._publish_worker_retrieve_state(
+                state,
                 request,
-                indexer_block_ids,
-                submitted_at,
-                indexer_future,
-            ) = entry
-            if not future.done() or not indexer_future.done():
-                continue
-            state = None
-            aborted_ids = getattr(self, "_dsa_cold_aborted_req_ids", None)
-            was_aborted = bool(aborted_ids is not None and req_id in aborted_ids)
+                location=state.location,
+                metadata_warm=True,
+                token_count=request.load_spec.lmcache_cached_tokens,
+                reuse_prepared_sources=True,
+            )
+            # Completion reports from different TP workers may be
+            # accumulated across multiple forwards. Preserve this
+            # worker's state while the scheduler is still waiting for
+            # the other workers; explicit finish/abort remains the
+            # authoritative cleanup path.
+            state._dsa_cold_prune_protected = True
+        published_at = serving_perf_now() if perf_enabled else 0.0
+        if perf_enabled:
+            serving_perf_log(
+                logger,
+                "worker_load_complete",
+                started=submitted_at,
+                req_id=req_id,
+                tokens=request.load_spec.lmcache_cached_tokens,
+                mode="dsa_cold_compact",
+                background_ms=round((completed_at - submitted_at) * 1000, 3),
+                scheduler_poll_ms=round((publish_started - completed_at) * 1000, 3),
+                publish_ms=round((published_at - publish_started) * 1000, 3),
+                publish_thread_cpu_ms=(
+                    round(
+                        (time.thread_time_ns() - publish_thread_started) / 1e6,
+                        3,
+                    )
+                    if publish_thread_started
+                    else None
+                ),
+                final_unhidden_ms=round((published_at - completed_at) * 1000, 3),
+            )
+        if perf_enabled:
+            logger.info(
+                "[DSA_COLD_COMPACT] request=%s generation=%d "
+                "status=%s tokens=%d indexer_blocks=%d elapsed_ms=%.3f",
+                req_id,
+                generation,
+                "aborted" if was_aborted else "ready",
+                request.load_spec.lmcache_cached_tokens,
+                len(indexer_block_ids),
+                (serving_perf_now() - submitted_at) * 1000,
+            )
+
+    def _cold_requires_paired_restart(self) -> bool:
+        check = getattr(self.lmcache_engine, "remote_fill_requires_paired_restart", None)
+        return bool(callable(check) and check())
+
+    def _fail_completed_cold_load(
+        self,
+        req_id: str,
+        entry: ColdLoadEntry,
+        state: Any,
+        exc: BaseException,
+        perf_enabled: bool,
+    ) -> bool:
+        generation, future, request, indexer_block_ids, submitted_at, indexer_future = entry
+        requires_restart = getattr(
+            self.lmcache_engine,
+            "remote_fill_requires_paired_restart",
+            None,
+        )
+        if callable(requires_restart) and requires_restart():
+            logger.critical(
+                "Cold compact Group-1 load has unknown native DMA "
+                "state; refusing to publish completion or reuse HBM "
+                "blocks for request %s",
+                req_id,
+                exc_info=True,
+            )
+            raise
+        if not request.load_spec.dsa_group1_direct_hbm:
             try:
-                assert request.load_spec is not None
-                state = future.result()
-                readiness = state.dense_load_readiness
-                query = getattr(readiness, "query", None)
-                # Keep the request parked without synchronizing the model
-                # thread while its small metadata copies are still pending.
-                if callable(query) and not query():
-                    continue
-                actual_generation = getattr(
-                    request.load_spec, "dsa_cold_load_generation", None
-                )
-                if generation != actual_generation:
-                    raise RuntimeError(
-                        "Cold compact completion generation mismatch: "
-                        f"req_id={req_id}, expected={generation}, "
-                        f"actual={actual_generation}"
-                    )
-                publish_started = serving_perf_now() if perf_enabled else 0.0
-                completed_at = getattr(
-                    state,
-                    "_dsa_cold_load_completed_at",
-                    publish_started,
-                )
-                publish_thread_started = (
-                    time.thread_time_ns() if perf_enabled else 0
-                )
-                if was_aborted:
-                    self._release_unadopted_shared_request_objects(state, request)
-                    self._release_shared_worker_retrieve_state(
-                        state, self.lmcache_engine
-                    )
-                    self._release_request_lookup_pins(req_id)
-                else:
-                    self._publish_worker_retrieve_state(
-                        state,
-                        request,
-                        location=state.location,
-                        metadata_warm=True,
-                        token_count=request.load_spec.lmcache_cached_tokens,
-                        reuse_prepared_sources=True,
-                    )
-                    # Completion reports from different TP workers may be
-                    # accumulated across multiple forwards. Preserve this
-                    # worker's state while the scheduler is still waiting for
-                    # the other workers; explicit finish/abort remains the
-                    # authoritative cleanup path.
-                    state._dsa_cold_prune_protected = True
-                published_at = serving_perf_now() if perf_enabled else 0.0
-                if perf_enabled:
-                    serving_perf_log(
-                        logger,
-                        "worker_load_complete",
-                        started=submitted_at,
-                        req_id=req_id,
-                        tokens=request.load_spec.lmcache_cached_tokens,
-                        mode="dsa_cold_compact",
-                        background_ms=round((completed_at - submitted_at) * 1000, 3),
-                        scheduler_poll_ms=round(
-                            (publish_started - completed_at) * 1000, 3
-                        ),
-                        publish_ms=round((published_at - publish_started) * 1000, 3),
-                        publish_thread_cpu_ms=(
-                            round(
-                                (time.thread_time_ns() - publish_thread_started) / 1e6,
-                                3,
-                            )
-                            if publish_thread_started
-                            else None
-                        ),
-                        final_unhidden_ms=round(
-                            (published_at - completed_at) * 1000, 3
-                        ),
-                    )
-                if perf_enabled:
-                    logger.info(
-                        "[DSA_COLD_COMPACT] request=%s generation=%d "
-                        "status=%s tokens=%d indexer_blocks=%d elapsed_ms=%.3f",
-                        req_id,
-                        generation,
-                        "aborted" if was_aborted else "ready",
-                        request.load_spec.lmcache_cached_tokens,
-                        len(indexer_block_ids),
-                        (serving_perf_now() - submitted_at) * 1000,
-                    )
-            except BaseException as exc:
-                requires_restart = getattr(
-                    self.lmcache_engine,
-                    "remote_fill_requires_paired_restart",
-                    None,
-                )
-                if callable(requires_restart) and requires_restart():
-                    logger.critical(
-                        "Cold compact Group-1 load has unknown native DMA "
-                        "state; refusing to publish completion or reuse HBM "
-                        "blocks for request %s",
-                        req_id,
-                        exc_info=True,
-                    )
-                    raise
-                if not request.load_spec.dsa_group1_direct_hbm:
-                    try:
-                        self._synchronize_dsa_cold_dense_load()
-                    except BaseException:
-                        logger.critical(
-                            "Cold compact load failed and its dense load stream "
-                            "could not be synchronized; retaining request blocks: %s",
-                            req_id,
-                            exc_info=True,
-                        )
-                        continue
-                failed_state = getattr(exc, "_lmcache_dsa_cold_state", None)
-                states = getattr(self, "_worker_retrieve_state", {})
-                if (
-                    failed_state is None
-                    and state is not None
-                    and state.req_id is not None
-                    and states.get(req_id) is not state
-                ):
-                    failed_state = state
-                if failed_state is not None:
-                    self._release_unadopted_shared_request_objects(
-                        failed_state, request
-                    )
-                    self._release_shared_worker_retrieve_state(
-                        failed_state, self.lmcache_engine
-                    )
-                self._invalid_block_ids.update(indexer_block_ids)
-                # A known-terminal failed attempt owns no usable sparse source.
-                # Release its lookup plan on both abort and recompute fallback.
-                self._release_request_lookup_pins(req_id)
-                logger.exception(
-                    "[DSA_COLD_COMPACT] request=%s generation=%d "
-                    "status=failed indexer_blocks=%d elapsed_ms=%.3f",
+                self._synchronize_dsa_cold_dense_load()
+            except BaseException:
+                logger.critical(
+                    "Cold compact load failed and its dense load stream "
+                    "could not be synchronized; retaining request blocks: %s",
                     req_id,
-                    generation,
-                    len(indexer_block_ids),
-                    ((serving_perf_now() if perf_enabled else 0.0) - submitted_at)
-                    * 1000,
+                    exc_info=True,
                 )
-                # Both workers are terminal and request owners have either
-                # retired or moved to the existing readiness retirement queue.
-                # Failed futures otherwise retain their request/plan frames in
-                # cycles until Python's cyclic collector runs. Preserve the
-                # traceback for the log above, then drop those frame owners.
-                _clear_terminal_load_tracebacks(exc, (future, indexer_future))
-            futures.pop(req_id, None)
-            if was_aborted:
-                assert aborted_ids is not None
-                aborted_ids.discard(req_id)
-                if not aborted_ids:
-                    del self._dsa_cold_aborted_req_ids
-            finished.add(req_id)
-        if not futures:
-            del self._dsa_cold_load_futures
-            if hasattr(self, "_dsa_cold_last_latent_future"):
-                del self._dsa_cold_last_latent_future
-            executor = getattr(self, "_dsa_cold_load_executor", None)
-            if executor is not None:
-                executor.shutdown(wait=False, cancel_futures=False)
-                del self._dsa_cold_load_executor
-        return finished or None
+                return False
+        failed_state = getattr(exc, "_lmcache_dsa_cold_state", None)
+        states = getattr(self, "_worker_retrieve_state", {})
+        if (
+            failed_state is None
+            and state is not None
+            and state.req_id is not None
+            and states.get(req_id) is not state
+        ):
+            failed_state = state
+        if failed_state is not None:
+            self._release_unadopted_shared_request_objects(failed_state, request)
+            self._release_shared_worker_retrieve_state(failed_state, self.lmcache_engine)
+        self._invalid_block_ids.update(indexer_block_ids)
+        # A known-terminal failed attempt owns no usable sparse source.
+        # Release its lookup plan on both abort and recompute fallback.
+        self._release_request_lookup_pins(req_id)
+        logger.exception(
+            "[DSA_COLD_COMPACT] request=%s generation=%d "
+            "status=failed indexer_blocks=%d elapsed_ms=%.3f",
+            req_id,
+            generation,
+            len(indexer_block_ids),
+            ((serving_perf_now() if perf_enabled else 0.0) - submitted_at) * 1000,
+        )
+        # Both workers are terminal and request owners have either
+        # retired or moved to the existing readiness retirement queue.
+        # Failed futures otherwise retain their request/plan frames in
+        # cycles until Python's cyclic collector runs. Preserve the
+        # traceback for the log above, then drop those frame owners.
+        _clear_terminal_load_tracebacks(exc, (future, indexer_future))
+        return True
 
     @_lmcache_nvtx_annotate
     def get_finished(
@@ -9873,16 +9772,16 @@ class LMCacheConnectorV1Impl:
                 )
                 if not offered:
                     live_pending.pop(req_id, None)
-        cold_futures = getattr(self, "_dsa_cold_load_futures", None)
+        coordinator = getattr(self, "_cold_load_coordinator", None)
+        cold_futures = coordinator.futures if coordinator is not None else None
         if cold_futures and finished_req_ids:
             aborted_cold = finished_req_ids.intersection(cold_futures)
             if aborted_cold:
-                aborted_ids = getattr(
-                    self, "_dsa_cold_aborted_req_ids", None
-                )
+                assert coordinator is not None
+                aborted_ids = coordinator.aborted
                 if aborted_ids is None:
                     aborted_ids = set()
-                    self._dsa_cold_aborted_req_ids = aborted_ids
+                    coordinator.aborted = aborted_ids
                 aborted_ids.update(aborted_cold)
         releasable_req_ids = set(finished_req_ids)
         releasable_req_ids -= aborted_cold
@@ -9951,7 +9850,7 @@ class LMCacheConnectorV1Impl:
                     entry, f"Live split connector is shutting down: {req_id}"
                 )
             live_pending.clear()
-        executor = getattr(self, "_dsa_cold_load_executor", None)
+        executor = getattr(getattr(self, "_cold_load_coordinator", None), "executor", None)
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=False)
             self._synchronize_dsa_cold_dense_load()

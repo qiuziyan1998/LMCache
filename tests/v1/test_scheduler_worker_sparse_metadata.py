@@ -1481,7 +1481,7 @@ def test_dsa_cold_compact_submit_captures_current_npu_device(
 ) -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     impl._block_size = 16
-    impl._dsa_cold_load_futures = {}
+    impl._get_cold_load_coordinator().futures = {}
     impl._run_dsa_cold_indexer_load = MagicMock()
     impl._run_dsa_cold_compact_load = MagicMock()
     impl._kvcaches_for_group = MagicMock(return_value=[])
@@ -1512,7 +1512,7 @@ def test_dsa_cold_compact_submit_captures_current_npu_device(
 def test_cold_compact_second_submit_resolves_gate_before_drain() -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     impl._block_size = 16
-    impl._dsa_cold_load_futures = {}
+    impl._get_cold_load_coordinator().futures = {}
     impl._kvcaches_for_group = MagicMock(return_value=[])
     impl.lmcache_engine = SimpleNamespace(
         remote_fill_requires_paired_restart=lambda: False
@@ -1553,7 +1553,7 @@ def test_cold_compact_second_submit_resolves_gate_before_drain() -> None:
 def test_cold_compact_second_submit_propagates_native_fatal() -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     impl._block_size = 16
-    impl._dsa_cold_load_futures = {}
+    impl._get_cold_load_coordinator().futures = {}
     impl._kvcaches_for_group = MagicMock(return_value=[])
     impl.lmcache_engine = SimpleNamespace(
         remote_fill_requires_paired_restart=lambda: True
@@ -1596,7 +1596,7 @@ def test_staged_sfa_native_barrier_waits_for_cold_compact_loads() -> None:
     second = MagicMock(done=MagicMock(return_value=True))
     first_indexer = MagicMock(done=MagicMock(return_value=True))
     second_indexer = MagicMock(done=MagicMock(return_value=True))
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         "cold-pending": (1, first, object(), set(), 0.0, first_indexer),
         "cold-complete": (1, second, object(), set(), 0.0, second_indexer),
     }
@@ -1607,7 +1607,7 @@ def test_staged_sfa_native_barrier_waits_for_cold_compact_loads() -> None:
     second.result.assert_called_once_with()
     first_indexer.result.assert_called_once_with()
     second_indexer.result.assert_called_once_with()
-    assert set(impl._dsa_cold_load_futures) == {
+    assert set(impl._get_cold_load_coordinator().futures) == {
         "cold-pending",
         "cold-complete",
     }
@@ -1620,7 +1620,7 @@ def test_staged_sfa_native_barrier_skips_direct_hbm_loads() -> None:
     request = SimpleNamespace(
         load_spec=SimpleNamespace(dsa_group1_direct_hbm=True)
     )
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         "direct-hbm": (1, latent, request, set(), 0.0, indexer),
     }
 
@@ -1637,7 +1637,7 @@ def test_staged_sfa_native_barrier_defers_cold_load_failure() -> None:
     request = SimpleNamespace(
         load_spec=SimpleNamespace(dsa_cold_load_generation=1)
     )
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         "cold-failed": (1, failed, request, {100}, 0.0, _completed_future()),
     }
     impl._synchronize_dsa_cold_dense_load = MagicMock()
@@ -1649,17 +1649,17 @@ def test_staged_sfa_native_barrier_defers_cold_load_failure() -> None:
     impl.synchronize_staged_sfa_capture_unsafe_loads()
 
     impl._synchronize_dsa_cold_dense_load.assert_called_once_with()
-    assert "cold-failed" in impl._dsa_cold_load_futures
+    assert "cold-failed" in impl._get_cold_load_coordinator().futures
     assert impl._drain_dsa_cold_load_futures() == {"cold-failed"}
     assert impl._invalid_block_ids == {100}
-    assert not hasattr(impl, "_dsa_cold_load_futures")
+    assert not impl._get_cold_load_coordinator().futures
 
 
 def test_staged_sfa_native_barrier_rejects_active_failed_stream() -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     failed = Future()
     failed.set_exception(RuntimeError("cold load failed"))
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         "cold-failed": (1, failed, object(), set(), 0.0, _completed_future()),
     }
     impl._synchronize_dsa_cold_dense_load = MagicMock(
@@ -1802,7 +1802,7 @@ def test_dsa_cold_compact_finished_signal_waits_for_future(
     state = WorkerRetrieveState(req_id="cold-future")
     state.location = "LocalCPUBackend"
     state._dsa_cold_load_completed_at = 2.0
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         "cold-future": (
             1,
             future,
@@ -1823,7 +1823,7 @@ def test_dsa_cold_compact_finished_signal_waits_for_future(
     monkeypatch.setattr(adapter_module, "serving_perf_now", lambda: 3.0)
 
     assert impl._drain_dsa_cold_load_futures() is None
-    assert "cold-future" in impl._dsa_cold_load_futures
+    assert "cold-future" in impl._get_cold_load_coordinator().futures
 
     future.set_result(state)
     assert impl._drain_dsa_cold_load_futures() == {"cold-future"}
@@ -1844,7 +1844,7 @@ def test_dsa_cold_compact_generation_mismatch_releases_returned_state() -> None:
     )
     state = WorkerRetrieveState(req_id="cold-stale-generation")
     future.set_result(state)
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         "cold-stale-generation": (
             1,
             future,
@@ -1891,7 +1891,7 @@ def test_dsa_cold_compact_failed_state_releases_after_sync_retry() -> None:
     error = RuntimeError("load failed")
     error._lmcache_dsa_cold_state = state
     future.set_exception(error)
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         "cold-sync-retry": (
             1,
             future,
@@ -1911,7 +1911,7 @@ def test_dsa_cold_compact_failed_state_releases_after_sync_retry() -> None:
     impl.lmcache_engine = object()
 
     assert impl._drain_dsa_cold_load_futures() is None
-    assert "cold-sync-retry" in impl._dsa_cold_load_futures
+    assert "cold-sync-retry" in impl._get_cold_load_coordinator().futures
     impl._release_shared_worker_retrieve_state.assert_not_called()
 
     assert impl._drain_dsa_cold_load_futures() == {"cold-sync-retry"}
@@ -1936,7 +1936,7 @@ def test_direct_hbm_known_failure_skips_legacy_dense_stream_sync() -> None:
             lmcache_cached_tokens=8192,
         )
     )
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         "direct-failed": (
             1,
             future,
@@ -1957,7 +1957,7 @@ def test_direct_hbm_known_failure_skips_legacy_dense_stream_sync() -> None:
     impl._synchronize_dsa_cold_dense_load.assert_not_called()
     impl._release_request_lookup_pins.assert_called_once_with("direct-failed")
     assert impl._invalid_block_ids == {100, 101}
-    assert not hasattr(impl, "_dsa_cold_load_futures")
+    assert not impl._get_cold_load_coordinator().futures
 
 
 def test_dsa_cold_ready_state_survives_cross_rank_completion_gap() -> None:
@@ -2003,7 +2003,7 @@ def test_dsa_cold_compact_abort_releases_unpublished_cpu_state() -> None:
     )
     state = WorkerRetrieveState(req_id="cold-aborted")
     future.set_result(state)
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         "cold-aborted": (
             1,
             future,
@@ -2013,7 +2013,7 @@ def test_dsa_cold_compact_abort_releases_unpublished_cpu_state() -> None:
             _completed_future(),
         )
     }
-    impl._dsa_cold_aborted_req_ids = {"cold-aborted"}
+    impl._get_cold_load_coordinator().aborted = {"cold-aborted"}
     impl.lmcache_engine = object()
     impl._publish_worker_retrieve_state = MagicMock()
     impl._release_unadopted_shared_request_objects = MagicMock()
@@ -2028,7 +2028,7 @@ def test_dsa_cold_compact_abort_releases_unpublished_cpu_state() -> None:
     )
     impl._release_shared_worker_retrieve_state.assert_called_once()
     impl._release_request_lookup_pins.assert_called_once_with("cold-aborted")
-    assert not hasattr(impl, "_dsa_cold_aborted_req_ids")
+    assert not impl._get_cold_load_coordinator().aborted
 
 
 def test_dsa_cold_compact_failure_does_not_mark_request_ready() -> None:

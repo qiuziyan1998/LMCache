@@ -13,6 +13,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.integration.vllm import cold_load as cold_load_mod
 from lmcache.integration.vllm import vllm_v1_adapter as adapter_mod
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorMetadata,
@@ -153,6 +154,7 @@ def test_cold_submit_and_publish_preserve_async_handoff(
         side_effect=None if perf_enabled else AssertionError("disabled perf clock"),
     )
     monkeypatch.setattr(adapter_mod, "serving_perf_enabled", lambda: perf_enabled)
+    monkeypatch.setattr(cold_load_mod, "serving_perf_enabled", lambda: perf_enabled)
     monkeypatch.setattr(adapter_mod, "serving_perf_now", clock)
     monkeypatch.setattr(adapter_mod, "time", SimpleNamespace(thread_time_ns=clock))
     monkeypatch.setattr(adapter_mod, "serving_perf_log", MagicMock())
@@ -167,7 +169,7 @@ def test_cold_submit_and_publish_preserve_async_handoff(
         load_spec=SimpleNamespace(dsa_cold_load_generation=1, lmcache_cached_tokens=5),
     )
     impl._submit_dsa_cold_compact_load(request)
-    assert impl._dsa_cold_load_futures["request"][3] == {7, 2}
+    assert impl._get_cold_load_coordinator().futures["request"][3] == {7, 2}
     assert impl._drain_dsa_cold_load_futures() is None
     source = PreparedSparseSource(layers=(), total_tokens=5)
     readiness = SimpleNamespace(
@@ -186,7 +188,7 @@ def test_cold_submit_and_publish_preserve_async_handoff(
     readiness.query.return_value = True
     assert impl._drain_dsa_cold_load_futures() == {"request"}
     assert impl._worker_retrieve_state["request"].prepared_sparse_sources[0] is source
-    assert not getattr(impl, "_dsa_cold_load_futures", None)
+    assert not impl._get_cold_load_coordinator().futures
     assert adapter_mod.serving_perf_log.call_count == (3 if perf_enabled else 0)
 
 
@@ -205,12 +207,12 @@ def test_cold_compact_drain_waits_for_both_dependencies() -> None:
     indexer_future: Future = Future()
     latent_future.set_result(WorkerRetrieveState(req_id="request"))
     request = SimpleNamespace(load_spec=SimpleNamespace(dsa_cold_load_generation=1))
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         "request": (1, latent_future, request, set(), 0.0, indexer_future)
     }
 
     assert impl._drain_dsa_cold_load_futures() is None
-    assert "request" in impl._dsa_cold_load_futures
+    assert "request" in impl._get_cold_load_coordinator().futures
 
 
 def test_cold_compact_drain_waits_for_deferred_npu_metadata() -> None:
@@ -223,13 +225,13 @@ def test_cold_compact_drain_waits_for_deferred_npu_metadata() -> None:
     )
     indexer_future.set_result(None)
     request = SimpleNamespace(load_spec=SimpleNamespace(dsa_cold_load_generation=1))
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         "request": (1, latent_future, request, set(), 0.0, indexer_future)
     }
 
     assert impl._drain_dsa_cold_load_futures() is None
     readiness.query.assert_called_once_with()
-    assert "request" in impl._dsa_cold_load_futures
+    assert "request" in impl._get_cold_load_coordinator().futures
 
 
 def test_capture_barrier_waits_for_indexer_after_latent_failure() -> None:
@@ -239,7 +241,7 @@ def test_capture_barrier_waits_for_indexer_after_latent_failure() -> None:
     latent_future.result.side_effect = RuntimeError("latent load failed")
     indexer_future = MagicMock()
     indexer_future.done.return_value = True
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         "request": (1, latent_future, object(), set(), 0.0, indexer_future)
     }
     impl._synchronize_dsa_cold_dense_load = MagicMock()
@@ -2239,7 +2241,7 @@ class TestWorkerRetrieveState:
 
         connector.synchronize_dense_load_readiness.assert_not_called()
         assert impl._worker_retrieve_state == {}
-        assert not hasattr(impl, "_dense_load_retirements")
+        assert not impl._get_cold_load_coordinator().retirements
 
     def test_compact_finish_defers_incomplete_readiness_without_blocking(self):
         readiness = object()
@@ -2272,7 +2274,7 @@ class TestWorkerRetrieveState:
         connector.synchronize_dense_load_readiness.assert_not_called()
         owner.ref_count_down.assert_not_called()
         assert impl._worker_retrieve_state == {}
-        assert impl._dense_load_retirements == {id(state): state}
+        assert impl._get_cold_load_coordinator().retirements == {id(state): state}
 
         connector.query_dense_load_readiness.return_value = True
         impl._drain_dense_load_retirements()
@@ -2283,7 +2285,7 @@ class TestWorkerRetrieveState:
         impl.lmcache_engine.release_shared_cpu_sparse_request.assert_called_once_with(
             "compact"
         )
-        assert not hasattr(impl, "_dense_load_retirements")
+        assert not impl._get_cold_load_coordinator().retirements
 
         impl._drain_dense_load_retirements()
         owner.ref_count_down.assert_called_once_with()
@@ -2301,10 +2303,10 @@ class TestWorkerRetrieveState:
         impl = _make_impl()
         impl._manager = SimpleNamespace(lmcache_engine=engine)
         state = WorkerRetrieveState(req_id="compact", dense_load_readiness=readiness)
-        impl._dense_load_retirements = {id(state): state}
+        impl._get_cold_load_coordinator().retirements = {id(state): state}
 
         impl._drain_dense_load_retirements()
-        assert impl._dense_load_retirements == {id(state): state}
+        assert impl._get_cold_load_coordinator().retirements == {id(state): state}
         connector.synchronize_dense_load_readiness.assert_not_called()
 
         impl._drain_dense_load_retirements()
@@ -2312,7 +2314,7 @@ class TestWorkerRetrieveState:
 
         impl._drain_dense_load_retirements(block=True)
         connector.synchronize_dense_load_readiness.assert_called_once_with(readiness)
-        assert not hasattr(impl, "_dense_load_retirements")
+        assert not impl._get_cold_load_coordinator().retirements
 
     def test_dense_retirement_without_query_retains_owners_without_blocking(self):
         readiness = object()
@@ -2322,17 +2324,17 @@ class TestWorkerRetrieveState:
             lmcache_engine=SimpleNamespace(gpu_connector=connector)
         )
         state = WorkerRetrieveState(req_id="compact", dense_load_readiness=readiness)
-        impl._dense_load_retirements = {id(state): state}
+        impl._get_cold_load_coordinator().retirements = {id(state): state}
 
         impl._drain_dense_load_retirements()
 
         connector.synchronize_dense_load_readiness.assert_not_called()
-        assert impl._dense_load_retirements == {id(state): state}
+        assert impl._get_cold_load_coordinator().retirements == {id(state): state}
 
         impl._drain_dense_load_retirements(block=True)
 
         connector.synchronize_dense_load_readiness.assert_called_once_with(readiness)
-        assert not hasattr(impl, "_dense_load_retirements")
+        assert not impl._get_cold_load_coordinator().retirements
 
     def test_cold_load_rejects_request_id_with_pending_retirement(self):
         readiness = object()
@@ -2344,7 +2346,7 @@ class TestWorkerRetrieveState:
             lmcache_engine=SimpleNamespace(gpu_connector=connector)
         )
         state = WorkerRetrieveState(req_id="reused", dense_load_readiness=readiness)
-        impl._dense_load_retirements = {id(state): state}
+        impl._get_cold_load_coordinator().retirements = {id(state): state}
 
         with pytest.raises(RuntimeError, match="request ID was reused"):
             impl._submit_dsa_cold_compact_load(SimpleNamespace(req_id="reused"))
@@ -2367,14 +2369,14 @@ class TestWorkerRetrieveState:
         impl = _make_impl()
         impl._manager = SimpleNamespace(lmcache_engine=engine)
         other = WorkerRetrieveState(req_id="other", dense_load_readiness=object())
-        impl._dense_load_retirements = {id(other): other}
+        impl._get_cold_load_coordinator().retirements = {id(other): other}
         if retiring_same_id:
             state = WorkerRetrieveState(
                 req_id="request", dense_load_readiness=readiness
             )
-            impl._dense_load_retirements[id(state)] = state
+            impl._get_cold_load_coordinator().retirements[id(state)] = state
         # An already submitted generation makes this a retry, with no new IO.
-        impl._dsa_cold_load_futures = {"request": (1,)}
+        impl._get_cold_load_coordinator().futures = {"request": (1,)}
         request = SimpleNamespace(
             req_id="request",
             load_spec=SimpleNamespace(dsa_cold_load_generation=1),
@@ -2382,7 +2384,7 @@ class TestWorkerRetrieveState:
 
         impl._submit_dsa_cold_compact_load(request)
 
-        assert impl._dense_load_retirements == {id(other): other}
+        assert impl._get_cold_load_coordinator().retirements == {id(other): other}
         connector.synchronize_dense_load_readiness.assert_not_called()
         if retiring_same_id:
             connector.query_dense_load_readiness.assert_called_once_with(readiness)
@@ -2440,7 +2442,7 @@ class TestWorkerRetrieveState:
         impl = _make_impl()
         impl._wait_for_save_done = True
         impl._finalize_worker_requests_after_store = MagicMock(return_value=set())
-        impl._dsa_cold_load_futures = {
+        impl._get_cold_load_coordinator().futures = {
             "compact": (
                 1,
                 Future(),
@@ -2454,8 +2456,8 @@ class TestWorkerRetrieveState:
         assert impl.get_finished({"compact"}) == (None, None)
 
         impl._finalize_worker_requests_after_store.assert_called_once_with(set())
-        assert impl._dsa_cold_aborted_req_ids == {"compact"}
-        assert "compact" in impl._dsa_cold_load_futures
+        assert impl._get_cold_load_coordinator().aborted == {"compact"}
+        assert "compact" in impl._get_cold_load_coordinator().futures
 
     def test_get_finished_defers_cleanup_until_wait_for_save(self):
         request = SimpleNamespace(
@@ -6970,7 +6972,7 @@ class TestWorkerRetrieveState:
     def test_live_split_without_compact_capability_uses_persistent_path(self):
         impl = _make_impl()
         impl._dsa_live_split_pending = {}
-        impl._dsa_cold_load_futures = {}
+        impl._get_cold_load_coordinator().futures = {}
         impl.lmcache_engine = SimpleNamespace(
             _prepare_live_split_import=MagicMock()
         )
@@ -7175,7 +7177,7 @@ class TestWorkerRetrieveState:
             dsa_remap_frontier=31,
         )
         request = SimpleNamespace(load_spec=load_spec)
-        impl._dsa_cold_load_futures = {
+        impl._get_cold_load_coordinator().futures = {
             "req-live": (4, latent, request, {9}, 0.0, dependency)
         }
         impl._dsa_live_split_pending = {
@@ -7317,7 +7319,7 @@ class TestWorkerRetrieveState:
         }
         old_future = object()
         impl._dsa_live_split_pending = {"req-live": old_pending}
-        impl._dsa_cold_load_futures = {"req-live": old_future}
+        impl._get_cold_load_coordinator().futures = {"req-live": old_future}
         impl._get_dsa_cold_load_executor = MagicMock()
         impl.lmcache_engine = SimpleNamespace(
             _prepare_live_split_import=MagicMock()
@@ -7338,6 +7340,6 @@ class TestWorkerRetrieveState:
         assert impl._dsa_live_split_pending["req-live"][
             "indexer_completion"
         ] is old_dependency
-        assert impl._dsa_cold_load_futures["req-live"] is old_future
+        assert impl._get_cold_load_coordinator().futures["req-live"] is old_future
         impl._get_dsa_cold_load_executor.assert_not_called()
         impl.lmcache_engine._prepare_live_split_import.assert_not_called()

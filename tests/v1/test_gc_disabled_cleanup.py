@@ -74,10 +74,10 @@ def _failed_adapter() -> tuple[Any, _Request, Future, Future]:
     request = _Request()
     latent = _failed_future(request)
     indexer = _failed_future(request)
-    impl._dsa_cold_load_futures = {
+    impl._get_cold_load_coordinator().futures = {
         request.req_id: (1, latent, request, {7}, 0.0, indexer)
     }
-    impl._dsa_cold_last_latent_future = latent
+    impl._get_cold_load_coordinator().last_latent_future = latent
     return impl, request, latent, indexer
 
 
@@ -87,7 +87,7 @@ def test_failed_cold_load_releases_frames_without_gc(gc_disabled: None) -> None:
         refs = [weakref.ref(obj) for obj in (impl, request, latent, indexer)]
         assert impl._drain_dsa_cold_load_futures() == {"request"}
         assert impl._invalid_block_ids == {7}
-        assert not hasattr(impl, "_dsa_cold_load_futures")
+        assert not impl._get_cold_load_coordinator().futures
         for future in (latent, indexer):
             error = future.exception()
             assert error.__traceback__ is None
@@ -106,7 +106,7 @@ def test_unretired_cold_load_preserves_failure_owners(
     impl, request, latent, indexer = _failed_adapter()
     if mode == "pending":
         indexer = Future()
-        impl._dsa_cold_load_futures[request.req_id] = (
+        impl._get_cold_load_coordinator().futures[request.req_id] = (
             1,
             latent,
             request,
@@ -129,7 +129,7 @@ def test_unretired_cold_load_preserves_failure_owners(
             impl._drain_dsa_cold_load_futures()
     else:
         assert impl._drain_dsa_cold_load_futures() is None
-    assert request.req_id in impl._dsa_cold_load_futures
+    assert request.req_id in impl._get_cold_load_coordinator().futures
     assert latent.exception().__traceback__ is not None
     assert impl._invalid_block_ids == set()
 
@@ -613,3 +613,31 @@ def test_remote_page_handoff_drops_failed_and_late_future_frames(
     assert len(refs) == 20
     assert all(ref() is None for ref in refs)
     assert not gc.isenabled()
+
+
+def test_cold_coordinator_preserves_subclass_and_direct_base_poll() -> None:
+    class Derived(adapter_mod.LMCacheConnectorV1Impl):
+        def _drain_dsa_cold_load_futures(self):
+            self.polls += 1
+            return super()._drain_dsa_cold_load_futures()
+
+    impl = object.__new__(Derived)
+    impl.polls = 0
+    coordinator = impl._get_cold_load_coordinator()
+    assert impl._drain_dsa_cold_load_futures() is None
+    assert impl.polls == 1
+    assert coordinator.futures == {}
+    assert adapter_mod.LMCacheConnectorV1Impl._drain_dsa_cold_load_futures(impl) is None
+    assert impl.polls == 1
+
+
+def test_idle_cold_coordinator_does_not_retain_adapter_without_gc(
+    gc_disabled: None,
+) -> None:
+    impl = object.__new__(adapter_mod.LMCacheConnectorV1Impl)
+    adapter_ref = weakref.ref(impl)
+    coordinator = impl._get_cold_load_coordinator()
+    assert impl._drain_dsa_cold_load_futures() is None
+    del impl
+    assert adapter_ref() is None
+    assert coordinator.poll() is None
