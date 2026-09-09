@@ -14,11 +14,14 @@ import pytest
 from lmcache.v1.remote_fill import (
     AbortRequest,
     DestinationNativeState,
+    InProcessRemoteFillTransport,
     OperationKind,
     PageDisposition,
     PreparedPage,
     ReplyLostError,
     RemoteFillStateCore,
+    RemoteFillClient,
+    RemoteFillService,
     ResultCode,
     TerminalOutcome,
     TransactionState,
@@ -43,6 +46,53 @@ def _select_group0_only(harness) -> None:
     negotiation = replace(harness.negotiation, shared_group1=False)
     harness.negotiation = negotiation
     harness.state._negotiation = negotiation
+
+
+@pytest.mark.parametrize("tp_independent", [False, True])
+@pytest.mark.parametrize("source_tp", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        {},
+        {"cache_namespace_tag": "other"},
+        {"layout_tag": "other"},
+        {"model_artifact_id": "other"},
+        {"chunk_size": 512},
+        {"model_layout": "other"},
+        {"group_dimensions": (512, 128)},
+        {"layer_count": 78},
+        {"save_only_first_rank": False},
+        {"shared_group1": True},
+        {"dp_size": 4},
+        {"global_te_push": False},
+        {"token_hash_algorithm": "sha256", "python_hash_seed": ""},
+        {"python_hash_seed": "1"},
+    ],
+)
+def test_tp_independent_negotiation_preserves_every_other_field(
+    harness, tp_independent: bool, source_tp: int, mismatch: dict
+) -> None:
+    """Only qualified TP differences may pass the existing wire negotiation."""
+    state = RemoteFillStateCore(
+        destination_engine_epoch=7,
+        shared_cache_generation=11,
+        descriptor_verification_key=b"test-key",
+        negotiation=replace(harness.negotiation, shared_group1=False),
+        page_lifecycle=harness.lifecycle,
+        tp_independent=tp_independent,
+    )
+    client = RemoteFillClient(InProcessRemoteFillTransport(RemoteFillService(state)))
+    request = msgspec.structs.replace(
+        harness.requests.negotiate(shared_group1=False), tp_size=source_tp, **mismatch
+    )
+    response = client.execute(request)
+    accepted = not mismatch and (tp_independent or source_tp == 8)
+    assert response.code is (
+        ResultCode.OK if accepted else ResultCode.RESERVATION_REJECTED
+    )
+    assert harness.lifecycle.prepare_calls == 0
+    for name in mismatch:
+        assert name in response.message
 
 
 def test_open_conservatively_reports_zero_until_exact_keys_arrive(harness) -> None:
