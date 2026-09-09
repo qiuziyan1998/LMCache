@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 import ast
+from copy import deepcopy
 
 # Third Party
 import pytest
@@ -134,7 +135,7 @@ def test_prepare_keeps_draft_suffix_and_avoids_target_loads(
 def test_zero_frontier_requires_explicit_authorization() -> None:
     adapter = FakeAdapter()
     adapter._drain_layerwise_retrievers()
-    with pytest.raises(RuntimeError, match="one shared-CPU sparse request"):
+    with pytest.raises(RuntimeError, match="unique sparse requests"):
         adapter.prepare_sparse_graph_step(("layers.0.attn", "layers.1.attn"))
     assert (
         adapter.prepare_sparse_graph_step(
@@ -166,3 +167,73 @@ def test_window_growth_prepares_before_returning_source() -> None:
         == 768
     )
     assert len(adapter.waits) == adapter.num_layers
+
+
+@pytest.mark.parametrize("cold", [False, True])
+@pytest.mark.parametrize("shared", [False, True])
+def test_batch_sources_follow_model_order_and_keep_draft_suffixes(
+    cold: bool, shared: bool
+) -> None:
+    adapter = FakeAdapter()
+    second = deepcopy(adapter.request)
+    second.req_id = "r2"
+    second.load_spec.lmcache_cached_tokens = 768
+    state = deepcopy(adapter.state)
+    second_source = SimpleNamespace(
+        layers=(object(),) * adapter.num_layers, total_tokens=768
+    )
+    state.prepared_sparse_sources = {0: second_source} if not cold else {}
+    state.indexer_npu_resident = not cold
+    state.shared_request_active = shared
+    adapter.state.shared_request_active = shared
+    adapter.lmcache_engine.enable_shared_cpu_cache = shared
+    adapter._worker_retrieve_state["r2"] = state
+    adapter._layerwise_requests.append(second)
+    adapter.layerwise_retrievers.append((object(), None))
+    calls = []
+
+    def retrieve(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        yield None
+
+    def wait(name: str, **kwargs: Any) -> None:
+        assert kwargs["request_ids"] == ["r1", "r2"]
+        assert kwargs["selected_token_counts"].tolist() == [0, 0]
+        assert kwargs["target_slot_mapping"].eq(-1).all()
+        adapter.waits.append(name)
+        state.prepared_sparse_sources = {0: second_source}
+        state.indexer_npu_resident = True
+
+    adapter.lmcache_engine.retrieve_layer_head_token_wise = retrieve
+    adapter.wait_for_layer_load = wait
+    result = adapter.prepare_sparse_graph_step(
+        ("layers.0.attn", "layers.1.attn"),
+        request_ids=("r2", "no-history", "r1"),
+        frontiers=(768, 0, 512),
+    )
+    assert result == (second_source, None, adapter.source)
+    assert len(adapter.waits) == (adapter.num_layers if cold else 0)
+    assert len(calls) == 2
+    assert all(call["prepared_start_layer"] == 2 for call in calls)
+    assert calls[0]["prepared_sparse_source"] is adapter.source
+    assert calls[1]["prepared_sparse_source"] is second_source
+
+
+def test_batch_cannot_invent_missing_positive_frontier_source() -> None:
+    adapter = FakeAdapter()
+    with pytest.raises(RuntimeError, match="preparation failed"):
+        adapter.prepare_sparse_graph_step(
+            ("layers.0.attn", "layers.1.attn"),
+            request_ids=("r1", "missing"),
+            frontiers=(512, 512),
+        )
+
+
+def test_batch_empty_source_is_explicit_per_request() -> None:
+    adapter = FakeAdapter()
+    adapter._drain_layerwise_retrievers()
+    assert adapter.prepare_sparse_graph_step(
+        ("layers.0.attn", "layers.1.attn"),
+        request_ids=("r0", "r2"),
+        frontiers=(0, 0),
+    ) == (None, None)
