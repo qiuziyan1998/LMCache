@@ -124,6 +124,8 @@ def _descriptor(
         kv_group=group,
         transfer_id="transfer-1",
         request_attempt=1,
+        destination_dp_rank=0,
+        destination_tp_rank=0,
         destination_engine_epoch=1,
         shared_cache_generation=1,
         manifest_digest="manifest",
@@ -607,5 +609,116 @@ def test_ambiguous_timeout_retains_source_until_original_call_finishes() -> None
         terminal = await raised.value.wait_for_terminal()
         assert terminal.return_code == 0
         await transport.close()
+
+    asyncio.run(run())
+
+
+def test_direct_push_import_compatibility() -> None:
+    from lmcache.v1.remote_fill.mooncake_transport import (
+        MooncakeDirectPushTransport as ExtractedTransport,
+    )
+
+    assert MooncakeDirectPushTransport is ExtractedTransport
+
+
+@pytest.mark.parametrize("disable_gc", [False, True])
+@pytest.mark.parametrize("completion", ["cancel", "timeout"])
+def test_direct_push_close_drains_original_native_call(
+    disable_gc: bool, completion: str,
+) -> None:
+    """Cancellation and close cannot release owners while native DMA runs."""
+    calls: list[tuple] = []
+    entered = threading.Event()
+    release = threading.Event()
+    owner = _Owner()
+    owner_ref = weakref.ref(owner)
+    plan = _source_plan(owner, calls)
+    transport = MooncakeDirectPushTransport(
+        _owner_registrar(_GlobalTE(calls)),
+        _Engine(calls, entered=entered, release=release),
+        worker_count=1,
+        max_operations=1,
+        timeout_seconds=0.01 if completion == "timeout" else 10,
+    )
+    was_enabled = gc.isenabled()
+    if disable_gc:
+        gc.disable()
+
+    async def run() -> None:
+        nonlocal owner, plan
+        push = asyncio.create_task(transport.push_external_pages(
+            remote_session="decoder:1234",
+            source_plan=plan,
+            destination_descriptors=(
+                _descriptor(key="page-0", group=0, ptr=0x5000, length=20),
+                _descriptor(key="page-1", group=1, ptr=0x6000, length=16),
+            ),
+            activation=_activation(),
+        ))
+        try:
+            assert await asyncio.to_thread(entered.wait, 1)
+            if completion == "cancel":
+                push.cancel()
+                await asyncio.sleep(0)
+                push.cancel()
+            else:
+                with pytest.raises(NativeDirectPushAmbiguousError):
+                    await push
+            owner = None  # type: ignore[assignment]
+            plan = None  # type: ignore[assignment]
+            closing = asyncio.create_task(transport.close())
+            await asyncio.sleep(0)
+            assert not closing.done()
+            assert owner_ref() is not None
+            assert [call[0] for call in calls].count("native") == 1
+            if completion == "cancel":
+                assert not push.done()
+            release.set()
+            if completion == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await push
+            await asyncio.wait_for(closing, timeout=1)
+        finally:
+            release.set()
+            await transport.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize("native_return", [None, True])
+def test_direct_push_ambiguous_native_status_retains_original_future(
+    native_return: object,
+) -> None:
+    calls: list[tuple] = []
+    owner = _Owner()
+    transport = MooncakeDirectPushTransport(
+        _owner_registrar(_GlobalTE(calls)),
+        _Engine(calls, return_code=native_return),
+        worker_count=1,
+        max_operations=1,
+        timeout_seconds=1,
+    )
+
+    async def run() -> None:
+        try:
+            with pytest.raises(NativeDirectPushAmbiguousError) as raised:
+                await transport.push_external_pages(
+                    remote_session="decoder:1234",
+                    source_plan=_source_plan(owner, calls),
+                    destination_descriptors=(
+                        _descriptor(key="page-0", group=0, ptr=0x5000, length=20),
+                        _descriptor(key="page-1", group=1, ptr=0x6000, length=16),
+                    ),
+                    activation=_activation(),
+                )
+            with pytest.raises(RuntimeError, match="ambiguous status"):
+                await raised.value.wait_for_terminal()
+            assert [call[0] for call in calls].count("native") == 1
+        finally:
+            await transport.close()
 
     asyncio.run(run())
