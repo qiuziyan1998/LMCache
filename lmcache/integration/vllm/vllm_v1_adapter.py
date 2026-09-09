@@ -35,6 +35,11 @@ import torch
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
 from lmcache import utils
+from lmcache.integration.vllm.cold_load import (
+    ColdIndexerResult,
+    ColdLoadEntry,
+    ColdLoadPlan,
+)
 from lmcache.integration.vllm.decode_window_commit import (
     publish_delayed_decode_window_commit,
 )
@@ -6320,7 +6325,9 @@ class LMCacheConnectorV1Impl:
                     "Cold compact request ID was reused before its prior dense "
                     f"load owners retired: req_id={request.req_id}"
                 )
-        futures = getattr(self, "_dsa_cold_load_futures", None)
+        futures: Optional[dict[str, ColdLoadEntry]] = getattr(
+            self, "_dsa_cold_load_futures", None
+        )
         if futures is None:
             futures = {}
             self._dsa_cold_load_futures = futures
@@ -6353,7 +6360,7 @@ class LMCacheConnectorV1Impl:
         ) * 1000
         build_started = serving_perf_now() if perf_enabled else 0.0
         token_count = getattr(request.load_spec, "lmcache_cached_tokens", 0)
-        plan = {
+        plan: ColdLoadPlan = {
             "request": request,
             "tokens": request.token_ids[:token_count],
             "token_mask": torch.ones(token_count, dtype=torch.bool),
@@ -6449,7 +6456,9 @@ class LMCacheConnectorV1Impl:
     def _try_prepare_dsa_live_split(self, request: ReqMeta) -> bool:
         """Reserve cold groups until live import succeeds or falls back."""
         pending = getattr(self, "_dsa_live_split_pending", None)
-        futures = getattr(self, "_dsa_cold_load_futures", None)
+        futures: Optional[dict[str, ColdLoadEntry]] = getattr(
+            self, "_dsa_cold_load_futures", None
+        )
         if (
             pending is not None and request.req_id in pending
         ) or (
@@ -6471,7 +6480,7 @@ class LMCacheConnectorV1Impl:
         token_count = request.load_spec.lmcache_cached_tokens
         perf_enabled = serving_perf_enabled()
         plan_started = serving_perf_now() if perf_enabled else 0.0
-        plan = {
+        plan: ColdLoadPlan = {
             "request": request,
             "tokens": request.token_ids[:token_count],
             "token_mask": torch.ones(token_count, dtype=torch.bool),
@@ -6760,8 +6769,8 @@ class LMCacheConnectorV1Impl:
             pending.pop(req_id, None)
 
     def _run_dsa_cold_indexer_load(
-        self, plan: dict[str, Any], npu_device_id: Optional[int]
-    ) -> tuple[torch.Tensor, Any, float, float]:
+        self, plan: ColdLoadPlan, npu_device_id: Optional[int]
+    ) -> ColdIndexerResult:
         """Load Group 1 densely after Group 0 shared-CPU publication."""
         perf_breakdown = {} if serving_perf_enabled() else None
         thread_started = (
@@ -7005,7 +7014,9 @@ class LMCacheConnectorV1Impl:
         remains parked until both groups finish, so warm batches must not wait
         for those unrelated request futures here.
         """
-        futures = getattr(self, "_dsa_cold_load_futures", None)
+        futures: Optional[dict[str, ColdLoadEntry]] = getattr(
+            self, "_dsa_cold_load_futures", None
+        )
         if not futures:
             return
         capture_unsafe = {
@@ -7067,7 +7078,7 @@ class LMCacheConnectorV1Impl:
 
     def _run_dsa_cold_compact_load(
         self,
-        plan: dict[str, Any],
+        plan: ColdLoadPlan,
         npu_device_id: Optional[int],
         indexer_future: Future,
         previous_latent_future: Optional[Future] = None,
@@ -9658,7 +9669,9 @@ class LMCacheConnectorV1Impl:
                 raise
 
     def _drain_dsa_cold_load_futures(self) -> Optional[set[str]]:
-        futures = getattr(self, "_dsa_cold_load_futures", None)
+        futures: Optional[dict[str, ColdLoadEntry]] = getattr(
+            self, "_dsa_cold_load_futures", None
+        )
         if not futures:
             return None
         perf_enabled = serving_perf_enabled()
