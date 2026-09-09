@@ -152,10 +152,10 @@ def test_cold_submit_and_publish_preserve_async_handoff(
         return_value=1.0,
         side_effect=None if perf_enabled else AssertionError("disabled perf clock"),
     )
-    monkeypatch.setattr(adapter_mod, "cold_start_perf_enabled", lambda: perf_enabled)
-    monkeypatch.setattr(adapter_mod, "cold_start_perf_now", clock)
+    monkeypatch.setattr(adapter_mod, "serving_perf_enabled", lambda: perf_enabled)
+    monkeypatch.setattr(adapter_mod, "serving_perf_now", clock)
     monkeypatch.setattr(adapter_mod, "time", SimpleNamespace(thread_time_ns=clock))
-    monkeypatch.setattr(adapter_mod, "cold_start_perf_log", MagicMock())
+    monkeypatch.setattr(adapter_mod, "serving_perf_log", MagicMock())
     monkeypatch.setattr(
         torch, "npu", SimpleNamespace(current_device=lambda: 0), raising=False
     )
@@ -187,7 +187,7 @@ def test_cold_submit_and_publish_preserve_async_handoff(
     assert impl._drain_dsa_cold_load_futures() == {"request"}
     assert impl._worker_retrieve_state["request"].prepared_sparse_sources[0] is source
     assert not getattr(impl, "_dsa_cold_load_futures", None)
-    assert adapter_mod.cold_start_perf_log.call_count == (3 if perf_enabled else 0)
+    assert adapter_mod.serving_perf_log.call_count == (3 if perf_enabled else 0)
 
 
 def test_cold_compact_executor_is_bounded_to_two_io_jobs() -> None:
@@ -252,7 +252,8 @@ def test_capture_barrier_waits_for_indexer_after_latent_failure() -> None:
 
 
 def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
-    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
+    monkeypatch.setenv("PD_SERVING_PERF", "1")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     impl = _make_impl()
     impl.num_layers = 2
     impl.device = "cpu"
@@ -314,7 +315,7 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
         "token_count": 4,
         "indexer_slots_cpu": torch.arange(4),
         "indexer_kvcaches": [object(), object()],
-        "planned_at": adapter_mod.cold_start_perf_now(),
+        "planned_at": adapter_mod.serving_perf_now(),
         "latent_shared_ready": Future(),
     }
     plan["latent_shared_ready"].set_result(None)
@@ -373,7 +374,7 @@ def test_cold_compact_shared_indexer_waits_for_latent_publication() -> None:
         "token_count": 4,
         "indexer_slots_cpu": torch.arange(4),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.cold_start_perf_now(),
+        "planned_at": adapter_mod.serving_perf_now(),
         "latent_shared_ready": gate,
     }
 
@@ -458,7 +459,7 @@ def test_cold_compact_prefetches_before_dense_retrieve() -> None:
         "token_count": 4,
         "indexer_slots_cpu": torch.arange(4),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.cold_start_perf_now(),
+        "planned_at": adapter_mod.serving_perf_now(),
         "latent_shared_ready": gate,
     }
 
@@ -509,7 +510,7 @@ def test_cold_compact_prefetch_owner_released_when_latent_load_fails() -> None:
         "token_count": 1,
         "indexer_slots_cpu": torch.arange(1),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.cold_start_perf_now(),
+        "planned_at": adapter_mod.serving_perf_now(),
         "latent_shared_ready": gate,
     }
 
@@ -567,7 +568,7 @@ def test_cold_compact_prefetch_failure_releases_and_uses_dense_path() -> None:
         "token_count": 1,
         "indexer_slots_cpu": torch.arange(1),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.cold_start_perf_now(),
+        "planned_at": adapter_mod.serving_perf_now(),
         "latent_shared_ready": gate,
     }
 
@@ -588,8 +589,8 @@ def test_cold_compact_direct_group1_bypasses_gate_and_layer_generator(
         return_value=1.0,
         side_effect=None if perf_enabled else AssertionError("disabled perf clock"),
     )
-    monkeypatch.setattr(adapter_mod, "cold_start_perf_enabled", lambda: perf_enabled)
-    monkeypatch.setattr(adapter_mod, "cold_start_perf_now", clock)
+    monkeypatch.setattr(adapter_mod, "serving_perf_enabled", lambda: perf_enabled)
+    monkeypatch.setattr(adapter_mod, "serving_perf_now", clock)
     monkeypatch.setattr(adapter_mod, "time", SimpleNamespace(thread_time_ns=clock))
     direct_load = MagicMock()
     retrieve = MagicMock(
@@ -693,7 +694,7 @@ def test_cold_compact_dense_failure_releases_prefetch_owner_only() -> None:
         "token_count": 1,
         "indexer_slots_cpu": torch.arange(1),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.cold_start_perf_now(),
+        "planned_at": adapter_mod.serving_perf_now(),
         "latent_shared_ready": gate,
     }
 
@@ -722,7 +723,7 @@ def test_cold_compact_dense_path_requires_source_retention_support() -> None:
         "token_count": 1,
         "indexer_slots_cpu": torch.arange(1),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.cold_start_perf_now(),
+        "planned_at": adapter_mod.serving_perf_now(),
         "latent_shared_ready": Future(),
     }
 
@@ -796,7 +797,7 @@ def test_failed_cold_indexer_does_not_double_release_adopted_source(
         "token_count": 4,
         "indexer_slots_cpu": torch.arange(4),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.cold_start_perf_now(),
+        "planned_at": adapter_mod.serving_perf_now(),
         "latent_shared_ready": Future(),
     }
     plan["latent_shared_ready"].set_result(None)
@@ -2421,12 +2422,12 @@ class TestWorkerRetrieveState:
         impl = _make_impl()
         impl._wait_for_save_done = True
         impl._finalize_worker_requests_after_store = MagicMock(return_value=set())
-        monkeypatch.setattr(adapter_mod, "cold_start_perf_enabled", lambda: False)
+        monkeypatch.setattr(adapter_mod, "serving_perf_enabled", lambda: False)
 
         def fail_clock() -> None:
             raise AssertionError("disabled diagnostics read a timing clock")
 
-        monkeypatch.setattr(adapter_mod, "cold_start_perf_now", fail_clock)
+        monkeypatch.setattr(adapter_mod, "serving_perf_now", fail_clock)
         monkeypatch.setattr(
             adapter_mod,
             "time",
@@ -3405,7 +3406,8 @@ class TestWorkerRetrieveState:
             adapter_mod.RETRIEVE_STATS_INTERVAL_SECONDS_ENV,
             "10",
         )
-        monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
+        monkeypatch.setenv("PD_SERVING_PERF", "1")
+        monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
         timestamps = iter((100.0, 105.0, 111.0, 112.0))
         monkeypatch.setattr(
             adapter_mod.time,
@@ -3453,7 +3455,8 @@ class TestWorkerRetrieveState:
         assert impl._retrieve_stats_token_count == 4
 
     def test_retrieve_stats_omit_tensor_counts_without_readback(self, monkeypatch):
-        monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
+        monkeypatch.setenv("PD_SERVING_PERF", "1")
+        monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
         monkeypatch.setenv(adapter_mod.RETRIEVE_STATS_INTERVAL_SECONDS_ENV, "10")
         impl, _, _ = make_worker_connector([], use_layerwise=True)
         # Meta tensors cannot be read back; even CPU tensors must be omitted
@@ -3463,7 +3466,8 @@ class TestWorkerRetrieveState:
         assert impl._retrieve_stats_request_count == 0
 
     def test_retrieve_stats_cold_perf_off_overrides_interval(self, monkeypatch):
-        monkeypatch.setenv("LMCACHE_COLD_START_PERF", "0")
+        monkeypatch.setenv("PD_SERVING_PERF", "0")
+        monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "0")
         monkeypatch.setenv(adapter_mod.RETRIEVE_STATS_INTERVAL_SECONDS_ENV, "10")
         impl, _, _ = make_worker_connector([], use_layerwise=True)
         impl._record_sparse_retrieve_stats(None, object(), row_count=2)
@@ -7083,10 +7087,10 @@ class TestWorkerRetrieveState:
         previous = Future()
         previous.set_result(None)
         events = []
-        monkeypatch.setattr(adapter_mod, "cold_start_perf_enabled", lambda: True)
+        monkeypatch.setattr(adapter_mod, "serving_perf_enabled", lambda: True)
         monkeypatch.setattr(
             adapter_mod,
-            "cold_start_perf_log",
+            "serving_perf_log",
             lambda _logger, event, **fields: events.append((event, fields)),
         )
 

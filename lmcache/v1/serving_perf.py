@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in structured timing for LMCache cold retrieval."""
+"""Opt-in PD serving timing, configured once before worker startup.
+
+Use PD_SERVING_PERF=1 for host timing, detail for additional host detail, or
+device for explicit device timing in supported components. Content diagnostics
+and operational failures have separate controls. Log schemas remain stable.
+"""
 
 # Standard
 from collections.abc import Iterator
@@ -12,10 +17,11 @@ import os
 import socket
 import time
 
-COLD_START_PERF_ENV = "LMCACHE_COLD_START_PERF"
+SERVING_PERF_ENV = "PD_SERVING_PERF"
 _FALSE_VALUES = {"", "0", "false", "no", "off"}
+_MODE = os.environ.get(SERVING_PERF_ENV, "0").strip().lower()
 _PERF_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
-    "lmcache_cold_start_perf_context", default=None
+    "lmcache_serving_perf_context", default=None
 )
 
 
@@ -31,22 +37,17 @@ def _clock_domain() -> tuple[str, str]:
 _HOST, _CLOCK_DOMAIN = _clock_domain()
 
 
-def cold_start_perf_enabled() -> bool:
-    return os.environ.get(COLD_START_PERF_ENV, "0").strip().lower() not in (
-        _FALSE_VALUES
-    )
+def serving_perf_enabled() -> bool:
+    return _MODE not in _FALSE_VALUES
 
 
-def cold_start_perf_detailed_enabled() -> bool:
+def serving_perf_detailed_enabled() -> bool:
     """Enable per-layer CPU diagnostics only for explicit detail/device modes.
 
     Ordinary values such as ``1`` retain coarse host logs. This function only
     reads configuration; it does not inspect tensors or call a device runtime.
     """
-    return os.environ.get(COLD_START_PERF_ENV, "0").strip().lower() in (
-        "detail",
-        "device",
-    )
+    return _MODE in ("detail", "device")
 
 
 def _non_json_field(_value: Any) -> str:
@@ -54,14 +55,14 @@ def _non_json_field(_value: Any) -> str:
     return "<non-JSON value>"
 
 
-def cold_start_perf_now() -> float:
+def serving_perf_now() -> float:
     return time.perf_counter()
 
 
 @contextmanager
-def cold_start_perf_scope(**fields: Any) -> Iterator[None]:
+def serving_perf_scope(**fields: Any) -> Iterator[None]:
     """Attach correlation fields to nested cold-perf events in this task."""
-    if not cold_start_perf_enabled():
+    if not serving_perf_enabled():
         yield
         return
     current = _PERF_CONTEXT.get() or {}
@@ -72,14 +73,14 @@ def cold_start_perf_scope(**fields: Any) -> Iterator[None]:
         _PERF_CONTEXT.reset(token)
 
 
-def cold_start_perf_log(
+def serving_perf_log(
     logger,
     event: str,
     *,
     started: float | None = None,
     **fields: Any,
 ) -> None:
-    if not cold_start_perf_enabled():
+    if not serving_perf_enabled():
         return
     if started is not None:
         fields["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)

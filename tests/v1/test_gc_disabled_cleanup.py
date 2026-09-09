@@ -33,7 +33,7 @@ def gc_disabled(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     logger = logging.Logger("gc-disabled-cleanup")
     logger.addHandler(logging.NullHandler())
     for module in (adapter_mod, mooncake_mod):
-        monkeypatch.setattr(module, "cold_start_perf_enabled", lambda: False)
+        monkeypatch.setattr(module, "serving_perf_enabled", lambda: False)
         monkeypatch.setattr(module, "logger", logger)
     monkeypatch.setattr(remote_mod, "logger", logger)
     try:
@@ -212,7 +212,7 @@ def _page_connector(
 def test_page_get_releases_caller_references_without_gc(
     gc_disabled: None, monkeypatch: pytest.MonkeyPatch, mode: str, perf_enabled: bool
 ) -> None:
-    monkeypatch.setattr(mooncake_mod, "cold_start_perf_enabled", lambda: perf_enabled)
+    monkeypatch.setattr(mooncake_mod, "serving_perf_enabled", lambda: perf_enabled)
     connector, keys = _page_connector(monkeypatch, mode)
 
     async def run() -> None:

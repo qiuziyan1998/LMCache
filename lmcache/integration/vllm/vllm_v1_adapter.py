@@ -56,10 +56,10 @@ from lmcache.v1.cache_engine import (
     LayerwiseStoreResult,
     LMCacheEngine,
 )
-from lmcache.v1.cold_start_perf import (
-    cold_start_perf_enabled,
-    cold_start_perf_log,
-    cold_start_perf_now,
+from lmcache.v1.serving_perf import (
+    serving_perf_enabled,
+    serving_perf_log,
+    serving_perf_now,
 )
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
@@ -2457,7 +2457,7 @@ class LMCacheConnectorV1Impl:
         row_count: int,
     ) -> None:
         """Record one request, combining all of its MTP rows."""
-        if not cold_start_perf_enabled():
+        if not serving_perf_enabled():
             return
         interval = self._ensure_retrieve_stats_state()
         if interval <= 0:
@@ -3341,7 +3341,7 @@ class LMCacheConnectorV1Impl:
             )
             if perf_state is not None:
                 request_started, token_count = perf_state
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "worker_load_abort",
                     started=request_started,
@@ -6335,23 +6335,23 @@ class LMCacheConnectorV1Impl:
                 f"is still active: req_id={request.req_id}, "
                 f"active_generation={existing[0]}, generation={generation}"
             )
-        perf_enabled = cold_start_perf_enabled()
-        plan_started = cold_start_perf_now() if perf_enabled else 0.0
+        perf_enabled = serving_perf_enabled()
+        plan_started = serving_perf_now() if perf_enabled else 0.0
         plan_thread_started = time.thread_time_ns() if perf_enabled else 0
-        block_ids_started = cold_start_perf_now() if perf_enabled else 0.0
+        block_ids_started = serving_perf_now() if perf_enabled else 0.0
         indexer_slots = request.indexer_slot_mapping[0]
         indexer_block_ids = _cold_indexer_block_ids(indexer_slots, self._block_size)
         block_ids_ms = (
-            (cold_start_perf_now() if perf_enabled else 0.0) - block_ids_started
+            (serving_perf_now() if perf_enabled else 0.0) - block_ids_started
         ) * 1000
-        device_started = cold_start_perf_now() if perf_enabled else 0.0
+        device_started = serving_perf_now() if perf_enabled else 0.0
         npu_device_id = (
             int(torch.npu.current_device()) if hasattr(torch, "npu") else None
         )
         device_ms = (
-            (cold_start_perf_now() if perf_enabled else 0.0) - device_started
+            (serving_perf_now() if perf_enabled else 0.0) - device_started
         ) * 1000
-        build_started = cold_start_perf_now() if perf_enabled else 0.0
+        build_started = serving_perf_now() if perf_enabled else 0.0
         token_count = getattr(request.load_spec, "lmcache_cached_tokens", 0)
         plan = {
             "request": request,
@@ -6361,16 +6361,16 @@ class LMCacheConnectorV1Impl:
             "indexer_slots_cpu": request.indexer_slot_mapping[0],
             "latent_kvcaches": self._kvcaches_for_group(0),
             "indexer_kvcaches": self._kvcaches_for_group(1),
-            "planned_at": (cold_start_perf_now() if perf_enabled else 0.0),
+            "planned_at": (serving_perf_now() if perf_enabled else 0.0),
             "plan_started": plan_started,
             "latent_shared_ready": Future(),
         }
         build_ms = (
-            (cold_start_perf_now() if perf_enabled else 0.0) - build_started
+            (serving_perf_now() if perf_enabled else 0.0) - build_started
         ) * 1000
-        submitted_at = cold_start_perf_now() if perf_enabled else 0.0
+        submitted_at = serving_perf_now() if perf_enabled else 0.0
         if perf_enabled:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "worker_load_start",
                 req_id=request.req_id,
@@ -6378,7 +6378,7 @@ class LMCacheConnectorV1Impl:
                 mode="dsa_cold_compact",
             )
         executor = self._get_dsa_cold_load_executor()
-        executor_submit_started = cold_start_perf_now() if perf_enabled else 0.0
+        executor_submit_started = serving_perf_now() if perf_enabled else 0.0
         indexer_future = executor.submit(
             self._run_dsa_cold_indexer_load,
             plan,
@@ -6425,10 +6425,10 @@ class LMCacheConnectorV1Impl:
             indexer_future,
         )
         executor_submit_ms = (
-            (cold_start_perf_now() if perf_enabled else 0.0) - executor_submit_started
+            (serving_perf_now() if perf_enabled else 0.0) - executor_submit_started
         ) * 1000
         if perf_enabled:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "cold_compact_plan_submit",
                 started=plan_started,
@@ -6469,7 +6469,8 @@ class LMCacheConnectorV1Impl:
             return False
         assert request.load_spec is not None
         token_count = request.load_spec.lmcache_cached_tokens
-        plan_started = cold_start_perf_now()
+        perf_enabled = serving_perf_enabled()
+        plan_started = serving_perf_now() if perf_enabled else 0.0
         plan = {
             "request": request,
             "tokens": request.token_ids[:token_count],
@@ -6478,7 +6479,7 @@ class LMCacheConnectorV1Impl:
             "indexer_slots_cpu": request.indexer_slot_mapping[0],
             "latent_kvcaches": self._kvcaches_for_group(0),
             "indexer_kvcaches": self._kvcaches_for_group(1),
-            "planned_at": cold_start_perf_now(),
+            "planned_at": serving_perf_now() if perf_enabled else 0.0,
             "plan_started": plan_started,
             "latent_shared_ready": Future(),
         }
@@ -6530,7 +6531,7 @@ class LMCacheConnectorV1Impl:
             completion,
             request,
             indexer_blocks,
-            cold_start_perf_now(),
+            serving_perf_now() if perf_enabled else 0.0,
             indexer_completion,
         )
         if pending is None:
@@ -6611,12 +6612,13 @@ class LMCacheConnectorV1Impl:
         self, handled_groups: tuple[int, ...]
     ) -> dict[str, dict[str, Any]]:
         pending = getattr(self, "_dsa_live_split_pending", None)
-        cold_start_perf_log(
-            logger,
-            "live_source_destination_provider_entry",
-            pending_count=len(pending or {}),
-            handled_groups=handled_groups,
-        )
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "live_source_destination_provider_entry",
+                pending_count=len(pending or {}),
+                handled_groups=handled_groups,
+            )
         if not pending:
             return {}
         handled_groups = tuple(handled_groups)
@@ -6680,13 +6682,14 @@ class LMCacheConnectorV1Impl:
 
     def accept_live_split_results(self, results: dict[str, str]) -> None:
         pending = getattr(self, "_dsa_live_split_pending", None)
-        cold_start_perf_log(
-            logger,
-            "live_source_result_accept_entry",
-            pending_count=len(pending or {}),
-            result_ids=sorted(results),
-            statuses=results,
-        )
+        if serving_perf_enabled():
+            serving_perf_log(
+                logger,
+                "live_source_result_accept_entry",
+                pending_count=len(pending or {}),
+                result_ids=sorted(results),
+                statuses=results,
+            )
         if not pending:
             return
         assert self.lmcache_engine is not None
@@ -6760,7 +6763,7 @@ class LMCacheConnectorV1Impl:
         self, plan: dict[str, Any], npu_device_id: Optional[int]
     ) -> tuple[torch.Tensor, Any, float, float]:
         """Load Group 1 densely after Group 0 shared-CPU publication."""
-        perf_breakdown = {} if cold_start_perf_enabled() else None
+        perf_breakdown = {} if serving_perf_enabled() else None
         thread_started = (
             time.thread_time_ns() if perf_breakdown is not None else 0
         )
@@ -6768,12 +6771,12 @@ class LMCacheConnectorV1Impl:
             plan["indexer_perf"] = perf_breakdown
 
         def stage_start() -> float:
-            return cold_start_perf_now() if perf_breakdown is not None else 0.0
+            return serving_perf_now() if perf_breakdown is not None else 0.0
 
         def finish_stage(name: str, stage_started: float) -> None:
             if perf_breakdown is not None:
                 perf_breakdown[name] = round(
-                    (cold_start_perf_now() - stage_started) * 1000, 3
+                    (serving_perf_now() - stage_started) * 1000, 3
                 )
 
         producer_setup_started = stage_start()
@@ -6781,7 +6784,7 @@ class LMCacheConnectorV1Impl:
             torch.npu.set_device(npu_device_id)
         finish_stage("producer_setup_ms", producer_setup_started)
         assert self.lmcache_engine is not None
-        started = cold_start_perf_now() if perf_breakdown is not None else 0.0
+        started = serving_perf_now() if perf_breakdown is not None else 0.0
         queue_ms = (started - plan["planned_at"]) * 1000
         request = plan["request"]
         indexer_slots_cpu = plan["indexer_slots_cpu"]
@@ -6819,7 +6822,7 @@ class LMCacheConnectorV1Impl:
             return (
                 plan["token_mask"],
                 None,
-                (cold_start_perf_now() if perf_breakdown is not None else 0.0)
+                (serving_perf_now() if perf_breakdown is not None else 0.0)
                 - started,
                 queue_ms,
             )
@@ -6987,7 +6990,7 @@ class LMCacheConnectorV1Impl:
         return (
             result,
             readiness,
-            (cold_start_perf_now() if perf_breakdown is not None else 0.0) - started,
+            (serving_perf_now() if perf_breakdown is not None else 0.0) - started,
             queue_ms,
         )
 
@@ -7087,8 +7090,8 @@ class LMCacheConnectorV1Impl:
         tokens = plan["tokens"]
         token_mask = plan["token_mask"]
         state = live_state or WorkerRetrieveState(req_id=request.req_id)
-        perf_enabled = cold_start_perf_enabled()
-        started = cold_start_perf_now() if perf_enabled else 0.0
+        perf_enabled = serving_perf_enabled()
+        started = serving_perf_now() if perf_enabled else 0.0
         indexer_readiness = None
         predecessor_wait_ms = 0.0
         latent_materialize_ms = 0.0
@@ -7100,7 +7103,7 @@ class LMCacheConnectorV1Impl:
         try:
             if previous_latent_future is not None:
                 predecessor_wait_started = (
-                    cold_start_perf_now() if perf_enabled else 0.0
+                    serving_perf_now() if perf_enabled else 0.0
                 )
                 try:
                     # Only wait for ordering. Re-raising a stored failure would
@@ -7112,17 +7115,17 @@ class LMCacheConnectorV1Impl:
                     pass
                 if perf_enabled:
                     predecessor_wait_ms = (
-                        cold_start_perf_now() - predecessor_wait_started
+                        serving_perf_now() - predecessor_wait_started
                     ) * 1000
             retrieve_location = "LocalCPU"
             if live_state is None:
                 latent_materialize_started = (
-                    cold_start_perf_now() if perf_enabled else 0.0
+                    serving_perf_now() if perf_enabled else 0.0
                 )
                 latent_materialize_thread_cpu_started = (
                     time.thread_time_ns() if perf_enabled else 0
                 )
-                phase_started = cold_start_perf_now() if perf_enabled else 0.0
+                phase_started = serving_perf_now() if perf_enabled else 0.0
                 empty_slots = torch.empty(0, dtype=torch.long)
                 retrieve_kwargs, _, _ = self._sparse_retrieve_kwargs(
                     request,
@@ -7140,12 +7143,12 @@ class LMCacheConnectorV1Impl:
                 )
                 if perf_enabled:
                     latent_kwargs_ms = (
-                        cold_start_perf_now() - phase_started
+                        serving_perf_now() - phase_started
                     ) * 1000
                 retrieve_kwargs["materialize_only"] = True
                 retrieve_kwargs["shared_cpu_phase"] = "dsa_cold_compact_latent"
                 retrieve_kwargs["_defer_sparse_pointer_copy"] = True
-                phase_started = cold_start_perf_now() if perf_enabled else 0.0
+                phase_started = serving_perf_now() if perf_enabled else 0.0
                 latent_retriever = (
                     self.lmcache_engine.retrieve_layer_head_token_wise(
                         tokens,
@@ -7155,23 +7158,23 @@ class LMCacheConnectorV1Impl:
                 )
                 if perf_enabled:
                     latent_generator_create_ms = (
-                        cold_start_perf_now() - phase_started
+                        serving_perf_now() - phase_started
                     ) * 1000
                 try:
-                    phase_started = cold_start_perf_now() if perf_enabled else 0.0
+                    phase_started = serving_perf_now() if perf_enabled else 0.0
                     latent_result = next(latent_retriever)
                     if perf_enabled:
                         latent_first_yield_ms = (
-                            cold_start_perf_now() - phase_started
+                            serving_perf_now() - phase_started
                         ) * 1000
                     for layer_id in range(self.num_layers):
                         phase_started = (
-                            cold_start_perf_now() if perf_enabled else 0.0
+                            serving_perf_now() if perf_enabled else 0.0
                         )
                         latent_result = latent_retriever.send(None)
                         if perf_enabled:
                             send_ms = (
-                                cold_start_perf_now() - phase_started
+                                serving_perf_now() - phase_started
                             ) * 1000
                             latent_send_sum_ms += send_ms
                             if send_ms > latent_send_max_ms:
@@ -7180,7 +7183,7 @@ class LMCacheConnectorV1Impl:
                 finally:
                     latent_retriever.close()
 
-                phase_started = cold_start_perf_now() if perf_enabled else 0.0
+                phase_started = serving_perf_now() if perf_enabled else 0.0
                 if (
                     latent_result is None
                     or int(latent_result.sum().item()) != token_count
@@ -7188,14 +7191,14 @@ class LMCacheConnectorV1Impl:
                     raise RuntimeError("Cold compact latent retrieve was incomplete")
                 if perf_enabled:
                     latent_result_check_ms = (
-                        cold_start_perf_now() - phase_started
+                        serving_perf_now() - phase_started
                     ) * 1000
                 retrieve_location = retrieve_kwargs.get(
                     "cached_retrieve_location"
                 )
                 if perf_enabled:
                     latent_materialize_ms = (
-                        cold_start_perf_now() - latent_materialize_started
+                        serving_perf_now() - latent_materialize_started
                     ) * 1000
                     latent_materialize_thread_cpu_ms = (
                         time.thread_time_ns()
@@ -7204,7 +7207,7 @@ class LMCacheConnectorV1Impl:
             latent_shared_ready = plan["latent_shared_ready"]
             if not latent_shared_ready.done():
                 latent_shared_ready.set_result(None)
-            dependency_wait_started = cold_start_perf_now() if perf_enabled else 0.0
+            dependency_wait_started = serving_perf_now() if perf_enabled else 0.0
             (
                 _,
                 indexer_readiness,
@@ -7212,7 +7215,7 @@ class LMCacheConnectorV1Impl:
                 indexer_queue_ms,
             ) = indexer_future.result()
             dependency_wait_ms = (
-                (cold_start_perf_now() if perf_enabled else 0.0)
+                (serving_perf_now() if perf_enabled else 0.0)
                 - dependency_wait_started
             ) * 1000
             if request.load_spec.dsa_group1_direct_hbm:
@@ -7227,20 +7230,20 @@ class LMCacheConnectorV1Impl:
                 additional_owners=tuple(plan.get("indexer_source_owners", ())),
             )
 
-            seal_started = cold_start_perf_now() if perf_enabled else 0.0
+            seal_started = serving_perf_now() if perf_enabled else 0.0
             state.indexer_npu_resident = True
             state.location = retrieve_location
             state.metadata_warm = state.has_cache()
             state.token_count = token_count
             self._refresh_prepared_sparse_sources(state, token_count)
             if perf_enabled:
-                latent_seal_ms = (cold_start_perf_now() - seal_started) * 1000
+                latent_seal_ms = (serving_perf_now() - seal_started) * 1000
             if state.prepared_sparse_sources.get(0) is None:
                 raise RuntimeError("Cold compact latent source was not sealed")
-            completed_at = cold_start_perf_now() if perf_enabled else 0.0
+            completed_at = serving_perf_now() if perf_enabled else 0.0
             state._dsa_cold_load_completed_at = completed_at
             if perf_enabled:
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "cold_compact_retrieve_complete",
                     started=started,
@@ -7458,7 +7461,7 @@ class LMCacheConnectorV1Impl:
 
         for load_idx, (idx, request) in enumerate(loadable_requests):
             request_perf_started = (
-                cold_start_perf_now() if cold_start_perf_enabled() else 0.0
+                serving_perf_now() if serving_perf_enabled() else 0.0
             )
             tokens = request.token_ids
             assert request.load_spec is not None
@@ -7694,12 +7697,12 @@ class LMCacheConnectorV1Impl:
                         None,
                     )
                     if cold_perf_active:
-                        load_started = cold_start_perf_now()
+                        load_started = serving_perf_now()
                         self._cold_perf_load_started[request.req_id] = (
                             request_perf_started,
                             token_count,
                         )
-                        cold_start_perf_log(
+                        serving_perf_log(
                             logger,
                             "worker_load_start",
                             req_id=request.req_id,
@@ -7738,11 +7741,11 @@ class LMCacheConnectorV1Impl:
                     self._layerwise_sparse_shared_ordered.append(False)
                     # NOTE: retrieve layers one by one with cpu prefetch
                     prime_started = (
-                        cold_start_perf_now() if cold_perf_active else 0.0
+                        serving_perf_now() if cold_perf_active else 0.0
                     )
                     next(layerwise_retriever)
                     if prime_started:
-                        cold_start_perf_log(
+                        serving_perf_log(
                             logger,
                             "prime_group",
                             started=prime_started,
@@ -7798,7 +7801,7 @@ class LMCacheConnectorV1Impl:
                             )
                         else:
                             indexer_setup_started = (
-                                cold_start_perf_now()
+                                serving_perf_now()
                                 if cold_perf_active
                                 else 0.0
                             )
@@ -7897,13 +7900,13 @@ class LMCacheConnectorV1Impl:
                                     True
                                 )
                             prime_started = (
-                                cold_start_perf_now()
+                                serving_perf_now()
                                 if cold_perf_active
                                 else 0.0
                             )
                             next(indexer_retriever)
                             if prime_started:
-                                cold_start_perf_log(
+                                serving_perf_log(
                                     logger,
                                     "prime_group",
                                     started=prime_started,
@@ -7925,7 +7928,7 @@ class LMCacheConnectorV1Impl:
                         retrieve_state.indexer_npu_resident = False
                         retrieve_state.indexer_npu_materialization_pending = False
                         if cold_perf_active:
-                            cold_start_perf_log(
+                            serving_perf_log(
                                 logger,
                                 "prime_group",
                                 req_id=request.req_id,
@@ -8816,23 +8819,29 @@ class LMCacheConnectorV1Impl:
             self.current_layer += 1
             if self.current_layer >= self.num_layers:
                 completed_requests = tuple(layerwise_requests)
-                dense_perf_states = [
-                    (
-                        request,
-                        self._cold_perf_dense_load_started.get(
-                            request.req_id,
-                            None,
-                        ),
-                    )
-                    for request in completed_requests
-                ]
-                finalize_started = (
-                    cold_start_perf_now()
-                    if any(
-                        request.req_id in self._cold_perf_load_started
+                perf_enabled = serving_perf_enabled()
+                dense_perf_states = ()
+                if perf_enabled:
+                    dense_perf_states = [
+                        (
+                            request,
+                            self._cold_perf_dense_load_started.get(
+                                request.req_id,
+                                None,
+                            ),
+                        )
                         for request in completed_requests
+                    ]
+                finalize_started = (
+                    serving_perf_now()
+                    if perf_enabled
+                    and (
+                        any(
+                            request.req_id in self._cold_perf_load_started
+                            for request in completed_requests
+                        )
+                        or any(state is not None for _, state in dense_perf_states)
                     )
-                    or any(state is not None for _, state in dense_perf_states)
                     else 0.0
                 )
                 with self._sparse_retrieve_state_guard(
@@ -8844,49 +8853,50 @@ class LMCacheConnectorV1Impl:
                     self._finalize_worker_retrieve_state_from_metadata(metadata)
                     self._drain_layerwise_retrievers()
                 finalize_ms = (
-                    (cold_start_perf_now() - finalize_started) * 1000
+                    (serving_perf_now() - finalize_started) * 1000
                     if finalize_started
                     else 0.0
                 )
-                dense_completed = cold_start_perf_now()
-                for request, perf_state in dense_perf_states:
-                    if perf_state is None:
-                        continue
-                    self._cold_perf_dense_load_started.pop(request.req_id, None)
-                    request_started, token_count = perf_state
-                    self._cold_perf_dense_load_completed[request.req_id] = (
-                        dense_completed
-                    )
-                    cold_start_perf_log(
-                        logger,
-                        "dense_worker_load_complete",
-                        started=request_started,
-                        req_id=request.req_id,
-                        tokens=token_count,
-                        layers=self.num_layers,
-                        finalize_ms=round(finalize_ms, 3),
-                        scope="layerwise_wall",
-                        includes_model_compute=True,
-                    )
-                for request in completed_requests:
-                    perf_state = self._cold_perf_load_started.pop(
-                        request.req_id,
-                        None,
-                    )
-                    if perf_state is None:
-                        continue
-                    request_started, token_count = perf_state
-                    cold_start_perf_log(
-                        logger,
-                        "worker_load_complete",
-                        started=request_started,
-                        req_id=request.req_id,
-                        tokens=token_count,
-                        layers=self.num_layers,
-                        finalize_ms=round(finalize_ms, 3),
-                        scope="layerwise_wall",
-                        includes_model_compute=True,
-                    )
+                if perf_enabled:
+                    dense_completed = serving_perf_now()
+                    for request, perf_state in dense_perf_states:
+                        if perf_state is None:
+                            continue
+                        self._cold_perf_dense_load_started.pop(request.req_id, None)
+                        request_started, token_count = perf_state
+                        self._cold_perf_dense_load_completed[request.req_id] = (
+                            dense_completed
+                        )
+                        serving_perf_log(
+                            logger,
+                            "dense_worker_load_complete",
+                            started=request_started,
+                            req_id=request.req_id,
+                            tokens=token_count,
+                            layers=self.num_layers,
+                            finalize_ms=round(finalize_ms, 3),
+                            scope="layerwise_wall",
+                            includes_model_compute=True,
+                        )
+                    for request in completed_requests:
+                        perf_state = self._cold_perf_load_started.pop(
+                            request.req_id,
+                            None,
+                        )
+                        if perf_state is None:
+                            continue
+                        request_started, token_count = perf_state
+                        serving_perf_log(
+                            logger,
+                            "worker_load_complete",
+                            started=request_started,
+                            req_id=request.req_id,
+                            tokens=token_count,
+                            layers=self.num_layers,
+                            finalize_ms=round(finalize_ms, 3),
+                            scope="layerwise_wall",
+                            includes_model_compute=True,
+                        )
 
         return
 
@@ -9651,7 +9661,7 @@ class LMCacheConnectorV1Impl:
         futures = getattr(self, "_dsa_cold_load_futures", None)
         if not futures:
             return None
-        perf_enabled = cold_start_perf_enabled()
+        perf_enabled = serving_perf_enabled()
         finished: set[str] = set()
         for req_id, entry in list(futures.items()):
             (
@@ -9685,7 +9695,7 @@ class LMCacheConnectorV1Impl:
                         f"req_id={req_id}, expected={generation}, "
                         f"actual={actual_generation}"
                     )
-                publish_started = cold_start_perf_now() if perf_enabled else 0.0
+                publish_started = serving_perf_now() if perf_enabled else 0.0
                 completed_at = getattr(
                     state,
                     "_dsa_cold_load_completed_at",
@@ -9715,9 +9725,9 @@ class LMCacheConnectorV1Impl:
                     # the other workers; explicit finish/abort remains the
                     # authoritative cleanup path.
                     state._dsa_cold_prune_protected = True
-                published_at = cold_start_perf_now() if perf_enabled else 0.0
+                published_at = serving_perf_now() if perf_enabled else 0.0
                 if perf_enabled:
-                    cold_start_perf_log(
+                    serving_perf_log(
                         logger,
                         "worker_load_complete",
                         started=submitted_at,
@@ -9750,7 +9760,7 @@ class LMCacheConnectorV1Impl:
                         "aborted" if was_aborted else "ready",
                         request.load_spec.lmcache_cached_tokens,
                         len(indexer_block_ids),
-                        (cold_start_perf_now() - submitted_at) * 1000,
+                        (serving_perf_now() - submitted_at) * 1000,
                     )
             except BaseException as exc:
                 requires_restart = getattr(
@@ -9804,7 +9814,7 @@ class LMCacheConnectorV1Impl:
                     req_id,
                     generation,
                     len(indexer_block_ids),
-                    ((cold_start_perf_now() if perf_enabled else 0.0) - submitted_at)
+                    ((serving_perf_now() if perf_enabled else 0.0) - submitted_at)
                     * 1000,
                 )
                 # Both workers are terminal and request owners have either
@@ -9834,8 +9844,8 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        perf_enabled = cold_start_perf_enabled()
-        finished_started = cold_start_perf_now() if perf_enabled else 0.0
+        perf_enabled = serving_perf_enabled()
+        finished_started = serving_perf_now() if perf_enabled else 0.0
         finished_thread_started = time.thread_time_ns() if perf_enabled else 0
         aborted_cold: set[str] = set()
         live_pending = getattr(self, "_dsa_live_split_pending", None)
@@ -9876,27 +9886,27 @@ class LMCacheConnectorV1Impl:
                 self._finished_req_ids_waiting_for_save.update(waiting_req_ids)
                 releasable_req_ids -= waiting_req_ids
 
-        store_finalize_started = cold_start_perf_now() if perf_enabled else 0.0
+        store_finalize_started = serving_perf_now() if perf_enabled else 0.0
         finished_sending = self._finalize_worker_requests_after_store(
             releasable_req_ids
         )
         store_finalize_ms = (
-            (cold_start_perf_now() - store_finalize_started) * 1000
+            (serving_perf_now() - store_finalize_started) * 1000
             if perf_enabled
             else 0.0
         )
         finished_sending.update(self._late_finished_sending)
         self._late_finished_sending.clear()
-        load_drain_started = cold_start_perf_now() if perf_enabled else 0.0
+        load_drain_started = serving_perf_now() if perf_enabled else 0.0
         finished_recving = self._drain_dsa_cold_load_futures()
         if perf_enabled:
-            completed = cold_start_perf_now()
+            completed = serving_perf_now()
             load_drain_ms = (completed - load_drain_started) * 1000
             elapsed_ms = (completed - finished_started) * 1000
         else:
             load_drain_ms = elapsed_ms = 0.0
         if elapsed_ms >= 100.0:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "decoder_connector_get_finished_slow",
                 started=finished_started,
@@ -10117,7 +10127,7 @@ class LMCacheConnectorV1Impl:
             0,
         )
         lookup_call_started = (
-            cold_start_perf_now() if cold_start_perf_enabled() else 0.0
+            serving_perf_now() if serving_perf_enabled() else 0.0
         )
         if lookup_call_started:
             self._cold_perf_lookup_started.setdefault(req_id, lookup_call_started)
@@ -10182,27 +10192,28 @@ class LMCacheConnectorV1Impl:
             req_id,
             lookup_call_started,
         )
-        cold_start_perf_log(
-            logger,
-            "scheduler_lookup",
-            started=lookup_started or None,
-            req_id=req_id,
-            prompt_tokens=request.num_tokens,
-            request_tokens=request.num_tokens,
-            request_prompt_tokens=request_prompt_tokens,
-            lookup_query_tokens=lookup_query_tokens,
-            query_scope=query_scope,
-            decode_committed_end=decode_committed_end,
-            resumed=resumed,
-            vllm_cached_tokens=num_computed_tokens,
-            lmcache_cached_tokens=num_external_hit_tokens,
-            lookup_call_ms=round(
-                (cold_start_perf_now() - lookup_call_started) * 1000,
-                3,
+        if lookup_call_started:
+            serving_perf_log(
+                logger,
+                "scheduler_lookup",
+                started=lookup_started or None,
+                req_id=req_id,
+                prompt_tokens=request.num_tokens,
+                request_tokens=request.num_tokens,
+                request_prompt_tokens=request_prompt_tokens,
+                lookup_query_tokens=lookup_query_tokens,
+                query_scope=query_scope,
+                decode_committed_end=decode_committed_end,
+                resumed=resumed,
+                vllm_cached_tokens=num_computed_tokens,
+                lmcache_cached_tokens=num_external_hit_tokens,
+                lookup_call_ms=round(
+                    (serving_perf_now() - lookup_call_started) * 1000,
+                    3,
+                )
+                if lookup_call_started
+                else 0.0,
             )
-            if lookup_call_started
-            else 0.0,
-        )
 
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.

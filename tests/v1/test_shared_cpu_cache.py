@@ -1584,11 +1584,11 @@ def test_sampled_lookup_logs_first_chunk_page_miss_by_group(monkeypatch):
     engine.config.extra_config = {"mooncake_page_first_multi_buffer": True}
     events = []
     monkeypatch.setattr(
-        cache_engine_module, "cold_start_perf_enabled", lambda: True
+        cache_engine_module, "serving_perf_enabled", lambda: True
     )
     monkeypatch.setattr(
         cache_engine_module,
-        "cold_start_perf_log",
+        "serving_perf_log",
         lambda _logger, event, **fields: events.append((event, fields)),
     )
 

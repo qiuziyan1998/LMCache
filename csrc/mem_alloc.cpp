@@ -68,25 +68,28 @@ using SteadyClock = std::chrono::steady_clock;
 
 constexpr size_t kMaxFirstTouchThreads = 8;
 
-bool cold_start_perf_enabled() {
-  const char* value = std::getenv("LMCACHE_COLD_START_PERF");
-  if (value == nullptr) return false;
-  std::string normalized(value);
-  normalized.erase(0, normalized.find_first_not_of(" \t\r\n"));
-  const size_t end = normalized.find_last_not_of(" \t\r\n");
-  if (end == std::string::npos) return false;
-  normalized.erase(end + 1);
-  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                 [](unsigned char c) { return std::tolower(c); });
-  return normalized != "0" && normalized != "false" && normalized != "no" &&
-         normalized != "off";
+bool serving_perf_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("PD_SERVING_PERF");
+    if (value == nullptr) return false;
+    std::string normalized(value);
+    normalized.erase(0, normalized.find_first_not_of(" \t\r\n"));
+    const size_t end = normalized.find_last_not_of(" \t\r\n");
+    if (end == std::string::npos) return false;
+    normalized.erase(end + 1);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return normalized != "0" && normalized != "false" && normalized != "no" &&
+           normalized != "off";
+  }();
+  return enabled;
 }
 
 void log_shared_slab_perf(const char* event, size_t size, const char* role,
                           size_t threads,
                           const SteadyClock::time_point* started = nullptr,
                           int status = 0) {
-  if (!cold_start_perf_enabled()) return;
+  if (!serving_perf_enabled()) return;
   const auto monotonic = SteadyClock::now();
   const auto wall = std::chrono::system_clock::now();
   const double monotonic_ms =
@@ -300,7 +303,8 @@ uintptr_t alloc_shm_pinned_ptr(
       throw std::runtime_error("sysconf(_SC_PAGESIZE) failed");
     const size_t touch_threads = first_touch_thread_count(
         size, static_cast<size_t>(raw_page_size));
-    const auto first_touch_started = SteadyClock::now();
+    const auto first_touch_started =
+        serving_perf_enabled() ? SteadyClock::now() : SteadyClock::time_point{};
     log_shared_slab_perf("shared_slab_first_touch_start", size, "owner",
                          touch_threads);
     parallel_first_touch(ptr, size, interleave_nodes, touch_threads);
@@ -312,7 +316,8 @@ uintptr_t alloc_shm_pinned_ptr(
     throw;
   }
 
-  const auto register_started = SteadyClock::now();
+  const auto register_started =
+      serving_perf_enabled() ? SteadyClock::now() : SteadyClock::time_point{};
   log_shared_slab_perf("shared_slab_host_register_start", size, "owner", 1);
   cudaError_t st = cudaHostRegister(ptr, size, 0);
   log_shared_slab_perf("shared_slab_host_register_complete", size, "owner", 1,
@@ -348,7 +353,8 @@ uintptr_t attach_shm_pinned_ptr(size_t size, const std::string& shm_name,
                              ": " + strerror(errno));
   }
 
-  const auto register_started = SteadyClock::now();
+  const auto register_started =
+      serving_perf_enabled() ? SteadyClock::now() : SteadyClock::time_point{};
   log_shared_slab_perf("shared_slab_host_register_start", size, "passive", 1);
   cudaError_t st = cudaHostRegister(ptr, size, 0);
   log_shared_slab_perf("shared_slab_host_register_complete", size, "passive",

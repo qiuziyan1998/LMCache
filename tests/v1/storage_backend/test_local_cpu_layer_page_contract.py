@@ -495,7 +495,8 @@ def test_external_commit_retention_trace_identifies_explicit_remove(
     page_backend: tuple[LocalCPUBackend, Callable[[int], list[LayerPageMemoryObj]]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
+    monkeypatch.setenv("PD_SERVING_PERF", "1")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     backend, allocate = page_backend
     group0 = [_page_key(0, 0)]
     group1 = [_page_key(0, 1)]
@@ -535,7 +536,8 @@ def test_external_commit_retention_trace_identifies_explicit_remove(
 def test_external_commit_retention_trace_identifies_layer_page_allocation_eviction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
+    monkeypatch.setenv("PD_SERVING_PERF", "1")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=8,
         local_cpu=True,

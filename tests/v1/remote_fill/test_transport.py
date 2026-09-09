@@ -232,7 +232,7 @@ def test_service_diagnostics_disabled_do_not_read_timing_clocks(
 ) -> None:
     """Disabled diagnostics add no timing work to the RPC service path."""
 
-    monkeypatch.setattr(service_module, "cold_start_perf_enabled", lambda: False)
+    monkeypatch.setattr(service_module, "serving_perf_enabled", lambda: False)
 
     def fail_clock() -> None:
         raise AssertionError("disabled diagnostics read a timing clock")

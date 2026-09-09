@@ -6,7 +6,7 @@ import time
 
 # Local
 from lmcache.logging import init_logger
-from lmcache.v1.cold_start_perf import cold_start_perf_enabled, cold_start_perf_log
+from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
 
 from .codec import (
     ProtocolValidationError,
@@ -51,7 +51,7 @@ class RemoteFillService:
             content or destination addresses.
         """
 
-        diagnose = cold_start_perf_enabled()
+        diagnose = serving_perf_enabled()
         started = time.perf_counter() if diagnose else 0.0
         thread_started = time.thread_time_ns() if diagnose else 0
         phase_started = started
@@ -85,7 +85,7 @@ class RemoteFillService:
                 ops[operation] = int(ops.get(operation, 0)) + 1
                 if operation in {"FINISH", "ABORT"}:
                     if float(stats["wall_ms"]) >= 100.0:
-                        cold_start_perf_log(
+                        serving_perf_log(
                             logger,
                             "remote_fill_decoder_control_summary",
                             transfer_id=transfer_id,
@@ -96,7 +96,7 @@ class RemoteFillService:
                         )
                     self._perf_transfers.pop(transfer_id, None)
             if elapsed_ms >= 100.0:
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "remote_fill_decoder_control_slow",
                     operation=operation,
@@ -174,14 +174,14 @@ class RemoteFillService:
             Transfer IDs requiring paired restart.
         """
 
-        if not cold_start_perf_enabled():
+        if not serving_perf_enabled():
             return self._state.run_maintenance()
         started = time.perf_counter()
         thread_started = time.thread_time_ns()
         result = self._state.run_maintenance()
         elapsed_ms = (time.perf_counter() - started) * 1000
         if elapsed_ms >= 100.0:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "remote_fill_decoder_maintenance_slow",
                 elapsed_ms=round(elapsed_ms, 3),

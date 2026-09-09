@@ -1749,10 +1749,10 @@ def test_dsa_cold_compact_finished_signal_waits_for_future(
     events = []
     monkeypatch.setattr(
         adapter_module,
-        "cold_start_perf_log",
+        "serving_perf_log",
         lambda _logger, event, **fields: events.append((event, fields)),
     )
-    monkeypatch.setattr(adapter_module, "cold_start_perf_now", lambda: 3.0)
+    monkeypatch.setattr(adapter_module, "serving_perf_now", lambda: 3.0)
 
     assert impl._drain_dsa_cold_load_futures() is None
     assert "cold-future" in impl._dsa_cold_load_futures

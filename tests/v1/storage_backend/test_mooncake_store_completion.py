@@ -37,6 +37,35 @@ from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 
 
+def test_page_lookup_skips_disabled_diagnostic_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mooncake_connector, "serving_perf_enabled", lambda: False)
+    forbidden = Mock(side_effect=AssertionError("disabled diagnostic work"))
+    monkeypatch.setattr(mooncake_connector, "serving_perf_now", forbidden)
+    monkeypatch.setattr(mooncake_connector, "serving_perf_log", forbidden)
+    monkeypatch.setattr(mooncake_connector, "trace_mooncake_keys", lambda *a, **k: None)
+
+    class Key:
+        @property
+        def kv_group(self) -> int:
+            raise AssertionError("diagnostic key-group scan")
+
+    exists = Mock(return_value=[1, 0, 1])
+    connector = SimpleNamespace(
+        _page_keys_for=lambda keys: ["a", "b", "c"],
+        store=SimpleNamespace(batch_is_exist=exists),
+    )
+    assert (
+        MooncakestoreConnector.batched_contains_layer_pages(
+            connector, [Key(), Key(), Key()]
+        )
+        == 1
+    )
+    exists.assert_called_once_with(["a", "b", "c"])
+    forbidden.assert_not_called()
+
+
 def _make_mooncake_connector(
     monkeypatch: pytest.MonkeyPatch,
     extra_config: dict,
@@ -1240,11 +1269,11 @@ def test_mooncake_direct_page_put_uses_latent_segment_hint(
     )
     events = []
     monkeypatch.setattr(
-        mooncake_connector, "cold_start_perf_enabled", lambda: True
+        mooncake_connector, "serving_perf_enabled", lambda: True
     )
     monkeypatch.setattr(
         mooncake_connector,
-        "cold_start_perf_log",
+        "serving_perf_log",
         lambda _logger, event, **fields: events.append((event, fields)),
     )
 
@@ -1712,11 +1741,11 @@ def test_mooncake_direct_external_get_registers_storage_and_validates_bytes(
     calls = []
     events = []
     monkeypatch.setattr(
-        mooncake_connector, "cold_start_perf_enabled", lambda: True
+        mooncake_connector, "serving_perf_enabled", lambda: True
     )
     monkeypatch.setattr(
         mooncake_connector,
-        "cold_start_perf_log",
+        "serving_perf_log",
         lambda _logger, event, **fields: events.append((event, fields)),
     )
 
@@ -2368,11 +2397,11 @@ def test_mooncake_layer_page_get_allocates_exact_full_and_tail_pages(
     )
     events = []
     monkeypatch.setattr(
-        mooncake_connector, "cold_start_perf_enabled", lambda: True
+        mooncake_connector, "serving_perf_enabled", lambda: True
     )
     monkeypatch.setattr(
         mooncake_connector,
-        "cold_start_perf_log",
+        "serving_perf_log",
         lambda _logger, event, **fields: events.append((event, fields)),
     )
 
@@ -2539,11 +2568,11 @@ def test_mooncake_page_put_merges_exact_partial_tail(
     connector.store = _PageStore()
     events = []
     monkeypatch.setattr(
-        mooncake_connector, "cold_start_perf_enabled", lambda: True
+        mooncake_connector, "serving_perf_enabled", lambda: True
     )
     monkeypatch.setattr(
         mooncake_connector,
-        "cold_start_perf_log",
+        "serving_perf_log",
         lambda _logger, event, **fields: events.append((event, fields)),
     )
     full_keys = [

@@ -12,7 +12,7 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine
-from lmcache.v1.cold_start_perf import cold_start_perf_enabled
+from lmcache.v1.serving_perf import serving_perf_enabled
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
@@ -274,7 +274,7 @@ class LMCacheLookupServer:
                         self.transport.send_response(identity, b"\x01")
                         continue
 
-                    perf_enabled = cold_start_perf_enabled()
+                    perf_enabled = serving_perf_enabled()
                     if perf_enabled:
                         lookup_started_at = _utc_timestamp()
                         lookup_started = time.perf_counter()

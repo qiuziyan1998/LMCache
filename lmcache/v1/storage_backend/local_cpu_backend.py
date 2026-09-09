@@ -27,7 +27,7 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
-from lmcache.v1.cold_start_perf import cold_start_perf_enabled, cold_start_perf_log
+from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     LayerPageMemoryObj,
@@ -197,7 +197,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.cpu_lock = threading.Lock()
 
         # Cold-start diagnostics are armed only by a successful external
-        # two-group commit while LMCACHE_COLD_START_PERF is enabled. Keeping an
+        # two-group commit while PD_SERVING_PERF is enabled. Keeping an
         # empty list in ordinary operation makes every mutation hook a single
         # predictable branch, with no logging or cache inspection.
         self._external_retention_trace_sequence = 0
@@ -626,7 +626,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             required_keys,
             ready_reservations,
             context="External two-group commit",
-            arm_retention_trace=cold_start_perf_enabled(),
+            arm_retention_trace=serving_perf_enabled(),
         )
 
     def commit_external_group0_prefix_if_absent(
@@ -1648,7 +1648,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             or not cause
         ):
             raise ValueError("invalid LocalCPU capacity-reclaim request")
-        started = time.perf_counter() if cold_start_perf_enabled() else None
+        started = time.perf_counter() if serving_perf_enabled() else None
         free_before, heap_bytes = self.get_allocator_capacity_bytes()
         target_free_bytes = required_bytes + max(
             min_free_bytes,
@@ -1688,7 +1688,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if not sufficient:
             self.stats_monitor.update_local_cpu_evict_failed_count(1)
         if started is not None:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 cause,
                 started=started,

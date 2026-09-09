@@ -482,7 +482,8 @@ def test_missing_local_prefix_rechecks_and_falls_back_to_persistent() -> None:
 def test_local_full_hint_records_retained_paired_actual_load(
     caplog, monkeypatch
 ) -> None:
-    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
+    monkeypatch.setenv("PD_SERVING_PERF", "1")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     storage = _PairStorageManager(local_pairs=2)
     engine = _engine(storage)
 
@@ -533,7 +534,8 @@ def test_persistent_direct_hbm_group0_overlay_is_retained_actual_load() -> None:
 def test_local_full_hint_records_missing_local_prefix_and_remote_fallback(
     caplog, monkeypatch
 ) -> None:
-    monkeypatch.setenv("LMCACHE_COLD_START_PERF", "1")
+    monkeypatch.setenv("PD_SERVING_PERF", "1")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     storage = _PairStorageManager(local_pairs=0, remote_pairs=2)
     engine = _engine(storage)
 

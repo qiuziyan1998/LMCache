@@ -2,6 +2,7 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import (
@@ -50,11 +51,11 @@ from lmcache.utils import (
     compress_slot_mapping,
     convert_tokens_to_list,
 )
-from lmcache.v1.cold_start_perf import (
-    cold_start_perf_enabled,
-    cold_start_perf_log,
-    cold_start_perf_now,
-    cold_start_perf_scope,
+from lmcache.v1.serving_perf import (
+    serving_perf_enabled,
+    serving_perf_log,
+    serving_perf_now,
+    serving_perf_scope,
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
@@ -1082,14 +1083,14 @@ class LMCacheEngine:
         )
 
     def _broadcast_shared_envelope(self, envelope: SharedHandleEnvelope) -> None:
-        perf_enabled = cold_start_perf_enabled()
-        started = cold_start_perf_now() if perf_enabled else None
+        perf_enabled = serving_perf_enabled()
+        started = serving_perf_now() if perf_enabled else None
         thread_started = time.thread_time_ns() if perf_enabled else 0
         condition, _, _ = self._shared_envelope_mailbox()
         with condition:
             self.broadcast_object_fn(envelope.to_dict(), self.metadata.first_rank)
         if perf_enabled:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "shared_handle_broadcast",
                 started=started,
@@ -1107,8 +1108,8 @@ class LMCacheEngine:
             )
 
     def _receive_shared_envelope(self) -> SharedHandleEnvelope:
-        perf_enabled = cold_start_perf_enabled()
-        started = cold_start_perf_now() if perf_enabled else None
+        perf_enabled = serving_perf_enabled()
+        started = serving_perf_now() if perf_enabled else None
         thread_started = time.thread_time_ns() if perf_enabled else 0
         raw = self.broadcast_object_fn(None, self.metadata.first_rank)
         if not isinstance(raw, dict):
@@ -1124,7 +1125,7 @@ class LMCacheEngine:
                 f"creation: error={exc}, raw={raw!r}"
             ) from exc
         if perf_enabled:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "shared_handle_receive",
                 started=started,
@@ -1187,8 +1188,8 @@ class LMCacheEngine:
         layer_id: int,
         kv_group: int,
     ) -> SharedHandleEnvelope:
-        perf_enabled = cold_start_perf_enabled()
-        matching_started = cold_start_perf_now() if perf_enabled else 0.0
+        perf_enabled = serving_perf_enabled()
+        matching_started = serving_perf_now() if perf_enabled else 0.0
         matching_thread_started = time.thread_time_ns() if perf_enabled else 0
         condition_wait_s = collective_receive_s = 0.0
         receive_count = 0
@@ -1219,24 +1220,24 @@ class LMCacheEngine:
                         return buffered
                     if self._shared_envelope_receive_active:
                         wait_started = (
-                            cold_start_perf_now() if perf_enabled else 0.0
+                            serving_perf_now() if perf_enabled else 0.0
                         )
                         condition.wait()
                         if perf_enabled:
                             condition_wait_s += (
-                                cold_start_perf_now() - wait_started
+                                serving_perf_now() - wait_started
                             )
                         continue
                     self._shared_envelope_receive_active = True
 
                 try:
                     receive_started = (
-                        cold_start_perf_now() if perf_enabled else 0.0
+                        serving_perf_now() if perf_enabled else 0.0
                     )
                     envelope = self._receive_shared_envelope()
                     if perf_enabled:
                         collective_receive_s += (
-                            cold_start_perf_now() - receive_started
+                            serving_perf_now() - receive_started
                         )
                         receive_count += 1
                     if envelope.generation != self.shared_cpu_cache_generation:
@@ -1278,10 +1279,10 @@ class LMCacheEngine:
                 condition.notify_all()
             if perf_enabled:
                 elapsed_ms = (
-                    cold_start_perf_now() - matching_started
+                    serving_perf_now() - matching_started
                 ) * 1000
                 if elapsed_ms >= 100.0:
-                    cold_start_perf_log(
+                    serving_perf_log(
                         logger,
                         "shared_handle_match_slow",
                         started=matching_started,
@@ -1327,8 +1328,8 @@ class LMCacheEngine:
             )
             return False
         result = bool(collective(bool(local_ready)))
-        if cold_start_perf_enabled():
-            cold_start_perf_log(
+        if serving_perf_enabled():
+            serving_perf_log(
                 logger,
                 "remote_fill_materialization_consensus",
                 req_id=req_id,
@@ -1430,8 +1431,8 @@ class LMCacheEngine:
         chunk_index_base: int = 0,
         validate_memory_objs: bool = True,
     ) -> list[SharedChunkHandle]:
-        perf_enabled = cold_start_perf_enabled()
-        started = cold_start_perf_now() if perf_enabled else None
+        perf_enabled = serving_perf_enabled()
+        started = serving_perf_now() if perf_enabled else None
         if self.shared_cpu_cache_name is None:
             raise ValueError("Shared CPU cache name is not initialized")
         if len(keys_layer) != len(mem_objs_layer):
@@ -1470,7 +1471,7 @@ class LMCacheEngine:
                 )
             )
         if perf_enabled:
-            cold_start_perf_log(
+            serving_perf_log(
                 logger,
                 "shared_handle_build",
                 started=started,
@@ -1490,7 +1491,7 @@ class LMCacheEngine:
         keys_layer_major: list[list[CacheEngineKey]],
     ) -> Optional[SharedHandleBatch]:
         """Compact a homogeneous all-layer page-first result."""
-        started = cold_start_perf_now() if cold_start_perf_enabled() else None
+        started = serving_perf_now() if serving_perf_enabled() else None
         if (
             getattr(self, "shared_cpu_cache_name", None) is None
             or len(memory_objs) != self.num_layers
@@ -1553,16 +1554,17 @@ class LMCacheEngine:
                 for chunk in range(page_chunks)
             ],
         )
-        cold_start_perf_log(
-            logger,
-            "shared_handle_batch_build",
-            started=started,
-            layers=self.num_layers,
-            chunks=chunks,
-            offsets=len(batch.offsets),
-            pages=page_chunks,
-            rank=self.metadata.worker_id,
-        )
+        if started is not None:
+            serving_perf_log(
+                logger,
+                "shared_handle_batch_build",
+                started=started,
+                layers=self.num_layers,
+                chunks=chunks,
+                offsets=len(batch.offsets),
+                pages=page_chunks,
+                rank=self.metadata.worker_id,
+            )
         return batch
 
     def _make_passive_layer_page_views(
@@ -1830,7 +1832,7 @@ class LMCacheEngine:
         if not chunks:
             return 0
         assert self.storage_manager is not None
-        perf_enabled = cold_start_perf_enabled()
+        perf_enabled = serving_perf_enabled()
 
         def tiered_locations(
             base_keys: list[CacheEngineKey],
@@ -2085,7 +2087,7 @@ class LMCacheEngine:
                 except Exception as error:
                     details = []
                     diagnostic_error = f"{type(error).__name__}: {error}"
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "scheduler_sample_probe",
                     lookup_id=lookup_id,
@@ -2596,28 +2598,12 @@ class LMCacheEngine:
             "remote_suffix": actual_load_end > common_local_end,
             **(diagnostics or {}),
         }
-        cold_start_perf_log(
-            logger,
-            "remote_fill_actual_load",
-            req_id=lookup_id,
-            outcome=outcome,
-            required_store_end=required_store_end,
-            common_local_end=common_local_end,
-            actual_load_end=actual_load_end,
-            destination_engine_epoch=destination_engine_epoch,
-            remote_suffix=actual_load_end > common_local_end,
-            **(diagnostics or {}),
-        )
-        logger.info(
-            "[LMCACHE_REMOTE_FILL] %s",
-            json.dumps(fields, separators=(",", ":"), sort_keys=True),
-        )
-        if not retained:
-            fields["event"] = "remote_fill_local_prefix_missing_at_load"
-            cold_start_perf_log(
+        if serving_perf_enabled():
+            serving_perf_log(
                 logger,
-                "remote_fill_local_prefix_missing_at_load",
+                "remote_fill_actual_load",
                 req_id=lookup_id,
+                outcome=outcome,
                 required_store_end=required_store_end,
                 common_local_end=common_local_end,
                 actual_load_end=actual_load_end,
@@ -2625,6 +2611,24 @@ class LMCacheEngine:
                 remote_suffix=actual_load_end > common_local_end,
                 **(diagnostics or {}),
             )
+        logger.info(
+            "[LMCACHE_REMOTE_FILL] %s",
+            json.dumps(fields, separators=(",", ":"), sort_keys=True),
+        )
+        if not retained:
+            fields["event"] = "remote_fill_local_prefix_missing_at_load"
+            if serving_perf_enabled():
+                serving_perf_log(
+                    logger,
+                    "remote_fill_local_prefix_missing_at_load",
+                    req_id=lookup_id,
+                    required_store_end=required_store_end,
+                    common_local_end=common_local_end,
+                    actual_load_end=actual_load_end,
+                    destination_engine_epoch=destination_engine_epoch,
+                    remote_suffix=actual_load_end > common_local_end,
+                    **(diagnostics or {}),
+                )
             logger.info(
                 "[LMCACHE_REMOTE_FILL] %s",
                 json.dumps(fields, separators=(",", ":"), sort_keys=True),
@@ -4179,14 +4183,14 @@ class LMCacheEngine:
                 remote_page_keys = page_keys[local_count:page_chunks]
                 resolver_call_id = (
                     f"{os.getpid()}:{time.monotonic_ns()}"
-                    if cold_start_perf_enabled()
+                    if serving_perf_enabled()
                     else None
                 )
-                with cold_start_perf_scope(
+                with (serving_perf_scope(
                     req_id=req_id,
                     rank=self.metadata.worker_id,
                     resolver_call_id=resolver_call_id,
-                ):
+                ) if resolver_call_id is not None else nullcontext()):
                     remote_count = contains(remote_page_keys)
                     if not 0 <= remote_count <= len(remote_page_keys):
                         raise ValueError(
@@ -4316,8 +4320,8 @@ class LMCacheEngine:
         )
         if not callable(timing_hook):
             timing_hook = None
-        perf_enabled = cold_start_perf_enabled()
-        perf_started = cold_start_perf_now() if perf_enabled else 0.0
+        perf_enabled = serving_perf_enabled()
+        perf_started = serving_perf_now() if perf_enabled else 0.0
         resolver_call_id = (
             f"{os.getpid()}:{time.monotonic_ns()}" if perf_enabled else None
         )
@@ -4366,11 +4370,11 @@ class LMCacheEngine:
             ) in windows:
                 started = start_stage()
                 try:
-                    with cold_start_perf_scope(
+                    with (serving_perf_scope(
                         req_id=req_id,
                         rank=self.metadata.worker_id,
                         resolver_call_id=resolver_call_id,
-                    ):
+                    ) if perf_enabled else nullcontext()):
                         fetched = self.storage_manager.batched_get(
                             fetch_keys,
                             location="RemoteBackend",
@@ -4519,7 +4523,7 @@ class LMCacheEngine:
                             fetched_obj.ref_count_down()
 
             if perf_enabled:
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "remote_resolver",
                     started=perf_started,
@@ -4538,7 +4542,7 @@ class LMCacheEngine:
                     exclusive_ms=round(
                         max(
                             0.0,
-                            cold_start_perf_now()
+                            serving_perf_now()
                             - perf_started
                             - stage_times.get("remote_get", 0.0),
                         )
@@ -4561,7 +4565,7 @@ class LMCacheEngine:
                     mem_obj.ref_count_down()
             finish_stage("rollback", started)
             if perf_enabled:
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "remote_resolver",
                     started=perf_started,
@@ -4580,7 +4584,7 @@ class LMCacheEngine:
                     exclusive_ms=round(
                         max(
                             0.0,
-                            cold_start_perf_now()
+                            serving_perf_now()
                             - perf_started
                             - stage_times.get("remote_get", 0.0),
                         )
@@ -4873,7 +4877,7 @@ class LMCacheEngine:
         layer_page_chunks = 0
         layer_pages: tuple[LayerPageMemoryObj, ...] = ()
         compact_batch: Optional[SharedHandleBatch] = None
-        perf_enabled = cold_start_perf_enabled()
+        perf_enabled = serving_perf_enabled()
         consume_started = consumer_send_s = consumer_finish_s = 0.0
         try:
             for layer_id in range(self.num_layers):
@@ -5056,13 +5060,13 @@ class LMCacheEngine:
                         )
 
                 if perf_enabled and not consume_started:
-                    consume_started = cold_start_perf_now()
+                    consume_started = serving_perf_now()
                 if layer_id == 0:
                     yield torch.sum(ret_mask)
                 else:
                     yield None
 
-                send_started = cold_start_perf_now() if perf_enabled else 0.0
+                send_started = serving_perf_now() if perf_enabled else 0.0
                 mem_obj_consumer.send(
                     LayerPageSource(
                         layer_pages,
@@ -5073,14 +5077,14 @@ class LMCacheEngine:
                     else mem_objs_layer
                 )
                 if send_started:
-                    consumer_send_s += cold_start_perf_now() - send_started
+                    consumer_send_s += serving_perf_now() - send_started
 
-            finish_started = cold_start_perf_now() if perf_enabled else 0.0
+            finish_started = serving_perf_now() if perf_enabled else 0.0
             next(mem_obj_consumer)
             self._close_shared_retrieve_consumer(mem_obj_consumer)
             mem_obj_consumer = None
             if finish_started:
-                consumer_finish_s += cold_start_perf_now() - finish_started
+                consumer_finish_s += serving_perf_now() - finish_started
             adoption_keys = keys_layer_major
             if (
                 req_id
@@ -5122,8 +5126,8 @@ class LMCacheEngine:
                 retrieved_tokens,
             )
             if consume_started:
-                elapsed_s = cold_start_perf_now() - consume_started
-                cold_start_perf_log(
+                elapsed_s = serving_perf_now() - consume_started
+                serving_perf_log(
                     logger,
                     "dense_shared_consume",
                     started=consume_started,
@@ -5202,7 +5206,7 @@ class LMCacheEngine:
         compact_batch: Optional[SharedHandleBatch] = None
         passive_pages: list[LayerPageMemoryObj] = []
         passive_page_tuple: tuple[LayerPageMemoryObj, ...] = ()
-        perf_enabled = cold_start_perf_enabled()
+        perf_enabled = serving_perf_enabled()
         consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
 
         try:
@@ -5217,7 +5221,7 @@ class LMCacheEngine:
                         kv_group=kv_group,
                     )
                     if perf_enabled and not consume_started:
-                        consume_started = cold_start_perf_now()
+                        consume_started = serving_perf_now()
                     try:
                         self._validate_shared_layerwise_envelope(
                             envelope,
@@ -5270,7 +5274,7 @@ class LMCacheEngine:
                     next(mem_obj_consumer)
                     if compact_batch is not None:
                         page_view_started = (
-                            cold_start_perf_now() if perf_enabled else 0.0
+                            serving_perf_now() if perf_enabled else 0.0
                         )
                         view_error: Exception | None = None
                         try:
@@ -5306,7 +5310,7 @@ class LMCacheEngine:
                         passive_pages.extend(passive_page_tuple)
                         to_release.extend(passive_pages)
                         if page_view_started:
-                            view_build_s += cold_start_perf_now() - page_view_started
+                            view_build_s += serving_perf_now() - page_view_started
                 elif (
                     compact_batch is None
                     and envelope is not None
@@ -5329,7 +5333,7 @@ class LMCacheEngine:
                     if compact_batch is not None
                     else envelope.handles  # type: ignore[union-attr]
                 )
-                view_started = cold_start_perf_now() if perf_enabled else 0.0
+                view_started = serving_perf_now() if perf_enabled else 0.0
                 page_chunks = len(passive_pages)
                 for chunk_index in range(page_chunks, expected_handle_count):
                     handle = layer_handles[chunk_index]
@@ -5381,7 +5385,7 @@ class LMCacheEngine:
                     mem_objs_layer.append(mem_obj)
                     to_release.append(mem_obj)
                 if view_started:
-                    view_build_s += cold_start_perf_now() - view_started
+                    view_build_s += serving_perf_now() - view_started
                 resolved_layers.append(mem_objs_layer)
                 handles_by_layer.append(layer_handles)
 
@@ -5391,7 +5395,7 @@ class LMCacheEngine:
                     yield None
 
                 assert mem_obj_consumer is not None
-                send_started = cold_start_perf_now() if perf_enabled else 0.0
+                send_started = serving_perf_now() if perf_enabled else 0.0
                 mem_obj_consumer.send(
                     LayerPageSource(
                         passive_page_tuple,
@@ -5402,15 +5406,15 @@ class LMCacheEngine:
                     else mem_objs_layer
                 )
                 if send_started:
-                    consumer_send_s += cold_start_perf_now() - send_started
+                    consumer_send_s += serving_perf_now() - send_started
 
             if mem_obj_consumer is not None:
-                finish_started = cold_start_perf_now() if perf_enabled else 0.0
+                finish_started = serving_perf_now() if perf_enabled else 0.0
                 next(mem_obj_consumer)
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
                 mem_obj_consumer = None
                 if finish_started:
-                    consumer_finish_s += cold_start_perf_now() - finish_started
+                    consumer_finish_s += serving_perf_now() - finish_started
             if resolved_layers:
                 adopted = self._adopt_dense_shared_retrieve_cache(
                     req_id=req_id,
@@ -5436,9 +5440,9 @@ class LMCacheEngine:
                 retrieved_tokens,
             )
             if consume_started and resolved_layers:
-                elapsed_s = cold_start_perf_now() - consume_started
+                elapsed_s = serving_perf_now() - consume_started
                 active_s = view_build_s + consumer_send_s + consumer_finish_s
-                cold_start_perf_log(
+                serving_perf_log(
                     logger,
                     "dense_shared_consume",
                     started=consume_started,
@@ -5892,7 +5896,7 @@ class LMCacheEngine:
             store_stats,
             tot_token_num,
         )
-        if cold_start_perf_enabled():
+        if serving_perf_enabled():
             tot_time = store_stats.time_to_store()
             logger.info(
                 "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
@@ -6117,7 +6121,7 @@ class LMCacheEngine:
             assert_layerwise_gpu_connector(self.gpu_connector)
 
             try:
-                store_perf_enabled = cold_start_perf_enabled()
+                store_perf_enabled = serving_perf_enabled()
                 t_start = time.perf_counter() if store_perf_enabled else 0.0
                 mem_obj_generator = self.gpu_connector.batched_from_gpu(
                     memory_objs, starts, ends, **kwargs
@@ -6306,7 +6310,7 @@ class LMCacheEngine:
         # retrieved: 256 tokens
         if not self._is_passive():
             kv_group = kwargs.get("kv_group", 0)
-            if cold_start_perf_enabled():
+            if serving_perf_enabled():
                 onload_time = retrieve_stats.time_to_retrieve()
                 logger.info(
                     "[req_id=%s kv_group=%s] Retrieved %d out of %d required tokens "
@@ -6451,7 +6455,7 @@ class LMCacheEngine:
 
         if shared_layerwise_retrieve:
             plan_started = (
-                cold_start_perf_now() if cold_start_perf_enabled() else None
+                serving_perf_now() if serving_perf_enabled() else None
             )
             location = None
             chunk_locations: list[list[str]] = []
@@ -6648,61 +6652,62 @@ class LMCacheEngine:
                 if remote_fill_plan is not None
                 else len(batch_plan or [])
             )
-            planned_locations = (
-                [location for location, _ in remote_fill_plan]
-                if remote_fill_plan is not None
-                else list(batch_plan or [])
-            )
-            planned_page_locations = (
-                [location for location, page in remote_fill_plan if page]
-                if remote_fill_plan is not None
-                else list(batch_plan or [])
-            )
-            partial_pages = (
-                sum(
-                    end - start != self.config.chunk_size
-                    for (start, end, _), (_, page) in zip(
-                        candidates,
-                        remote_fill_plan,
-                        strict=True,
-                    )
-                    if page
-                )
-                if remote_fill_plan is not None
-                else sum(
-                    end - start != self.config.chunk_size
-                    for start, end, _ in candidates[:planned_page_chunks]
-                )
-            )
-            cold_start_perf_log(
-                logger,
-                "shared_location_plan",
-                started=plan_started,
-                req_id=req_id,
-                rank=self.metadata.worker_id,
-                phase=phase,
-                kv_group=kv_group,
-                chunks=len(keys),
-                objects=planned_page_chunks
-                + max(0, len(keys) - planned_page_chunks) * self.num_layers,
-                logical_objects=sum(map(len, keys)),
-                physical_pages=planned_page_chunks,
-                partial_pages=partial_pages,
-                local_pages=planned_page_locations.count("LocalCPUBackend"),
-                remote_pages=planned_page_locations.count("RemoteBackend"),
-                unresolved_pages=max(0, len(candidates) - len(planned_locations)),
-                logical_layers_avoided=planned_page_chunks
-                * max(0, self.num_layers - 1),
-                mode=(
-                    "remote_fill_plan"
+            if serving_perf_enabled():
+                planned_locations = (
+                    [location for location, _ in remote_fill_plan]
                     if remote_fill_plan is not None
-                    else "page_batch"
-                    if batch_plan is not None and "RemoteBackend" in batch_plan
-                    else "local_batch"
-                    if batch_plan is not None
-                    else "per_object"
-                ),
-            )
+                    else list(batch_plan or [])
+                )
+                planned_page_locations = (
+                    [location for location, page in remote_fill_plan if page]
+                    if remote_fill_plan is not None
+                    else list(batch_plan or [])
+                )
+                partial_pages = (
+                    sum(
+                        end - start != self.config.chunk_size
+                        for (start, end, _), (_, page) in zip(
+                            candidates,
+                            remote_fill_plan,
+                            strict=True,
+                        )
+                        if page
+                    )
+                    if remote_fill_plan is not None
+                    else sum(
+                        end - start != self.config.chunk_size
+                        for start, end, _ in candidates[:planned_page_chunks]
+                    )
+                )
+                serving_perf_log(
+                    logger,
+                    "shared_location_plan",
+                    started=plan_started,
+                    req_id=req_id,
+                    rank=self.metadata.worker_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    chunks=len(keys),
+                    objects=planned_page_chunks
+                    + max(0, len(keys) - planned_page_chunks) * self.num_layers,
+                    logical_objects=sum(map(len, keys)),
+                    physical_pages=planned_page_chunks,
+                    partial_pages=partial_pages,
+                    local_pages=planned_page_locations.count("LocalCPUBackend"),
+                    remote_pages=planned_page_locations.count("RemoteBackend"),
+                    unresolved_pages=max(0, len(candidates) - len(planned_locations)),
+                    logical_layers_avoided=planned_page_chunks
+                    * max(0, self.num_layers - 1),
+                    mode=(
+                        "remote_fill_plan"
+                        if remote_fill_plan is not None
+                        else "page_batch"
+                        if batch_plan is not None and "RemoteBackend" in batch_plan
+                        else "local_batch"
+                        if batch_plan is not None
+                        else "per_object"
+                    ),
+                )
             if missing_shared_chunks and self.shared_cpu_cache_strict:
                 message = (
                     "Shared CPU dense prefix layerwise retrieve missing required "
@@ -7054,7 +7059,7 @@ class LMCacheEngine:
                 remote_fill_diagnostics = (
                     {}
                     if pin
-                    and cold_start_perf_enabled()
+                    and serving_perf_enabled()
                     and self._remote_fill_local_full_hint(request_configs)
                     is not None
                     else None
