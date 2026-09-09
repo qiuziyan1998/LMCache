@@ -1720,6 +1720,74 @@ def test_dsa_cold_compact_worker_retains_sources_when_stream_sync_fails() -> Non
     impl._release_shared_worker_retrieve_state.assert_not_called()
 
 
+@pytest.mark.parametrize("predecessor_failed", [False, True])
+def test_dsa_cold_compact_background_order_retains_sources_without_host_sync(
+    predecessor_failed: bool,
+) -> None:
+    """Ordered background completion adopts owners before readiness publication."""
+    events: list[str] = []
+    owner = object()
+    readiness = object()
+    request = SimpleNamespace(
+        req_id="cold-source-lifetime",
+        load_spec=SimpleNamespace(dsa_group1_direct_hbm=False),
+    )
+    state = WorkerRetrieveState(req_id=request.req_id)
+    plan = {
+        "request": request,
+        "token_count": 1,
+        "tokens": [1],
+        "token_mask": object(),
+        "latent_shared_ready": Future(),
+        "indexer_source_owners": (owner,),
+    }
+
+    def predecessor_exception() -> Any:
+        assert not plan["latent_shared_ready"].done()
+        events.append("predecessor")
+        return RuntimeError("prior request failed") if predecessor_failed else None
+
+    def indexer_result() -> tuple[Any, Any, float, float]:
+        assert plan["latent_shared_ready"].done()
+        events.append("indexer")
+        return (None, readiness, 0.0, 0.0)
+
+    def record_readiness() -> Any:
+        events.append("readiness")
+        return readiness
+
+    def seal(result: WorkerRetrieveState, _count: int) -> None:
+        assert result.dense_load_source_owners == (owner,)
+        assert result.dense_load_readiness is readiness
+        events.append("seal")
+        result.prepared_sparse_sources[0] = object()
+
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    impl.num_layers = 1
+    impl._num_layers_for_group = lambda _group: 1
+    impl._refresh_prepared_sparse_sources = seal
+    impl._synchronize_dsa_cold_dense_load = MagicMock()
+    impl._synchronize_dsa_cold_dense_readiness = MagicMock()
+    impl.lmcache_engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(record_dense_load_readiness=record_readiness)
+    )
+
+    result = impl._run_dsa_cold_compact_load(
+        plan,
+        None,
+        SimpleNamespace(result=indexer_result),
+        SimpleNamespace(exception=predecessor_exception),
+        live_state=state,
+    )
+
+    assert result is state
+    assert state.indexer_npu_resident
+    assert not state.dense_load_readiness_consumed
+    assert events == ["predecessor", "indexer", "readiness", "seal"]
+    impl._synchronize_dsa_cold_dense_load.assert_not_called()
+    impl._synchronize_dsa_cold_dense_readiness.assert_not_called()
+
+
 def test_dsa_cold_compact_finished_signal_waits_for_future(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
