@@ -1401,6 +1401,13 @@ class LMCacheEngine:
                 f"kv_group={kv_group}, keys={len(keys_layer)}, "
                 f"memory_objs={len(mem_objs_layer)}"
             )
+        # This synchronous publication batch has one initialized slab/KV group.
+        # Reuse only those invariants; object metadata and pins stay live checks.
+        context = (
+            self._shared_rank0_object_context(kv_group)
+            if validate_memory_objs and mem_objs_layer
+            else None
+        )
         handles: list[SharedChunkHandle] = []
         for chunk_offset, (key, mem_obj) in enumerate(
             zip(keys_layer, mem_objs_layer, strict=True)
@@ -1414,6 +1421,7 @@ class LMCacheEngine:
                     layer_id=layer_id,
                     kv_group=kv_group,
                     chunk_index=chunk_index,
+                    _context=context,
                 )
             handles.append(
                 SharedChunkHandle.from_memory_obj(
