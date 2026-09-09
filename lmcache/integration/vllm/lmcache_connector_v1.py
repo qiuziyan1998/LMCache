@@ -213,6 +213,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
     def finish_layerwise_prefill_save(self, metadata: Any) -> None:
         self._lmcache_engine.finish_layerwise_prefill_save(metadata)
 
+    def abort_layerwise_prefill_step(self) -> None:
+        """Collectively abort the active managed P step without save completion."""
+        self._lmcache_engine.abort_layerwise_prefill_step()
+
     def wait_for_save(self):
         """
         Block until all the save operations is done. This is called

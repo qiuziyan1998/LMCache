@@ -119,8 +119,12 @@ LAYERWISE_PREFILL_MAX_PENDING_JOBS_ENV = (
 LAYERWISE_PREFILL_MAX_PENDING_BYTES_ENV = (
     "LMCACHE_LAYERWISE_PREFILL_MAX_PENDING_BYTES"
 )
+LAYERWISE_PREFILL_MAX_PENDING_FUTURES_ENV = (
+    "LMCACHE_LAYERWISE_PREFILL_MAX_PENDING_FUTURES"
+)
 LAYERWISE_PREFILL_DEFAULT_MAX_PENDING_JOBS = 8
 LAYERWISE_PREFILL_DEFAULT_MAX_PENDING_BYTES = 64 << 20
+LAYERWISE_PREFILL_DEFAULT_MAX_PENDING_FUTURES = 8
 
 
 class LayerwisePrefillSavePhase(Enum):
@@ -232,13 +236,47 @@ class LayerwisePrefillWindowCoordinator:
         *,
         max_pending_jobs: Optional[int] = None,
         max_pending_bytes: Optional[int] = None,
+        max_pending_futures: Optional[int] = None,
     ):
         self._topology = topology_cache
         self._backend = backend
         self._accepts_validation_errors = (
             getattr(backend, "accepts_coordinator_validation_errors", False) is True
         )
+        self._manages_pending_work = (
+            getattr(backend, "manages_pending_work", False) is True
+        )
+        if self._manages_pending_work:
+            if not self._accepts_validation_errors or not self.supports_transfer_window:
+                raise ValueError(
+                    "Managed layerwise-prefill backend requires collective validation "
+                    "and transfer-window support"
+                )
+            hooks = (
+                "configure_window_limits",
+                "pending_jobs",
+                "pending_bytes",
+                "pending_futures",
+                "window_stats",
+                "bind_step",
+                "wait_for_load",
+                "submit_save",
+                "submit_load",
+                "finish_save",
+                "finish_step",
+                "abort_step",
+                "abort_request",
+            )
+            if self.supports_sync_callbacks:
+                hooks += ("sync_save",)
+            for name in hooks:
+                # Dynamic __getattr__ placeholders must not advertise a capability.
+                if not callable(getattr(type(backend), name, None)) or not callable(
+                    getattr(backend, name, None)
+                ):
+                    raise ValueError(f"Missing managed layerwise-prefill hook: {name}")
         self._lock = threading.RLock()
+        self._step_generations: tuple[tuple[str, int], ...] = ()
         self._arenas: dict[str, _LayerwisePrefillRequestArena] = {}
         self._stale_arenas: dict[
             tuple[str, int], _LayerwisePrefillRequestArena
@@ -260,6 +298,24 @@ class LayerwisePrefillWindowCoordinator:
                 LAYERWISE_PREFILL_DEFAULT_MAX_PENDING_BYTES,
             )
         )
+        if max_pending_futures is None:
+            max_pending_futures = (
+                _layerwise_prefill_window_limit(
+                    LAYERWISE_PREFILL_MAX_PENDING_FUTURES_ENV,
+                    LAYERWISE_PREFILL_DEFAULT_MAX_PENDING_FUTURES,
+                )
+                if self._manages_pending_work
+                else LAYERWISE_PREFILL_DEFAULT_MAX_PENDING_FUTURES
+            )
+        if type(max_pending_futures) is not int or max_pending_futures <= 0:
+            raise ValueError("max_pending_futures must be a positive integer")
+        self._max_pending_futures = max_pending_futures
+        if self._manages_pending_work:
+            backend.configure_window_limits(
+                self._max_pending_jobs,
+                self._max_pending_bytes,
+                self._max_pending_futures,
+            )
 
     @property
     def topology_signature(self) -> str:
@@ -274,6 +330,16 @@ class LayerwisePrefillWindowCoordinator:
     @property
     def max_pending_bytes(self) -> int:
         return self._max_pending_bytes
+
+    @property
+    def max_pending_futures(self) -> int:
+        """Maximum outstanding remote futures for a managed transfer window."""
+        return self._max_pending_futures
+
+    @property
+    def manages_pending_work(self) -> bool:
+        """Whether the validated backend owns resource admission and counters."""
+        return self._manages_pending_work
 
     @property
     def supports_sync_callbacks(self) -> bool:
@@ -294,6 +360,8 @@ class LayerwisePrefillWindowCoordinator:
 
     def pending_jobs(self) -> int:
         with self._lock:
+            if self._manages_pending_work:
+                return self._backend.pending_jobs()
             return sum(
                 1
                 for arena in self._arenas.values()
@@ -304,16 +372,33 @@ class LayerwisePrefillWindowCoordinator:
 
     def pending_bytes(self) -> int:
         with self._lock:
+            if self._manages_pending_work:
+                return self._backend.pending_bytes()
             return sum(arena.pending_bytes for arena in self._arenas.values())
+
+    def pending_futures(self) -> int:
+        """Return backend remote credits, or distinct unfinished generic futures."""
+        with self._lock:
+            if self._manages_pending_work:
+                return self._backend.pending_futures()
+            return len(
+                {
+                    id(job.persist_future)
+                    for arena in (*self._arenas.values(), *self._stale_arenas.values())
+                    for job in arena.jobs.values()
+                    if job.persist_future is not None and not job.persist_future.done()
+                }
+            )
 
     def bind_step(
         self,
         requests: list[LayerwisePrefillRequest],
         kv_caches: dict[str, Any],
         *,
+        callbacks: Optional[tuple[Any, ...]] = None,
         validation_error: Optional[Exception] = None,
     ) -> None:
-        """Start a synchronous step, invalidating the preceding completion state.
+        """Bind requests/caches and, for managed windows, exact forward callbacks.
 
         Only the backend with collective coordinator-error handling supports
         explicit binding. A failed bind cannot expose the previous step's
@@ -339,6 +424,15 @@ class LayerwisePrefillWindowCoordinator:
                         raise RuntimeError("Previous synchronous step is not persisted")
             except Exception as exc:
                 error = exc
+            previous_generations = tuple(
+                (request_id, generation)
+                for request_id, generation in self._step_generations
+                if generation > self._released_generations.get(request_id, 0)
+                and (
+                    (arena := self._resolve_arena(request_id, generation)) is None
+                    or not self._request_persist_done_unlocked(arena)
+                )
+            )
             # Invalidate before entering the backend: even a failed new bind
             # must not leave an observable old success for these requests.
             if not isinstance(requests, list):
@@ -356,7 +450,28 @@ class LayerwisePrefillWindowCoordinator:
                     arena.save_cursors.clear()
                     arena.pending_load_rows.clear()
                     arena.load_submitted_through.clear()
-            self._backend.bind_step(requests, kv_caches, validation_error=error)
+            if self._manages_pending_work:
+                step_generations = tuple(
+                    (req.request_id, req.allocation_generation)
+                    for req in requests
+                    if isinstance(req, LayerwisePrefillRequest)
+                    and isinstance(req.request_id, str)
+                    and type(req.allocation_generation) is int
+                    and req.allocation_generation > 0
+                )
+                try:
+                    self._backend.bind_step(
+                        requests, kv_caches, callbacks=callbacks, validation_error=error
+                    )
+                except BaseException:
+                    # A failed rebind may still own the preceding batch.
+                    self._step_generations = tuple(
+                        dict.fromkeys((*previous_generations, *step_generations))
+                    )
+                    raise
+                self._step_generations = step_generations
+            else:
+                self._backend.bind_step(requests, kv_caches, validation_error=error)
 
     def _expected_groups(self, execution: Any) -> tuple[int, ...]:
         return (0,) if execution.indexer is None else (0, 1)
@@ -535,12 +650,20 @@ class LayerwisePrefillWindowCoordinator:
         self, generations: tuple[tuple[str, int], ...], row: Any
     ) -> None:
         """Check all cursors before replacing arenas or resetting chunk state."""
-        self._validate_active_generations(generations)
+        self._validate_active_generations(
+            generations, allow_new=not self._manages_pending_work
+        )
         for request_id, generation in generations:
             arena = self._arenas.get(request_id)
             if arena is None or arena.allocation_generation != generation:
                 arena = _LayerwisePrefillRequestArena(request_id, generation)
-            expected = self._prepare_save_cursor(arena, row, reset=False)
+            # Managed chunk rollover belongs to bind_step, never pre-HCOM:
+            # waiting here on the shared assembly Future would deadlock.
+            expected = (
+                arena.save_cursors.get(row.kv_group, 0)
+                if self._manages_pending_work
+                else self._prepare_save_cursor(arena, row, reset=False)
+            )
             if row.row_ordinal != expected:
                 raise RuntimeError(
                     "Layerwise-prefill saves must arrive in per-group row "
@@ -627,17 +750,29 @@ class LayerwisePrefillWindowCoordinator:
                 "Layerwise-prefill save submission requires a row-aware backend "
                 "with transfer-window support."
             )
-        self._validate_metadata(metadata)
-        generations = self._metadata_request_generations(metadata)
-        row = metadata.row
-        extra_bytes = self._kv_layer_bytes(kv_layer)
         with self._lock:
-            self._validate_save_batch(generations, row)
-            self._enforce_pending_bounds(extra_bytes)
-            self._backend.submit_save(metadata, kv_layer, attn_metadata)
+            if self._manages_pending_work:
+                generations, validation = self._validate_callback_batch(
+                    metadata, save=True
+                )
+                self._backend.submit_save(
+                    metadata, kv_layer, attn_metadata, **validation
+                )
+                if validation["validation_error"] is not None:
+                    return
+                extra_bytes = 0
+            else:
+                self._validate_metadata(metadata)
+                generations = self._metadata_request_generations(metadata)
+                self._validate_save_batch(generations, metadata.row)
+                extra_bytes = self._kv_layer_bytes(kv_layer)
+                self._enforce_pending_bounds(extra_bytes)
+                self._backend.submit_save(metadata, kv_layer, attn_metadata)
+            row = metadata.row
             for index, (request_id, generation) in enumerate(generations):
                 arena = self._arena_for(request_id, generation)
-                self._prepare_save_cursor(arena, row)
+                if not self._manages_pending_work:
+                    self._prepare_save_cursor(arena, row)
                 arena.jobs[(row.kv_group, row.row_ordinal)] = (
                     _LayerwisePrefillWindowJob(
                         bytes=extra_bytes if index == 0 else 0,
@@ -657,6 +792,43 @@ class LayerwisePrefillWindowCoordinator:
                 "Layerwise-prefill save completion requires a row-aware backend "
                 "with transfer-window support."
             )
+        if self._manages_pending_work:
+            with self._lock:
+                error = None
+                records = []
+                try:
+                    self._validate_metadata(metadata)
+                    generations = self._metadata_request_generations(metadata)
+                    self._validate_active_generations(generations, allow_new=False)
+                    row = metadata.row
+                    for request_id, generation in generations:
+                        arena = self._arenas[request_id]
+                        job = arena.jobs.get((row.kv_group, row.row_ordinal))
+                        if job is None:
+                            raise RuntimeError(
+                                "Layerwise-prefill finish arrived before its submit"
+                            )
+                        if job.request_generations != generations:
+                            raise RuntimeError(
+                                "Layerwise-prefill finish identity differs "
+                                "from its submit"
+                            )
+                        if job.phase is not LayerwisePrefillSavePhase.SAVE_SUBMITTED:
+                            raise RuntimeError("Duplicate layerwise-prefill finish")
+                        records.append((arena, job))
+                except Exception as exc:
+                    error = exc
+                # Every rank must reach the common post-HCOM ACK, including
+                # stale, duplicate and malformed callbacks. Mutate only after it.
+                future = self._backend.finish_save(metadata, validation_error=error)
+                if error is not None:
+                    raise error
+                if not isinstance(future, Future):
+                    raise TypeError("Managed row save must return a Future")
+                for arena, job in records:
+                    job.phase = LayerwisePrefillSavePhase.SOURCE_DONE
+                    job.persist_future = future
+            return
         self._validate_metadata(metadata)
         generations = self._metadata_request_generations(metadata)
         row = metadata.row
@@ -782,6 +954,19 @@ class LayerwisePrefillWindowCoordinator:
                 "Layerwise-prefill load submission requires a row-aware backend "
                 "with transfer-window support."
             )
+        if self._manages_pending_work:
+            with self._lock:
+                error = None
+                try:
+                    self._validate_metadata(metadata)
+                    generations = self._metadata_request_generations(metadata)
+                    self._validate_active_generations(generations, allow_new=False)
+                except Exception as exc:
+                    error = exc
+                # The final execution has no successor, but still participates
+                # in backend validation and exact-once lookahead accounting.
+                self._backend.submit_load(metadata, validation_error=error)
+            return
         self._validate_metadata(metadata)
         generations = self._metadata_request_generations(metadata)
         execution = metadata.execution
@@ -826,10 +1011,21 @@ class LayerwisePrefillWindowCoordinator:
         """Drop request arenas, retaining a tombstone against old callbacks."""
 
         with self._lock:
+            arena = self._arenas.get(request_id)
             if self._backend is not None:
                 abort = getattr(self._backend, "abort_request", None)
                 if callable(abort):
-                    abort(request_id)
+                    if self._manages_pending_work:
+                        abort(
+                            request_id,
+                            allocation_generation=(
+                                arena.allocation_generation
+                                if arena is not None
+                                else None
+                            ),
+                        )
+                    else:
+                        abort(request_id)
             arena = self._arenas.pop(request_id, None)
             if arena is not None:
                 self._released_generations[request_id] = arena.allocation_generation
@@ -837,6 +1033,27 @@ class LayerwisePrefillWindowCoordinator:
                 key for key in self._stale_arenas if key[0] == request_id
             ]:
                 del self._stale_arenas[key]
+
+    def abort_step(self) -> None:
+        """Collectively drain a managed batch, then retire only its bound generations.
+
+        Backend drain errors propagate without dropping protocol ownership. Other
+        completed requests remain available for generation-scoped normal cleanup.
+        Generic backends are unaffected.
+        """
+        if not self._manages_pending_work:
+            return
+        with self._lock:
+            self._backend.abort_step()
+            for request_id, generation in self._step_generations:
+                arena = self._arenas.get(request_id)
+                if arena is not None and arena.allocation_generation == generation:
+                    del self._arenas[request_id]
+                self._stale_arenas.pop((request_id, generation), None)
+                self._released_generations[request_id] = max(
+                    generation, self._released_generations.get(request_id, 0)
+                )
+            self._step_generations = ()
 
     def request_persist_done(self, request_id: str) -> bool:
         """Whether every required row of a request reached PERSIST_DONE."""
@@ -2881,6 +3098,8 @@ class LMCacheConnectorV1Impl:
                 tuple[frozenset[str], int]
             ] = None
             self._wait_for_save_done = True
+            self._layerwise_prefill_step_active = False
+            self._layerwise_prefill_step_request_ids: tuple[str, ...] = ()
             self._finished_req_ids_waiting_for_save: set[str] = set()
             self._late_finished_sending: set[str] = set()
             self._completed_decode_window_saves: dict[str, int] = {}
@@ -4148,6 +4367,14 @@ class LMCacheConnectorV1Impl:
         requests: Iterable[ReqMeta],
     ) -> None:
         """Release a partially constructed layerwise retrieve step."""
+        window = getattr(self, "_layerwise_prefill_window", None)
+        if (
+            getattr(self, "_layerwise_prefill_p_node", False)
+            and window is not None
+            and window.manages_pending_work
+        ):
+            self.abort_layerwise_prefill_step()
+            return
         for request in requests:
             self._cold_perf_dense_load_started.pop(request.req_id, None)
             self._cold_perf_dense_load_completed.pop(request.req_id, None)
@@ -4461,6 +4688,14 @@ class LMCacheConnectorV1Impl:
 
     def _abort_save_step(self, requests: Iterable[ReqMeta]) -> None:
         """Discard partial stores without advancing decode-window progress."""
+        window = getattr(self, "_layerwise_prefill_window", None)
+        if (
+            getattr(self, "_layerwise_prefill_p_node", False)
+            and window is not None
+            and window.manages_pending_work
+        ):
+            self.abort_layerwise_prefill_step()
+            return
         expected = getattr(self, "_decode_window_save_expected_start", None)
         saved_expected = dict(expected or {})
         for request in requests:
@@ -7145,8 +7380,15 @@ class LMCacheConnectorV1Impl:
                 return
             window = self._layerwise_prefill_window_or_raise("bind")
             ordered = metadata.layerwise_prefill_requests or []
+            callbacks = ()
+            if window.manages_pending_work:
+                self._layerwise_prefill_step_active = True
             error = None
             try:
+                if window.manages_pending_work:
+                    self._layerwise_prefill_step_request_ids = tuple(
+                        request.req_id for request in metadata.requests
+                    )
                 if metadata.layerwise_prefill_requests is None:
                     raise RuntimeError(
                         "P-node forward lost its bank-aware request bindings"
@@ -7168,13 +7410,12 @@ class LMCacheConnectorV1Impl:
                         window.wait_for_request_persist_done(request.req_id)
                         window.release_request(request.req_id)
                 # Scheduler order can differ from actual worker callback order.
-                callbacks = next(
-                    (
-                        item.layerwise_prefill_callback_metadata
-                        for item in attn_metadata.values()
-                        if getattr(item, "layerwise_prefill_callback_metadata", ())
-                    ),
-                    (),
+                callbacks = tuple(
+                    callback
+                    for item in attn_metadata.values()
+                    for callback in getattr(
+                        item, "layerwise_prefill_callback_metadata", ()
+                    )
                 )
                 if not callbacks:
                     raise RuntimeError("P-node forward has no canonical row callbacks")
@@ -7198,7 +7439,7 @@ class LMCacheConnectorV1Impl:
             except Exception as exc:
                 error = exc
             window.bind_step(
-                ordered, self.kv_caches, validation_error=error
+                ordered, self.kv_caches, callbacks=callbacks, validation_error=error
             )
             return
         if getattr(metadata, "dsa_cold_compact_load_pending", False):
@@ -9269,6 +9510,36 @@ class LMCacheConnectorV1Impl:
             )
         window.finish_save(metadata)
 
+    def abort_layerwise_prefill_step(self) -> None:
+        """Drain an active managed P step once, without publishing save progress.
+
+        Called collectively on model/finalization errors, including deferred MTP
+        execution. Feature-off and synchronous/generic windows are no-ops. Drain
+        failures propagate and retain ownership for worker restart.
+        """
+        window = getattr(self, "_layerwise_prefill_window", None)
+        if (
+            not getattr(self, "_layerwise_prefill_p_node", False)
+            or window is None
+            or not window.manages_pending_work
+            or not getattr(self, "_layerwise_prefill_step_active", False)
+        ):
+            return
+        # Nested model, load and save exception handlers must not repeat an ACK.
+        self._layerwise_prefill_step_active = False
+        window.abort_step()
+        for req_id in self._layerwise_prefill_step_request_ids:
+            self._drop_layerwise_save_storers(req_id)
+            self._drop_worker_retrieve_state(req_id)
+            self._cold_perf_dense_load_started.pop(req_id, None)
+            self._cold_perf_dense_load_completed.pop(req_id, None)
+            self._cold_perf_load_started.pop(req_id, None)
+            self._completed_decode_window_saves.pop(req_id, None)
+            self._finished_req_ids_waiting_for_save.discard(req_id)
+            self._late_finished_sending.discard(req_id)
+        self._layerwise_prefill_step_request_ids = ()
+        self._wait_for_save_done = True
+
     def layerwise_prefill_request_persist_done(self, request_id: str) -> bool:
         """Whether every required row of a request reached PERSIST_DONE."""
 
@@ -9313,6 +9584,9 @@ class LMCacheConnectorV1Impl:
                     )
                 self._mark_prefill_committed(request)
                 self._maybe_lookup_unpin_for_request(request)
+            if window.manages_pending_work:
+                self._layerwise_prefill_step_active = False
+                self._layerwise_prefill_step_request_ids = ()
             return
 
         if self.kv_role == "kv_consumer":
@@ -11199,7 +11473,9 @@ class LMCacheConnectorV1Impl:
         logger.info(
             "Layerwise-prefill P node: residency_mode=PREFILL_LAYERWISE "
             "topology_signature=%s group_cardinalities=%s "
-            "max_pending_jobs=%d max_pending_bytes=%d "
+            "max_pending_jobs=%d max_pending_bytes=%d max_pending_futures=%d "
+            "managed_pending_work=%s pending_jobs=%d pending_bytes=%d "
+            "pending_futures=%d "
             "cpu_cache_bytes=%d mooncake_segment_bytes=%d "
             "connector_transfer_window=%s connector_sync_callbacks=%s "
             "connector_indexer_persistence=%s",
@@ -11207,6 +11483,11 @@ class LMCacheConnectorV1Impl:
             list(topology_cache.group_cardinalities),
             window.max_pending_jobs,
             window.max_pending_bytes,
+            window.max_pending_futures,
+            window.manages_pending_work,
+            window.pending_jobs(),
+            window.pending_bytes(),
+            window.pending_futures(),
             cpu_cache_bytes,
             segment_bytes,
             window.supports_transfer_window,

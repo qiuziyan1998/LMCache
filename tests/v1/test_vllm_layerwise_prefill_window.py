@@ -3,6 +3,7 @@
 
 # Standard
 from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import Mock
@@ -18,10 +19,14 @@ from vllm.v1.kv_cache_interface import DSAExecutionRow, DSAKVRow
 
 # First Party
 from lmcache.integration.vllm import vllm_v1_adapter as adapter_module
+from lmcache.integration.vllm.layerwise_prefill import LayerwisePrefillRequest
+from lmcache.integration.vllm.lmcache_connector_v1 import LMCacheConnectorV1Dynamic
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LayerwisePrefillSavePhase,
     LayerwisePrefillWindowCoordinator,
     LMCacheConnectorV1Impl,
+    LMCacheConnectorMetadata,
+    ReqMeta,
     _DSAKVTopologyCache,
 )
 
@@ -1080,3 +1085,579 @@ def test_connector_logs_p_node_observability(
         assert "cannot start" not in diagnostic
         assert "override" not in diagnostic
         assert "138" not in diagnostic
+
+
+class ManagedBackend(RecordingBackend):
+    """Managed public contract double; pre-HCOM failures surface only at finish."""
+
+    manages_pending_work = True
+    accepts_coordinator_validation_errors = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.future: Future = Future()
+        self.error: Optional[Exception] = None
+        self.validations: list[tuple[str, Any, Optional[Exception]]] = []
+        self.counts = (0, 0, 0)
+        self.bindings: list[Any] = []
+        self.releases: list[tuple[str, Optional[int]]] = []
+
+    def configure_window_limits(
+        self, max_jobs: int, max_bytes: int, max_futures: int
+    ) -> None:
+        self.limits = (max_jobs, max_bytes, max_futures)
+        self.events.append("configure")
+
+    def pending_jobs(self) -> int:
+        return self.counts[0]
+
+    def pending_bytes(self) -> int:
+        return self.counts[1]
+
+    def pending_futures(self) -> int:
+        return self.counts[2]
+
+    def window_stats(self) -> dict[str, int]:
+        return dict(
+            zip(("max_jobs", "max_bytes", "max_futures"), self.limits, strict=True)
+        )
+
+    def bind_step(
+        self,
+        requests: list,
+        caches: dict,
+        *,
+        callbacks: Optional[tuple] = None,
+        validation_error: Optional[Exception] = None,
+    ) -> None:
+        self.events.append("bind")
+        self.bindings.append((requests, caches, callbacks, validation_error))
+        if validation_error is not None:
+            raise ValueError(f"bind ACK: {validation_error}")
+        self.future = Future()
+
+    def wait_for_load(
+        self, metadata: Any, *, validation_error: Optional[Exception] = None
+    ) -> None:
+        self.validations.append(("wait", metadata, validation_error))
+        if validation_error is not None:
+            raise ValueError(f"entry ACK: {validation_error}")
+
+    def submit_save(
+        self,
+        metadata: Any,
+        kv_layer: Any,
+        attn_metadata: Any = None,
+        *,
+        validation_error: Optional[Exception] = None,
+    ) -> None:
+        self.validations.append(("save", metadata, validation_error))
+        self.error = self.error or validation_error
+        self.events.append("submit-save")
+
+    def submit_load(
+        self, metadata: Any, *, validation_error: Optional[Exception] = None
+    ) -> None:
+        self.validations.append(("load", metadata, validation_error))
+        self.error = self.error or validation_error
+        self.events.append("submit-load")
+
+    def finish_save(
+        self, metadata: Any, *, validation_error: Optional[Exception] = None
+    ) -> Future:
+        self.validations.append(("finish", metadata, validation_error))
+        self.events.append("finish-ACK")
+        error = self.error or validation_error
+        if error is not None:
+            raise ValueError(f"source ACK: {error}")
+        return self.future
+
+    def finish_step(self) -> None:
+        self.events.append("finish-step")
+        self.future.set_result(None)
+
+    def abort_step(self) -> None:
+        self.events.append("abort-step")
+
+    def abort_request(
+        self, request_id: str, *, allocation_generation: Optional[int] = None
+    ) -> None:
+        self.releases.append((request_id, allocation_generation))
+
+
+def _binding(request_id: str = "req-1", generation: int = 7) -> LayerwisePrefillRequest:
+    return LayerwisePrefillRequest(
+        request_id=request_id,
+        allocation_generation=generation,
+        token_ids=(1,),
+        compute_start=0,
+        compute_end=1,
+        restore_end=0,
+        block_ids_by_bank=(((1,), (2,)), ((3,), (4,))),
+        block_size=1,
+    )
+
+
+@pytest.mark.parametrize("flag", [False, 1, "true", Mock()])
+def test_managed_flag_requires_exact_true(flag: Any) -> None:
+    backend = RecordingBackend()
+    backend.manages_pending_work = flag
+    coordinator = LayerwisePrefillWindowCoordinator(_topology_cache(), backend)
+    assert coordinator.manages_pending_work is False
+    assert coordinator.supports_transfer_window is True
+    assert coordinator.pending_futures() == 0
+
+
+@pytest.mark.parametrize(
+    "hook",
+    [
+        "configure_window_limits",
+        "pending_jobs",
+        "pending_bytes",
+        "pending_futures",
+        "window_stats",
+        "bind_step",
+        "wait_for_load",
+        "submit_save",
+        "submit_load",
+        "finish_save",
+        "finish_step",
+        "abort_step",
+        "abort_request",
+        "sync_save",
+    ],
+)
+def test_managed_capability_rejects_missing_hooks(
+    monkeypatch: pytest.MonkeyPatch, hook: str
+) -> None:
+    backend = ManagedBackend()
+    monkeypatch.setattr(backend, hook, None)
+    with pytest.raises(ValueError, match=hook):
+        LayerwisePrefillWindowCoordinator(_topology_cache(), backend)
+    assert backend.events == []
+
+
+def test_managed_capability_rejects_dynamic_placeholder_hooks() -> None:
+    backend = Mock(
+        manages_pending_work=True,
+        accepts_coordinator_validation_errors=True,
+        supports_transfer_window=True,
+    )
+    with pytest.raises(ValueError, match="configure_window_limits"):
+        LayerwisePrefillWindowCoordinator(_topology_cache(), backend)
+
+
+@pytest.mark.parametrize("flag", [False, 1, "true"])
+def test_managed_capability_requires_collective_validation(flag: Any) -> None:
+    backend = ManagedBackend()
+    backend.accepts_coordinator_validation_errors = flag
+    with pytest.raises(ValueError, match="collective validation"):
+        LayerwisePrefillWindowCoordinator(_topology_cache(), backend)
+
+
+@pytest.mark.parametrize("source", ["default", "env", "constructor"])
+def test_managed_limits_configured_before_bind_and_counters_delegated(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    names = ("JOBS", "BYTES", "FUTURES")
+    for name in names:
+        monkeypatch.delenv(
+            f"LMCACHE_LAYERWISE_PREFILL_MAX_PENDING_{name}", raising=False
+        )
+    limits = (8, 64 << 20, 8) if source == "default" else (3, 2048, 2)
+    if source != "default":
+        for name, value in zip(names, limits, strict=True):
+            monkeypatch.setenv(
+                f"LMCACHE_LAYERWISE_PREFILL_MAX_PENDING_{name}",
+                str(value) if source == "env" else "invalid",
+            )
+    kwargs = (
+        dict(
+            zip(
+                ("max_pending_jobs", "max_pending_bytes", "max_pending_futures"),
+                limits,
+                strict=True,
+            )
+        )
+        if source == "constructor"
+        else {}
+    )
+    backend = ManagedBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(
+        _topology_cache(), backend, **kwargs
+    )
+    assert backend.limits == limits
+    assert (
+        coordinator.max_pending_jobs,
+        coordinator.max_pending_bytes,
+        coordinator.max_pending_futures,
+    ) == limits
+    coordinator.bind_step([_binding()], {}, callbacks=())
+    assert backend.events == ["configure", "bind"]
+    backend.counts = (2, 1234, 1)
+    assert (
+        coordinator.pending_jobs(),
+        coordinator.pending_bytes(),
+        coordinator.pending_futures(),
+    ) == backend.counts
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "8"])
+def test_future_limit_constructor_requires_positive_integer(value: Any) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        LayerwisePrefillWindowCoordinator(
+            _topology_cache(), ManagedBackend(), max_pending_futures=value
+        )
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "true", "1.5", ""])
+def test_future_limit_env_is_strict_and_managed_only(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("LMCACHE_LAYERWISE_PREFILL_MAX_PENDING_FUTURES", value)
+    with pytest.raises(ValueError, match="MAX_PENDING_FUTURES"):
+        LayerwisePrefillWindowCoordinator(_topology_cache(), ManagedBackend())
+    assert (
+        LayerwisePrefillWindowCoordinator(
+            _topology_cache(), RecordingBackend()
+        ).max_pending_futures
+        == 8
+    )
+
+
+def test_generic_pending_futures_deduplicates_shared_batch_and_rows() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    assert coordinator.pending_futures() == 0
+    future = Future()
+    for metadata in _callback(cache, 0, request_generations=(("a", 1), ("b", 2))):
+        backend.persist_futures[metadata.row] = future
+        coordinator.submit_save(metadata, _kv_layer())
+        coordinator.finish_save(metadata)
+    assert coordinator.pending_futures() == 1
+    future.set_result(None)
+    assert coordinator.pending_futures() == 0
+
+
+def test_managed_101_source_rows_do_not_consume_assembly_future_credits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _topology_cache()
+    backend = ManagedBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    monkeypatch.setattr(
+        backend.future,
+        "result",
+        Mock(
+            side_effect=AssertionError("blocked on assembly before all rows executed")
+        ),
+    )
+    _drive_full_request(coordinator, cache)
+    assert backend.events.count("submit-save") == 101
+    assert backend.events.count("submit-load") == 79
+    assert backend.events.count("finish-ACK") == 101
+    assert (
+        coordinator.pending_jobs(),
+        coordinator.pending_bytes(),
+        coordinator.pending_futures(),
+    ) == (0, 0, 0)
+    assert not coordinator.request_persist_done("req-1")
+    # Only protocol records remain; the backend owns all source resource credit.
+    assert all(
+        job.phase is LayerwisePrefillSavePhase.SOURCE_DONE and job.bytes == 0
+        for job in coordinator._arenas["req-1"].jobs.values()
+    )
+    monkeypatch.undo()
+    backend.finish_step()
+    coordinator.wait_for_request_persist_done("req-1")
+    assert coordinator.request_persist_done("req-1")
+
+
+@pytest.mark.parametrize("phase", ["save", "load", "finish"])
+@pytest.mark.parametrize("invalid", ["metadata", "generation", "row", "batch"])
+def test_managed_validation_is_reported_by_post_hcom_ack(
+    phase: str, invalid: str
+) -> None:
+    cache = _topology_cache()
+    backend = ManagedBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    metadata = _callback(cache, 0)[0]
+    bad = {
+        "metadata": None,
+        "generation": replace(metadata, request_generations=(("req-1", 6),)),
+        "row": SimpleNamespace(
+            execution=metadata.execution,
+            row=replace(metadata.row, bank=99),
+            request_generations=metadata.request_generations,
+        ),
+        "batch": replace(metadata, request_generations=(("req-1", 7), ("new", 7))),
+    }[invalid]
+    coordinator.wait_for_load(metadata)
+    coordinator.submit_save(bad if phase == "save" else metadata, _kv_layer())
+    coordinator.submit_load(bad if phase == "load" else metadata)
+    assert "finish-ACK" not in backend.events
+    if phase == "save":
+        assert coordinator._arenas["req-1"].jobs == {}
+    with pytest.raises(ValueError, match="source ACK"):
+        coordinator.finish_save(bad if phase == "finish" else metadata)
+    validation = next(item for item in backend.validations if item[0] == phase)
+    assert validation[1] is bad and isinstance(validation[2], Exception)
+    assert backend.events[-1] == "finish-ACK"
+    assert not coordinator.has_request("new")
+    assert not coordinator.request_persist_done("req-1")
+
+
+@pytest.mark.parametrize("failure", ["missing", "duplicate", "batch"])
+def test_managed_finish_state_rejections_still_reach_backend(failure: str) -> None:
+    cache = _topology_cache()
+    backend = ManagedBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    metadata = _callback(cache, 0, request_generations=(("req-1", 7), ("req-2", 7)))[0]
+    coordinator.wait_for_load(metadata)
+    if failure != "missing":
+        coordinator.submit_save(metadata, _kv_layer())
+    if failure == "duplicate":
+        coordinator.finish_save(metadata)
+    if failure == "batch":
+        metadata = _callback(cache, 0)[0]
+    with pytest.raises(ValueError, match="source ACK"):
+        coordinator.finish_save(metadata)
+    assert backend.validations[-1][0] == "finish"
+    assert isinstance(backend.validations[-1][2], RuntimeError)
+
+
+def test_managed_reused_callback_identity_is_checked_by_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _topology_cache()
+    backend = ManagedBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    metadata = _callback(cache, 0)[0]
+    coordinator.wait_for_load(metadata)
+    coordinator.submit_save(metadata, _kv_layer())
+    old = replace(metadata)
+    finish = Mock(side_effect=ValueError("callback object is not registered"))
+    monkeypatch.setattr(backend, "finish_save", finish)
+    with pytest.raises(ValueError, match="not registered"):
+        coordinator.finish_save(old)
+    finish.assert_called_once_with(old, validation_error=None)
+    assert coordinator._arenas["req-1"].jobs[(0, 0)].phase is (
+        LayerwisePrefillSavePhase.SAVE_SUBMITTED
+    )
+
+
+def test_managed_wait_reports_validation_at_row_entry() -> None:
+    backend = ManagedBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(_topology_cache(), backend)
+    with pytest.raises(ValueError, match="entry ACK"):
+        coordinator.wait_for_load(None)
+    assert backend.validations[-1][0] == "wait"
+
+
+def test_managed_unbound_chunk_rollover_never_waits_pre_hcom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _topology_cache((1, 1))
+    backend = ManagedBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    _drive_full_request(coordinator, cache)
+    result = Mock(side_effect=AssertionError("waited on unfinished assembly"))
+    monkeypatch.setattr(backend.future, "result", result)
+    metadata = _callback(cache, 0)[0]
+    coordinator.submit_save(metadata, _kv_layer())
+    result.assert_not_called()
+    assert isinstance(backend.validations[-1][2], RuntimeError)
+    with pytest.raises(ValueError, match="source ACK.*per-group row order"):
+        coordinator.finish_save(metadata)
+
+
+def test_managed_release_keeps_arena_until_backend_generation_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _topology_cache()
+    backend = ManagedBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    coordinator.wait_for_load(_callback(cache, 0, generation=8)[0])
+    abort = Mock(side_effect=RuntimeError("cannot release source yet"))
+    monkeypatch.setattr(backend, "abort_request", abort)
+    with pytest.raises(RuntimeError, match="cannot release"):
+        coordinator.release_request("req-1")
+    abort.assert_called_once_with("req-1", allocation_generation=8)
+    assert coordinator.has_request("req-1")
+
+
+@pytest.mark.parametrize("failure", ["none", "bind", "abort"])
+def test_managed_abort_and_release_are_exact_generation_scoped(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    cache = _topology_cache((1, 1))
+    backend = ManagedBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    coordinator.bind_step([_binding()], {}, callbacks=())
+    _drive_full_request(coordinator, cache)
+    backend.finish_step()
+    coordinator.wait_for_request_persist_done("req-1")
+    if failure == "bind":
+        with pytest.raises(ValueError, match="bind ACK"):
+            coordinator.bind_step(
+                [_binding("req-2", 8)], {}, callbacks=(),
+                validation_error=ValueError("malformed next forward"),
+            )
+        coordinator.abort_step()
+        assert coordinator.request_persist_done("req-1")
+        assert not coordinator.has_request("req-2")
+        return
+    coordinator.bind_step([_binding("req-2", 8)], {}, callbacks=())
+    metadata = _callback(cache, 0, request_generations=(("req-2", 8),))[0]
+    coordinator.wait_for_load(metadata)
+    coordinator.submit_save(metadata, _kv_layer())
+    if failure == "abort":
+        monkeypatch.setattr(
+            backend, "abort_step", Mock(side_effect=RuntimeError("unsafe drain"))
+        )
+        with pytest.raises(RuntimeError, match="unsafe drain"):
+            coordinator.abort_step()
+        assert coordinator.has_request("req-2")
+    else:
+        coordinator.abort_step()
+        assert not coordinator.has_request("req-2")
+        with pytest.raises(ValueError, match="released generation"):
+            coordinator.wait_for_load(metadata)
+    assert coordinator.request_persist_done("req-1")
+    coordinator.release_request("req-1")
+    assert backend.releases == [("req-1", 7)]
+    assert not coordinator.has_request("req-1")
+
+
+def _start_managed_adapter(
+    monkeypatch: pytest.MonkeyPatch, *, malformed: bool = False
+) -> tuple[LMCacheConnectorV1Impl, ManagedBackend, tuple, dict]:
+    backend = ManagedBackend()
+    impl = _window_connector(monkeypatch, backend)
+    impl._layerwise_prefill_p_node = True
+    impl.kv_caches = {"registered": _kv_layer()}
+    bindings = [_binding(), _binding("req-2", 8)]
+    callbacks = tuple(
+        metadata
+        for execution in range(79)
+        for metadata in _callback(
+            impl._dsa_kv_topology_cache,
+            execution,
+            request_generations=(("req-2", 8), ("req-1", 7)),
+        )
+    )
+    attention = {"unrelated": SimpleNamespace()}
+    for metadata in callbacks:
+        attention[metadata.row.layer_name] = SimpleNamespace(
+            layerwise_prefill_callback_metadata=(metadata,)
+        )
+    attention["alias"] = attention[callbacks[-1].row.layer_name]
+    if malformed:
+        attention["bad"] = SimpleNamespace(layerwise_prefill_callback_metadata=1)
+    connector_metadata = LMCacheConnectorMetadata(
+        requests=[ReqMeta(req_id=req.request_id, token_ids=[1]) for req in bindings],
+        layerwise_prefill_requests=bindings,
+    )
+    impl._parent = SimpleNamespace(_get_connector_metadata=lambda: connector_metadata)
+    # These are worker-only fields; the startup helper constructs scheduler state.
+    impl._layerwise_save_storers = {}
+    impl._deferred_latent_pending = set()
+    impl._decode_window_save_completed_groups = set()
+    impl._prefill_save_completed_groups = {}
+    impl._completed_decode_window_saves = {}
+    impl._finished_req_ids_waiting_for_save = set()
+    impl._late_finished_sending = set()
+    impl._cold_perf_dense_load_started = {}
+    impl._cold_perf_dense_load_completed = {}
+    impl._cold_perf_load_started = {}
+    monkeypatch.setattr(impl, "_drop_worker_retrieve_state", Mock())
+    return impl, backend, callbacks, attention
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_adapter_binds_all_actual_callbacks_and_forwards_initial_errors(
+    monkeypatch: pytest.MonkeyPatch, malformed: bool
+) -> None:
+    impl, backend, callbacks, attention = _start_managed_adapter(
+        monkeypatch, malformed=malformed
+    )
+    context = SimpleNamespace(attn_metadata=attention)
+    if malformed:
+        with pytest.raises(ValueError, match="bind ACK"):
+            impl.start_load_kv(context)
+        assert backend.events.count("abort-step") == 1
+        assert isinstance(backend.bindings[-1][-1], TypeError)
+    else:
+        impl.start_load_kv(context)
+        bindings, caches, bound, error = backend.bindings[-1]
+        assert [req.request_id for req in bindings] == ["req-2", "req-1"]
+        assert caches is impl.kv_caches
+        assert error is None
+        assert len(bound) == 102  # Identical-object aliases are backend-validated.
+        assert all(
+            actual is expected
+            for actual, expected in zip(bound[:-1], callbacks, strict=True)
+        )
+        assert bound[-1] is callbacks[-1]
+        assert backend.validations == []  # No row entry or transfer during bind.
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_adapter_abort_is_once_and_never_reports_completion(
+    monkeypatch: pytest.MonkeyPatch, failure: bool
+) -> None:
+    impl, backend, callbacks, attention = _start_managed_adapter(monkeypatch)
+    impl.start_load_kv(SimpleNamespace(attn_metadata=attention))
+    impl.wait_for_layerwise_prefill_load(callbacks[0])
+    impl.submit_layerwise_prefill_save(callbacks[0], _kv_layer())
+    if failure:
+        monkeypatch.setattr(
+            backend,
+            "abort_step",
+            Mock(side_effect=RuntimeError("unknown device fence")),
+        )
+        with pytest.raises(RuntimeError, match="unknown device fence"):
+            impl.abort_layerwise_prefill_step()
+    else:
+        impl.abort_layerwise_prefill_step()
+    impl._abort_save_step(())
+    impl._abort_layerwise_retrieve_step(())
+    impl.abort_layerwise_prefill_step()
+    if failure:
+        backend.abort_step.assert_called_once_with()
+        assert impl._layerwise_prefill_window.has_request("req-1")
+    else:
+        assert backend.events.count("abort-step") == 1
+        assert not impl._layerwise_prefill_window.has_request("req-1")
+    assert backend.releases == []
+    assert not impl.layerwise_prefill_request_persist_done("req-1")
+    assert impl.get_completed_decode_window_saves() == {}
+
+
+@pytest.mark.parametrize(
+    "managed,p_node,active",
+    [
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+    ],
+)
+def test_adapter_abort_is_noop_without_active_managed_p_step(
+    monkeypatch: pytest.MonkeyPatch, managed: bool, p_node: bool, active: bool
+) -> None:
+    backend = ManagedBackend() if managed else RecordingBackend()
+    impl = _window_connector(monkeypatch, backend)
+    impl._layerwise_prefill_p_node = p_node
+    impl._layerwise_prefill_step_active = active
+    events = backend.events.copy()
+    impl.abort_layerwise_prefill_step()
+    assert backend.events == events
+    assert backend.aborted == []
+
+
+def test_dynamic_connector_delegates_step_abort() -> None:
+    connector = object.__new__(LMCacheConnectorV1Dynamic)
+    connector._lmcache_engine = Mock()
+    connector.abort_layerwise_prefill_step()
+    connector._lmcache_engine.abort_layerwise_prefill_step.assert_called_once_with()
