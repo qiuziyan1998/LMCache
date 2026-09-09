@@ -484,6 +484,13 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "prefill_group0_direct_hbm": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": "Load sender dense-prefix Group 0 directly from Mooncake "
+        "into NPU blocks while retaining Group 1 in shared LocalCPU.",
+    },
     "dsa_group1_load_mode": {
         "type": str,
         "default": "p2p_preferred",
@@ -900,6 +907,18 @@ def _validate_config(self):
                 "slab and must not conflict."
                 + shared_cpu_config_context
             )
+
+    if self.prefill_group0_direct_hbm and (
+        self.pd_role != "sender"
+        or self.dsa_group1_load_mode != "persistent_direct_hbm"
+        or not enable_shared_cpu_cache
+        or self.enable_blending
+    ):
+        raise ValueError(
+            "prefill_group0_direct_hbm requires pd_role=sender, "
+            "dsa_group1_load_mode=persistent_direct_hbm, shared LocalCPU "
+            "and enable_blending=false"
+        )
 
     if self.remote_fill_submission_mode not in _REMOTE_FILL_SUBMISSION_MODES:
         raise ValueError(

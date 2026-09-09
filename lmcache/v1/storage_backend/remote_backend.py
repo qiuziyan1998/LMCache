@@ -640,6 +640,11 @@ class RemoteBackend(StorageBackendInterface):
             )
             self._external_page_fatal_error = error
             raise error from timeout_error
+        finally:
+            # A terminal exception's traceback includes this frame. Do not
+            # retain its Future (and external owners) in a cycle with GC off.
+            # Unknown-state errors explicitly retain their native Future.
+            del future
 
     def batched_external_pages_exist(
         self, keys: Sequence[CacheEngineKey]

@@ -5,8 +5,10 @@
 from types import SimpleNamespace
 from typing import Any, Sequence
 import asyncio
+import gc
 import threading
 import time
+import weakref
 
 # Third Party
 import pytest
@@ -25,6 +27,99 @@ from lmcache.v1.storage_backend.remote_backend import (
     RemoteBackend,
     RemoteExternalPageReader,
 )
+from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
+    MooncakestoreConnector,
+)
+
+
+def test_terminal_read_error_releases_owners_without_cyclic_gc() -> None:
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+
+    class Owner:
+        pass
+
+    refs = []
+
+    async def fail(*args: Any) -> None:
+        raise RuntimeError("known terminal failure")
+
+    backend = object.__new__(RemoteBackend)
+    backend.loop = loop
+    backend.connection = SimpleNamespace(batched_get_external_pages=fail)
+    backend._mla_worker_id_as0_mode = False
+    backend._external_page_outer_timeout_secs = lambda: 2
+
+    def attempt() -> None:
+        owner = Owner()
+        refs.append(weakref.ref(owner))
+        try:
+            backend.batched_get_external_pages(
+                ["key"], [[1]], [[1]], (owner,), "request"
+            )
+        except RuntimeError:
+            pass
+
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(3):
+            attempt()
+        asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop).result(2)
+        assert all(ref() is None for ref in refs)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(2)
+        loop.close()
+        if enabled:
+            gc.enable()
+
+
+def test_short_read_connector_releases_owners_without_cyclic_gc() -> None:
+    class Owner:
+        device = SimpleNamespace(type="cpu")
+
+    refs = []
+
+    async def run() -> None:
+        connector = object.__new__(MooncakestoreConnector)
+        connector.save_chunk_meta = False
+        connector._page_first_multi_buffer = True
+        connector.config = SimpleNamespace(transfer_timeout=1)
+        connector._external_put_lock = asyncio.Lock()
+        connector._external_native_deadline = lambda: time.perf_counter() + 2
+        connector._inflight_put_tasks = set()
+        connector._validate_external_buffer_owners = lambda *args: None
+        connector._external_page_key = lambda key, size: key
+        connector._register_external_owners = lambda owners: None
+        connector.store = SimpleNamespace(
+            batch_get_into_multi_buffers=lambda *args: [-1]
+        )
+
+        async def attempt() -> None:
+            owner = Owner()
+            refs.append(weakref.ref(owner))
+            try:
+                await connector.batched_get_external_pages(
+                    ["key"], [[1]], [[8]], (owner,), "request"
+                )
+            except RuntimeError:
+                pass
+
+        for _ in range(3):
+            await attempt()
+        await asyncio.sleep(0)
+        assert not connector._inflight_put_tasks
+
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        asyncio.run(run())
+        assert all(ref() is None for ref in refs)
+    finally:
+        if enabled:
+            gc.enable()
 
 
 class _ExternalPageConnector:

@@ -2211,6 +2211,11 @@ class LMCacheEngine:
                     if pin and getattr(self.config, "pd_role", None) == "sender"
                     else (0,)
                 )
+                if (
+                    getattr(self.config, "prefill_group0_direct_hbm", False)
+                    and getattr(self.config, "pd_role", None) == "sender"
+                ):
+                    local_groups = (1,) if pin else ()
                 for group in local_groups:
                     local_count, group_mapping = (
                         self.storage_manager.batched_contains_layer_pages(
@@ -4650,7 +4655,10 @@ class LMCacheEngine:
         kwargs: dict[str, Any],
     ) -> None:
         """Fence failed dense loads before releasing retained sources."""
-        if memory_objs and kwargs.get("_retain_shared_dense_cache"):
+        if memory_objs and (
+            kwargs.get("_retain_shared_dense_cache")
+            or kwargs.get("_retain_dense_sources_until_save")
+        ):
             synchronize = getattr(
                 self.gpu_connector, "synchronize_dense_load_stream", None
             )
@@ -4719,6 +4727,13 @@ class LMCacheEngine:
         kwargs: dict[str, Any],
     ) -> bool:
         """Move a completed dense retrieve directly into sparse request state."""
+        if req_id and kwargs.get("_retain_dense_sources_until_save"):
+            # Keep the load's sources until the normal request/save fence,
+            # without building sparse pointer caches or a mixed G0/G1 seed.
+            self.register_shared_cpu_sparse_request(
+                req_id, owned_groups={kv_group: memory_objs}
+            )
+            return True
         if not req_id or not kwargs.get("_retain_shared_dense_cache"):
             return False
         if not self.supports_dense_sparse_cache_retention():

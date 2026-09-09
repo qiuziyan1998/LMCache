@@ -2416,7 +2416,12 @@ class MooncakestoreConnector(RemoteConnector):
                 f"Mooncake direct page load failed or was short: {failed[:4]}"
             )
             error.failed_pages = failed  # type: ignore[attr-defined]
-            raise error
+            try:
+                raise error
+            finally:
+                # Do not retain this exception through its own traceback frame
+                # (which also owns the external destinations) when GC is off.
+                del error
         trace_mooncake_keys(
             "get", page_keys, statuses, api="connector.direct_npu_page_get"
         )
