@@ -2171,13 +2171,14 @@ class LMCacheEngine:
         lookup_id: Optional[str],
         pin: bool,
     ) -> int:
-        """Prove a Mooncake pair prefix, then overlay its G0 LocalCPU prefix."""
+        """Prove a Mooncake pair prefix, then overlay role-appropriate CPU hits."""
 
         assert self.storage_manager is not None
         if "RemoteBackend" not in search_range:
             return 0
 
-        local_mapping: dict[str, list[CacheEngineKey]] = {}
+        local_mapping: dict[str, list[CacheEngineKey]] = defaultdict(list)
+        pins_registered = False
         try:
             pair_count, persistent_mapping = (
                 self.storage_manager.batched_contains_two_group_layer_pages(
@@ -2201,24 +2202,38 @@ class LMCacheEngine:
             if pair_count == 0:
                 return 0
 
-            local_count = 0
+            local_counts = [0, 0]
             if "LocalCPUBackend" in search_range:
-                local_count, local_mapping = (
-                    self.storage_manager.batched_contains_layer_pages(
-                        group_keys[0][:pair_count],
-                        ["LocalCPUBackend"],
-                        pin,
-                    )
+                # P loads both groups through shared CPU pages. D must keep
+                # Group 1 on the persistent direct-to-HBM path.
+                local_groups = (
+                    (0, 1)
+                    if pin and getattr(self.config, "pd_role", None) == "sender"
+                    else (0,)
                 )
-                local_keys = local_mapping.get("LocalCPUBackend", [])
-                if (
-                    not 0 <= local_count <= pair_count
-                    or set(local_mapping) - {"LocalCPUBackend"}
-                    or len(local_keys) != local_count
-                ):
-                    raise RuntimeError(
-                        "Group-0 LocalCPU overlay returned invalid prefix mapping"
+                for group in local_groups:
+                    local_count, group_mapping = (
+                        self.storage_manager.batched_contains_layer_pages(
+                            group_keys[group][:pair_count],
+                            ["LocalCPUBackend"],
+                            pin,
+                        )
                     )
+                    # Retain each returned pin before validation so a later
+                    # group failure also rolls back earlier successful pins.
+                    for location, keys in group_mapping.items():
+                        local_mapping[location].extend(keys)
+                    local_keys = group_mapping.get("LocalCPUBackend", [])
+                    if (
+                        not 0 <= local_count <= pair_count
+                        or set(group_mapping) - {"LocalCPUBackend"}
+                        or len(local_keys) != local_count
+                    ):
+                        raise RuntimeError(
+                            f"Group-{group} LocalCPU overlay returned invalid "
+                            "prefix mapping"
+                        )
+                    local_counts[group] = local_count
 
             plan = tuple(
                 _RemoteFillChunkLookupPlan(
@@ -2227,9 +2242,11 @@ class LMCacheEngine:
                     chunk_hash=key.chunk_hash,
                     locations_by_group=(
                         "LocalCPUBackend"
-                        if index < local_count
+                        if index < local_counts[0]
                         else "RemoteBackend",
-                        "RemoteBackend",
+                        "LocalCPUBackend"
+                        if index < local_counts[1]
+                        else "RemoteBackend",
                     ),
                     page_by_group=(True, True),
                 )
@@ -2239,15 +2256,22 @@ class LMCacheEngine:
                 assert lookup_id is not None
                 for location, keys in local_mapping.items():
                     self.lookup_pins[lookup_id][location].extend(keys)
+                pins_registered = True
                 self._remote_fill_lookup_plans[lookup_id] = _RemoteFillLookupPlan(
                     plan
                 )
             return plan[-1].end
         except Exception:
             if pin:
-                for location, keys in local_mapping.items():
-                    if keys:
-                        self.storage_manager.batched_unpin(keys, [location])
+                if pins_registered:
+                    # The request registry now owns the pins; remove it before
+                    # the caller's error cleanup can attempt another release.
+                    assert lookup_id is not None
+                    self._release_lookup_pins(lookup_id)
+                else:
+                    for location, keys in local_mapping.items():
+                        if keys:
+                            self.storage_manager.batched_unpin(keys, [location])
             raise
 
     def _lookup_remote_fill_two_group_prefix(

@@ -3,8 +3,11 @@
 
 # Standard
 from collections import defaultdict
-import logging
+from collections.abc import Iterator
+from threading import RLock
 from types import SimpleNamespace
+import gc
+import logging
 
 # Third Party
 import pytest
@@ -17,8 +20,10 @@ from lmcache.v1.cache_engine import (
     _RemoteFillMaterializationError,
 )
 from lmcache.v1.event_manager import EventStatus
+from lmcache.v1.mooncake_layout import mooncake_valid_tokens
 from lmcache.v1.remote_fill import content_digest
 from lmcache.v1.shared_cpu_cache import SharedHandleEnvelope
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 
 
@@ -128,18 +133,21 @@ class _PairStorageManager:
     ):
         keys = list(keys)
         self.page_calls.append((keys, search_range, pin))
+        error = self.page_errors.get(keys[0].kv_group)
+        if error is not None:
+            raise error
         if (
             search_range == ["LocalCPUBackend"]
             and self.local_page_hits is not None
         ):
-            hits = min(int(self.local_page_hits), len(keys))
+            hits = self.local_page_hits
+            if isinstance(hits, dict):
+                hits = hits.get(keys[0].kv_group, 0)
+            hits = min(int(hits), len(keys))
             return (
                 hits,
                 {"LocalCPUBackend": keys[:hits]} if hits else {},
             )
-        error = self.page_errors.get(keys[0].kv_group)
-        if error is not None:
-            raise error
         limit = self.page_result_limits.get(keys[0].kv_group)
         if limit is not None:
             if limit <= 0:
@@ -394,6 +402,358 @@ def test_persistent_direct_hbm_overlay_error_has_no_remote_pair_pins() -> None:
     assert storage.unpinned == []
     assert "req" not in engine._remote_fill_lookup_plans
     assert engine.lookup_pins["req"] == {}
+
+
+@pytest.mark.parametrize("role", ["sender", "receiver", None])
+@pytest.mark.parametrize("local0", [0, 1, 2])
+@pytest.mark.parametrize("local1", [0, 1, 2])
+@pytest.mark.parametrize("remote_pairs", [0, 1, 2])
+@pytest.mark.parametrize("pin", [False, True])
+def test_persistent_prefix_overlays_cpu_by_role(
+    role: str | None, local0: int, local1: int, remote_pairs: int, pin: bool
+) -> None:
+    storage = _PairStorageManager(remote_pairs=remote_pairs)
+    storage.local_page_hits = {0: local0, 1: local1}
+    engine = _engine(storage)
+    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    if role is not None:
+        engine.config.pd_role = role
+
+    assert engine.lookup(list(range(8)), lookup_id="req", pin=pin) == 4 * remote_pairs
+    assert [(call[2], call[3]) for call in storage.pair_calls] == [
+        (["RemoteBackend"], False)
+    ]
+    groups = [0, 1] if role == "sender" and pin else [0]
+    assert [keys[0].kv_group for keys, _, _ in storage.page_calls] == (
+        groups if remote_pairs else []
+    )
+    assert all(
+        len(keys) == remote_pairs and search == ["LocalCPUBackend"] and pinned == pin
+        for keys, search, pinned in storage.page_calls
+    )
+    if not pin or not remote_pairs:
+        assert engine.lookup_pins == {}
+        assert engine._remote_fill_lookup_plans == {}
+        assert storage.unpinned == []
+        return
+
+    counts = [
+        min(local0, remote_pairs),
+        min(local1, remote_pairs) if role == "sender" else 0,
+    ]
+    assert [
+        chunk.locations_by_group
+        for chunk in engine._remote_fill_lookup_plans["req"].chunks
+    ] == [
+        tuple(
+            "LocalCPUBackend" if index < counts[group] else "RemoteBackend"
+            for group in (0, 1)
+        )
+        for index in range(remote_pairs)
+    ]
+    expected = [
+        key
+        for keys, _, _ in storage.page_calls
+        for key in keys[: counts[keys[0].kv_group]]
+    ]
+    assert engine.lookup_pins["req"].get("LocalCPUBackend", []) == expected
+    engine.lookup_unpin("req")
+    assert engine.lookup_pins == {}
+    assert engine._remote_fill_lookup_plans == {}
+    assert storage.unpinned == ([(expected, ["LocalCPUBackend"])] if expected else [])
+
+
+@pytest.mark.parametrize(
+    "search_range,expected", [(["RemoteBackend"], 8), (["LocalCPUBackend"], 0)]
+)
+def test_sender_overlay_respects_search_range(
+    search_range: list[str], expected: int
+) -> None:
+    storage = _PairStorageManager(local_pairs=2, remote_pairs=2)
+    storage.local_page_hits = {0: 2, 1: 2}
+    engine = _engine(storage)
+    engine.config.pd_role = "sender"
+    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    assert (
+        engine.lookup(
+            list(range(8)), search_range=search_range, lookup_id="req", pin=True
+        )
+        == expected
+    )
+    assert storage.page_calls == []
+    assert engine.lookup_pins == {}
+    if expected:
+        assert all(
+            chunk.locations_by_group == ("RemoteBackend", "RemoteBackend")
+            for chunk in engine._remote_fill_lookup_plans["req"].chunks
+        )
+
+
+def test_sender_other_load_mode_preserves_paired_local_lookup() -> None:
+    storage = _PairStorageManager(local_pairs=2, remote_pairs=2)
+    engine = _engine(storage)
+    engine.config.pd_role = "sender"
+    assert engine.lookup(list(range(8)), lookup_id="req", pin=True) == 8
+    assert storage.page_calls == []
+    assert [call[2] for call in storage.pair_calls] == [["LocalCPUBackend"]]
+
+
+@pytest.mark.parametrize("pin", [False, True])
+@pytest.mark.parametrize("failure", ["exception", "count", "mapping"])
+def test_sender_group1_overlay_failure_releases_all_returned_pins(
+    pin: bool, failure: str
+) -> None:
+    storage = _PairStorageManager(remote_pairs=2)
+    storage.local_page_hits = {0: 2, 1: 1}
+    original = storage.batched_contains_layer_pages
+    returned = []
+
+    def contains(keys: list, search_range: list[str], do_pin: bool) -> tuple[int, dict]:
+        if keys[0].kv_group == 1 and failure == "exception":
+            raise RuntimeError("group1 lookup failed")
+        count, mapping = original(keys, search_range, do_pin)
+        returned.extend(mapping.get("LocalCPUBackend", []))
+        if keys[0].kv_group == 1:
+            if failure == "count":
+                count = 3
+            elif failure == "mapping":
+                count = 2  # The backend pinned only one page.
+        return count, mapping
+
+    storage.batched_contains_layer_pages = contains
+    engine = _engine(storage)
+    engine.config.pd_role = "sender"
+    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    assert engine.lookup(list(range(8)), lookup_id="req", pin=pin) == (0 if pin else 8)
+    assert engine.lookup_pins == {}
+    assert engine._remote_fill_lookup_plans == {}
+    assert storage.unpinned == ([(returned, ["LocalCPUBackend"])] if pin else [])
+
+
+@pytest.mark.parametrize("hot_pages", [0, 1, 2])
+@pytest.mark.parametrize("tail_tokens", [1, 3, 4])
+@pytest.mark.parametrize("disable_gc", [False, True])
+def test_sender_group1_load_reuses_and_warms_exact_cpu_pages(
+    monkeypatch: pytest.MonkeyPatch, hot_pages: int, tail_tokens: int, disable_gc: bool
+) -> None:
+    """Exercise lookup, exact materialization and LocalCPU reference ownership."""
+    import lmcache.v1.cache_engine as cache_engine_module
+    import lmcache.v1.storage_backend.local_cpu_backend as local_cpu_module
+
+    class Page:
+        num_layers = 2
+
+        def __init__(self, key: CacheEngineKey) -> None:
+            self.tokens = mooncake_valid_tokens(key, 4)
+            self.payload = bytes([key.chunk_hash % 256, key.kv_group]) * self.tokens
+            self.refs = 1
+            self.pins = 0
+
+        def is_valid(self) -> bool:
+            return self.refs > 0
+
+        def get_shape(self) -> tuple[int, int]:
+            return (self.tokens, 2)
+
+        def ref_count_up(self) -> None:
+            self.refs += 1
+
+        def ref_count_down(self) -> None:
+            self.refs -= 1
+
+        def unpin(self) -> None:
+            self.pins -= 1
+            assert self.pins >= 0
+
+        @staticmethod
+        def pin_many(pages: list["Page"]) -> bool:
+            for page in pages:
+                page.pins += 1
+            return True
+
+    monkeypatch.setattr(cache_engine_module, "LayerPageMemoryObj", Page)
+    monkeypatch.setattr(local_cpu_module, "LayerPageMemoryObj", Page)
+    local = object.__new__(LocalCPUBackend)
+    local.hot_cache = {}
+    local.cpu_lock = RLock()
+    local.keys_in_request = []
+    local.use_hot = True
+    local.batched_msg_sender = None
+    local._external_retention_traces = ()
+    local._compatible_layer_page = lambda old, new: old is not None
+    local.cache_policy = SimpleNamespace(update_on_put_many=lambda keys: None)
+    storage = _PairStorageManager(remote_pairs=2)
+    engine = _engine(storage)
+    engine.config.pd_role = "sender"
+    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine._shared_local_cpu_backend = lambda: local
+    engine._expected_shared_cpu_chunk_metadata = lambda **kwargs: (
+        (kwargs["num_tokens"], 2),
+        None,
+        None,
+    )
+    engine._validate_rank0_shared_mem_obj = lambda *args, **kwargs: None
+
+    def empty_legacy_tail(**kwargs: object) -> list:
+        assert kwargs["keys_layer"] == []
+        return []
+
+    engine._resolve_shared_rank0_layer_mem_objs = empty_legacy_tail
+
+    def make_key(
+        chunk_hash: int,
+        request_configs: dict | None = None,
+        kv_group: int = 0,
+        valid_tokens: int | None = None,
+    ) -> CacheEngineKey:
+        configs = dict(request_configs or {})
+        if valid_tokens is not None and valid_tokens < 4:
+            configs["lmcache.tag.internal.valid_tokens"] = str(valid_tokens)
+        return CacheEngineKey(
+            "model", 1, 0, chunk_hash, torch.bfloat16, configs, kv_group=kv_group
+        )
+
+    group_keys = {
+        group: [
+            make_key(0x100 + index, kv_group=group, valid_tokens=tokens)
+            for index, tokens in enumerate((4, tail_tokens))
+        ]
+        for group in (0, 1)
+    }
+
+    def tokens(**kwargs: object) -> Iterator[tuple[int, int, CacheEngineKey]]:
+        group = kwargs.get("kv_group", 0)
+        return iter(
+            [(0, 4, group_keys[group][0]), (4, 4 + tail_tokens, group_keys[group][1])]
+        )
+
+    engine.token_database = SimpleNamespace(
+        process_tokens=tokens, _make_key_by_hash=make_key
+    )
+
+    def publish(keys: list[CacheEngineKey]) -> list[Page]:
+        pages = [Page(key) for key in keys]
+        local.batched_submit_layer_pages(keys, pages)
+        return pages
+
+    for group, count in ((0, 2), (1, hot_pages)):
+        for page in publish(group_keys[group][:count]):
+            page.ref_count_down()
+    cached_before = dict(local.hot_cache)
+    remote_gets = []
+
+    def remote_get(keys: list[CacheEngineKey]) -> list[Page]:
+        remote_gets.append(list(keys))
+        return publish(keys)
+
+    storage.storage_backends = {
+        "RemoteBackend": SimpleNamespace(batched_get_layer_pages=remote_get)
+    }
+    storage.get_active_storage_backends = lambda **kwargs: [("LocalCPUBackend", local)]
+    storage.batched_contains_layer_pages = (
+        lambda keys, search, pin: StorageManager.batched_contains_layer_pages(
+            storage, keys, search, pin
+        )
+    )
+    storage.batched_unpin = lambda keys, locations: local.batched_unpin(keys)
+
+    was_enabled = gc.isenabled()
+    if disable_gc:
+        gc.disable()
+    try:
+        for attempt in range(2):
+            req = f"req-{attempt}"
+            assert (
+                engine.lookup(list(range(4 + tail_tokens)), lookup_id=req, pin=True)
+                == 4 + tail_tokens
+            )
+            candidates = list(tokens())
+            plan = engine._remote_fill_retrieve_plan(req, candidates, 1)
+            resolved, count = engine._resolve_shared_rank0_layer_pages(
+                req_id=req,
+                phase="dense_prefix",
+                kv_group=1,
+                keys_layer_major=[group_keys[1]] * 2,
+                page_chunks=2,
+                base_page_keys=group_keys[1],
+                exact_chunk_locations=[location for location, _ in plan],
+            )
+            assert count == 2
+            for key, page in zip(group_keys[1], resolved[0], strict=True):
+                assert page is local.hot_cache[key]
+                assert page.payload == Page(key).payload
+                if key in cached_before:
+                    assert page is cached_before[key]
+                page.unpin()  # Materializer pin, independent of lookup pin.
+                page.ref_count_down()
+            engine.lookup_unpin(req)
+            assert all(
+                page.refs == 1 and page.pins == 0 for page in local.hot_cache.values()
+            )
+        assert remote_gets == ([group_keys[1][hot_pages:]] if hot_pages < 2 else [])
+        assert engine.lookup_pins == {}
+        assert engine._remote_fill_lookup_plans == {}
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize("role", ["sender", "receiver"])
+@pytest.mark.parametrize("other_request", [False, True])
+def test_sender_plan_publication_failure_releases_pins_once(
+    role: str, other_request: bool
+) -> None:
+    """An allocation failure after registering pins must not unpin them twice."""
+
+    class FailingPlanRegistry(dict):
+        def __setitem__(self, key: str, value: object) -> None:
+            raise MemoryError("lookup plan publication failed")
+
+    storage = _PairStorageManager(remote_pairs=2)
+    storage.local_page_hits = {0: 2, 1: 1}
+    pin_counts = defaultdict(int)
+    original_contains = storage.batched_contains_layer_pages
+    original_unpin = storage.batched_unpin
+
+    def contains(keys: list, search: list[str], pin: bool) -> tuple[int, dict]:
+        count, mapping = original_contains(keys, search, pin)
+        if pin:
+            for key in mapping.get("LocalCPUBackend", []):
+                pin_counts[key] += 1
+        return count, mapping
+
+    def unpin(keys: list, locations: list[str]) -> None:
+        original_unpin(keys, locations)
+        for key in keys:
+            pin_counts[key] -= 1
+
+    storage.batched_contains_layer_pages = contains
+    storage.batched_unpin = unpin
+    engine = _engine(storage)
+    engine.config.pd_role = role
+    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    if other_request:
+        assert engine.lookup(list(range(8)), lookup_id="other", pin=True) == 8
+        storage.page_calls.clear()
+    engine._remote_fill_lookup_plans = FailingPlanRegistry(
+        engine._remote_fill_lookup_plans
+    )
+
+    assert engine.lookup(list(range(8)), lookup_id="req", pin=True) == 0
+    expected = [
+        key
+        for keys, _, _ in storage.page_calls
+        for key in keys[: storage.local_page_hits[keys[0].kv_group]]
+    ]
+    assert storage.unpinned == [(expected, ["LocalCPUBackend"])]
+    assert all(count == int(other_request) for count in pin_counts.values())
+    if other_request:
+        assert set(engine._remote_fill_lookup_plans) == {"other"}
+        assert set(engine.lookup_pins) == {"other"}
+        engine.lookup_unpin("other")
+    assert all(count == 0 for count in pin_counts.values())
+    assert engine.lookup_pins == {}
+    assert engine._remote_fill_lookup_plans == {}
 
 
 def test_groups_from_different_persistent_tiers_do_not_form_a_hit() -> None:
