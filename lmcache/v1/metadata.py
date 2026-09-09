@@ -66,6 +66,9 @@ class LMCacheMetadata:
     kv_connector_extra_config: Optional[dict] = None
     """ vLLM max_model_len; used to cap layerwise GPU staging in two-group DSA """
     max_model_len: Optional[int] = None
+    # Derived from native serving topology, never from a deployment override.
+    # Payload format/ownership must still be qualified by the cache integration.
+    mla_cache_tp_replicated: bool = False
 
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""
