@@ -11607,7 +11607,9 @@ class LMCacheConnectorV1Impl:
         snapshots, self._checkpoint_snapshots = self._checkpoint_snapshots, []
         self._build_preemption_controls(controls, output, snapshots)
         metadata = original(self, output)
-        controls.requests = metadata.requests
+        # Preserve ordinary extension flags, especially the async cold-load
+        # trigger used before the no-forward early return.
+        controls.__dict__.update(metadata.__dict__)
         return controls
 
     def _build_preemption_controls(
