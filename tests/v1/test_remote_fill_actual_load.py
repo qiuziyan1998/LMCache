@@ -499,39 +499,6 @@ def test_sender_other_load_mode_preserves_paired_local_lookup() -> None:
 
 
 @pytest.mark.parametrize("pin", [False, True])
-@pytest.mark.parametrize(
-    "local1,remote_pairs", [(0, 2), (1, 2), (2, 2), (2, 1), (2, 0)]
-)
-def test_sender_direct_group0_lookup_only_pins_group1(
-    pin: bool, local1: int, remote_pairs: int
-) -> None:
-    storage = _PairStorageManager(remote_pairs=remote_pairs)
-    storage.local_page_hits = {0: 2, 1: local1}
-    engine = _engine(storage)
-    engine.config.pd_role = "sender"
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
-    engine.config.prefill_group0_direct_hbm = True
-    assert engine.lookup(list(range(8)), lookup_id="req", pin=pin) == 4 * remote_pairs
-    assert [keys[0].kv_group for keys, _, _ in storage.page_calls] == (
-        [1] if pin and remote_pairs else []
-    )
-    if pin and remote_pairs:
-        assert [
-            chunk.locations_by_group
-            for chunk in engine._remote_fill_lookup_plans["req"].chunks
-        ] == [
-            ("RemoteBackend", "LocalCPUBackend" if i < local1 else "RemoteBackend")
-            for i in range(remote_pairs)
-        ]
-        assert all(
-            key.kv_group == 1
-            for key in engine.lookup_pins["req"].get("LocalCPUBackend", [])
-        )
-        engine.lookup_unpin("req")
-    assert engine.lookup_pins == {}
-
-
-@pytest.mark.parametrize("pin", [False, True])
 @pytest.mark.parametrize("failure", ["exception", "count", "mapping"])
 def test_sender_group1_overlay_failure_releases_all_returned_pins(
     pin: bool, failure: str

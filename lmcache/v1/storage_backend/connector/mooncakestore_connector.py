@@ -2416,11 +2416,7 @@ class MooncakestoreConnector(RemoteConnector):
                 f"Mooncake direct page load failed or was short: {failed[:4]}"
             )
             error.failed_pages = failed  # type: ignore[attr-defined]
-            try:
-                raise error
-            finally:
-                if getattr(self.config, "prefill_group0_direct_hbm", False):
-                    del error
+            raise error
         trace_mooncake_keys(
             "get", page_keys, statuses, api="connector.direct_npu_page_get"
         )

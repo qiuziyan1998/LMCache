@@ -1828,9 +1828,25 @@ class LMCacheConnectorV1Impl:
         )
         self._apply_extra_config(config, vllm_config)
         self.config = config
+        if getattr(config, "prefill_group0_direct_hbm", False):
+            select = getattr(type(self), "prefill_direct_type", None)
+            if not callable(select):
+                raise RuntimeError("Prefill direct loading requires LMCache-Ascend")
+            config.validate()
+            selected = select()
+            if not issubclass(selected, type(self)):
+                raise TypeError("Prefill adapter must extend the configured adapter")
+            # Both classes have the same instance layout. Specialize once,
+            # before services start; serving methods do not dispatch on a knob.
+            self.__class__ = selected
 
         service_factory = VllmServiceFactory(config, vllm_config, role.name.lower())
         self._manager = LMCacheManager(config, service_factory, connector=self)
+        engine = self._manager.lmcache_engine
+        if engine is not None and bool(
+            getattr(type(engine), "prefill_direct_active", False)
+        ) != bool(getattr(config, "prefill_group0_direct_hbm", False)):
+            raise ValueError("Prefill direct loading is fixed at engine startup")
 
         # Start services managed by LMCacheManager
         self._manager.start_services()
@@ -1928,9 +1944,6 @@ class LMCacheConnectorV1Impl:
         self._deferred_latent_pending: set[LayerwiseSaveKey] = set()
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.enable_sparse_attention = config.enable_sparse_attention
-        self._prefill_group0_direct_hbm = getattr(
-            config, "prefill_group0_direct_hbm", False
-        )
         self._retrieve_stats_interval_seconds = (
             _retrieve_stats_interval_seconds()
         )
@@ -6183,18 +6196,6 @@ class LMCacheConnectorV1Impl:
         )
         if callable(preflight):
             preflight(self._kvcaches_for_group(1))
-        if getattr(self, "_prefill_group0_direct_hbm", False):
-            preflight = getattr(
-                self.lmcache_engine, "preflight_prefill_group0_direct_hbm", None
-            )
-            loader = getattr(
-                self.lmcache_engine, "retrieve_prefill_group0_direct", None
-            )
-            if not callable(preflight) or not callable(loader):
-                raise RuntimeError(
-                    "prefill_group0_direct_hbm requires the Ascend direct loader"
-                )
-            preflight(self._kvcaches_for_group(0))
 
     def seal_sparse_destination_layout(self) -> None:
         """Register fixed Group-0 buffers after successful final staged capture.
@@ -7340,10 +7341,6 @@ class LMCacheConnectorV1Impl:
             return
 
         if len(self.kv_caches) == 0:
-            if getattr(self, "_prefill_group0_direct_hbm", False):
-                raise RuntimeError(
-                    "prefill_group0_direct_hbm requires register_kv_caches preflight"
-                )
             logger.warning(
                 "Please update LMCacheConnector, "
                 "use register_kv_caches to init kv_caches"
@@ -7413,10 +7410,6 @@ class LMCacheConnectorV1Impl:
             tokens = request.token_ids
             assert request.load_spec is not None
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
-            prefill_direct = (
-                not request.is_sparse_decode
-                and getattr(self, "_prefill_group0_direct_hbm", False)
-            )
             sparse_bound_state = (
                 self._worker_retrieve_state_for_warm_ref(request)
                 if request.sparse_warm_ref
@@ -7439,12 +7432,8 @@ class LMCacheConnectorV1Impl:
                 slot_mapping = request.slot_mapping[0]
             else:
                 assert request.slot_mapping
-                slot_mapping = (
-                    request.slot_mapping[0]
-                    if prefill_direct
-                    else request.slot_mapping[0].to(
-                        device=self.device, dtype=torch.long
-                    )
+                slot_mapping = request.slot_mapping[0].to(
+                    device=self.device, dtype=torch.long
                 )
 
             if not request.is_sparse_decode:
@@ -7942,94 +7931,75 @@ class LMCacheConnectorV1Impl:
                     retrieve_slot_mapping = slot_mapping
                     if lmcache_cached_tokens < len(slot_mapping):
                         retrieve_slot_mapping = slot_mapping[:lmcache_cached_tokens]
-                    if prefill_direct:
-                        # Retire a prior load lease without releasing fresh lookup pins.
-                        self._drop_worker_retrieve_state(
-                            request.req_id, release_lookup_pins=False
-                        )
-                        dsa_two_groups = self._is_dsa_two_groups()
-                        dense_preflight_state = {}
-                        retain_dense_seed = False
-                        indexer_cache = {"_retain_dense_sources_until_save": True}
-                        layerwise_retriever = (
-                            self.lmcache_engine.retrieve_prefill_group0_direct(
-                                retrieve_tokens, token_mask, kvcaches=kvcaches,
-                                slot_mapping=retrieve_slot_mapping,
-                                req_id=request.req_id,
-                                request_configs=request.request_configs,
-                                shared_cpu_request_preflight_state=dense_preflight_state,
-                            )
-                        )
-                    else:
-                        retrieve_state = self._worker_retrieve_state.get(
-                            request.req_id
-                        )
-                        if retrieve_state is None:
-                            retrieve_state = WorkerRetrieveState(req_id=request.req_id)
-                        dsa_two_groups = self._is_dsa_two_groups()
-                        shared_cpu_enabled = bool(
-                            getattr(
-                                self.lmcache_engine,
-                                "enable_shared_cpu_cache",
-                                False,
-                            )
-                        )
-                        supports_dense_retention = getattr(
+                    retrieve_state = self._worker_retrieve_state.get(
+                        request.req_id
+                    )
+                    if retrieve_state is None:
+                        retrieve_state = WorkerRetrieveState(req_id=request.req_id)
+                    dsa_two_groups = self._is_dsa_two_groups()
+                    shared_cpu_enabled = bool(
+                        getattr(
                             self.lmcache_engine,
-                            "supports_dense_sparse_cache_retention",
-                            None,
+                            "enable_shared_cpu_cache",
+                            False,
                         )
-                        retain_dense_seed = (
-                            shared_cpu_enabled
-                            and getattr(self, "enable_sparse_attention", False)
-                            and callable(supports_dense_retention)
-                            and supports_dense_retention()
-                        )
-                        if retain_dense_seed and (
-                            retrieve_state.shared_request_active
-                            or retrieve_state.dense_prefix_seed
-                            or retrieve_state.group_has_data(0, dsa_two_groups)
-                            or (
-                                dsa_two_groups
-                                and retrieve_state.group_has_data(
-                                    1,
-                                    dsa_two_groups=True,
-                                )
+                    )
+                    supports_dense_retention = getattr(
+                        self.lmcache_engine,
+                        "supports_dense_sparse_cache_retention",
+                        None,
+                    )
+                    retain_dense_seed = (
+                        shared_cpu_enabled
+                        and getattr(self, "enable_sparse_attention", False)
+                        and callable(supports_dense_retention)
+                        and supports_dense_retention()
+                    )
+                    if retain_dense_seed and (
+                        retrieve_state.shared_request_active
+                        or retrieve_state.dense_prefix_seed
+                        or retrieve_state.group_has_data(0, dsa_two_groups)
+                        or (
+                            dsa_two_groups
+                            and retrieve_state.group_has_data(
+                                1,
+                                dsa_two_groups=True,
                             )
-                        ):
-                            self._release_shared_worker_retrieve_state(
-                                retrieve_state,
-                                self.lmcache_engine,
-                            )
-                            retrieve_state = WorkerRetrieveState(req_id=request.req_id)
-                        dense_preflight_state: dict[str, Any] = {}
-                        latent_cache = retrieve_state.cache_kwargs(
-                            0,
-                            dsa_two_groups,
                         )
-                        indexer_cache = (
-                            retrieve_state.cache_kwargs(1, dsa_two_groups=True)
-                            if dsa_two_groups
-                            else None
+                    ):
+                        self._release_shared_worker_retrieve_state(
+                            retrieve_state,
+                            self.lmcache_engine,
                         )
-                        if retain_dense_seed:
-                            retrieve_state.dense_prefix_seed = True
-                            retrieve_state.metadata_warm = True
-                        layerwise_retriever = self.lmcache_engine.retrieve_layer(
-                            retrieve_tokens,
-                            token_mask,
-                            kvcaches=kvcaches,
-                            slot_mapping=retrieve_slot_mapping,
-                            vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                            sync=sync,
-                            kv_group=0,
-                            req_id=request.req_id,
-                            request_configs=request.request_configs,
-                            shared_cpu_request_ordinal=idx,
-                            shared_cpu_request_preflight_state=dense_preflight_state,
-                            _retain_shared_dense_cache=retain_dense_seed,
-                            **(latent_cache if retain_dense_seed else {}),
-                        )
+                        retrieve_state = WorkerRetrieveState(req_id=request.req_id)
+                    dense_preflight_state: dict[str, Any] = {}
+                    latent_cache = retrieve_state.cache_kwargs(
+                        0,
+                        dsa_two_groups,
+                    )
+                    indexer_cache = (
+                        retrieve_state.cache_kwargs(1, dsa_two_groups=True)
+                        if dsa_two_groups
+                        else None
+                    )
+                    if retain_dense_seed:
+                        retrieve_state.dense_prefix_seed = True
+                        retrieve_state.metadata_warm = True
+                    layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                        retrieve_tokens,
+                        token_mask,
+                        kvcaches=kvcaches,
+                        slot_mapping=retrieve_slot_mapping,
+                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        sync=sync,
+                        kv_group=0,
+                        req_id=request.req_id,
+                        request_configs=request.request_configs,
+                        shared_cpu_request_ordinal=idx,
+                        shared_cpu_request_preflight_state=dense_preflight_state,
+                        _retain_shared_dense_cache=retain_dense_seed,
+                        **(latent_cache if retain_dense_seed else {}),
+                    )
                     self.layerwise_retrievers.append(
                         (layerwise_retriever, None)
                     )
@@ -8095,10 +8065,7 @@ class LMCacheConnectorV1Impl:
                                 dense_preflight_state
                             ),
                             _retain_shared_dense_cache=retain_dense_seed,
-                            **(
-                                indexer_cache
-                                if retain_dense_seed or prefill_direct else {}
-                            ),
+                            **(indexer_cache if retain_dense_seed else {}),
                         )
                         self.layerwise_retrievers[-1] = (
                             layerwise_retriever,
@@ -8113,10 +8080,6 @@ class LMCacheConnectorV1Impl:
                         indexer_retriever,
                     )
 
-                    if prefill_direct:
-                        # G1 keeps its hot-cache reference and per-load engine
-                        # lease, without manufacturing a CPU sparse seed for G0.
-                        continue
                     if retain_dense_seed:
                         retrieve_state.location = "LocalCPUBackend"
                         retrieve_state.token_count = len(retrieve_tokens)

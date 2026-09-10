@@ -634,22 +634,12 @@ class RemoteBackend(StorageBackendInterface):
                 except NativeExternalPageTransferUnknownError as error:
                     self._external_page_fatal_error = error
                     raise
-                except BaseException:
-                    if getattr(self.config, "prefill_group0_direct_hbm", False):
-                        del future
-                    raise
                 return
             error = NativeExternalPageTransferUnknownError(
                 "get", cast(asyncio.Future[Any], future)
             )
             self._external_page_fatal_error = error
             raise error from timeout_error
-        except BaseException:
-            # Opted-in P errors must not retain owners through a Future cycle
-            # with cyclic GC disabled. Unknown DMA above keeps its owner latch.
-            if getattr(self.config, "prefill_group0_direct_hbm", False):
-                del future
-            raise
 
     def batched_external_pages_exist(
         self, keys: Sequence[CacheEngineKey]
