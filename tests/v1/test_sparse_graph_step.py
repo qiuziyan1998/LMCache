@@ -13,7 +13,7 @@ import pytest
 import torch
 
 
-def load_prepare_method() -> Any:
+def load_prepare_method(name: str = "prepare_sparse_graph_step") -> Any:
     """Load the real method without vLLM/NPU import-time dependencies."""
     path = (
         Path(__file__).resolve().parents[2]
@@ -28,8 +28,7 @@ def load_prepare_method() -> Any:
     method = next(
         node
         for node in cls.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "prepare_sparse_graph_step"
+        if isinstance(node, ast.FunctionDef) and node.name == name
     )
     module = ast.Module(
         body=[
@@ -45,21 +44,37 @@ def load_prepare_method() -> Any:
         "_lmcache_nvtx_annotate": lambda fn: fn,
     }
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
-    return namespace["prepare_sparse_graph_step"]
+    return namespace[name]
 
 
 class FakeAdapter:
     prepare_sparse_graph_step = load_prepare_method()
+    _sparse_decode_requires_index_materialization = load_prepare_method(
+        "_sparse_decode_requires_index_materialization"
+    )
 
-    def __init__(self, *, warm: bool = True, draft: bool = True) -> None:
-        self.num_layers = 3 if draft else 2
+    def __init__(
+        self,
+        *,
+        warm: bool = True,
+        draft: bool = True,
+        native_index: bool = False,
+        target_layers: int = 2,
+    ) -> None:
+        self.num_layers = target_layers + int(draft)
         self._latent_layer_names = [f"layers.{i}.attn" for i in range(self.num_layers)]
         self.current_layer = 0
         self.device = "cpu"
+        self.kv_role = "kv_both"
+        self.native_index = native_index
+        self.bootstrap_completes = True
         self.request = SimpleNamespace(
             req_id="r1",
             is_sparse_decode=True,
             load_spec=SimpleNamespace(lmcache_cached_tokens=512),
+            shared_index_skipped=native_index,
+            resumed_from_preemption=False,
+            disagg_spec=None,
         )
         self.source = SimpleNamespace(
             layers=(object(),) * self.num_layers, total_tokens=512
@@ -67,8 +82,8 @@ class FakeAdapter:
         self.state = SimpleNamespace(
             prepared_sparse_sources={0: self.source} if warm else {},
             shared_request_active=warm,
-            indexer_npu_resident=warm,
-            indexer_npu_materialization_pending=not warm,
+            indexer_npu_resident=warm and not native_index,
+            indexer_npu_materialization_pending=not warm and not native_index,
             slot_mapping=torch.zeros(512),
             decode_ret_mask=None,
         )
@@ -81,7 +96,7 @@ class FakeAdapter:
         self.waits: list[str] = []
         self.suffix_kwargs: dict[str, Any] = {}
         self.lmcache_engine = SimpleNamespace(
-            enable_shared_cpu_cache=True,
+            enable_shared_cpu_cache=not native_index,
             is_healthy=lambda: True,
             retrieve_layer_head_token_wise=self.retrieve,
         )
@@ -91,6 +106,9 @@ class FakeAdapter:
         yield None
 
     def _is_dsa_two_groups(self) -> bool:
+        return True
+
+    def _shared_cpu_materialize_index_on_decode_cold(self) -> bool:
         return True
 
     def _kvcaches_for_group(self, group: int) -> list[Any]:
@@ -108,10 +126,10 @@ class FakeAdapter:
         assert kwargs["target_slot_mapping"].eq(-1).all()
         self.waits.append(name)
         self.current_layer += 1
-        if self.current_layer == self.num_layers:
+        if self.current_layer == self.num_layers and self.bootstrap_completes:
             self.state.prepared_sparse_sources = {0: self.source}
             self.state.shared_request_active = True
-            self.state.indexer_npu_resident = True
+            self.state.indexer_npu_resident = not self.native_index
             self.state.indexer_npu_materialization_pending = False
             self._drain_layerwise_retrievers()
 
@@ -237,3 +255,99 @@ def test_batch_empty_source_is_explicit_per_request() -> None:
         request_ids=("r0", "r2"),
         frontiers=(0, 0),
     ) == (None, None)
+
+
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("target_layers", [2, 8])
+def test_local_prefill_index_does_not_require_lmcache_materialization(
+    warm: bool, draft: bool, target_layers: int
+) -> None:
+    adapter = FakeAdapter(
+        warm=warm, draft=draft, native_index=True, target_layers=target_layers
+    )
+    # prepare_sparse_graph_step executes the real eager materialization policy,
+    # loaded above, rather than an unconditional index-ready test stub.
+    source = adapter.prepare_sparse_graph_step(
+        tuple(f"layers.{i}.attn" for i in range(target_layers)),
+        request_ids=("r1",),
+        frontiers=(512,),
+    )
+    assert source == (adapter.source,)
+    assert not adapter.state.indexer_npu_resident
+    assert len(adapter.waits) == (0 if warm else adapter.num_layers)
+    assert len(adapter.layerwise_retrievers) == int(draft)
+
+
+def test_native_index_still_bootstraps_growing_latent_history() -> None:
+    adapter = FakeAdapter(native_index=True)
+    adapter.source = SimpleNamespace(
+        layers=(object(),) * adapter.num_layers, total_tokens=768
+    )
+    adapter.request.load_spec.lmcache_cached_tokens = 768
+    source = adapter.prepare_sparse_graph_step(
+        ("layers.0.attn", "layers.1.attn"),
+        request_ids=("r1",),
+        frontiers=(768,),
+    )
+    assert source[0].total_tokens == 768
+    assert len(adapter.waits) == adapter.num_layers
+    assert not adapter.state.indexer_npu_resident
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["shared", "consumer", "resumed", "disaggregated", "no_skip", "pending"],
+)
+def test_native_index_exception_does_not_bypass_other_readiness_guards(
+    case: str,
+) -> None:
+    adapter = FakeAdapter(native_index=True)
+    adapter.bootstrap_completes = False
+    if case == "shared":
+        adapter.lmcache_engine.enable_shared_cpu_cache = True
+    elif case == "consumer":
+        adapter.kv_role = "kv_consumer"
+    elif case == "resumed":
+        adapter.request.resumed_from_preemption = True
+    elif case == "disaggregated":
+        adapter.request.disagg_spec = object()
+    elif case == "no_skip":
+        adapter.request.shared_index_skipped = False
+    else:
+        adapter.state.indexer_npu_materialization_pending = True
+    with pytest.raises(RuntimeError, match="index_resident=False"):
+        adapter.prepare_sparse_graph_step(
+            ("layers.0.attn", "layers.1.attn"),
+            request_ids=("r1",),
+            frontiers=(512,),
+        )
+
+
+def test_native_index_never_hides_short_or_missing_latent_source() -> None:
+    for warm in (False, True):
+        adapter = FakeAdapter(warm=warm, native_index=True)
+        adapter.bootstrap_completes = False
+        with pytest.raises(RuntimeError) as error:
+            adapter.prepare_sparse_graph_step(
+                ("layers.0.attn", "layers.1.attn"),
+                request_ids=("r1",),
+                frontiers=(768,),
+            )
+        assert "req_id=r1 frontier=768" in str(error.value)
+        assert "source_tokens=" + ("512" if warm else "None") in str(error.value)
+        assert "native_index=True" in str(error.value)
+
+
+def test_native_index_requires_all_registered_index_layers() -> None:
+    class MissingIndexLayer(FakeAdapter):
+        def _kvcaches_for_group(self, group: int) -> list[Any]:
+            return [torch.zeros(1)] * (self.num_layers - int(group == 1))
+
+    adapter = MissingIndexLayer(native_index=True)
+    with pytest.raises(RuntimeError, match="native_index=False"):
+        adapter.prepare_sparse_graph_step(
+            ("layers.0.attn", "layers.1.attn"),
+            request_ids=("r1",),
+            frontiers=(512,),
+        )

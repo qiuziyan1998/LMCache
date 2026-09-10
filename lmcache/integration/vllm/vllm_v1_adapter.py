@@ -6896,6 +6896,9 @@ class LMCacheConnectorV1Impl:
         Bootstrap advances metadata and loads the top-k-independent index cache
         using empty latent selections. Warm steps do not advance target-layer
         generators. Any draft suffix keeps its normal layerwise retrieval.
+        Local non-resumed kv_both requests may reuse their native prefill index
+        when start_load_kv explicitly skipped index retrieval under that policy.
+        Shared, consumer and restored requests still require materialization.
         The caller must finish device work before releasing request ownership.
         """
         requests = tuple(self._layerwise_requests)
@@ -6928,6 +6931,26 @@ class LMCacheConnectorV1Impl:
                 "ordered target-layer prefix; no layerwise fallback was taken."
             )
         shared = getattr(self.lmcache_engine, "enable_shared_cpu_cache", False)
+        # Local kv_both intentionally skips group-1 retrieval: the live request
+        # already owns its prefill index in vLLM's NPU cache. start_load_kv marks
+        # that skip and clears LMCache's *materialized* index state. Requiring
+        # indexer_npu_resident unconditionally rejects this supported eager
+        # policy as soon as a decode window needs a positive historical source.
+        # Do not extend that assumption to shared/consumer, resumed, disaggregated
+        # or incompletely registered index caches.
+        native_index_requests = {
+            request.req_id
+            for request in requests
+            if not shared
+            and getattr(self, "kv_role", None) == "kv_both"
+            and getattr(request, "shared_index_skipped", False)
+            and not getattr(request, "resumed_from_preemption", False)
+            and getattr(request, "disagg_spec", None) is None
+            and len(self._kvcaches_for_group(1)) == self.num_layers
+            and not self._sparse_decode_requires_index_materialization(
+                request, shared_cpu_enabled=False
+            )
+        }
 
         def source_ready(req_id: str, frontier: int) -> bool:
             if frontier == 0:
@@ -6938,7 +6961,7 @@ class LMCacheConnectorV1Impl:
                 source is not None
                 and source.total_tokens >= frontier
                 and (not shared or state.shared_request_active)
-                and state.indexer_npu_resident
+                and (state.indexer_npu_resident or req_id in native_index_requests)
                 and not state.indexer_npu_materialization_pending
                 and len(source.layers) == self.num_layers
             )
@@ -6969,7 +6992,28 @@ class LMCacheConnectorV1Impl:
             source_ready(req_id, frontier)
             for req_id, frontier in zip(request_ids, frontiers, strict=True)
         ):
-            raise RuntimeError("Full SFA graph source/index cache preparation failed")
+            details = []
+            for req_id, frontier in zip(request_ids, frontiers, strict=True):
+                if source_ready(req_id, frontier):
+                    continue
+                state = self._worker_retrieve_state.get(req_id)
+                source = None if state is None else state.prepared_sparse_sources.get(0)
+                details.append(
+                    f"req_id={req_id} frontier={frontier} "
+                    f"source_tokens={None if source is None else source.total_tokens} "
+                    f"source_layers={0 if source is None else len(source.layers)} "
+                    f"expected_layers={self.num_layers} "
+                    f"native_index={req_id in native_index_requests} "
+                    f"index_resident={getattr(state, 'indexer_npu_resident', False)} "
+                    "index_pending="
+                    f"{getattr(state, 'indexer_npu_materialization_pending', False)} "
+                    f"shared_active={getattr(state, 'shared_request_active', False)}"
+                )
+            raise RuntimeError(
+                "Full SFA graph source/index cache preparation failed: "
+                f"kv_role={getattr(self, 'kv_role', None)} shared_cpu={shared}; "
+                + "; ".join(details)
+            )
         sources = tuple(
             self._worker_retrieve_state[req_id].prepared_sparse_sources[0]
             if frontier
