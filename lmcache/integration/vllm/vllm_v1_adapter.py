@@ -44,6 +44,9 @@ from lmcache.integration.vllm.cold_load import (
 from lmcache.integration.vllm.decode_window_commit import (
     publish_delayed_decode_window_commit,
 )
+from lmcache.integration.vllm.preemption_checkpoint import (
+    CaptureSpec, CheckpointResult, PendingCheckpoint, SealSpec, choose_checkpoint_end,
+)
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
@@ -103,6 +106,18 @@ RETRIEVE_STATS_INTERVAL_SECONDS_ENV = (
     "VLLM_ASCEND_LMCACHE_RETRIEVE_STATS_INTERVAL_SECONDS"
 )
 LayerwiseSaveKey = tuple[str, str, int, int, int]
+
+
+def completed_cold_resume_state(request: Any, state: Any) -> bool:
+    """Match completed worker state to the exact load generation being promoted."""
+    spec = request.load_spec
+    return bool(spec is not None and getattr(spec, "dsa_cold_compact_resume", False)
+                and state is not None
+                and getattr(state, "completed_cold_load_generation", None)
+                == getattr(spec, "dsa_cold_load_generation", -1)
+                and state.token_count == spec.lmcache_cached_tokens
+                and state.indexer_npu_resident
+                and state.prepared_sparse_sources.get(0) is not None)
 
 
 def _clear_terminal_load_tracebacks(
@@ -1793,6 +1808,10 @@ class ReqMeta:
 @dataclass
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
+    # Class defaults do not add fields to ordinary metadata serialization.
+    preemption_captures = ()
+    preemption_seals = ()
+    preemption_cancels = ()
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -1804,7 +1823,15 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
         self.requests.append(req_meta)
 
 
+@dataclass
+class PreemptionConnectorMetadata(LMCacheConnectorMetadata):
+    preemption_captures: tuple[CaptureSpec, ...] = ()
+    preemption_seals: tuple[SealSpec, ...] = ()
+    preemption_cancels: tuple[tuple[str, int], ...] = ()
+
+
 class LMCacheConnectorV1Impl:
+    supports_preemption_checkpoint = False
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -1828,6 +1855,11 @@ class LMCacheConnectorV1Impl:
         )
         self._apply_extra_config(config, vllm_config)
         self.config = config
+        if getattr(config, "decode_preemption_checkpoint", False):
+            self._validate_preemption_checkpoint_setup(config, vllm_config)
+        self._preemption_checkpoints: dict[str, PendingCheckpoint] = {}
+        self._checkpoint_snapshots: list[tuple] = []
+        self._checkpoint_cancels: list[tuple[str, int]] = []
 
         service_factory = VllmServiceFactory(config, vllm_config, role.name.lower())
         self._manager = LMCacheManager(config, service_factory, connector=self)
@@ -2662,7 +2694,8 @@ class LMCacheConnectorV1Impl:
             or bound_state.shared_index_status != "present"
             or not bound_state.indexer_npu_resident
             or request.load_spec is None
-            or bool(getattr(request, "resumed_from_preemption", False))
+            or (bool(getattr(request, "resumed_from_preemption", False))
+                and not completed_cold_resume_state(request, bound_state))
         ):
             return INDEXER_RETRIEVE_FULL
         metadata_current = (
@@ -3925,6 +3958,18 @@ class LMCacheConnectorV1Impl:
                 if request_blocks.intersection(invalid_blocks):
                     cold_failed.add(req_id)
                     cold_loaded.discard(req_id)
+                    checkpoints = getattr(self, "_preemption_checkpoints", None)
+                    checkpoint = checkpoints.get(req_id) if checkpoints else None
+                    request = self._unfinished_requests.get(req_id) if checkpoint is not None else None
+                    if checkpoint is not None and request is not None and (
+                        checkpoint.capture.generation == request.num_preemptions
+                    ):
+                        # This is a failed restore, not a late writer reply.
+                        # Do not retry its generated prefix indefinitely.
+                        checkpoint.status = "failed"
+                        request.kv_resume_checkpoint = None
+                        self._resume_lookup_queries.pop(req_id, None)
+                        self.lookup_client.clear_lookup_status(req_id)
             for req_id in finished_recving:
                 load_spec = self.load_specs.get(req_id)
                 request_blocks = validation_blocks.pop(req_id, None)
@@ -4971,7 +5016,7 @@ class LMCacheConnectorV1Impl:
     def _should_invalidate_worker_retrieve_state(
         self, request: ReqMeta, token_count: int
     ) -> bool:
-        if request.resumed_from_preemption:
+        if request.resumed_from_preemption and not self._completed_cold_resume(request):
             return True
         state = self._worker_retrieve_state.get(request.req_id)
         if state is None:
@@ -9648,6 +9693,7 @@ class LMCacheConnectorV1Impl:
             # the other workers; explicit finish/abort remains the
             # authoritative cleanup path.
             state._dsa_cold_prune_protected = True
+            state.completed_cold_load_generation = generation
         published_at = serving_perf_now() if perf_enabled else 0.0
         if perf_enabled:
             serving_perf_log(
@@ -10007,6 +10053,19 @@ class LMCacheConnectorV1Impl:
                 "_dsa_group1_direct_hbm_deferred_req_ids", req_id
             )
         resumed = getattr(request, "status", None) == RequestStatus.PREEMPTED
+        checkpoints = getattr(self, "_preemption_checkpoints", None)
+        checkpoint = checkpoints.get(req_id) if checkpoints else None
+        if checkpoint is not None and checkpoint.capture.generation == request.num_preemptions:
+            if checkpoint.status not in ("ready", "failed"):
+                if not checkpoint.expire(time.monotonic(), self.config.blocking_timeout_secs):
+                    return None
+                request.kv_resume_checkpoint = None
+                self._arm_preemption_controls()
+                self._resume_lookup_queries.pop(req_id, None)
+                if self.lookup_client is not None:
+                    self.lookup_client.clear_lookup_status(req_id)
+        else:
+            checkpoint = None
         prompt_token_ids = getattr(request, "prompt_token_ids", None)
         request_prompt_tokens = len(prompt_token_ids or ())
         query_end = request.num_tokens
@@ -10031,6 +10090,9 @@ class LMCacheConnectorV1Impl:
                     ):
                         query_end = decode_committed_end
                         query_scope = "decode_committed"
+                if checkpoint is not None and checkpoint.status == "ready":
+                    query_end = checkpoint.end
+                    query_scope = "preemption_checkpoint"
                 query = (query_end, query_scope, decode_committed_end)
                 self._resume_lookup_queries[req_id] = query
             query_end, query_scope, decode_committed_end = query
@@ -10132,6 +10194,12 @@ class LMCacheConnectorV1Impl:
         # This will be removed in the future if vLLM's scheduler provides
         # a better support for this case.
         full_request_hit = num_external_hit_tokens == request.num_tokens
+        if (
+            query_scope == "preemption_checkpoint"
+            and num_external_hit_tokens == query_end
+            and query_end < request.num_tokens
+        ):
+            request.kv_resume_checkpoint = (request.num_preemptions, request.num_tokens, query_end)
         full_resumed_query_hit = (
             resumed
             and query_scope != "all_tokens"
@@ -10969,24 +11037,7 @@ class LMCacheConnectorV1Impl:
             if request.req_id.startswith("mock_req"):
                 continue
             load_spec = self.load_specs.pop(request.req_id, None)
-            cold_loaded_ids = getattr(self, "_dsa_cold_loaded_req_ids", None)
-            cold_compact_resume = bool(
-                cold_loaded_ids is not None and request.req_id in cold_loaded_ids
-            )
-            if cold_compact_resume:
-                assert cold_loaded_ids is not None
-                cold_loaded_ids.remove(request.req_id)
-                if not cold_loaded_ids:
-                    del self._dsa_cold_loaded_req_ids
-                if load_spec is None:
-                    raise RuntimeError("Cold compact resume lost its LoadSpec")
-                delattr(load_spec, "dsa_cold_compact_load")
-                # The scheduler calls update_state_after_alloc(..., 0) when it
-                # promotes a completed asynchronous load. That callback clears
-                # can_load for ordinary requests, but a cold resume still needs
-                # the prepared per-layer Group-0 transfer on its first forward.
-                load_spec.can_load = True
-                load_spec.dsa_cold_compact_resume = True
+            cold_compact_resume = self._take_completed_cold_load(request.req_id, load_spec)
             num_tokens_to_compute = (
                 request.num_computed_tokens
                 + scheduler_output.num_scheduled_tokens[request.req_id]
@@ -11158,6 +11209,11 @@ class LMCacheConnectorV1Impl:
                     f"but expected {expected} "
                     f"(full_hit_adj={full_hit_adj})"
                 )
+                if self._take_completed_cold_load(req_id, load_spec):
+                    self._add_completed_cold_resume(
+                        meta, request_tracker, request, new_token_ids, new_block_ids, load_spec
+                    )
+                    continue
 
             # When retrieve fail, vllm will call _handle_invalid_blocks to
             # reset request.num_computed_tokens, this will lead to
@@ -11368,6 +11424,11 @@ class LMCacheConnectorV1Impl:
         # This callback runs in the scheduler process. Worker-owned state is
         # released when the same request ID reaches worker-side get_finished().
         req_id = request.request_id
+        # Worker cancellation is carried by finished_req_ids; physical buffer
+        # retirement remains owned by its transfer, not this scheduler record.
+        checkpoints = getattr(self, "_preemption_checkpoints", None)
+        if checkpoints:
+            checkpoints.pop(req_id, None)
         self._cold_perf_lookup_started.pop(request.request_id, None)
         self._resume_lookup_queries.pop(request.request_id, None)
         self._dsa_kv_policy_states.pop(request.request_id, None)
@@ -11456,3 +11517,173 @@ class LMCacheConnectorV1Impl:
         if self.lmcache_engine is not None:
             return self.lmcache_engine.get_kv_events()
         return []
+
+    def accept_preemption_result(self, result: CheckpointResult) -> None:
+        """Record a writer acknowledgement without sealing optimistic history."""
+        request = self._unfinished_requests.get(result.req_id)
+        if request is None or request.num_preemptions != result.generation:
+            return
+        pending = self._preemption_checkpoints.get(result.req_id)
+        if pending is not None and pending.accept(result):
+            if pending.status == "captured" or pending.cancel_pending:
+                self._arm_preemption_controls()
+            if serving_perf_enabled():
+                serving_perf_log(logger, "decoder_preemption_checkpoint", req_id=result.req_id,
+                                 generation=result.generation, status=result.status,
+                                 end=result.end, reason=result.reason, **(result.timings_ms or {}))
+            self._resume_lookup_queries.pop(result.req_id, None)
+            if self.lookup_client is not None:
+                self.lookup_client.clear_lookup_status(result.req_id)
+
+    def _validate_preemption_checkpoint_setup(self, config: Any, vllm_config: Any) -> None:
+        raise ValueError("decode_preemption_checkpoint requires the Ascend checkpoint extension")
+
+    def _take_completed_cold_load(self, req_id: str, load_spec: Optional[LoadSpec]) -> bool:
+        ids = getattr(self, "_dsa_cold_loaded_req_ids", None)
+        if ids is None or req_id not in ids:
+            return False
+        if load_spec is None:
+            raise RuntimeError("Cold compact resume lost its LoadSpec")
+        ids.remove(req_id)
+        if hasattr(load_spec, "dsa_cold_compact_load"):
+            delattr(load_spec, "dsa_cold_compact_load")
+        load_spec.can_load = True
+        load_spec.dsa_cold_compact_resume = True
+        return True
+
+    def _completed_cold_resume(self, request: ReqMeta) -> bool:
+        return completed_cold_resume_state(request, self._worker_retrieve_state.get(request.req_id))
+
+    def _add_completed_cold_resume(
+        self,
+        meta: LMCacheConnectorMetadata,
+        tracker: RequestTracker,
+        request: Any,
+        new_tokens: list[int],
+        new_blocks: Any,
+        spec: LoadSpec,
+    ) -> None:
+        """Promote completed loading only inside the existing resumed-request branch."""
+        tokens = list(request.all_token_ids)
+        tracker.update(
+            new_tokens,
+            new_blocks,
+            preempted=True,
+            lmcache_cached_tokens=spec.lmcache_cached_tokens,
+            vllm_cached_tokens=spec.vllm_cached_tokens,
+            all_token_ids=tokens,
+        )
+        frontier = int(spec.dsa_remap_frontier)
+        tracker.dsa_nonresident_frontier = max(
+            tracker.dsa_nonresident_frontier, frontier
+        )
+        tracker.sparse_remap_frontier = frontier
+        tracker.seed_sparse_decode_tokens(tokens, spec.lmcache_cached_tokens)
+        self._add_decode_window_save_metas(meta, tracker)
+        request_meta = self._build_request_meta(tracker, spec, is_sparse_decode=True)
+        if request_meta is not None:
+            request_meta.resumed_from_preemption = True
+            meta.add_request(request_meta)
+
+    def prepare_preemption_checkpoint(self, snapshot: tuple) -> None:
+        """Arm one metadata emission from the scheduler's preemption branch."""
+        self._checkpoint_snapshots.append(snapshot)
+        self._arm_preemption_controls()
+
+    def _arm_preemption_controls(self) -> None:
+        if "_checkpoint_build_original" not in self.__dict__:
+            from types import MethodType
+            from weakref import proxy
+
+            self._checkpoint_build_original = type(self).build_connector_meta
+            self.build_connector_meta = MethodType(type(self)._build_checkpoint_connector_meta, proxy(self))
+
+    def _build_checkpoint_connector_meta(self, output: Any) -> KVConnectorMetadata:
+        # Restore actual derived-class dispatch before calling it. No wrapper,
+        # flag test or pending-state scan remains on the next ordinary step.
+        original = self.__dict__.pop("_checkpoint_build_original")
+        self.__dict__.pop("build_connector_meta")
+        controls = PreemptionConnectorMetadata()
+        snapshots, self._checkpoint_snapshots = self._checkpoint_snapshots, []
+        self._build_preemption_controls(controls, output, snapshots)
+        metadata = original(self, output)
+        controls.requests = metadata.requests
+        return controls
+
+    def _build_preemption_controls(
+        self, meta: LMCacheConnectorMetadata, output: Any, snapshots: tuple | list = ()
+    ) -> None:
+        captures, seals = [], []
+        cancels = list(getattr(self, "_checkpoint_cancels", ()))
+        self._checkpoint_cancels = []
+        chunk = self._lmcache_chunk_size
+        limit = max(self._decode_window_save_window_size, chunk) + chunk
+        for req_id, generation, blocks, end in snapshots:
+            tracker = self._request_trackers.get(req_id)
+            if (
+                tracker is None
+                or tracker.skip_save
+                or self.kv_role != "kv_both"
+                or getattr(self, "force_skip_save", False)
+                or (tracker.request_configs or {}).get("lmcache.skip_save", False)
+            ):
+                continue
+            if not getattr(self.config, "dsa_two_groups", False) or len(blocks) != 2:
+                continue
+            base = (
+                max(tracker.prompt_len, tracker.decode_window_save_committed_end)
+                // chunk
+                * chunk
+            )
+            if not base < end <= base + limit:
+                continue
+            old = self._preemption_checkpoints.get(req_id)
+            if old is not None:
+                cancels.append((req_id, old.capture.generation))
+            capture = CaptureSpec(
+                req_id,
+                generation,
+                base,
+                end,
+                max(base, tracker.dsa_nonresident_frontier),
+                blocks,
+                tracker.request_configs,
+            )
+            self._preemption_checkpoints[req_id] = PendingCheckpoint(capture)
+            self._resume_lookup_queries.pop(req_id, None)
+            captures.append(capture)
+        for req_id, pending in tuple(self._preemption_checkpoints.items()):
+            request = self._unfinished_requests.get(req_id)
+            if (
+                req_id in output.finished_req_ids
+                or request is None
+                or request.is_finished()
+                or request.num_preemptions != pending.capture.generation
+            ):
+                cancels.append((req_id, pending.capture.generation))
+                self._preemption_checkpoints.pop(req_id, None)
+                continue
+            if pending.cancel_pending:
+                cancels.append((req_id, pending.capture.generation))
+                pending.cancel_pending = False
+            if pending.status != "captured":
+                continue
+            end = choose_checkpoint_end(request.num_tokens, pending.capture)
+            if not end:
+                pending.status = "failed"
+                cancels.append((req_id, pending.capture.generation))
+                continue
+            tokens = list(request.all_token_ids[:end])
+            if len(tokens) != end or any(token < 0 for token in tokens):
+                pending.status = "failed"
+                cancels.append((req_id, pending.capture.generation))
+                continue
+            hashes, positions = extract_mm_features(request)
+            if hashes and positions:
+                tokens = _apply_mm_hashes(tokens, hashes, positions)
+            pending.end = end
+            pending.status = "persisting"
+            seals.append(SealSpec(req_id, pending.capture.generation, tuple(tokens)))
+        meta.preemption_captures = tuple(captures)
+        meta.preemption_seals = tuple(seals)
+        meta.preemption_cancels = tuple(cancels)

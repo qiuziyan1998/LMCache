@@ -494,6 +494,13 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
             "load persistent pages directly into final HBM."
         ),
     },
+    "decode_preemption_checkpoint": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": "Capture generated decoder KV before HBM reuse and restore "
+        "verified checkpoints. Requires the Ascend checkpoint worker extension.",
+    },
     "enable_npu_transfer_validation": {
         "type": bool,
         "default": True,

@@ -14,9 +14,6 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 import torch
 
-# First Party
-from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
-
 if TYPE_CHECKING:
     # Third Party
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -35,6 +32,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         role: KVConnectorRole,
         kv_cache_config: Optional[Any] = None,
     ):
+        # Resolve the implementation after platform patches, including when
+        # this dynamic wrapper was imported before lmcache-ascend.
+        from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorV1Impl
+
         if kv_cache_config is not None:
             super().__init__(
                 vllm_config=vllm_config,
@@ -48,6 +49,31 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
     @property
     def supports_dsa_compact_external_load(self) -> bool:
         return self._lmcache_engine.supports_dsa_cold_compact_load()
+
+    @property
+    def supports_preemption_checkpoint(self) -> bool:
+        """Whether this connector requests pre-overwrite decoder snapshots."""
+        return bool(getattr(self._lmcache_engine.config, "decode_preemption_checkpoint", False))
+
+    def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
+        """Drain source owners before the runner reuses preempted blocks."""
+        handle = getattr(self._lmcache_engine, "handle_preemptions", None)
+        if callable(handle):
+            handle(preempted_req_ids)
+
+    def prepare_preemption_checkpoint(self, snapshot: tuple) -> None:
+        """Forward a scheduler victim snapshot to the actual implementation."""
+        self._lmcache_engine.prepare_preemption_checkpoint(snapshot)
+
+    def handle_preemptions_with_metadata(
+        self, preempted_req_ids: set[str], metadata: KVConnectorMetadata
+    ) -> None:
+        """Bind only this LMCache child's checkpoint controls before overwrite."""
+        try:
+            self.bind_connector_metadata(metadata)
+            self.handle_preemptions(preempted_req_ids)
+        finally:
+            self.clear_connector_metadata()
 
     @property
     def supports_dsa_live_split_source(self) -> bool:
