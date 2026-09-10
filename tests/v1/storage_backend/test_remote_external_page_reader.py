@@ -176,7 +176,7 @@ class _ExternalPageConnector:
 def _config() -> LMCacheEngineConfig:
     return LMCacheEngineConfig.from_defaults(
         remote_url="mooncakestore://127.0.0.1:50051",
-        dsa_group1_load_mode="persistent_direct_hbm",
+        dsa_index_transfer_mode="persistent_direct_hbm",
         extra_config={
             "save_only_first_rank": True,
             "remote_enable_mla_worker_id_as0": True,

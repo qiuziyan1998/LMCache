@@ -253,7 +253,7 @@ def test_remote_fill_internally_enables_borrowed_global_transfer_engine():
 def test_group1_load_mode_defaults_to_p2p_preferred():
     config = LMCacheEngineConfig.from_defaults()
 
-    assert config.dsa_group1_load_mode == "p2p_preferred"
+    assert config.dsa_index_transfer_mode == "p2p_preferred"
 
 
 def test_dsa_two_groups_requires_layerwise_retrieve():
@@ -267,15 +267,15 @@ def test_dsa_two_groups_requires_layerwise_retrieve():
 
 
 def test_group1_load_mode_rejects_unknown_value():
-    config = LMCacheEngineConfig.from_defaults(dsa_group1_load_mode="race_both")
+    config = LMCacheEngineConfig.from_defaults(dsa_index_transfer_mode="race_both")
 
-    with pytest.raises(ValueError, match="dsa_group1_load_mode"):
+    with pytest.raises(ValueError, match="dsa_index_transfer_mode"):
         config.validate()
 
 
 def test_group1_parallel_prefetch_rejects_silent_serial_fallback():
     config = LMCacheEngineConfig.from_defaults(
-        dsa_group1_load_mode="persistent_parallel_prefetch"
+        dsa_index_transfer_mode="persistent_parallel_prefetch"
     )
 
     with pytest.raises(
@@ -292,7 +292,7 @@ def test_group1_parallel_prefetch_accepts_complete_page_layout_contract():
         save_unfull_chunk=True,
         dsa_two_groups=True,
         enable_dsa_cold_compact_load=True,
-        dsa_group1_load_mode="persistent_parallel_prefetch",
+        dsa_index_transfer_mode="persistent_parallel_prefetch",
         remote_url="mooncakestore://metadata",
         extra_config={
             "enable_shared_cpu_cache": True,
@@ -325,7 +325,7 @@ def _persistent_direct_hbm_config(
         dsa_two_groups=True,
         enable_dsa_cold_compact_load=True,
         enable_remote_lmcache_store=True,
-        dsa_group1_load_mode="persistent_direct_hbm",
+        dsa_index_transfer_mode="persistent_direct_hbm",
         pd_role="receiver",
         external_lookup_client=external_lookup_client,
         remote_url="mooncakestore://metadata",
@@ -338,14 +338,14 @@ def test_group1_persistent_direct_hbm_accepts_complete_contract():
 
     config.validate()
 
-    assert config.dsa_group1_load_mode == "persistent_direct_hbm"
+    assert config.dsa_index_transfer_mode == "persistent_direct_hbm"
 
 
 def test_prefill_group0_defaults_off_and_accepts_sender_contract() -> None:
     config = _persistent_direct_hbm_config()
-    assert config.prefill_group0_direct_hbm is False
+    assert config.prefill_latent_direct_load is False
     config.pd_role = "sender"
-    config.prefill_group0_direct_hbm = True
+    config.prefill_latent_direct_load = True
     config.validate()
     assert config.local_cpu is True
 
@@ -355,7 +355,7 @@ def test_prefill_group0_defaults_off_and_accepts_sender_contract() -> None:
     [
         ("pd_role", "receiver"),
         ("pd_role", None),
-        ("dsa_group1_load_mode", "p2p_preferred"),
+        ("dsa_index_transfer_mode", "p2p_preferred"),
         ("enable_blending", True),
         ("local_cpu", False),
     ],
@@ -363,7 +363,7 @@ def test_prefill_group0_defaults_off_and_accepts_sender_contract() -> None:
 def test_prefill_group0_rejects_unsupported_contract(field: str, value: object) -> None:
     config = _persistent_direct_hbm_config()
     config.pd_role = "sender"
-    config.prefill_group0_direct_hbm = True
+    config.prefill_latent_direct_load = True
     setattr(config, field, value)
     with pytest.raises(ValueError):
         config.validate()
@@ -372,16 +372,16 @@ def test_prefill_group0_rejects_unsupported_contract(field: str, value: object) 
 def test_prefill_group0_requires_shared_cpu_for_group1() -> None:
     config = _persistent_direct_hbm_config(enable_shared_cpu_cache=False)
     config.pd_role = "sender"
-    config.prefill_group0_direct_hbm = True
+    config.prefill_latent_direct_load = True
     with pytest.raises(ValueError, match="shared LocalCPU"):
         config.validate()
 
 
 def test_prefill_group0_environment_bool(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LMCACHE_PREFILL_GROUP0_DIRECT_HBM", "false")
-    assert LMCacheEngineConfig.from_env().prefill_group0_direct_hbm is False
-    monkeypatch.setenv("LMCACHE_PREFILL_GROUP0_DIRECT_HBM", "true")
-    assert LMCacheEngineConfig.from_env().prefill_group0_direct_hbm is True
+    monkeypatch.setenv("LMCACHE_PREFILL_LATENT_DIRECT_LOAD", "false")
+    assert LMCacheEngineConfig.from_env().prefill_latent_direct_load is False
+    monkeypatch.setenv("LMCACHE_PREFILL_LATENT_DIRECT_LOAD", "true")
+    assert LMCacheEngineConfig.from_env().prefill_latent_direct_load is True
 
 
 def test_group1_persistent_direct_hbm_accepts_sender_without_decoder_slab():

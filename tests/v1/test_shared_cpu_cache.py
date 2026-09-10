@@ -2127,7 +2127,7 @@ def _make_engine_for_sparse_capacity(
     }
     engine.config = SimpleNamespace(
         enable_sparse_attention=True,
-        dsa_group1_load_mode=group1_load_mode,
+        dsa_index_transfer_mode=group1_load_mode,
         chunk_size=256,
         max_local_cpu_size=max_local_cpu_size,
         extra_config=extra_config,
@@ -2561,7 +2561,7 @@ def test_direct_hbm_contract_does_not_require_group1_cpu_materialization():
         shared=True,
     )
     engine.broadcast_object_fn = lambda obj, src=0: obj
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.dsa_index_transfer_mode = "persistent_direct_hbm"
     engine.config.get_extra_config_value = (
         lambda key, default=None: False
         if key == "shared_cpu_materialize_index_on_decode_cold"

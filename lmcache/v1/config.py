@@ -484,14 +484,14 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
-    "prefill_group0_direct_hbm": {
+    "prefill_latent_direct_load": {
         "type": bool,
         "default": False,
         "env_converter": _to_bool,
         "description": "Load sender dense-prefix Group 0 directly from Mooncake "
         "into NPU blocks while retaining Group 1 in shared LocalCPU.",
     },
-    "dsa_group1_load_mode": {
+    "dsa_index_transfer_mode": {
         "type": str,
         "default": "p2p_preferred",
         "env_converter": str,
@@ -823,10 +823,10 @@ def _validate_config(self):
         "persistent_serial",
         "persistent_parallel_prefetch",
     }
-    if self.dsa_group1_load_mode not in group1_load_modes:
+    if self.dsa_index_transfer_mode not in group1_load_modes:
         raise ValueError(
-            "dsa_group1_load_mode must be one of "
-            f"{sorted(group1_load_modes)}, got {self.dsa_group1_load_mode!r}"
+            "dsa_index_transfer_mode must be one of "
+            f"{sorted(group1_load_modes)}, got {self.dsa_index_transfer_mode!r}"
         )
 
     if self.dsa_two_groups and not self.use_layerwise:
@@ -908,15 +908,15 @@ def _validate_config(self):
                 + shared_cpu_config_context
             )
 
-    if self.prefill_group0_direct_hbm and (
+    if self.prefill_latent_direct_load and (
         self.pd_role != "sender"
-        or self.dsa_group1_load_mode != "persistent_direct_hbm"
+        or self.dsa_index_transfer_mode != "persistent_direct_hbm"
         or not enable_shared_cpu_cache
         or self.enable_blending
     ):
         raise ValueError(
-            "prefill_group0_direct_hbm requires pd_role=sender, "
-            "dsa_group1_load_mode=persistent_direct_hbm, shared LocalCPU "
+            "prefill_latent_direct_load requires pd_role=sender, "
+            "dsa_index_transfer_mode=persistent_direct_hbm, shared LocalCPU "
             "and enable_blending=false"
         )
 
@@ -970,7 +970,7 @@ def _validate_config(self):
                 "remote_fill_window_tokens must be a positive multiple of chunk_size"
             )
         direct_groups = (
-            (0,) if self.dsa_group1_load_mode == "persistent_direct_hbm" else (0, 1)
+            (0,) if self.dsa_index_transfer_mode == "persistent_direct_hbm" else (0, 1)
         )
         required_control_pages = (
             self.remote_fill_window_tokens // self.chunk_size
@@ -1071,7 +1071,7 @@ def _validate_config(self):
                 + ", ".join(f"{name}=true" for name in missing_flags)
             )
 
-    if self.dsa_group1_load_mode in {
+    if self.dsa_index_transfer_mode in {
         "persistent_parallel_prefetch",
         "persistent_direct_hbm",
     }:
@@ -1092,7 +1092,7 @@ def _validate_config(self):
                 extra_config.get("mooncake_layer_merged_page_objects", False)
             ),
         }
-        if self.dsa_group1_load_mode == "persistent_parallel_prefetch":
+        if self.dsa_index_transfer_mode == "persistent_parallel_prefetch":
             persistent_requirements.update(
                 {
                     "enable_dsa_cold_compact_load": (
@@ -1101,7 +1101,7 @@ def _validate_config(self):
                     "enable_shared_cpu_cache": enable_shared_cpu_cache,
                 }
             )
-        if self.dsa_group1_load_mode == "persistent_direct_hbm":
+        if self.dsa_index_transfer_mode == "persistent_direct_hbm":
             save_only_first_rank = bool(
                 extra_config.get("save_only_first_rank", False)
             )
@@ -1148,7 +1148,7 @@ def _validate_config(self):
         ]
         if missing_persistent_requirements:
             raise ValueError(
-                f"dsa_group1_load_mode={self.dsa_group1_load_mode} requires "
+                f"dsa_index_transfer_mode={self.dsa_index_transfer_mode} requires "
                 + ", ".join(missing_persistent_requirements)
             )
 

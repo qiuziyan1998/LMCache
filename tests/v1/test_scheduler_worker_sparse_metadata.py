@@ -55,7 +55,7 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl.config.enable_sparse_attention = True
     impl.config.enable_shared_cpu_cache = False
     impl.config.use_layerwise = True
-    impl.config.dsa_group1_load_mode = "p2p_preferred"
+    impl.config.dsa_index_transfer_mode = "p2p_preferred"
     impl.config.priority_limit = None
     impl.kv_role = "kv_both"
     impl.async_loading = False
@@ -556,7 +556,7 @@ def test_direct_hbm_busy_request_defers_without_pins_and_retries_fresh(
     impl.config.enable_dsa_cold_compact_load = True
     impl.config.dsa_two_groups = True
     impl.config.enable_shared_cpu_cache = True
-    impl.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    impl.config.dsa_index_transfer_mode = "persistent_direct_hbm"
     impl.config.min_retrieve_tokens = 0
     impl._vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(enable_prefix_caching=False)
@@ -1004,7 +1004,7 @@ def test_persistent_group1_modes_disable_live_split(mode: str) -> None:
     impl = _make_scheduler_impl()
     impl.config.dsa_two_groups = True
     impl.config.enable_shared_cpu_cache = True
-    impl.config.dsa_group1_load_mode = mode
+    impl.config.dsa_index_transfer_mode = mode
     impl.config.get_extra_config_value.side_effect = (
         lambda key, default=False: key == "mooncake_direct_npu_prefill_store"
     )
@@ -1301,7 +1301,7 @@ def test_cold_meta_requires_two_sided_latent_activation(
     impl._block_size = 2
     impl._dsa_cold_indexer_block_ids = {}
     impl._live_latent_split_requested = negotiated
-    impl.config.dsa_group1_load_mode = mode
+    impl.config.dsa_index_transfer_mode = mode
     impl._vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(data_parallel_index=1)
     )
@@ -1366,7 +1366,7 @@ def test_cold_meta_does_not_negotiate_live_split_without_source() -> None:
     impl = _make_scheduler_impl()
     impl._block_size = 2
     impl._dsa_cold_indexer_block_ids = {}
-    impl.config.dsa_group1_load_mode = "p2p_preferred"
+    impl.config.dsa_index_transfer_mode = "p2p_preferred"
     impl._vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             data_parallel_index=0,

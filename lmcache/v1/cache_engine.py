@@ -2160,7 +2160,7 @@ class LMCacheEngine:
         )
 
     def _persistent_direct_hbm_split_group_enabled(self) -> bool:
-        return self.config.dsa_group1_load_mode == "persistent_direct_hbm"
+        return self.config.dsa_index_transfer_mode == "persistent_direct_hbm"
 
     def _lookup_persistent_direct_hbm_prefix(
         self,
@@ -2212,7 +2212,7 @@ class LMCacheEngine:
                     else (0,)
                 )
                 if (
-                    getattr(self.config, "prefill_group0_direct_hbm", False)
+                    getattr(self.config, "prefill_latent_direct_load", False)
                     and getattr(self.config, "pd_role", None) == "sender"
                 ):
                     local_groups = (1,) if pin else ()

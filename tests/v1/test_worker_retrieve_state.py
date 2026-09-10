@@ -393,7 +393,7 @@ def test_cold_compact_shared_indexer_waits_for_latent_publication() -> None:
 def test_cold_compact_prefetches_before_dense_retrieve() -> None:
     impl = _make_impl()
     impl.config = SimpleNamespace(
-        dsa_group1_load_mode="persistent_parallel_prefetch"
+        dsa_index_transfer_mode="persistent_parallel_prefetch"
     )
     impl.num_layers = 1
     impl.device = "cpu"
@@ -482,7 +482,7 @@ def test_cold_compact_prefetches_before_dense_retrieve() -> None:
 def test_cold_compact_prefetch_owner_released_when_latent_load_fails() -> None:
     impl = _make_impl()
     impl.config = SimpleNamespace(
-        dsa_group1_load_mode="persistent_parallel_prefetch"
+        dsa_index_transfer_mode="persistent_parallel_prefetch"
     )
     impl.num_layers = 1
     impl.device = "cpu"
@@ -527,7 +527,7 @@ def test_cold_compact_prefetch_owner_released_when_latent_load_fails() -> None:
 def test_cold_compact_prefetch_failure_releases_and_uses_dense_path() -> None:
     impl = _make_impl()
     impl.config = SimpleNamespace(
-        dsa_group1_load_mode="persistent_parallel_prefetch"
+        dsa_index_transfer_mode="persistent_parallel_prefetch"
     )
     impl.num_layers = 1
     impl.device = "cpu"
@@ -660,7 +660,7 @@ def test_cold_compact_dense_failure_releases_prefetch_owner_only() -> None:
 
     impl = _make_impl()
     impl.config = SimpleNamespace(
-        dsa_group1_load_mode="persistent_parallel_prefetch"
+        dsa_index_transfer_mode="persistent_parallel_prefetch"
     )
     impl.num_layers = 1
     impl.device = "cpu"

@@ -229,7 +229,7 @@ def _engine(storage_manager):
     engine.config = SimpleNamespace(
         enable_remote_lmcache_store=True,
         dsa_two_groups=True,
-        dsa_group1_load_mode="p2p_preferred",
+        dsa_index_transfer_mode="p2p_preferred",
         use_layerwise=True,
         enable_shared_cpu_cache=True,
         chunk_size=4,
@@ -317,7 +317,7 @@ def test_persistent_direct_hbm_uses_remote_pair_proof_then_group0_overlay() -> N
     storage = _PairStorageManager(local_pairs=2, remote_pairs=2)
     storage.local_page_hits = 1
     engine = _engine(storage)
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.dsa_index_transfer_mode = "persistent_direct_hbm"
     engine.config.enable_remote_lmcache_store = False
 
     assert engine.lookup(list(range(8)), lookup_id="req", pin=True) == 8
@@ -356,7 +356,7 @@ def test_persistent_direct_hbm_stops_at_remote_pair_hole_without_legacy_probe() 
     storage.page_results = {0: "RemoteBackend", 1: "RemoteBackend"}
     storage.legacy_results = {0: "RemoteBackend", 1: "RemoteBackend"}
     engine = _engine(storage)
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.dsa_index_transfer_mode = "persistent_direct_hbm"
 
     assert engine.lookup(list(range(8)), lookup_id="req", pin=True) == 4
 
@@ -375,7 +375,7 @@ def test_persistent_direct_hbm_stops_at_remote_pair_hole_without_legacy_probe() 
 def test_persistent_direct_hbm_requires_remote_backend_in_search_range() -> None:
     storage = _PairStorageManager(local_pairs=2, remote_pairs=2)
     engine = _engine(storage)
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.dsa_index_transfer_mode = "persistent_direct_hbm"
 
     assert (
         engine.lookup(
@@ -394,7 +394,7 @@ def test_persistent_direct_hbm_overlay_error_has_no_remote_pair_pins() -> None:
     storage = _PairStorageManager(remote_pairs=2)
     storage.page_errors = {0: RuntimeError("local overlay failed")}
     engine = _engine(storage)
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.dsa_index_transfer_mode = "persistent_direct_hbm"
 
     assert engine.lookup(list(range(8)), lookup_id="req", pin=True) == 0
 
@@ -415,7 +415,7 @@ def test_persistent_prefix_overlays_cpu_by_role(
     storage = _PairStorageManager(remote_pairs=remote_pairs)
     storage.local_page_hits = {0: local0, 1: local1}
     engine = _engine(storage)
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.dsa_index_transfer_mode = "persistent_direct_hbm"
     if role is not None:
         engine.config.pd_role = role
 
@@ -473,7 +473,7 @@ def test_sender_overlay_respects_search_range(
     storage.local_page_hits = {0: 2, 1: 2}
     engine = _engine(storage)
     engine.config.pd_role = "sender"
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.dsa_index_transfer_mode = "persistent_direct_hbm"
     assert (
         engine.lookup(
             list(range(8)), search_range=search_range, lookup_id="req", pin=True
@@ -509,8 +509,8 @@ def test_sender_direct_group0_lookup_only_pins_group1(
     storage.local_page_hits = {0: 2, 1: local1}
     engine = _engine(storage)
     engine.config.pd_role = "sender"
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
-    engine.config.prefill_group0_direct_hbm = True
+    engine.config.dsa_index_transfer_mode = "persistent_direct_hbm"
+    engine.config.prefill_latent_direct_load = True
     assert engine.lookup(list(range(8)), lookup_id="req", pin=pin) == 4 * remote_pairs
     assert [keys[0].kv_group for keys, _, _ in storage.page_calls] == (
         [1] if pin and remote_pairs else []
@@ -556,7 +556,7 @@ def test_sender_group1_overlay_failure_releases_all_returned_pins(
     storage.batched_contains_layer_pages = contains
     engine = _engine(storage)
     engine.config.pd_role = "sender"
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.dsa_index_transfer_mode = "persistent_direct_hbm"
     assert engine.lookup(list(range(8)), lookup_id="req", pin=pin) == (0 if pin else 8)
     assert engine.lookup_pins == {}
     assert engine._remote_fill_lookup_plans == {}
@@ -618,7 +618,7 @@ def test_sender_group1_load_reuses_and_warms_exact_cpu_pages(
     storage = _PairStorageManager(remote_pairs=2)
     engine = _engine(storage)
     engine.config.pd_role = "sender"
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.dsa_index_transfer_mode = "persistent_direct_hbm"
     engine._shared_local_cpu_backend = lambda: local
     engine._expected_shared_cpu_chunk_metadata = lambda **kwargs: (
         (kwargs["num_tokens"], 2),
@@ -764,7 +764,7 @@ def test_sender_plan_publication_failure_releases_pins_once(
     storage.batched_unpin = unpin
     engine = _engine(storage)
     engine.config.pd_role = role
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.dsa_index_transfer_mode = "persistent_direct_hbm"
     if other_request:
         assert engine.lookup(list(range(8)), lookup_id="other", pin=True) == 8
         storage.page_calls.clear()
@@ -906,7 +906,7 @@ def test_persistent_direct_hbm_group0_overlay_is_retained_actual_load() -> None:
     storage = _PairStorageManager(remote_pairs=2)
     storage.local_page_hits = 2
     engine = _engine(storage)
-    engine.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    engine.config.dsa_index_transfer_mode = "persistent_direct_hbm"
 
     assert (
         engine.lookup(

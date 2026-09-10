@@ -1928,8 +1928,8 @@ class LMCacheConnectorV1Impl:
         self._deferred_latent_pending: set[LayerwiseSaveKey] = set()
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.enable_sparse_attention = config.enable_sparse_attention
-        self._prefill_group0_direct_hbm = getattr(
-            config, "prefill_group0_direct_hbm", False
+        self._prefill_latent_direct_load = getattr(
+            config, "prefill_latent_direct_load", False
         )
         self._retrieve_stats_interval_seconds = (
             _retrieve_stats_interval_seconds()
@@ -6183,7 +6183,7 @@ class LMCacheConnectorV1Impl:
         )
         if callable(preflight):
             preflight(self._kvcaches_for_group(1))
-        if getattr(self, "_prefill_group0_direct_hbm", False):
+        if getattr(self, "_prefill_latent_direct_load", False):
             preflight = getattr(
                 self.lmcache_engine, "preflight_prefill_group0_direct_hbm", None
             )
@@ -6192,7 +6192,7 @@ class LMCacheConnectorV1Impl:
             )
             if not callable(preflight) or not callable(loader):
                 raise RuntimeError(
-                    "prefill_group0_direct_hbm requires the Ascend direct loader"
+                    "prefill_latent_direct_load requires the Ascend direct loader"
                 )
             preflight(self._kvcaches_for_group(0))
 
@@ -6210,7 +6210,7 @@ class LMCacheConnectorV1Impl:
             and getattr(config, "dsa_two_groups", False)
             and getattr(config, "enable_remote_lmcache_store", False)
             and getattr(config, "pd_role", None) == "receiver"
-            and getattr(config, "dsa_group1_load_mode", None) == "persistent_direct_hbm"
+            and getattr(config, "dsa_index_transfer_mode", None) == "persistent_direct_hbm"
             and not getattr(self._vllm_config.model_config, "enable_sleep_mode", False)
             and self.kv_caches
         ):
@@ -6811,7 +6811,7 @@ class LMCacheConnectorV1Impl:
         if (
             getattr(
                 getattr(self, "config", None),
-                "dsa_group1_load_mode",
+                "dsa_index_transfer_mode",
                 "p2p_preferred",
             )
             == "persistent_parallel_prefetch"
@@ -7340,9 +7340,9 @@ class LMCacheConnectorV1Impl:
             return
 
         if len(self.kv_caches) == 0:
-            if getattr(self, "_prefill_group0_direct_hbm", False):
+            if getattr(self, "_prefill_latent_direct_load", False):
                 raise RuntimeError(
-                    "prefill_group0_direct_hbm requires register_kv_caches preflight"
+                    "prefill_latent_direct_load requires register_kv_caches preflight"
                 )
             logger.warning(
                 "Please update LMCacheConnector, "
@@ -7415,7 +7415,7 @@ class LMCacheConnectorV1Impl:
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             prefill_direct = (
                 not request.is_sparse_decode
-                and getattr(self, "_prefill_group0_direct_hbm", False)
+                and getattr(self, "_prefill_latent_direct_load", False)
             )
             sparse_bound_state = (
                 self._worker_retrieve_state_for_warm_ref(request)
@@ -9933,7 +9933,7 @@ class LMCacheConnectorV1Impl:
 
     def _group1_p2p_preferred(self) -> bool:
         return (
-            getattr(self.config, "dsa_group1_load_mode", "p2p_preferred")
+            getattr(self.config, "dsa_index_transfer_mode", "p2p_preferred")
             == "p2p_preferred"
         )
 
@@ -10231,7 +10231,7 @@ class LMCacheConnectorV1Impl:
             dsa_cold_compact_load
             and getattr(
                 self.config,
-                "dsa_group1_load_mode",
+                "dsa_index_transfer_mode",
                 "p2p_preferred",
             )
             == "persistent_direct_hbm"

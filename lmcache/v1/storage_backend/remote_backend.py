@@ -1131,7 +1131,7 @@ class RemoteExternalPageReader:
                 "RemoteExternalPageReader requires mooncakestore://"
             )
         if (
-            config.dsa_group1_load_mode == "persistent_direct_hbm"
+            config.dsa_index_transfer_mode == "persistent_direct_hbm"
             and int(metadata.first_rank) != 0
         ):
             raise ValueError(

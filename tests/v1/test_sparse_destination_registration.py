@@ -22,7 +22,7 @@ def _registration_setup() -> tuple[LMCacheConnectorV1Impl, MagicMock]:
         dsa_two_groups=True,
         enable_remote_lmcache_store=True,
         pd_role="receiver",
-        dsa_group1_load_mode="persistent_direct_hbm",
+        dsa_index_transfer_mode="persistent_direct_hbm",
     )
     impl._vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(enable_sleep_mode=False)
@@ -92,7 +92,7 @@ def test_destination_registration_keeps_unsupported_paths_unsealed(mode: str) ->
     elif mode == "no_remote":
         impl.config.enable_remote_lmcache_store = False
     elif mode == "other_group1":
-        impl.config.dsa_group1_load_mode = "p2p_preferred"
+        impl.config.dsa_index_transfer_mode = "p2p_preferred"
     elif mode == "scheduler":
         impl._role = adapter_mod.KVConnectorRole.SCHEDULER
     else:

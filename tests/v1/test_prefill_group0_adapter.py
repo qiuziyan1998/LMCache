@@ -34,7 +34,7 @@ def test_prefill_group0_adapter_dispatch_keeps_group1_cache_path(
             Mock(side_effect=AssertionError("G0 CPU slots were uploaded")),
         )
     impl, _, _ = make_worker_connector([request], use_layerwise=True)
-    impl._prefill_group0_direct_hbm = enabled
+    impl._prefill_latent_direct_load = enabled
     impl._lmcache_chunk_size = 4
     impl.num_layers = 2
     impl._block_size = 4
