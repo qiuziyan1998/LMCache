@@ -341,6 +341,49 @@ def test_group1_persistent_direct_hbm_accepts_complete_contract():
     assert config.dsa_group1_load_mode == "persistent_direct_hbm"
 
 
+def test_prefill_group0_defaults_off_and_accepts_sender_contract() -> None:
+    config = _persistent_direct_hbm_config()
+    assert config.prefill_group0_direct_hbm is False
+    config.pd_role = "sender"
+    config.prefill_group0_direct_hbm = True
+    config.validate()
+    assert config.local_cpu is True
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("pd_role", "receiver"),
+        ("pd_role", None),
+        ("dsa_group1_load_mode", "p2p_preferred"),
+        ("enable_blending", True),
+        ("local_cpu", False),
+    ],
+)
+def test_prefill_group0_rejects_unsupported_contract(field: str, value: object) -> None:
+    config = _persistent_direct_hbm_config()
+    config.pd_role = "sender"
+    config.prefill_group0_direct_hbm = True
+    setattr(config, field, value)
+    with pytest.raises(ValueError):
+        config.validate()
+
+
+def test_prefill_group0_requires_shared_cpu_for_group1() -> None:
+    config = _persistent_direct_hbm_config(enable_shared_cpu_cache=False)
+    config.pd_role = "sender"
+    config.prefill_group0_direct_hbm = True
+    with pytest.raises(ValueError, match="shared LocalCPU"):
+        config.validate()
+
+
+def test_prefill_group0_environment_bool(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LMCACHE_PREFILL_GROUP0_DIRECT_HBM", "false")
+    assert LMCacheEngineConfig.from_env().prefill_group0_direct_hbm is False
+    monkeypatch.setenv("LMCACHE_PREFILL_GROUP0_DIRECT_HBM", "true")
+    assert LMCacheEngineConfig.from_env().prefill_group0_direct_hbm is True
+
+
 def test_group1_persistent_direct_hbm_accepts_sender_without_decoder_slab():
     config = _persistent_direct_hbm_config()
     config.pd_role = "sender"

@@ -15,6 +15,7 @@ _POINTER_FIELD_PATTERN = re.compile(
     r"(?i)\b((?:source|destination|remote)_?)?(?:ptr|pointer|address)\s*[=:]\s*\d+"
 )
 _DIAGNOSTIC_NAMES = {
+    "RF-P-000": "producer_startup_failure",
     "RF-D-000": "decoder_startup_failure",
     "RF-D-001": "decoder_retained_prefix_missing",
     "RF-D-002": "decoder_paired_prefix_lookup_failure",
