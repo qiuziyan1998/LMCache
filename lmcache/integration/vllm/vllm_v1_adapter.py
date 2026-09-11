@@ -9678,6 +9678,7 @@ class LMCacheConnectorV1Impl:
             self._release_unadopted_shared_request_objects(state, request)
             self._release_shared_worker_retrieve_state(state, self.lmcache_engine)
             self._release_request_lookup_pins(req_id)
+            self._finish_aborted_cold_load(req_id)
         else:
             self._publish_worker_retrieve_state(
                 state,
@@ -9796,7 +9797,14 @@ class LMCacheConnectorV1Impl:
         # cycles until Python's cyclic collector runs. Preserve the
         # traceback for the log above, then drop those frame owners.
         _clear_terminal_load_tracebacks(exc, (future, indexer_future))
+        coordinator = getattr(self, "_cold_load_coordinator", None)
+        if coordinator is not None and req_id in (coordinator.aborted or ()):
+            self._finish_aborted_cold_load(req_id)
         return True
+
+    def _finish_aborted_cold_load(self, req_id: str) -> None:
+        """Acknowledge the connector's delayed cleanup after receive retirement."""
+        self._late_finished_sending.add(req_id)
 
     @_lmcache_nvtx_annotate
     def get_finished(
@@ -9853,10 +9861,12 @@ class LMCacheConnectorV1Impl:
             if perf_enabled
             else 0.0
         )
-        finished_sending.update(self._late_finished_sending)
-        self._late_finished_sending.clear()
         load_drain_started = serving_perf_now() if perf_enabled else 0.0
         finished_recving = self._drain_dsa_cold_load_futures()
+        # Cold-load retirement can enqueue its final cleanup acknowledgement.
+        # Include it now rather than requiring an otherwise idle extra step.
+        finished_sending.update(self._late_finished_sending)
+        self._late_finished_sending.clear()
         if perf_enabled:
             completed = serving_perf_now()
             load_drain_ms = (completed - load_drain_started) * 1000
