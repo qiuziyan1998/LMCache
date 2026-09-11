@@ -2,6 +2,7 @@
 # Standard
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -44,7 +45,7 @@ from lmcache.v1.mooncake_layout import (
 )
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
-from lmcache.v1.storage_backend.cache_policy import get_cache_policy
+from lmcache.v1.storage_backend.cache_policy import LRUCachePolicy, get_cache_policy
 from lmcache.v1.system_detection import NUMADetector, SystemMemoryDetector
 
 if TYPE_CHECKING:
@@ -1620,6 +1621,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         min_free_ratio: float,
         num_layers: int,
         cause: str,
+        max_scan_entries: Optional[int] = None,
     ) -> bool:
         """Evict enough eligible entries to accommodate one allocation.
 
@@ -1632,6 +1634,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             min_free_ratio: Heap-relative free-capacity floor after allocation.
             num_layers: Layer count used to expand legacy layerwise keys.
             cause: Retention-trace cause recorded for removed entries.
+            max_scan_entries: Optional LRU candidate-window limit. This mode
+                never waits for the cache lock, and refuses other policies.
 
         Returns:
             Whether the allocator reached the required free-capacity target.
@@ -1646,6 +1650,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             or not 0 <= min_free_ratio <= 1
             or num_layers <= 0
             or not cause
+            or (max_scan_entries is not None and max_scan_entries <= 0)
         ):
             raise ValueError("invalid LocalCPU capacity-reclaim request")
         started = time.perf_counter() if serving_perf_enabled() else None
@@ -1658,7 +1663,20 @@ class LocalCPUBackend(AllocatorBackendInterface):
         evicted_bytes = 0
         evicted_keys = 0
         removed: list[MemoryObj] = []
-        if free_before < target_free_bytes:
+        if free_before < target_free_bytes and max_scan_entries is not None:
+            if self.cpu_lock.acquire(blocking=False):
+                try:
+                    keys, removed, evictable_bytes = self._pop_bounded_reclaim_locked(
+                        target_free_bytes - free_before,
+                        num_layers,
+                        max_scan_entries,
+                        cause,
+                    )
+                    evicted_keys = len(keys)
+                    evicted_bytes = sum(obj.get_physical_size() for obj in removed)
+                finally:
+                    self.cpu_lock.release()
+        elif free_before < target_free_bytes:
             with self.cpu_lock:
                 if self.use_hot:
                     evictable_bytes = sum(
@@ -1709,6 +1727,52 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 ),
             )
         return sufficient
+
+    def _pop_bounded_reclaim_locked(
+        self, required_bytes: int, num_layers: int, max_entries: int, cause: str
+    ) -> tuple[list[CacheEngineKey], list[MemoryObj], int]:
+        """Select a bounded LRU window atomically before removing any entries."""
+        if not self.use_hot or type(self.cache_policy) is not LRUCachePolicy:
+            return [], [], 0
+        seen = set()
+        candidates = []
+        evictable_bytes = 0
+        for key in islice(self.hot_cache, max_entries):
+            if key in seen:
+                continue
+            keys = (
+                [key]
+                if isinstance(self.hot_cache[key], LayerPageMemoryObj)
+                or not isinstance(key, LayerCacheEngineKey)
+                else [
+                    item
+                    for item in key.split_layers(num_layers)
+                    if item in self.hot_cache
+                ]
+            )
+            if len(seen) + sum(item not in seen for item in keys) > max_entries:
+                break
+            seen.update(keys)
+            # Count every legacy sibling against the budget, even when layers
+            # are far apart in LRU order. All must be unpinned/unborrowed.
+            if not all(self.hot_cache[item].can_evict for item in keys):
+                continue
+            candidates.append(key)
+            evictable_bytes += sum(
+                self.hot_cache[item].get_physical_size() for item in keys
+            )
+            if evictable_bytes >= required_bytes:
+                break
+        if evictable_bytes < required_bytes:
+            return [], [], evictable_bytes
+        removed_keys, removed_objects = [], []
+        for key in candidates:
+            keys, objects = self._pop_layer_page_evict_candidate_locked(
+                num_layers, cause=cause, selected_key=key
+            )
+            removed_keys.extend(keys)
+            removed_objects.extend(objects)
+        return removed_keys, removed_objects, evictable_bytes
 
     def close(self) -> None:
         if self.batched_msg_sender is not None:
@@ -2082,13 +2146,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
         num_layers: int,
         *,
         cause: str,
+        selected_key: Optional[CacheEngineKey] = None,
     ) -> tuple[list[CacheEngineKey], list[MemoryObj]]:
-        candidates = self.cache_policy.get_evict_candidates(
-            self.hot_cache, num_candidates=1
-        )
-        if not candidates:
-            return [], []
-        key = candidates[0]
+        if selected_key is None:
+            candidates = self.cache_policy.get_evict_candidates(
+                self.hot_cache, num_candidates=1
+            )
+            if not candidates:
+                return [], []
+            selected_key = candidates[0]
+        key = selected_key
         keys = (
             [key]
             if isinstance(self.hot_cache.get(key), LayerPageMemoryObj)
