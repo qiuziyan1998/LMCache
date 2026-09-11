@@ -28,6 +28,7 @@ from lmcache.v1.config_base import (
 )
 
 logger = init_logger(__name__)
+_REMOTE_FILL_SUBMISSION_MODES = frozenset(("final_deferred", "per_chunk"))
 
 
 # Configuration aliases and deprecated mappings
@@ -60,6 +61,20 @@ _DEPRECATED_CONFIGS = {
         "save_indexer_only_first_rank is deprecated; use "
         "extra_config.save_only_first_rank to control both MLA latent and "
         "DSA index first-rank storage policy"
+    ),
+    "remote_fill_transport_mode": (
+        "remote_fill_transport_mode is internal and ignored"
+    ),
+    "remote_fill_publish_mode": "remote_fill_publish_mode is internal and ignored",
+    "remote_fill_require_both_groups": (
+        "remote_fill_require_both_groups is internal and ignored"
+    ),
+    "remote_fill_persistent_placement": (
+        "remote_fill_persistent_placement is internal and ignored"
+    ),
+    "remote_fill_allow_evict": "remote_fill_allow_evict is internal and ignored",
+    "remote_fill_busy_loop_alloc": (
+        "remote_fill_busy_loop_alloc is internal and ignored"
     ),
 }
 
@@ -228,6 +243,163 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     "pd_proxy_port": {"type": Optional[int], "default": None, "env_converter": int},
     # Transfer-related configurations
     "transfer_channel": {"type": Optional[str], "default": None, "env_converter": str},
+    # Direct remote LocalCPU fill (default-off; native work remains request-ARM gated)
+    "enable_remote_lmcache_store": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "remote_fill_submission_mode": {
+        "type": str,
+        "default": "per_chunk",
+        "env_converter": str,
+    },
+    "remote_fill_cache_namespace": {
+        "type": str,
+        "default": "",
+        "env_converter": str,
+    },
+    "remote_fill_model_artifact_id": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
+    "remote_fill_max_active_transactions": {
+        "type": int,
+        "default": 8,
+        "env_converter": int,
+    },
+    "remote_fill_max_inflight_windows_per_request": {
+        "type": int,
+        "default": 2,
+        "env_converter": int,
+    },
+    "remote_fill_max_inflight_bytes": {
+        "type": int,
+        "default": 8 * 1024**3,
+        "env_converter": int,
+    },
+    "remote_fill_max_reserved_bytes": {
+        "type": int,
+        "default": 16 * 1024**3,
+        "env_converter": int,
+    },
+    "remote_fill_max_bytes_per_request": {
+        "type": int,
+        "default": 64 * 1024**3,
+        "env_converter": int,
+    },
+    "remote_fill_min_free_bytes": {
+        "type": int,
+        "default": 8 * 1024**3,
+        "env_converter": int,
+    },
+    "remote_fill_min_free_ratio": {
+        "type": float,
+        "default": 0.05,
+        "env_converter": float,
+    },
+    "remote_fill_max_native_operations": {
+        "type": int,
+        "default": 2,
+        "env_converter": int,
+    },
+    "remote_fill_direct_worker_count": {
+        "type": int,
+        "default": 2,
+        "env_converter": int,
+    },
+    "remote_fill_window_tokens": {
+        "type": int,
+        "default": 4096,
+        "env_converter": int,
+    },
+    "remote_fill_max_control_pages_per_window": {
+        "type": int,
+        # Zero derives the exact direct-group bound from window/chunk size.
+        "default": 0,
+        "env_converter": int,
+    },
+    "remote_fill_max_rpc_message_bytes": {
+        "type": int,
+        "default": 64 * 1024,
+        "env_converter": int,
+    },
+    "remote_fill_open_timeout_ms": {
+        "type": int,
+        "default": 5000,
+        "env_converter": int,
+    },
+    "remote_fill_reserve_timeout_ms": {
+        "type": int,
+        "default": 5000,
+        "env_converter": int,
+    },
+    "remote_fill_arm_timeout_ms": {
+        "type": int,
+        "default": 5000,
+        "env_converter": int,
+    },
+    "remote_fill_transfer_timeout_ms": {
+        "type": int,
+        "default": 30000,
+        "env_converter": int,
+    },
+    "remote_fill_finish_timeout_ms": {
+        "type": int,
+        "default": 30000,
+        "env_converter": int,
+    },
+    "remote_fill_reservation_ttl_sec": {
+        "type": int,
+        "default": 30,
+        "env_converter": int,
+    },
+    "remote_fill_terminal_record_ttl_sec": {
+        "type": int,
+        "default": 300,
+        "env_converter": int,
+    },
+    "remote_fill_native_hard_timeout_ms": {
+        "type": int,
+        "default": 120000,
+        "env_converter": int,
+    },
+    "remote_fill_control_host": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
+    "remote_fill_control_advertise_host": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
+    "remote_fill_control_port_start": {
+        "type": Optional[int],
+        "default": None,
+        "env_converter": int,
+    },
+    "remote_fill_descriptor_ttl_sec": {
+        "type": int,
+        "default": 10,
+        "env_converter": int,
+    },
+    "remote_fill_circuit_breaker_enabled": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
+    "remote_fill_circuit_breaker_failure_threshold": {
+        "type": int,
+        "default": 3,
+        "env_converter": int,
+    },
+    "remote_fill_circuit_breaker_cooldown_sec": {
+        "type": int,
+        "default": 60,
+        "env_converter": int,
+    },
     # Nixl-related configurations
     "nixl_backends": {
         "type": Optional[list[str]],
@@ -311,6 +483,34 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "type": bool,
         "default": False,
         "env_converter": _to_bool,
+    },
+    "dsa_group1_load_mode": {
+        "type": str,
+        "default": "p2p_preferred",
+        "env_converter": str,
+        "description": (
+            "Group-1 cold-load policy: prefer live P2P, force serial "
+            "persistent load, overlap persistent prefetch with Group 0, or "
+            "load persistent pages directly into final HBM."
+        ),
+    },
+    "enable_npu_transfer_validation": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+        "description": "Validate NPU transfer slots, cached destinations, and "
+        "registered source spans before native kernel launch.",
+    },
+    "enable_npu_content_diagnostics": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": (
+            "Fingerprint sampled Group-1 source, P2P destination, first "
+            "decoder-consume, and selected top-k tensors. Diagnostic NPU-to-CPU "
+            "readback may synchronize device work; keep disabled outside "
+            "correctness investigations."
+        ),
     },
     "enable_shared_cpu_cache": {
         "type": bool,
@@ -610,6 +810,25 @@ def _validate_config(self):
             "min_retrieve_tokens must be >= 0, got %d" % self.min_retrieve_tokens
         )
 
+    group1_load_modes = {
+        "p2p_preferred",
+        "persistent_direct_hbm",
+        "persistent_serial",
+        "persistent_parallel_prefetch",
+    }
+    if self.dsa_group1_load_mode not in group1_load_modes:
+        raise ValueError(
+            "dsa_group1_load_mode must be one of "
+            f"{sorted(group1_load_modes)}, got {self.dsa_group1_load_mode!r}"
+        )
+
+    if self.dsa_two_groups and not self.use_layerwise:
+        raise ValueError(
+            "dsa_two_groups=true requires use_layerwise=true. The dense "
+            "non-layerwise retrieve path only materializes KV group 0 and "
+            "must not run with an uninitialized Group-1 index cache."
+        )
+
     if self.enable_blending:
         if not self.save_unfull_chunk:
             logger.warning(
@@ -682,6 +901,141 @@ def _validate_config(self):
                 + shared_cpu_config_context
             )
 
+    if self.remote_fill_submission_mode not in _REMOTE_FILL_SUBMISSION_MODES:
+        raise ValueError(
+            "remote_fill_submission_mode must be one of "
+            f"{sorted(_REMOTE_FILL_SUBMISSION_MODES)}, got "
+            f"{self.remote_fill_submission_mode!r}"
+        )
+    remote_fill_active = bool(self.enable_remote_lmcache_store)
+    if remote_fill_active:
+        # These are invariants of the only implemented RemoteFill protocol,
+        # not deployment choices: layerwise DSA two-group pages, immutable
+        # final-only publication, non-evicting reservations, and prefiller-
+        # local persistence.  Enabling the feature selects that contract.
+        self.use_layerwise = True
+        self.dsa_two_groups = True
+        self.enable_sparse_attention = True
+        self.save_unfull_chunk = True
+        extra_config = dict(extra_config)
+        extra_config.update(
+            {
+                "save_only_first_rank": True,
+                "mooncake_page_first_multi_buffer": True,
+                "mooncake_layer_merged_page_objects": True,
+                "save_chunk_meta": False,
+            }
+        )
+        self.extra_config = extra_config
+        required_remote_fill = {
+            "remote_url=mooncakestore://...": str(self.remote_url).startswith(
+                "mooncakestore://"
+            ),
+        }
+        missing_remote_fill = [
+            name for name, enabled in required_remote_fill.items() if not enabled
+        ]
+        if missing_remote_fill:
+            raise ValueError(
+                "enable_remote_lmcache_store requires " + ", ".join(missing_remote_fill)
+            )
+        if self.pre_caching_hash_algorithm == "builtin":
+            # RemoteFill always crosses process/host boundaries. Select the
+            # existing deterministic vLLM hash instead of requiring operators
+            # to configure Python's process-global hash seed before startup.
+            self.pre_caching_hash_algorithm = "sha256_cbor"
+        if self.remote_fill_window_tokens <= 0 or (
+            self.remote_fill_window_tokens % self.chunk_size
+        ):
+            raise ValueError(
+                "remote_fill_window_tokens must be a positive multiple of chunk_size"
+            )
+        direct_groups = (
+            (0,) if self.dsa_group1_load_mode == "persistent_direct_hbm" else (0, 1)
+        )
+        required_control_pages = (
+            self.remote_fill_window_tokens // self.chunk_size
+        ) * len(direct_groups)
+        if self.remote_fill_max_control_pages_per_window == 0:
+            self.remote_fill_max_control_pages_per_window = required_control_pages
+        elif self.remote_fill_max_control_pages_per_window < required_control_pages:
+            raise ValueError(
+                "remote_fill_max_control_pages_per_window="
+                f"{self.remote_fill_max_control_pages_per_window} is too small for "
+                f"direct_groups={direct_groups}; requires at least "
+                f"{required_control_pages} pages per window"
+            )
+        positive_remote_fill_values = {
+            "remote_fill_max_active_transactions": (
+                self.remote_fill_max_active_transactions
+            ),
+            "remote_fill_max_inflight_windows_per_request": (
+                self.remote_fill_max_inflight_windows_per_request
+            ),
+            "remote_fill_max_inflight_bytes": self.remote_fill_max_inflight_bytes,
+            "remote_fill_max_reserved_bytes": self.remote_fill_max_reserved_bytes,
+            "remote_fill_max_bytes_per_request": (
+                self.remote_fill_max_bytes_per_request
+            ),
+            "remote_fill_max_native_operations": (
+                self.remote_fill_max_native_operations
+            ),
+            "remote_fill_direct_worker_count": self.remote_fill_direct_worker_count,
+            "remote_fill_max_rpc_message_bytes": (
+                self.remote_fill_max_rpc_message_bytes
+            ),
+            "remote_fill_open_timeout_ms": self.remote_fill_open_timeout_ms,
+            "remote_fill_reserve_timeout_ms": self.remote_fill_reserve_timeout_ms,
+            "remote_fill_arm_timeout_ms": self.remote_fill_arm_timeout_ms,
+            "remote_fill_transfer_timeout_ms": self.remote_fill_transfer_timeout_ms,
+            "remote_fill_finish_timeout_ms": self.remote_fill_finish_timeout_ms,
+            "remote_fill_reservation_ttl_sec": self.remote_fill_reservation_ttl_sec,
+            "remote_fill_terminal_record_ttl_sec": (
+                self.remote_fill_terminal_record_ttl_sec
+            ),
+            "remote_fill_native_hard_timeout_ms": (
+                self.remote_fill_native_hard_timeout_ms
+            ),
+            "remote_fill_descriptor_ttl_sec": self.remote_fill_descriptor_ttl_sec,
+        }
+        nonpositive = [
+            name for name, value in positive_remote_fill_values.items() if value <= 0
+        ]
+        if nonpositive:
+            raise ValueError(
+                "remote fill requires positive values for " + ", ".join(nonpositive)
+            )
+        minimum_pin_timeout = (
+            float(self.remote_fill_native_hard_timeout_ms) / 1000.0 + 60.0
+        )
+        if float(self.pin_timeout_sec) <= minimum_pin_timeout:
+            raise ValueError(
+                "remote fill requires pin_timeout_sec to exceed the native hard "
+                "timeout by more than 60 seconds"
+            )
+        if self.remote_fill_min_free_bytes < 0:
+            raise ValueError("remote_fill_min_free_bytes must be non-negative")
+        if not 0 <= self.remote_fill_min_free_ratio < 1:
+            raise ValueError("remote_fill_min_free_ratio must be in [0, 1)")
+        control_port = self.remote_fill_control_port_start
+        if control_port is not None and not 0 < control_port < 65536:
+            raise ValueError(
+                "remote_fill_control_port_start must be between 1 and 65535"
+            )
+        advertise_host = self.remote_fill_control_advertise_host
+        if advertise_host is not None and not advertise_host.strip():
+            raise ValueError(
+                "remote_fill_control_advertise_host must be non-empty when set"
+            )
+        if self.remote_fill_circuit_breaker_failure_threshold <= 0:
+            raise ValueError(
+                "remote_fill_circuit_breaker_failure_threshold must be positive"
+            )
+        if self.remote_fill_circuit_breaker_cooldown_sec <= 0:
+            raise ValueError(
+                "remote_fill_circuit_breaker_cooldown_sec must be positive"
+            )
+
     if self.enable_dsa_cold_compact_load:
         required_flags = {
             "use_layerwise": self.use_layerwise,
@@ -696,6 +1050,87 @@ def _validate_config(self):
             raise ValueError(
                 "enable_dsa_cold_compact_load requires "
                 + ", ".join(f"{name}=true" for name in missing_flags)
+            )
+
+    if self.dsa_group1_load_mode in {
+        "persistent_parallel_prefetch",
+        "persistent_direct_hbm",
+    }:
+        persistent_requirements = {
+            "use_layerwise": self.use_layerwise,
+            "enable_sparse_attention": self.enable_sparse_attention,
+            "dsa_two_groups": self.dsa_two_groups,
+            "remote_url=mooncakestore://...": str(self.remote_url).startswith(
+                "mooncakestore://"
+            ),
+            "extra_config.save_only_first_rank": bool(
+                extra_config.get("save_only_first_rank", False)
+            ),
+            "extra_config.mooncake_page_first_multi_buffer": bool(
+                extra_config.get("mooncake_page_first_multi_buffer", False)
+            ),
+            "extra_config.mooncake_layer_merged_page_objects": bool(
+                extra_config.get("mooncake_layer_merged_page_objects", False)
+            ),
+        }
+        if self.dsa_group1_load_mode == "persistent_parallel_prefetch":
+            persistent_requirements.update(
+                {
+                    "enable_dsa_cold_compact_load": (
+                        self.enable_dsa_cold_compact_load
+                    ),
+                    "enable_shared_cpu_cache": enable_shared_cpu_cache,
+                }
+            )
+        if self.dsa_group1_load_mode == "persistent_direct_hbm":
+            save_only_first_rank = bool(
+                extra_config.get("save_only_first_rank", False)
+            )
+            persistent_requirements.update(
+                {
+                    "pd_role=sender|receiver": self.pd_role
+                    in {"sender", "receiver"},
+                    "enable_remote_lmcache_store=true": bool(
+                        self.enable_remote_lmcache_store
+                    ),
+                    "extra_config.remote_enable_mla_worker_id_as0!=false": bool(
+                        extra_config.get(
+                            "remote_enable_mla_worker_id_as0",
+                            save_only_first_rank,
+                        )
+                    ),
+                    "extra_config.save_chunk_meta=false": not bool(
+                        extra_config.get("save_chunk_meta", False)
+                    ),
+                    "external_lookup_client=None": (
+                        self.external_lookup_client is None
+                    ),
+                }
+            )
+            if self.pd_role == "receiver":
+                persistent_requirements.update(
+                    {
+                        "enable_dsa_cold_compact_load": (
+                            self.enable_dsa_cold_compact_load
+                        ),
+                        "enable_shared_cpu_cache": enable_shared_cpu_cache,
+                        "shared_cpu_cache_strict=true": bool(
+                            extra_config.get(
+                                "shared_cpu_cache_strict",
+                                self.shared_cpu_cache_strict,
+                            )
+                        ),
+                    }
+                )
+        missing_persistent_requirements = [
+            name
+            for name, enabled in persistent_requirements.items()
+            if not enabled
+        ]
+        if missing_persistent_requirements:
+            raise ValueError(
+                f"dsa_group1_load_mode={self.dsa_group1_load_mode} requires "
+                + ", ".join(missing_persistent_requirements)
             )
 
     if self.experimental_sampled_layerwise_lookup:

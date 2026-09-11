@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 # Third Party
@@ -82,9 +83,7 @@ def test_build_prepared_sparse_source_rejects_owner_pointer_mismatch() -> None:
             [torch.tensor([101], dtype=torch.int64)],
             num_layers=1,
             total_tokens=6,
-            cached_memory_objs=[
-                [MagicMock(spec=MemoryObj), MagicMock(spec=MemoryObj)]
-            ],
+            cached_memory_objs=[[MagicMock(spec=MemoryObj), MagicMock(spec=MemoryObj)]],
         )
 
 
@@ -110,6 +109,21 @@ def test_build_prepared_sparse_source_waits_for_token_coverage() -> None:
     assert source is None
 
 
+@pytest.mark.parametrize("chunk_counts", [(4, 3), (3, 4, 1)])
+def test_build_prepared_sparse_source_rejects_invalid_tail_coverage(
+    chunk_counts: tuple[int, ...],
+) -> None:
+    chunks = len(chunk_counts)
+    with pytest.raises(ValueError, match="coverage|non-tail chunks"):
+        build_prepared_sparse_source(
+            [[torch.empty(1)] * chunks],
+            [torch.arange(chunks, dtype=torch.int64)],
+            num_layers=1,
+            total_tokens=6 if chunks == 2 else 8,
+            chunk_token_counts=chunk_counts,
+        )
+
+
 def test_build_prepared_sparse_source_rejects_wrong_pointer_device() -> None:
     with pytest.raises(ValueError, match="wrong device"):
         build_prepared_sparse_source(
@@ -129,4 +143,38 @@ def test_build_prepared_sparse_source_rejects_noncontiguous_pointer_table() -> N
             [torch.tensor([101, 0, 102, 0], dtype=torch.int64)[::2]],
             num_layers=1,
             total_tokens=6,
+        )
+
+
+@pytest.mark.parametrize("counts", [(4,), (2,), (4, 4), (4, 2)])
+def test_prepared_source_validates_configured_chunk_size(
+    counts: tuple[int, ...],
+) -> None:
+    source = build_prepared_sparse_source(
+        [[torch.empty(1)] * len(counts)],
+        [torch.arange(len(counts), dtype=torch.long)],
+        num_layers=1,
+        total_tokens=sum(counts),
+        chunk_token_counts=counts,
+        chunk_size=4,
+    )
+    assert source is not None
+    assert source.validated_chunk_size == 4
+    # Replacing metadata must not preserve a validation of the old contents.
+    changed = replace(source, chunk_token_counts=(8,), total_tokens=8)
+    assert changed.validated_chunk_size is None
+
+
+@pytest.mark.parametrize("counts", [(5,), (2, 2), (8, 2), (4, 2, 1)])
+def test_prepared_source_rejects_wrong_configured_chunks(
+    counts: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError, match="chunk"):
+        build_prepared_sparse_source(
+            [[torch.empty(1)] * len(counts)],
+            [torch.arange(len(counts), dtype=torch.long)],
+            num_layers=1,
+            total_tokens=sum(counts),
+            chunk_token_counts=counts,
+            chunk_size=4,
         )

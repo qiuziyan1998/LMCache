@@ -304,6 +304,31 @@ class TestCacheEngineKey:
         restored = CacheEngineKey.from_string(s)
         assert restored == key_with_tags
 
+    @pytest.mark.parametrize(
+        "chunk_hash",
+        (
+            bytes.fromhex("ab" * 32),
+            bytes.fromhex("00" + "ab" * 31),
+        ),
+    )
+    def test_from_string_bytes_roundtrip(self, chunk_hash: bytes) -> None:
+        key = CacheEngineKey(
+            model_name="test_model",
+            world_size=1,
+            worker_id=0,
+            chunk_hash=chunk_hash,
+            dtype=torch.float16,
+        )
+
+        restored = CacheEngineKey.from_string(
+            key.to_string(),
+            chunk_hash_type=bytes,
+        )
+
+        assert restored == key
+        assert isinstance(restored.chunk_hash, bytes)
+        assert restored.to_string() == key.to_string()
+
     def test_from_string_invalid(self):
         with pytest.raises(ValueError):
             CacheEngineKey.from_string("invalid")

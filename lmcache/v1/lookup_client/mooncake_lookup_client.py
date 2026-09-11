@@ -12,6 +12,7 @@ from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_key_trace import trace_mooncake_keys
 from lmcache.v1.mooncake_layout import (
+    mooncake_legacy_key,
     mooncake_page_key,
     mooncake_page_layout_enabled,
 )
@@ -73,7 +74,7 @@ class MooncakeLookupClient(LookupClientInterface):
         """
         # process token_ids to cacheengine keys
         ends = []
-        chunk_keys_by_chunk: list[list[str]] = []
+        chunk_group_keys: list[list[CacheEngineKey]] = []
         use_layerwise = bool(
             getattr(getattr(self, "config", None), "use_layerwise", False)
         )
@@ -89,65 +90,133 @@ class MooncakeLookupClient(LookupClientInterface):
         )
         page_first = use_layerwise and mooncake_page_layout_enabled(self.config)
 
-        for start, end, key in self.token_database.process_tokens(
-            token_ids, request_configs=request_configs
-        ):
+        base_chunks = list(
+            self.token_database.process_tokens(
+                token_ids, request_configs=request_configs
+            )
+        )
+        group1_keys: list[CacheEngineKey] = []
+        if dsa_two_groups and base_chunks:
+            group1_chunks = list(
+                self.token_database.process_tokens(
+                    hashes=[key.chunk_hash for _, _, key in base_chunks],
+                    offsets=[end - start for start, end, _ in base_chunks],
+                    request_configs=request_configs,
+                    kv_group=1,
+                )
+            )
+            if [
+                (start, end, key.chunk_hash)
+                for start, end, key in group1_chunks
+            ] != [
+                (start, end, key.chunk_hash)
+                for start, end, key in base_chunks
+            ]:
+                raise ValueError(
+                    "KV groups produced inconsistent chunk metadata"
+                )
+            group1_keys = [key for _, _, key in group1_chunks]
+
+        for chunk_index, (start, end, key) in enumerate(base_chunks):
             assert isinstance(key, CacheEngineKey)
             group_keys = [key]
             if dsa_two_groups:
-                make_key = self.token_database._make_key_by_hash
-                index_key = make_key(
-                    key.chunk_hash,
-                    request_configs,
-                    kv_group=1,
-                )
-                group_keys.append(index_key)
+                group_keys.append(group1_keys[chunk_index])
+            chunk_group_keys.append(group_keys)
+            ends.append(end)
 
-            if page_first and end - start == self.config.chunk_size:
-                chunk_keys = [
-                    mooncake_page_key(group_key, num_layers)
-                    for group_key in group_keys
-                ]
-            elif sampled_lookup:
-                chunk_keys = [
-                    key.to_string()
+        def string_keys(
+            group_keys: list[CacheEngineKey], *, sampled: bool
+        ) -> list[str]:
+            def serialize(key: CacheEngineKey) -> str:
+                return mooncake_legacy_key(key) if page_first else key.to_string()
+
+            if sampled:
+                return [
+                    serialize(key)
                     for key in first_last_layer_keys(group_keys, num_layers)
                 ]
-            elif use_layerwise:
-                chunk_keys = [
-                    layer_key.to_string()
+            if use_layerwise:
+                return [
+                    serialize(layer_key)
                     for group_key in group_keys
                     for layer_key in group_key.split_layers(num_layers)
                 ]
-            else:
-                chunk_keys = [group_key.to_string() for group_key in group_keys]
-            chunk_keys_by_chunk.append(chunk_keys)
-            ends.append(end)
+            return [serialize(group_key) for group_key in group_keys]
+
+        def batch_exists(keys: list[str]) -> bool:
+            if not keys:
+                return False
+            results = self.store.batch_is_exist(keys)
+            trace_mooncake_keys(
+                "lookup",
+                keys,
+                results,
+                api="MooncakeLookupClient.batch_is_exist",
+                lookup_id=lookup_id,
+            )
+            return len(results) == len(keys) and all(
+                result == 1 for result in results
+            )
+
+        if page_first:
+            page_keys_by_chunk = [
+                [mooncake_page_key(key, num_layers) for key in group_keys]
+                for group_keys in chunk_group_keys
+            ]
+
+            def page_or_legacy_exists(index: int) -> bool:
+                if batch_exists(page_keys_by_chunk[index]):
+                    return True
+                return batch_exists(
+                    string_keys(
+                        chunk_group_keys[index], sampled=sampled_lookup
+                    )
+                )
+
+            if sampled_lookup:
+                winner = find_last_sampled_hit(
+                    len(chunk_group_keys), page_or_legacy_exists
+                )
+                return 0 if winner is None else ends[winner]
+
+            flat_page_keys = [key for chunk in page_keys_by_chunk for key in chunk]
+            page_results = self.store.batch_is_exist(flat_page_keys)
+            trace_mooncake_keys(
+                "lookup",
+                flat_page_keys,
+                page_results,
+                api="MooncakeLookupClient.batch_is_exist",
+                lookup_id=lookup_id,
+            )
+            offset = 0
+            for index, page_keys in enumerate(page_keys_by_chunk):
+                chunk_results = page_results[offset : offset + len(page_keys)]
+                offset += len(page_keys)
+                page_hit = len(chunk_results) == len(page_keys) and all(
+                    result == 1 for result in chunk_results
+                )
+                if not page_hit and not batch_exists(
+                    string_keys(chunk_group_keys[index], sampled=False)
+                ):
+                    return ends[index - 1] if index else 0
+            return ends[-1] if ends else 0
 
         if sampled_lookup:
-            def batch_exists(keys: list[str]) -> bool:
-                if not keys:
-                    return False
-                results = self.store.batch_is_exist(keys)
-                trace_mooncake_keys(
-                    "lookup",
-                    keys,
-                    results,
-                    api="MooncakeLookupClient.batch_is_exist",
-                    lookup_id=lookup_id,
-                )
-                return len(results) == len(keys) and all(
-                    result == 1 for result in results
-                )
-
             winner = find_last_sampled_hit(
-                len(chunk_keys_by_chunk),
-                lambda index: batch_exists(chunk_keys_by_chunk[index]),
+                len(chunk_group_keys),
+                lambda index: batch_exists(
+                    string_keys(chunk_group_keys[index], sampled=True)
+                ),
             )
             return 0 if winner is None else ends[winner]
 
         # Use batch_is_exist to check all keys at once
         # rets is list of int: 1 = found, 0 = not found, -1 = error
+        chunk_keys_by_chunk = [
+            string_keys(group_keys, sampled=False)
+            for group_keys in chunk_group_keys
+        ]
         keys = [key for chunk_keys in chunk_keys_by_chunk for key in chunk_keys]
         rets = self.store.batch_is_exist(keys)
         trace_mooncake_keys(

@@ -5,6 +5,8 @@ Tests for LMCacheManager.
 
 # Standard
 from unittest.mock import MagicMock, patch
+import threading
+import time
 
 # Third Party
 import pytest
@@ -12,7 +14,7 @@ import pytest
 # First Party
 from lmcache.integration.base_service_factory import BaseServiceFactory
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.manager import LMCacheManager, _run_with_timeout
 
 
 def _make_mock_factory(**overrides):
@@ -328,6 +330,52 @@ class TestLMCacheManagerShutdown:
 
             # lookup_client should still be closed even if offload_server failed
             mock_lookup_client.close.assert_called_once()
+
+    def test_shutdown_timeout_does_not_wait_for_callback_exit(self):
+        """A timed-out callback may drain later without blocking shutdown."""
+        release = threading.Event()
+        started = time.monotonic()
+
+        completed, error = _run_with_timeout(
+            release.wait,
+            timeout=0.01,
+            thread_name="lmcache-test-blocked-close",
+        )
+
+        assert completed is False
+        assert error is None
+        assert time.monotonic() - started < 0.5
+        release.set()
+
+    def test_cache_engine_destroy_runs_on_shutdown_caller(self):
+        """Native engine ownership is never detached to a timeout thread."""
+        manager = LMCacheManager(
+            config=LMCacheEngineConfig.from_defaults(),
+            service_factory=_make_mock_factory(),
+        )
+        caller = threading.get_ident()
+        destroy_threads: list[int] = []
+
+        with patch("lmcache.v1.manager.LMCacheEngineBuilder") as builder:
+            builder.destroy.side_effect = (
+                lambda _instance_id: destroy_threads.append(threading.get_ident())
+            )
+            manager.stop_services()
+
+        assert destroy_threads == [caller]
+
+    def test_cache_engine_destroy_failure_is_not_swallowed(self):
+        """A failed native close must retain the builder entry and fail stop."""
+        manager = LMCacheManager(
+            config=LMCacheEngineConfig.from_defaults(),
+            service_factory=_make_mock_factory(),
+        )
+
+        with patch("lmcache.v1.manager.LMCacheEngineBuilder") as builder:
+            builder.destroy.side_effect = RuntimeError("ownership unknown")
+            with pytest.raises(RuntimeError, match="ownership unknown"):
+                manager.stop_services()
+            builder.destroy.assert_called_once()
 
 
 class TestLMCacheManagerHelpers:

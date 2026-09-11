@@ -29,6 +29,7 @@ class RpcClientTransport(abc.ABC):
     def send_and_recv_all(
         self,
         msg: list[Any],
+        timeout_ms: int | None = None,
     ) -> list[bytes]:
         """Send structured data to all ranks and collect
         responses.
@@ -41,6 +42,8 @@ class RpcClientTransport(abc.ABC):
             msg: List of Python objects to send as
                 message frames. Each element will be
                 serialized by the transport's codec.
+            timeout_ms: Optional timeout for this operation. Implementations
+                use their configured default when omitted.
 
         Returns:
             List of raw response bytes, one per rank.

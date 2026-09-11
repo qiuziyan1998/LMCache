@@ -354,7 +354,7 @@ class CacheEngineKey:
     model_name: str
     world_size: int
     worker_id: int
-    chunk_hash: int
+    chunk_hash: int | bytes
     dtype: torch.dtype
     request_configs: Optional[dict] = field(default_factory=dict)
     tags: Optional[tuple] = field(init=False, default=None)
@@ -441,10 +441,36 @@ class CacheEngineKey:
         return self.get_layer(0)
 
     @staticmethod
-    def from_string(s):
+    def from_string(
+        s: str,
+        *,
+        chunk_hash_type: type[int] | type[bytes] = int,
+    ) -> "CacheEngineKey":
+        """Reconstruct a cache key from its canonical string representation.
+
+        Args:
+            s: Canonical cache-key string produced by :meth:`to_string`.
+            chunk_hash_type: Exact in-memory representation expected for the
+                hexadecimal chunk hash. Existing callers default to ``int``;
+                digest-based hashing callers can request ``bytes``.
+
+        Returns:
+            A cache key whose chunk hash uses ``chunk_hash_type``.
+
+        Raises:
+            TypeError: If ``chunk_hash_type`` is neither ``int`` nor ``bytes``.
+            ValueError: If the canonical key is malformed.
+        """
+
         parts = s.split("@")
         if len(parts) < 5:
             raise ValueError(f"Invalid key string: {s}")
+        if chunk_hash_type is int:
+            chunk_hash: int | bytes = int(parts[3], 16)
+        elif chunk_hash_type is bytes:
+            chunk_hash = bytes.fromhex(parts[3])
+        else:
+            raise TypeError("chunk_hash_type must be int or bytes")
         request_configs = None
         # Format: model@ws@wid@hash@dtype[@kv_group][@tags...]
         # kv_group defaults to 0 for backward compat with old 5-part keys.
@@ -466,7 +492,7 @@ class CacheEngineKey:
             model_name=parts[0],
             world_size=int(parts[1]),
             worker_id=int(parts[2]),
-            chunk_hash=int(parts[3], 16),
+            chunk_hash=chunk_hash,
             dtype=STR_DTYPE_TO_TORCH_DTYPE[parts[4]],
             request_configs=request_configs,
             kv_group=kv_group,

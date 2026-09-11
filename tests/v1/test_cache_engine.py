@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import OrderedDict
 from copy import deepcopy
+import asyncio
 import os
 import random
 import shlex
 import subprocess
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 
@@ -22,6 +25,11 @@ import lmcache.v1.cache_engine as cache_engine_module
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventStatus, EventType
+from lmcache.v1.remote_fill.native import (
+    NativeExternalPageTransferUnknownError,
+)
+from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+from lmcache.v1.storage_backend.storage_manager import StorageManager
 
 # Local
 from .utils import (
@@ -156,6 +164,110 @@ def test_layerwise_retrieve_preserves_cleanup_locations(
     assert all(
         mem_obj.ref_count_down_calls == 1
         for mem_obj in engine.storage_manager.returned
+    )
+
+
+def test_layerwise_retrieve_rejects_incomplete_later_layer(monkeypatch):
+    class FakeKey:
+        def __init__(self, chunk_id):
+            self.chunk_id = chunk_id
+
+        def split_layers(self, num_layers):
+            return [
+                SimpleNamespace(chunk_id=self.chunk_id, layer_id=layer_id)
+                for layer_id in range(num_layers)
+            ]
+
+    class FakeMemoryObj:
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+            self.ref_count_down_calls = 0
+            self.is_pinned = True
+            self.unpin_calls = 0
+
+        def ref_count_down(self):
+            self.ref_count_down_calls += 1
+
+        def unpin(self):
+            self.unpin_calls += 1
+            self.is_pinned = False
+
+    class FakeStorageManager:
+        def __init__(self):
+            self.returned = []
+
+        @staticmethod
+        def contains(_key, _retrieve_locations):
+            return "RemoteBackend"
+
+        def layerwise_batched_get(self, keys, location=None):
+            del location
+            for layer_id, layer_keys in enumerate(keys):
+                count = len(layer_keys) if layer_id == 0 else len(layer_keys) - 1
+                mem_objs = [FakeMemoryObj(layer_id) for _ in range(count)]
+                self.returned.extend(mem_objs)
+                yield SimpleNamespace(result=lambda objs=mem_objs: objs)
+
+    class FakeLoadStream:
+        def __init__(self):
+            self.synchronize_calls = 0
+
+        def synchronize(self):
+            self.synchronize_calls += 1
+
+    class FakeGPUConnector:
+        def __init__(self):
+            self.load_stream = FakeLoadStream()
+            self.layers_sent = 0
+            self.closed = False
+
+        def batched_to_gpu(self, _starts, _ends, **_kwargs):
+            try:
+                while True:
+                    yield
+                    self.layers_sent += 1
+            finally:
+                self.closed = True
+
+    monkeypatch.setattr(cache_engine_module, "CacheEngineKey", FakeKey)
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.retrieve_locations = ["RemoteBackend"]
+    engine.storage_manager = FakeStorageManager()
+    engine.gpu_connector = FakeGPUConnector()
+    engine.token_database = SimpleNamespace(
+        process_tokens=lambda **_kwargs: iter(
+            [(0, 1, FakeKey(0)), (1, 2, FakeKey(1))]
+        )
+    )
+    engine.stats_monitor = SimpleNamespace(
+        on_retrieve_request=lambda _num_tokens: "monitor-id",
+        on_retrieve_finished=lambda _monitor_id, _num_tokens: None,
+    )
+    engine.is_healthy = lambda: True
+    engine._get_req_id = lambda _kwargs: "req"
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: False
+    engine._is_passive = lambda: False
+
+    with pytest.raises(RuntimeError, match="incomplete layer"):
+        list(engine.retrieve_layer([1, 2]))
+
+    assert engine.gpu_connector.layers_sent == 1
+    assert engine.gpu_connector.load_stream.synchronize_calls == 1
+    assert engine.gpu_connector.closed is True
+    assert engine.storage_manager.returned
+    assert all(
+        mem_obj.ref_count_down_calls == 1
+        for mem_obj in engine.storage_manager.returned
+    )
+    assert all(
+        mem_obj.unpin_calls == 1 for mem_obj in engine.storage_manager.returned
     )
 
 
@@ -1451,6 +1563,138 @@ def test_builder_destroy(autorelease_v1):
 
     # Verify destroying non-existent instance doesn't raise error
     LMCacheEngineBuilder.destroy("non_existent_id")  # Should not raise
+
+
+def test_builder_destroy_retains_instance_when_engine_close_fails():
+    """A failed close keeps the same engine reachable and non-replaceable."""
+
+    class FailingEngine:
+        def close(self) -> None:
+            raise RuntimeError("native ownership unknown")
+
+    instance_id = "test_destroy_fatal"
+    engine = FailingEngine()
+    config = LMCacheEngineConfig.from_defaults()
+    metadata = dumb_metadata()
+    stat_logger = SimpleNamespace(shutdown=lambda: None)
+    LMCacheEngineBuilder._instances[instance_id] = engine
+    LMCacheEngineBuilder._cfgs[instance_id] = config
+    LMCacheEngineBuilder._metadatas[instance_id] = metadata
+    LMCacheEngineBuilder._stat_loggers[instance_id] = stat_logger
+    try:
+        with pytest.raises(RuntimeError, match="native ownership unknown"):
+            LMCacheEngineBuilder.destroy(instance_id)
+
+        assert LMCacheEngineBuilder.get(instance_id) is engine
+        assert LMCacheEngineBuilder._cfgs[instance_id] is config
+        assert LMCacheEngineBuilder._metadatas[instance_id] is metadata
+        assert LMCacheEngineBuilder._stat_loggers[instance_id] is stat_logger
+        assert (
+            LMCacheEngineBuilder.get_or_create(
+                instance_id,
+                config,
+                metadata,
+                None,
+                mock_up_broadcast_fn,
+                mock_up_broadcast_object_fn,
+            )
+            is engine
+        )
+        with pytest.raises(ValueError, match="different configuration"):
+            LMCacheEngineBuilder.get_or_create(
+                instance_id,
+                LMCacheEngineConfig.from_defaults(chunk_size=512),
+                metadata,
+                None,
+                mock_up_broadcast_fn,
+                mock_up_broadcast_object_fn,
+            )
+    finally:
+        LMCacheEngineBuilder._instances.pop(instance_id, None)
+        LMCacheEngineBuilder._cfgs.pop(instance_id, None)
+        LMCacheEngineBuilder._metadatas.pop(instance_id, None)
+        LMCacheEngineBuilder._stat_loggers.pop(instance_id, None)
+
+
+def test_builder_retains_tp0_after_external_hbm_dma_becomes_unknown():
+    """Direct-HBM use makes the ordinary TP0 close chain fail-stop."""
+
+    class UnknownConnection:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def batched_get_external_pages(self, *_args) -> None:
+            terminal = asyncio.get_running_loop().create_future()
+            terminal.set_result(None)
+            raise NativeExternalPageTransferUnknownError("get", terminal)
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever)
+    loop_thread.start()
+    connection = UnknownConnection()
+    backend = object.__new__(RemoteBackend)
+    backend.connection = connection
+    backend.loop = loop
+    backend.config = SimpleNamespace(
+        blocking_timeout_secs=0.01,
+        remote_fill_native_hard_timeout_ms=10,
+    )
+    backend._mla_worker_id_as0_mode = False
+    backend._external_page_fatal_error = None
+    backend._strict_external_destination_ownership = False
+    backend.external_page_only = False
+    backend._close_lock = threading.Lock()
+    backend._close_future = None
+
+    storage_manager = object.__new__(StorageManager)
+    storage_manager.storage_backends = OrderedDict(RemoteBackend=backend)
+    storage_manager.loop = loop
+    storage_manager.thread = loop_thread
+
+    mapping_close_calls = []
+    engine = object.__new__(LMCacheEngine)
+    engine.lmcache_worker = None
+    engine._shared_cpu_request_leases = {}
+    engine.storage_manager = storage_manager
+    engine.shared_cpu_cache_mapping = SimpleNamespace(
+        close=lambda: mapping_close_calls.append("close")
+    )
+
+    instance_id = "test_destroy_external_hbm_fatal"
+    config = LMCacheEngineConfig.from_defaults()
+    metadata = dumb_metadata()
+    LMCacheEngineBuilder._instances[instance_id] = engine
+    LMCacheEngineBuilder._cfgs[instance_id] = config
+    LMCacheEngineBuilder._metadatas[instance_id] = metadata
+    LMCacheEngineBuilder._stat_loggers[instance_id] = SimpleNamespace(
+        shutdown=lambda: None
+    )
+    try:
+        with pytest.raises(NativeExternalPageTransferUnknownError):
+            backend.batched_get_external_pages(
+                [], [], [], (), "external-hbm-request"
+            )
+        assert backend.requires_strict_external_close()
+
+        with pytest.raises(RuntimeError, match="completion is unknown"):
+            LMCacheEngineBuilder.destroy(instance_id)
+
+        assert LMCacheEngineBuilder.get(instance_id) is engine
+        assert storage_manager.storage_backends["RemoteBackend"] is backend
+        assert connection.close_calls == 0
+        assert mapping_close_calls == []
+        assert loop_thread.is_alive()
+    finally:
+        LMCacheEngineBuilder._instances.pop(instance_id, None)
+        LMCacheEngineBuilder._cfgs.pop(instance_id, None)
+        LMCacheEngineBuilder._metadatas.pop(instance_id, None)
+        LMCacheEngineBuilder._stat_loggers.pop(instance_id, None)
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=1.0)
+        loop.close()
 
 
 @pytest.mark.skipif(

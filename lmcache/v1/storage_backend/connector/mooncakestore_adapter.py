@@ -37,4 +37,6 @@ class MooncakestoreConnectorAdapter(ConnectorAdapter):
             loop=context.loop,
             local_cpu_backend=context.local_cpu_backend,
             lmcache_config=context.config,
+            lmcache_metadata=context.metadata,
+            external_page_only=context.external_page_only,
         )

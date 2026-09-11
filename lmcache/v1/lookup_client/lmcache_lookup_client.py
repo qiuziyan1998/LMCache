@@ -12,6 +12,7 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine
+from lmcache.v1.serving_perf import serving_perf_enabled
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
@@ -21,6 +22,8 @@ from lmcache.v1.rpc.transport import (
 )
 
 logger = init_logger(__name__)
+
+_LOOKUP_CLEANUP_OP = "__lmcache_lookup_cleanup__"
 
 
 def _utc_timestamp() -> str:
@@ -136,21 +139,16 @@ class LMCacheLookupClient(LookupClientInterface):
             lookup_mode = "tokens"
             lookup_input_count = len(token_ids)
 
-        rpc_started_at = _utc_timestamp()
-        rpc_started = time.perf_counter()
         responses = self.transport.send_and_recv_all(msg_buf)
-        rpc_elapsed_ms = (time.perf_counter() - rpc_started) * 1000
 
         # Transport returns empty list on failure
         if not responses:
             logger.error(
-                "Lookup RPC returned no responses: failed_at=%s started_at=%s "
-                "elapsed_ms=%.3f caller=LMCacheLookupClient.lookup "
+                "Lookup RPC returned no responses: failed_at=%s "
+                "caller=LMCacheLookupClient.lookup "
                 "lookup_id=%s mode=%s input_count=%s token_count=%s "
                 "transport=%s timeout_ms=%s",
                 _utc_timestamp(),
-                rpc_started_at,
-                rpc_elapsed_ms,
                 lookup_id,
                 lookup_mode,
                 lookup_input_count,
@@ -179,6 +177,19 @@ class LMCacheLookupClient(LookupClientInterface):
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.reqs_status.pop(lookup_id, None)
+
+    def cleanup_lookup(self, lookup_id: str) -> None:
+        """Release lookup pins on every worker before forgetting local state."""
+        responses = self.transport.send_and_recv_all(
+            [_LOOKUP_CLEANUP_OP, lookup_id, ""]
+        )
+        if len(responses) != self.transport.world_size:
+            raise RuntimeError(
+                "Lookup cleanup did not reach every worker: "
+                f"lookup_id={lookup_id}, responses={len(responses)}, "
+                f"workers={self.transport.world_size}"
+            )
+        self.clear_lookup_status(lookup_id)
 
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports
@@ -258,20 +269,27 @@ class LMCacheLookupServer:
                         json.loads(request_configs_str) if request_configs_str else None
                     )
 
-                    lookup_started_at = _utc_timestamp()
-                    lookup_started = time.perf_counter()
-                    lookup_mode = "tokens" if self.enable_blending else "hashes"
-                    lookup_input_count = len(data_frames[0])
-                    logger.info(
-                        "Lookup server processing started: started_at=%s "
-                        "caller=LMCacheLookupServer.process_request lookup_id=%s "
-                        "mode=%s input_count=%s client_timeout_ms=%s",
-                        lookup_started_at,
-                        lookup_id,
-                        lookup_mode,
-                        lookup_input_count,
-                        self.lmcache_engine.config.lookup_timeout_ms,
-                    )
+                    if data_frames[0] == _LOOKUP_CLEANUP_OP:
+                        self.lmcache_engine.cleanup_memory_objs(lookup_id)
+                        self.transport.send_response(identity, b"\x01")
+                        continue
+
+                    perf_enabled = serving_perf_enabled()
+                    if perf_enabled:
+                        lookup_started_at = _utc_timestamp()
+                        lookup_started = time.perf_counter()
+                        lookup_mode = "tokens" if self.enable_blending else "hashes"
+                        lookup_input_count = len(data_frames[0])
+                        logger.info(
+                            "Lookup server processing started: started_at=%s "
+                            "caller=LMCacheLookupServer.process_request lookup_id=%s "
+                            "mode=%s input_count=%s client_timeout_ms=%s",
+                            lookup_started_at,
+                            lookup_id,
+                            lookup_mode,
+                            lookup_input_count,
+                            self.lmcache_engine.config.lookup_timeout_ms,
+                        )
                     if not self.enable_blending:
                         hashes = data_frames[0]
                         offsets = data_frames[1]
@@ -290,28 +308,31 @@ class LMCacheLookupServer:
                             pin=True,
                             request_configs=request_configs,
                         )
-                    lookup_elapsed_ms = (time.perf_counter() - lookup_started) * 1000
-                    log_lookup = (
-                        logger.warning
-                        if lookup_elapsed_ms
-                        >= self.lmcache_engine.config.lookup_timeout_ms
-                        else logger.debug
-                    )
-                    log_lookup(
-                        "Lookup server processing completed: completed_at=%s "
-                        "started_at=%s elapsed_ms=%.3f "
-                        "caller=LMCacheLookupServer.process_request lookup_id=%s "
-                        "mode=%s input_count=%s result_tokens=%s "
-                        "client_timeout_ms=%s",
-                        _utc_timestamp(),
-                        lookup_started_at,
-                        lookup_elapsed_ms,
-                        lookup_id,
-                        lookup_mode,
-                        lookup_input_count,
-                        lookup_result,
-                        self.lmcache_engine.config.lookup_timeout_ms,
-                    )
+                    if perf_enabled:
+                        lookup_elapsed_ms = (
+                            time.perf_counter() - lookup_started
+                        ) * 1000
+                        log_lookup = (
+                            logger.warning
+                            if lookup_elapsed_ms
+                            >= self.lmcache_engine.config.lookup_timeout_ms
+                            else logger.debug
+                        )
+                        log_lookup(
+                            "Lookup server processing completed: completed_at=%s "
+                            "started_at=%s elapsed_ms=%.3f "
+                            "caller=LMCacheLookupServer.process_request lookup_id=%s "
+                            "mode=%s input_count=%s result_tokens=%s "
+                            "client_timeout_ms=%s",
+                            _utc_timestamp(),
+                            lookup_started_at,
+                            lookup_elapsed_ms,
+                            lookup_id,
+                            lookup_mode,
+                            lookup_input_count,
+                            lookup_result,
+                            self.lmcache_engine.config.lookup_timeout_ms,
+                        )
                     response = lookup_result.to_bytes(4, "big")
                     self.transport.send_response(identity, response)
                 except json.JSONDecodeError as e:

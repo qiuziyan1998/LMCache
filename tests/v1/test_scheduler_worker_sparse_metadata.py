@@ -5,6 +5,7 @@
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 # Third Party
@@ -20,6 +21,9 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LoadSpec,
     RequestTracker,
     WorkerRetrieveState,
+    _has_live_group1_source_for_dp,
+    _has_live_latent_source_for_dp,
+    _live_split_source_dp_rank,
 )
 from tests.v1.connector_test_utils import make_worker_impl
 
@@ -51,8 +55,10 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl.config.enable_sparse_attention = True
     impl.config.enable_shared_cpu_cache = False
     impl.config.use_layerwise = True
+    impl.config.dsa_group1_load_mode = "p2p_preferred"
     impl.config.priority_limit = None
     impl.kv_role = "kv_both"
+    impl.async_loading = False
     impl.force_skip_save = False
     impl._block_size = 16
     impl._lmcache_chunk_size = 256
@@ -63,13 +69,40 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl._dsa_kv_policy_log = False
     impl._dsa_kv_policy_states = {}
     impl._cold_perf_lookup_started = {}
+    impl._resume_lookup_queries = {}
     impl._discard_partial_chunks = True
     impl._request_trackers = {}
     impl._unfinished_requests = {}
     impl.load_specs = {}
     impl._requests_priority = {}
     impl._cold_perf_lookup_started = {}
+    impl.skip_last_n_tokens = 0
     return impl
+
+
+def _completed_future(result: Any = None) -> Future:
+    future = Future()
+    future.set_result(result)
+    return future
+
+
+def _make_preempted_lookup_request(
+    req_id: str,
+    prompt_len: int,
+    output_tokens: list[int],
+) -> SimpleNamespace:
+    prompt = list(range(prompt_len))
+    return SimpleNamespace(
+        request_id=req_id,
+        status=adapter_module.RequestStatus.PREEMPTED,
+        priority=0,
+        prompt_token_ids=prompt,
+        num_prompt_tokens=prompt_len,
+        all_token_ids=prompt + output_tokens,
+        num_tokens=prompt_len + len(output_tokens),
+        num_output_tokens=len(output_tokens),
+        sampling_params=None,
+    )
 
 
 def _make_vllm_request(
@@ -454,6 +487,952 @@ def test_dsa_cold_compact_is_disabled_with_vllm_prefix_caching() -> None:
     assert not impl.supports_dsa_cold_compact_load()
 
 
+def test_live_split_does_not_require_decoder_cold_load() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key == "mooncake_direct_npu_prefill_store"
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        kv_transfer_config=SimpleNamespace(
+            get_from_extra_config=lambda side, default: {
+                "prefill": {"tp_size": 2},
+                "decode": {"tp_size": 2},
+            }.get(side, default)
+        ),
+    )
+    impl.use_layerwise = False
+    impl.async_loading = False
+    impl._release_request_lookup_pins = MagicMock()
+    impl._drop_worker_retrieve_state = MagicMock()
+    impl._manager = SimpleNamespace(lookup_client=MagicMock())
+    request = SimpleNamespace(
+        request_id="live-prefill",
+        status=adapter_module.RequestStatus.FINISHED_STOPPED,
+        kv_transfer_params={"do_remote_decode": True},
+    )
+
+    assert impl.supports_dsa_live_split()
+    assert not impl.supports_dsa_live_latent_split()
+    assert not impl.supports_dsa_cold_compact_load()
+    impl.request_finished(request, [])
+    assert request.kv_transfer_params["request_live_split"] is True
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_request_finished_delays_only_compact_block_release(compact: bool) -> None:
+    impl = _make_scheduler_impl()
+    impl._resume_lookup_queries["finished"] = (22_016, "decode_committed", 22_016)
+    impl.use_layerwise = False
+    impl.async_loading = False
+    impl._release_request_lookup_pins = MagicMock()
+    impl._drop_worker_retrieve_state = MagicMock()
+    lookup_client = MagicMock()
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+    request = SimpleNamespace(
+        request_id="finished",
+        status=adapter_module.RequestStatus.FINISHED_STOPPED,
+        kv_transfer_params=None,
+        dsa_compact_allocated=compact,
+    )
+
+    delay_free, _ = impl.request_finished(request, [])
+
+    assert delay_free is compact
+    assert "finished" not in impl._resume_lookup_queries
+    lookup_client.clear_lookup_status.assert_called_once_with("finished")
+
+
+@pytest.mark.parametrize("async_loading", [False, True])
+def test_direct_hbm_busy_request_defers_without_pins_and_retries_fresh(
+    async_loading: bool,
+) -> None:
+    impl = _make_scheduler_impl()
+    impl.async_loading = async_loading
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.dsa_group1_load_mode = "persistent_direct_hbm"
+    impl.config.min_retrieve_tokens = 0
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.side_effect = [8192, -1]
+    lookup_client.lookup.return_value = 8192
+    impl._manager = SimpleNamespace(
+        lookup_client=lookup_client,
+        lmcache_engine=None,
+    )
+    impl._dsa_group1_direct_hbm_active_req_id = "active"
+    request = SimpleNamespace(
+        request_id="deferred",
+        num_tokens=8192,
+        all_token_ids=list(range(8192)),
+        prompt_token_ids=list(range(8192)),
+        sampling_params=None,
+    )
+
+    assert impl.get_num_new_matched_tokens(request, 0) is None
+    lookup_client.cleanup_lookup.assert_called_once_with("deferred")
+    lookup_client.cancel_lookup.assert_not_called()
+    lookup_client.clear_lookup_status.assert_not_called()
+    assert impl._dsa_group1_direct_hbm_deferred_req_ids == {"deferred"}
+
+    # Repeated scheduler polls neither repeat lookup nor retain a source plan.
+    assert impl.get_num_new_matched_tokens(request, 0) is None
+    assert lookup_client.lookup_cache.call_count == 1
+
+    impl.update_connector_output(
+        SimpleNamespace(
+            finished_recving={"active"},
+            completed_decode_window_saves={},
+        )
+    )
+    assert impl.get_num_new_matched_tokens(request, 0) == 8191
+    assert lookup_client.lookup_cache.call_count == 2
+    lookup_client.lookup.assert_called_once()
+    assert not hasattr(impl, "_dsa_group1_direct_hbm_deferred_req_ids")
+    assert impl.load_specs["deferred"].dsa_group1_direct_hbm
+
+
+@pytest.mark.parametrize("async_loading", [False, True])
+def test_request_finished_clears_direct_hbm_deferred_state(
+    async_loading: bool,
+) -> None:
+    impl = _make_scheduler_impl()
+    impl.use_layerwise = False
+    impl.async_loading = async_loading
+    impl._dsa_group1_direct_hbm_deferred_req_ids = {"cancelled", "other"}
+    impl._release_request_lookup_pins = MagicMock()
+    impl._drop_worker_retrieve_state = MagicMock()
+    lookup_client = MagicMock()
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+    request = SimpleNamespace(
+        request_id="cancelled",
+        status=adapter_module.RequestStatus.FINISHED_ABORTED,
+        kv_transfer_params=None,
+        dsa_compact_allocated=False,
+    )
+
+    impl.request_finished(request, [])
+
+    assert impl._dsa_group1_direct_hbm_deferred_req_ids == {"other"}
+    impl._release_request_lookup_pins.assert_called_once_with("cancelled")
+    lookup_client.clear_lookup_status.assert_called_once_with("cancelled")
+    lookup_client.cancel_lookup.assert_not_called()
+
+
+def test_request_finished_does_not_release_inflight_direct_hbm_slot() -> None:
+    impl = _make_scheduler_impl()
+    impl.use_layerwise = False
+    impl.async_loading = False
+    impl._dsa_group1_direct_hbm_active_req_id = "inflight"
+    impl._release_request_lookup_pins = MagicMock()
+    impl._drop_worker_retrieve_state = MagicMock()
+    impl._manager = SimpleNamespace(lookup_client=MagicMock())
+    request = SimpleNamespace(
+        request_id="inflight",
+        status=adapter_module.RequestStatus.FINISHED_ABORTED,
+        kv_transfer_params=None,
+        dsa_compact_allocated=True,
+    )
+
+    delay_free, _ = impl.request_finished(request, [])
+
+    assert delay_free
+    impl._release_request_lookup_pins.assert_not_called()
+    impl._manager.lookup_client.clear_lookup_status.assert_called_once_with(
+        "inflight"
+    )
+    assert impl._dsa_group1_direct_hbm_active_req_id == "inflight"
+    # A rank-local failure signal is not the all-worker terminal fence and
+    # therefore cannot open the scheduler-global direct-load slot.
+    impl.update_connector_output(
+        SimpleNamespace(
+            finished_recving=set(),
+            invalid_block_ids={101},
+            completed_decode_window_saves={},
+        )
+    )
+    assert impl._dsa_group1_direct_hbm_active_req_id == "inflight"
+    impl.update_connector_output(
+        SimpleNamespace(
+            finished_recving={"inflight"},
+            completed_decode_window_saves={},
+        )
+    )
+    assert not hasattr(impl, "_dsa_group1_direct_hbm_active_req_id")
+
+
+def test_request_finished_releases_predispatch_direct_hbm_allocation() -> None:
+    impl = _make_scheduler_impl()
+    impl.use_layerwise = False
+    impl.async_loading = False
+    impl._release_request_lookup_pins = MagicMock()
+    impl._drop_worker_retrieve_state = MagicMock()
+    impl._manager = SimpleNamespace(lookup_client=MagicMock())
+    req_id = "predispatch-request-finished"
+    load_spec = LoadSpec(0, 8192, True)
+    load_spec.dsa_group1_direct_hbm = True
+    impl.load_specs[req_id] = load_spec
+    impl._pending_dsa_cold_load_metas = {
+        req_id: SimpleNamespace(load_spec=load_spec)
+    }
+    impl._dsa_cold_indexer_block_ids = {req_id: {101, 102}}
+    impl._dsa_group1_direct_hbm_active_req_id = req_id
+    request = SimpleNamespace(
+        request_id=req_id,
+        status=adapter_module.RequestStatus.FINISHED_ABORTED,
+        kv_transfer_params=None,
+        dsa_compact_allocated=True,
+    )
+
+    delay_free, _ = impl.request_finished(request, [])
+
+    assert not delay_free
+    assert req_id not in impl.load_specs
+    assert not hasattr(impl, "_pending_dsa_cold_load_metas")
+    assert not hasattr(impl, "_dsa_cold_indexer_block_ids")
+    assert not hasattr(impl, "_dsa_group1_direct_hbm_active_req_id")
+    impl._release_request_lookup_pins.assert_called_once_with(req_id)
+
+
+def test_finished_pending_direct_hbm_request_releases_predispatch_slot() -> None:
+    impl = _make_scheduler_impl()
+    req_id = "predispatch-cancelled"
+    load_spec = LoadSpec(0, 8192, True)
+    load_spec.dsa_group1_direct_hbm = True
+    impl.load_specs[req_id] = load_spec
+    impl._pending_dsa_cold_load_metas = {
+        req_id: SimpleNamespace(load_spec=load_spec)
+    }
+    impl._dsa_group1_direct_hbm_active_req_id = req_id
+
+    meta = impl.build_connector_meta(
+        StubSchedulerOutput(
+            finished_req_ids={req_id},
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData([], [], []),
+            num_scheduled_tokens={},
+        )
+    )
+
+    assert meta.requests == []
+    assert not hasattr(impl, "_pending_dsa_cold_load_metas")
+    assert not hasattr(impl, "_dsa_group1_direct_hbm_active_req_id")
+
+
+def test_finished_emitted_direct_hbm_request_waits_for_worker_terminal() -> None:
+    impl = _make_scheduler_impl()
+    req_id = "emitted-cancelled"
+    impl._dsa_group1_direct_hbm_active_req_id = req_id
+
+    impl.build_connector_meta(
+        StubSchedulerOutput(
+            finished_req_ids={req_id},
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData([], [], []),
+            num_scheduled_tokens={},
+        )
+    )
+
+    assert impl._dsa_group1_direct_hbm_active_req_id == req_id
+    impl.update_connector_output(
+        SimpleNamespace(
+            finished_recving={req_id},
+            completed_decode_window_saves={},
+        )
+    )
+    assert not hasattr(impl, "_dsa_group1_direct_hbm_active_req_id")
+
+
+def test_direct_hbm_metadata_failure_releases_lookup_pins() -> None:
+    impl = _make_scheduler_impl()
+    impl._dsa_cold_load_generation = 0
+    impl._build_dsa_cold_compact_meta = MagicMock(
+        side_effect=RuntimeError("metadata failed")
+    )
+    engine = MagicMock()
+    impl._manager = SimpleNamespace(
+        lookup_client=MagicMock(),
+        lmcache_engine=engine,
+    )
+    req_id = "metadata-failed"
+    load_spec = LoadSpec(
+        vllm_cached_tokens=0,
+        lmcache_cached_tokens=8192,
+        can_load=False,
+    )
+    load_spec.dsa_cold_compact_load = True
+    load_spec.dsa_group1_direct_hbm = True
+    impl.load_specs[req_id] = load_spec
+    request = SimpleNamespace(request_id=req_id, num_tokens=8192)
+
+    with pytest.raises(RuntimeError, match="metadata failed"):
+        impl.update_state_after_alloc(request, 8191, object())
+
+    engine.lookup_unpin.assert_called_once_with(req_id)
+    assert req_id not in impl.load_specs
+    assert not hasattr(impl, "_dsa_group1_direct_hbm_active_req_id")
+
+
+def test_direct_hbm_missing_blocks_rolls_back_lookup_state() -> None:
+    impl = _make_scheduler_impl()
+    engine = MagicMock()
+    impl._manager = SimpleNamespace(
+        lookup_client=MagicMock(),
+        lmcache_engine=engine,
+    )
+    req_id = "missing-blocks"
+    load_spec = LoadSpec(0, 8192, False)
+    load_spec.dsa_cold_compact_load = True
+    load_spec.dsa_group1_direct_hbm = True
+    impl.load_specs[req_id] = load_spec
+    request = SimpleNamespace(request_id=req_id, num_tokens=8192)
+
+    with pytest.raises(ValueError, match="requires KVCacheBlocks metadata"):
+        impl.update_state_after_alloc(request, 8191)
+
+    engine.lookup_unpin.assert_called_once_with(req_id)
+    assert req_id not in impl.load_specs
+    assert not hasattr(impl, "_dsa_group1_direct_hbm_active_req_id")
+
+
+def test_preempted_lookup_without_decode_cache_uses_prompt_boundary() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.save_decode_cache = False
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    request = _make_preempted_lookup_request(
+        "partial-tail-resume",
+        22_012,
+        [100_001, 100_002],
+    )
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = -1
+    lookup_client.lookup.side_effect = lambda tokens, **_: (
+        len(request.prompt_token_ids)
+        if len(tokens) == len(request.prompt_token_ids)
+        else 21_504
+    )
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+
+    matched = impl.get_num_new_matched_tokens(request, 0)
+
+    assert matched == 22_012
+    assert lookup_client.lookup.call_args.args[0] == request.prompt_token_ids
+    load_spec = impl.load_specs[request.request_id]
+    assert load_spec.lmcache_cached_tokens == 22_012
+    assert load_spec.dsa_cold_compact_load
+    assert load_spec.dsa_committed_end == 22_012
+    assert load_spec.dsa_remap_frontier == 22_012
+    assert request.num_tokens - matched == 2
+
+
+def test_preempted_lookup_with_decode_cache_recomputes_output_suffix() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.save_decode_cache = True
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    request = _make_preempted_lookup_request(
+        "decode-cache-resume",
+        22_012,
+        [100_001, 100_002],
+    )
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = -1
+    lookup_client.lookup.side_effect = lambda tokens, **_: (
+        len(request.prompt_token_ids)
+        if len(tokens) == len(request.prompt_token_ids)
+        else 21_504
+    )
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+
+    matched = impl.get_num_new_matched_tokens(request, 0)
+
+    assert impl.config.save_decode_cache
+    assert matched == len(request.prompt_token_ids)
+    assert lookup_client.lookup.call_args.args[0] == request.prompt_token_ids
+    assert impl.load_specs[request.request_id].dsa_cold_compact_load
+    assert request.num_tokens - matched == request.num_output_tokens
+
+
+def test_preempted_lookup_uses_published_decode_window() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    impl._decode_window_save_window_size = impl._lmcache_chunk_size
+    request = _make_preempted_lookup_request(
+        "decode-window-resume",
+        22_012,
+        [100_001, 100_002, 100_003, 100_004, 100_005, 100_006],
+    )
+    committed_end = 22_016
+    impl._request_trackers[request.request_id] = SimpleNamespace(
+        prompt_len=len(request.prompt_token_ids),
+        token_ids=list(request.all_token_ids),
+        decode_window_save_committed_end=committed_end,
+        disagg_spec=None,
+        skip_save=False,
+        request_configs=None,
+        is_decode_phase=True,
+    )
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = -1
+    lookup_client.lookup.side_effect = lambda tokens, **_: len(tokens)
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+
+    matched = impl.get_num_new_matched_tokens(request, 0)
+
+    assert matched == committed_end
+    assert (
+        lookup_client.lookup.call_args.args[0]
+        == request.all_token_ids[:committed_end]
+    )
+    assert impl.load_specs[request.request_id].dsa_cold_compact_load
+    assert request.num_tokens - matched == 2
+
+
+def test_preempted_lookup_never_claims_unverified_decode_window() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    impl._decode_window_save_window_size = impl._lmcache_chunk_size
+    request = _make_preempted_lookup_request(
+        "decode-window-short-hit",
+        22_012,
+        [100_001, 100_002, 100_003, 100_004, 100_005, 100_006],
+    )
+    committed_end = 22_016
+    actual_hit = 21_760
+    impl._request_trackers[request.request_id] = SimpleNamespace(
+        prompt_len=len(request.prompt_token_ids),
+        token_ids=list(request.all_token_ids),
+        decode_window_save_committed_end=committed_end,
+        disagg_spec=None,
+        skip_save=False,
+        request_configs=None,
+        is_decode_phase=True,
+    )
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = -1
+    lookup_client.lookup.return_value = actual_hit
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+
+    matched = impl.get_num_new_matched_tokens(request, 0)
+
+    assert matched == actual_hit
+    assert impl.load_specs[request.request_id].lmcache_cached_tokens == actual_hit
+    assert not getattr(
+        impl.load_specs[request.request_id], "dsa_cold_compact_load", False
+    )
+
+
+def test_preempted_async_lookup_freezes_decode_window_query() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    impl._decode_window_save_window_size = impl._lmcache_chunk_size
+    request = _make_preempted_lookup_request(
+        "decode-window-async",
+        22_012,
+        list(range(100_001, 100_263)),
+    )
+    initial_end = 22_016
+    tracker = SimpleNamespace(
+        prompt_len=len(request.prompt_token_ids),
+        token_ids=list(request.all_token_ids),
+        decode_window_save_committed_end=initial_end,
+        disagg_spec=None,
+        skip_save=False,
+        request_configs=None,
+        is_decode_phase=True,
+    )
+    impl._request_trackers[request.request_id] = tracker
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.side_effect = [-1, initial_end]
+    lookup_client.lookup.return_value = None
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+
+    assert impl.get_num_new_matched_tokens(request, 0) is None
+    tracker.decode_window_save_committed_end = 22_272
+    matched = impl.get_num_new_matched_tokens(request, 0)
+
+    assert matched == initial_end
+    lookup_client.lookup.assert_called_once()
+    assert lookup_client.lookup.call_args.args[0] == request.all_token_ids[:initial_end]
+    assert impl._resume_lookup_queries[request.request_id][:2] == (
+        initial_end,
+        "decode_committed",
+    )
+
+
+def test_live_split_honors_shared_cpu_flag_from_extra_config() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = False
+    impl.config.extra_config = {"enable_shared_cpu_cache": True}
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key == "mooncake_direct_npu_prefill_store"
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+
+    assert impl.supports_dsa_live_split()
+
+
+@pytest.mark.parametrize(
+    "mode", ("persistent_serial", "persistent_parallel_prefetch")
+)
+def test_persistent_group1_modes_disable_live_split(mode: str) -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.dsa_group1_load_mode = mode
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key == "mooncake_direct_npu_prefill_store"
+    )
+
+    assert not impl.supports_dsa_live_split()
+
+
+def test_live_latent_split_requires_explicit_opt_in() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "mooncake_direct_npu_prefill_store",
+            "enable_dsa_live_latent_split",
+            "mooncake_reuse_vllm_transfer_engine",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        kv_transfer_config=SimpleNamespace(
+            get_from_extra_config=lambda side, default: {
+                "prefill": {"tp_size": 2},
+                "decode": {"tp_size": 2},
+            }.get(side, default)
+        ),
+    )
+
+    assert impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_source_activation_requires_transport_negotiation() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "mooncake_direct_npu_prefill_store",
+            "enable_dsa_live_latent_split",
+            "mooncake_reuse_vllm_transfer_engine",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+    impl._live_latent_split_requested = False
+
+    assert impl.supports_dsa_live_latent_split()
+    assert impl._live_latent_split_requested is False
+
+    impl.configure_live_latent_source(True)
+    assert impl._live_latent_split_requested is True
+
+    impl.configure_live_latent_source(False)
+    assert impl._live_latent_split_requested is False
+
+
+def test_live_latent_split_requires_shared_transfer_engine() -> None:
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "mooncake_direct_npu_prefill_store",
+            "enable_dsa_live_latent_split",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+
+    assert not impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_decoder_does_not_require_prefill_direct_store() -> None:
+    impl = _make_scheduler_impl()
+    impl.kv_role = "kv_consumer"
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "enable_dsa_live_latent_split",
+            "mooncake_reuse_vllm_transfer_engine",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+
+    assert not impl.supports_dsa_live_split()
+    assert impl.supports_dsa_cold_compact_load()
+    assert impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_producer_still_requires_direct_store() -> None:
+    impl = _make_scheduler_impl()
+    impl.kv_role = "kv_producer"
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.use_layerwise = True
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key
+        in {
+            "enable_dsa_live_latent_split",
+            "mooncake_reuse_vllm_transfer_engine",
+        }
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False)
+    )
+
+    assert not impl.supports_dsa_live_split()
+    assert not impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_kv_both_accepts_each_local_protocol_half() -> None:
+    impl = _make_scheduler_impl()
+    impl.kv_role = "kv_both"
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.use_layerwise = True
+    enabled = {
+        "mooncake_direct_npu_prefill_store",
+        "enable_dsa_live_latent_split",
+        "mooncake_reuse_vllm_transfer_engine",
+    }
+    impl.config.get_extra_config_value.side_effect = (
+        lambda key, default=False: key in enabled
+    )
+    impl._vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        kv_transfer_config=SimpleNamespace(
+            get_from_extra_config=lambda side, default: {
+                "prefill": {"tp_size": 2},
+                "decode": {"tp_size": 2},
+            }.get(side, default)
+        ),
+    )
+
+    assert impl.supports_dsa_live_split()
+    assert impl.supports_dsa_cold_compact_load()
+    assert impl.supports_dsa_live_latent_split()
+
+    impl.config.enable_dsa_cold_compact_load = False
+    assert impl.supports_dsa_live_latent_split()
+
+    impl.config.enable_dsa_cold_compact_load = True
+    enabled.remove("mooncake_direct_npu_prefill_store")
+    assert impl.supports_dsa_live_latent_split()
+
+    impl.config.enable_dsa_cold_compact_load = False
+    assert not impl.supports_dsa_live_latent_split()
+
+
+def test_live_latent_source_gate_requires_exact_tp0_dp_descriptor() -> None:
+    hybrid = {
+        "format": "layer_slot_runs_v1",
+        "tp_rank": 0,
+        "dp_rank": 2,
+        "group_byte_totals": [0, 64],
+        "latent_group_byte_total": 128,
+        "compact_layout": {
+            "group_id": 1,
+            "token_count": 4,
+            "layers": [{"layer_id": 0}],
+            "runs": [{"token_count": 4}],
+        },
+        "latent_layout": {
+            "group_id": 0,
+            "token_count": 4,
+            "layers": [{"layer_id": 0}],
+            "pages": [{"token_count": 4}],
+        },
+    }
+    params = {
+        "ascend_live_split_source_v1": {"descriptors": [hybrid]}
+    }
+
+    assert _has_live_latent_source_for_dp(params, 2, 4)
+    assert not _has_live_latent_source_for_dp(params, 1, 4)
+    assert not _has_live_latent_source_for_dp(params, 2, 5)
+    assert not _has_live_latent_source_for_dp({}, 2, 4)
+    assert not _has_live_latent_source_for_dp(
+        {
+            "ascend_live_split_source_v1": {
+                "descriptors": [{**hybrid, "latent_layout": None}]
+            }
+        },
+        2,
+        4,
+    )
+    for malformed in (
+        {**hybrid, "tp_rank": None},
+        {**hybrid, "tp_rank": 0.0},
+        {**hybrid, "dp_rank": "bad"},
+        {
+            **hybrid,
+            "latent_layout": {
+                **hybrid["latent_layout"],
+                "token_count": "bad",
+            },
+        },
+        {
+            **hybrid,
+            "latent_layout": {
+                **hybrid["latent_layout"],
+                "token_count": 4.0,
+            },
+        },
+    ):
+        assert not _has_live_latent_source_for_dp(
+            {
+                "ascend_live_split_source_v1": {
+                    "descriptors": [malformed]
+                }
+            },
+            2,
+            4,
+        )
+
+
+def test_live_group1_source_gate_requires_complete_tp_set() -> None:
+    def descriptor(tp_rank: int, *, tokens: int = 4) -> dict:
+        return {
+            "tp_rank": tp_rank,
+            "dp_rank": 1,
+            "group_byte_totals": [0, 64],
+            "compact_layout": {
+                "group_id": 1,
+                "token_count": tokens,
+                "layers": [{"layer_id": 0}],
+                "runs": [{"token_count": tokens}],
+            },
+        }
+
+    complete = {
+        "ascend_live_split_source_v1": {
+            "descriptors": [descriptor(0), descriptor(1)]
+        }
+    }
+    assert _has_live_group1_source_for_dp(complete, 1, 4, 2)
+    assert not _has_live_group1_source_for_dp({}, 1, 4, 2)
+    assert not _has_live_group1_source_for_dp(
+        {
+            "ascend_live_split_source_v1": {
+                "descriptors": [descriptor(0)]
+            }
+        },
+        1,
+        4,
+        2,
+    )
+    assert not _has_live_group1_source_for_dp(complete, 0, 4, 2)
+    assert not _has_live_group1_source_for_dp(
+        {
+            "ascend_live_split_source_v1": {
+                "descriptors": [descriptor(0), descriptor(1, tokens=3)]
+            }
+        },
+        1,
+        4,
+        2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("negotiated", "mode", "expected"),
+    [
+        (False, "p2p_preferred", False),
+        (True, "p2p_preferred", True),
+        (True, "persistent_serial", False),
+        (True, "persistent_parallel_prefetch", False),
+    ],
+)
+def test_cold_meta_requires_two_sided_latent_activation(
+    negotiated: bool,
+    mode: str,
+    expected: bool,
+) -> None:
+    impl = _make_scheduler_impl()
+    impl._block_size = 2
+    impl._dsa_cold_indexer_block_ids = {}
+    impl._live_latent_split_requested = negotiated
+    impl.config.dsa_group1_load_mode = mode
+    impl._vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_index=1)
+    )
+    tokens = [1, 2, 3, 4]
+    request = SimpleNamespace(
+        request_id="req-live",
+        all_token_ids=tokens,
+        prompt_token_ids=tokens,
+        sampling_params=SimpleNamespace(extra_args=None),
+        mm_features=None,
+        mm_hashes=None,
+        kv_transfer_params={
+            "live_split_capabilities": (
+                "ascend_live_split_v2",
+                "ascend_live_split_compact_v1",
+                "ascend_live_split_latent_cpu_v1",
+            ),
+            "remote_block_ids": [1, 2],
+            "remote_dp_rank": 0,
+            "ascend_live_split_source_v1": {
+                "descriptors": [{
+                    "tp_rank": 0,
+                    "dp_rank": 0,
+                    "format": "layer_slot_runs_v1",
+                    "group_byte_totals": [0, 64],
+                    "latent_group_byte_total": 128,
+                    "compact_layout": {
+                        "group_id": 1,
+                        "token_count": len(tokens),
+                        "layers": [{"layer_id": 0}],
+                        "runs": [{"token_count": len(tokens)}],
+                    },
+                    "latent_layout": {
+                        "group_id": 0,
+                        "token_count": len(tokens),
+                        "layers": [{"layer_id": 0}],
+                        "pages": [{"token_count": len(tokens)}],
+                    },
+                }]
+            },
+        },
+    )
+    load_spec = LoadSpec(
+        vllm_cached_tokens=0,
+        lmcache_cached_tokens=len(tokens),
+        can_load=True,
+    )
+    load_spec.dsa_cold_load_generation = 1
+    blocks = SimpleNamespace(
+        get_unhashed_block_ids_all_groups=lambda: [[], [10, 11]]
+    )
+
+    meta = impl._build_dsa_cold_compact_meta(request, blocks, load_spec)
+
+    assert getattr(meta, "live_split_requested", False) is (
+        mode == "p2p_preferred"
+    )
+    assert meta.live_split_latent_cpu is expected
+
+
+def test_cold_meta_does_not_negotiate_live_split_without_source() -> None:
+    impl = _make_scheduler_impl()
+    impl._block_size = 2
+    impl._dsa_cold_indexer_block_ids = {}
+    impl.config.dsa_group1_load_mode = "p2p_preferred"
+    impl._vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_index=0,
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+        )
+    )
+    tokens = [1, 2, 3, 4]
+    request = SimpleNamespace(
+        request_id="req-persistent-fallback",
+        all_token_ids=tokens,
+        prompt_token_ids=tokens,
+        sampling_params=SimpleNamespace(extra_args=None),
+        mm_features=None,
+        mm_hashes=None,
+        kv_transfer_params={
+            "live_split_capabilities": (
+                "ascend_live_split_v2",
+                "ascend_live_split_compact_v1",
+            ),
+            "live_split_transfer_id": "capability-without-source",
+            "remote_block_ids": [1, 2],
+            "remote_dp_rank": 0,
+        },
+    )
+    load_spec = LoadSpec(
+        vllm_cached_tokens=0,
+        lmcache_cached_tokens=len(tokens),
+        can_load=True,
+    )
+    blocks = SimpleNamespace(
+        get_unhashed_block_ids_all_groups=lambda: [[], [10, 11]]
+    )
+
+    meta = impl._build_dsa_cold_compact_meta(request, blocks, load_spec)
+
+    assert getattr(meta, "live_split_requested", False) is False
+    assert getattr(meta, "live_split_remote_block_ids", None) is None
+
+
+def test_dp2_live_split_requires_explicit_global_source_route() -> None:
+    parallel = SimpleNamespace(data_parallel_size=2, data_parallel_index=1)
+    base = {
+        "live_split_capabilities": ("ascend_live_split_v2",),
+        "remote_dp_rank": 0,
+    }
+
+    assert _live_split_source_dp_rank(base, parallel) is None
+    assert _live_split_source_dp_rank(
+        {
+            **base,
+            "live_split_capabilities": (
+                "ascend_live_split_v2",
+                "ascend_live_split_dp_routing_v1",
+            ),
+        },
+        parallel,
+    ) == 0
+    assert _live_split_source_dp_rank(
+        {**base, "remote_dp_rank": True}, parallel
+    ) is None
+    assert _live_split_source_dp_rank(
+        {**base, "remote_dp_rank": 2}, parallel
+    ) is None
+
+
 def test_dsa_cold_compact_alloc_metadata_has_only_indexer_slots() -> None:
     impl = _make_scheduler_impl()
     impl.config.enable_dsa_cold_compact_load = True
@@ -502,44 +1481,153 @@ def test_dsa_cold_compact_submit_captures_current_npu_device(
 ) -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     impl._block_size = 16
-    impl._dsa_cold_load_futures = {}
+    impl._get_cold_load_coordinator().futures = {}
+    impl._run_dsa_cold_indexer_load = MagicMock()
     impl._run_dsa_cold_compact_load = MagicMock()
+    impl._kvcaches_for_group = MagicMock(return_value=[])
     executor = SimpleNamespace(submit=MagicMock(return_value=Future()))
     impl._get_dsa_cold_load_executor = lambda: executor
     fake_npu = SimpleNamespace(current_device=MagicMock(return_value=5))
     monkeypatch.setattr(adapter_module.torch, "npu", fake_npu, raising=False)
     request = SimpleNamespace(
         req_id="cold-device-submit",
-        load_spec=SimpleNamespace(dsa_cold_load_generation=1),
+        load_spec=SimpleNamespace(
+            dsa_cold_load_generation=1,
+            lmcache_cached_tokens=2,
+            dsa_group1_direct_hbm=False,
+        ),
         indexer_slot_mapping=[torch.tensor([160, 161])],
+        token_ids=[1, 2],
     )
 
     impl._submit_dsa_cold_compact_load(request)
 
-    executor.submit.assert_called_once_with(
-        impl._run_dsa_cold_compact_load,
-        request,
-        5,
+    assert executor.submit.call_count == 2
+    assert executor.submit.call_args_list[0].args[0] is impl._run_dsa_cold_indexer_load
+    assert executor.submit.call_args_list[0].args[2] == 5
+    assert executor.submit.call_args_list[1].args[0] is impl._run_dsa_cold_compact_load
+    assert executor.submit.call_args_list[1].args[2] == 5
+
+
+def test_cold_compact_second_submit_resolves_gate_before_drain() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    impl._block_size = 16
+    impl._get_cold_load_coordinator().futures = {}
+    impl._kvcaches_for_group = MagicMock(return_value=[])
+    impl.lmcache_engine = SimpleNamespace(
+        remote_fill_requires_paired_restart=lambda: False
     )
+    submit_error = RuntimeError("latent submit failed")
+
+    class FailSecondSubmit:
+        calls = 0
+        plan = None
+
+        def submit(self, _fn: Any, plan: dict[str, Any], *_args: Any) -> Any:
+            self.calls += 1
+            if self.calls == 2:
+                raise submit_error
+            self.plan = plan
+            return SimpleNamespace(result=plan["latent_shared_ready"].result)
+
+    executor = FailSecondSubmit()
+    impl._get_dsa_cold_load_executor = lambda: executor
+    request = SimpleNamespace(
+        req_id="second-submit",
+        load_spec=SimpleNamespace(
+            dsa_cold_load_generation=1,
+            lmcache_cached_tokens=2,
+            dsa_group1_direct_hbm=False,
+        ),
+        indexer_slot_mapping=[torch.tensor([160, 161])],
+        token_ids=[1, 2],
+    )
+
+    with pytest.raises(RuntimeError, match="latent submit failed"):
+        impl._submit_dsa_cold_compact_load(request)
+
+    assert executor.plan is not None
+    assert executor.plan["latent_shared_ready"].done()
+
+
+def test_cold_compact_second_submit_propagates_native_fatal() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    impl._block_size = 16
+    impl._get_cold_load_coordinator().futures = {}
+    impl._kvcaches_for_group = MagicMock(return_value=[])
+    impl.lmcache_engine = SimpleNamespace(
+        remote_fill_requires_paired_restart=lambda: True
+    )
+    native_error = RuntimeError("unknown native DMA")
+
+    class FatalFirstSubmit:
+        calls = 0
+
+        def submit(self, _fn: Any, plan: dict[str, Any], *_args: Any) -> Any:
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("latent submit failed")
+
+            def result() -> None:
+                assert plan["latent_shared_ready"].done()
+                raise native_error
+
+            return SimpleNamespace(result=result)
+
+    impl._get_dsa_cold_load_executor = FatalFirstSubmit
+    request = SimpleNamespace(
+        req_id="fatal-second-submit",
+        load_spec=SimpleNamespace(
+            dsa_cold_load_generation=1,
+            lmcache_cached_tokens=2,
+            dsa_group1_direct_hbm=True,
+        ),
+        indexer_slot_mapping=[torch.tensor([160, 161])],
+        token_ids=[1, 2],
+    )
+
+    with pytest.raises(RuntimeError, match="unknown native DMA"):
+        impl._submit_dsa_cold_compact_load(request)
 
 
 def test_staged_sfa_native_barrier_waits_for_cold_compact_loads() -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     first = MagicMock(done=MagicMock(return_value=False))
     second = MagicMock(done=MagicMock(return_value=True))
-    impl._dsa_cold_load_futures = {
-        "cold-pending": (1, first, object(), set(), 0.0),
-        "cold-complete": (1, second, object(), set(), 0.0),
+    first_indexer = MagicMock(done=MagicMock(return_value=True))
+    second_indexer = MagicMock(done=MagicMock(return_value=True))
+    impl._get_cold_load_coordinator().futures = {
+        "cold-pending": (1, first, object(), set(), 0.0, first_indexer),
+        "cold-complete": (1, second, object(), set(), 0.0, second_indexer),
     }
 
     impl.synchronize_staged_sfa_capture_unsafe_loads()
 
     first.result.assert_called_once_with()
     second.result.assert_called_once_with()
-    assert set(impl._dsa_cold_load_futures) == {
+    first_indexer.result.assert_called_once_with()
+    second_indexer.result.assert_called_once_with()
+    assert set(impl._get_cold_load_coordinator().futures) == {
         "cold-pending",
         "cold-complete",
     }
+
+
+def test_staged_sfa_native_barrier_skips_direct_hbm_loads() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    latent = MagicMock(done=MagicMock(return_value=False))
+    indexer = MagicMock(done=MagicMock(return_value=False))
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(dsa_group1_direct_hbm=True)
+    )
+    impl._get_cold_load_coordinator().futures = {
+        "direct-hbm": (1, latent, request, set(), 0.0, indexer),
+    }
+
+    impl.synchronize_staged_sfa_capture_unsafe_loads()
+
+    latent.result.assert_not_called()
+    indexer.result.assert_not_called()
 
 
 def test_staged_sfa_native_barrier_defers_cold_load_failure() -> None:
@@ -549,8 +1637,8 @@ def test_staged_sfa_native_barrier_defers_cold_load_failure() -> None:
     request = SimpleNamespace(
         load_spec=SimpleNamespace(dsa_cold_load_generation=1)
     )
-    impl._dsa_cold_load_futures = {
-        "cold-failed": (1, failed, request, {100}, 0.0),
+    impl._get_cold_load_coordinator().futures = {
+        "cold-failed": (1, failed, request, {100}, 0.0, _completed_future()),
     }
     impl._synchronize_dsa_cold_dense_load = MagicMock()
     impl._release_unadopted_shared_request_objects = MagicMock()
@@ -561,18 +1649,18 @@ def test_staged_sfa_native_barrier_defers_cold_load_failure() -> None:
     impl.synchronize_staged_sfa_capture_unsafe_loads()
 
     impl._synchronize_dsa_cold_dense_load.assert_called_once_with()
-    assert "cold-failed" in impl._dsa_cold_load_futures
+    assert "cold-failed" in impl._get_cold_load_coordinator().futures
     assert impl._drain_dsa_cold_load_futures() == {"cold-failed"}
     assert impl._invalid_block_ids == {100}
-    assert not hasattr(impl, "_dsa_cold_load_futures")
+    assert not impl._get_cold_load_coordinator().futures
 
 
 def test_staged_sfa_native_barrier_rejects_active_failed_stream() -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     failed = Future()
     failed.set_exception(RuntimeError("cold load failed"))
-    impl._dsa_cold_load_futures = {
-        "cold-failed": (1, failed, object(), set(), 0.0),
+    impl._get_cold_load_coordinator().futures = {
+        "cold-failed": (1, failed, object(), set(), 0.0, _completed_future()),
     }
     impl._synchronize_dsa_cold_dense_load = MagicMock(
         side_effect=RuntimeError("stream still active")
@@ -632,89 +1720,72 @@ def test_dsa_cold_compact_worker_retains_sources_when_stream_sync_fails() -> Non
     impl._release_shared_worker_retrieve_state.assert_not_called()
 
 
-def test_dsa_cold_compact_worker_syncs_before_retrievers_release_sources(
+@pytest.mark.parametrize("predecessor_failed", [False, True])
+def test_dsa_cold_compact_background_order_retains_sources_without_host_sync(
+    predecessor_failed: bool,
 ) -> None:
+    """Ordered background completion adopts owners before readiness publication."""
     events: list[str] = []
-
-    class FakeRetriever:
-        def __init__(self, name: str, values: list[object]) -> None:
-            self.name = name
-            self.values = iter(values)
-
-        def __next__(self):
-            events.append(f"{self.name}:next")
-            return next(self.values)
-
-        def send(self, _value):
-            events.append(f"{self.name}:send")
-            return next(self.values)
-
-        def close(self) -> None:
-            events.append(f"{self.name}:close")
-
-    completed = torch.tensor([True])
-    latent_retriever = FakeRetriever("latent", [completed, completed])
-    indexer_retriever = FakeRetriever(
-        "indexer", [None, None, completed]
-    )
-    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
-    impl.num_layers = 1
-    impl.device = torch.device("cpu")
-    impl._num_layers_for_group = lambda _kv_group: 1
-    impl._kvcaches_for_group = lambda _kv_group: []
-    impl._sparse_retrieve_kwargs = MagicMock(return_value=({}, None, None))
-    impl._synchronize_dsa_cold_dense_load = lambda: events.append("sync")
-    impl._refresh_prepared_sparse_sources = lambda state, _token_count: (
-        state.prepared_sparse_sources.__setitem__(0, object())
-    )
-    impl._release_unadopted_shared_request_objects = MagicMock()
-    impl._release_shared_worker_retrieve_state = MagicMock()
-    impl.lmcache_engine = SimpleNamespace(
-        retrieve_layer_head_token_wise=MagicMock(
-            return_value=latent_retriever
-        ),
-        retrieve_layer=MagicMock(return_value=indexer_retriever),
-    )
+    owner = object()
+    readiness = object()
     request = SimpleNamespace(
         req_id="cold-source-lifetime",
-        load_spec=SimpleNamespace(lmcache_cached_tokens=1),
-        token_ids=[1],
-        indexer_slot_mapping=[torch.tensor([0])],
-        request_configs=None,
+        load_spec=SimpleNamespace(dsa_group1_direct_hbm=False),
     )
-
-    state = impl._run_dsa_cold_compact_load(request, None)
-
-    assert state.req_id == request.req_id
-    assert events == [
-        "latent:next",
-        "indexer:next",
-        "indexer:next",
-        "latent:send",
-        "sync",
-        "indexer:next",
-        "latent:close",
-        "indexer:close",
-    ]
-    impl._release_unadopted_shared_request_objects.assert_not_called()
-    impl._release_shared_worker_retrieve_state.assert_not_called()
-
-
-def test_dsa_cold_collective_fence_waits_in_submission_order() -> None:
-    events: list[str] = []
-    first = MagicMock()
-    first.result.side_effect = lambda: events.append("first")
-    second = MagicMock()
-    second.result.side_effect = lambda: events.append("second")
-    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
-    impl._dsa_cold_load_futures = {
-        "first": (1, first, object(), set(), 0.0),
-        "second": (1, second, object(), set(), 0.0),
+    state = WorkerRetrieveState(req_id=request.req_id)
+    plan = {
+        "request": request,
+        "token_count": 1,
+        "tokens": [1],
+        "token_mask": object(),
+        "latent_shared_ready": Future(),
+        "indexer_source_owners": (owner,),
     }
 
-    impl._wait_for_dsa_cold_collectives_before_foreground()
+    def predecessor_exception() -> Any:
+        assert not plan["latent_shared_ready"].done()
+        events.append("predecessor")
+        return RuntimeError("prior request failed") if predecessor_failed else None
 
-    assert events == ["first", "second"]
+    def indexer_result() -> tuple[Any, Any, float, float]:
+        assert plan["latent_shared_ready"].done()
+        events.append("indexer")
+        return (None, readiness, 0.0, 0.0)
+
+    def record_readiness() -> Any:
+        events.append("readiness")
+        return readiness
+
+    def seal(result: WorkerRetrieveState, _count: int) -> None:
+        assert result.dense_load_source_owners == (owner,)
+        assert result.dense_load_readiness is readiness
+        events.append("seal")
+        result.prepared_sparse_sources[0] = object()
+
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    impl.num_layers = 1
+    impl._num_layers_for_group = lambda _group: 1
+    impl._refresh_prepared_sparse_sources = seal
+    impl._synchronize_dsa_cold_dense_load = MagicMock()
+    impl._synchronize_dsa_cold_dense_readiness = MagicMock()
+    impl.lmcache_engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(record_dense_load_readiness=record_readiness)
+    )
+
+    result = impl._run_dsa_cold_compact_load(
+        plan,
+        None,
+        SimpleNamespace(result=indexer_result),
+        SimpleNamespace(exception=predecessor_exception),
+        live_state=state,
+    )
+
+    assert result is state
+    assert state.indexer_npu_resident
+    assert not state.dense_load_readiness_consumed
+    assert events == ["predecessor", "indexer", "readiness", "seal"]
+    impl._synchronize_dsa_cold_dense_load.assert_not_called()
+    impl._synchronize_dsa_cold_dense_readiness.assert_not_called()
 
 
 def test_dsa_cold_compact_finished_signal_waits_for_future(
@@ -731,21 +1802,28 @@ def test_dsa_cold_compact_finished_signal_waits_for_future(
     state = WorkerRetrieveState(req_id="cold-future")
     state.location = "LocalCPUBackend"
     state._dsa_cold_load_completed_at = 2.0
-    impl._dsa_cold_load_futures = {
-        "cold-future": (1, future, request, {100, 101}, 0.0)
+    impl._get_cold_load_coordinator().futures = {
+        "cold-future": (
+            1,
+            future,
+            request,
+            {100, 101},
+            0.0,
+            _completed_future(),
+        )
     }
     impl._publish_worker_retrieve_state = MagicMock()
     impl._invalid_block_ids = set()
     events = []
     monkeypatch.setattr(
         adapter_module,
-        "cold_start_perf_log",
+        "serving_perf_log",
         lambda _logger, event, **fields: events.append((event, fields)),
     )
-    monkeypatch.setattr(adapter_module, "cold_start_perf_now", lambda: 3.0)
+    monkeypatch.setattr(adapter_module, "serving_perf_now", lambda: 3.0)
 
     assert impl._drain_dsa_cold_load_futures() is None
-    assert "cold-future" in impl._dsa_cold_load_futures
+    assert "cold-future" in impl._get_cold_load_coordinator().futures
 
     future.set_result(state)
     assert impl._drain_dsa_cold_load_futures() == {"cold-future"}
@@ -766,13 +1844,21 @@ def test_dsa_cold_compact_generation_mismatch_releases_returned_state() -> None:
     )
     state = WorkerRetrieveState(req_id="cold-stale-generation")
     future.set_result(state)
-    impl._dsa_cold_load_futures = {
-        "cold-stale-generation": (1, future, request, {100}, 0.0)
+    impl._get_cold_load_coordinator().futures = {
+        "cold-stale-generation": (
+            1,
+            future,
+            request,
+            {100},
+            0.0,
+            _completed_future(),
+        )
     }
     impl._worker_retrieve_state = {}
     impl._synchronize_dsa_cold_dense_load = MagicMock()
     impl._release_unadopted_shared_request_objects = MagicMock()
     impl._release_shared_worker_retrieve_state = MagicMock()
+    impl._release_request_lookup_pins = MagicMock()
     impl._publish_worker_retrieve_state = MagicMock()
     impl._invalid_block_ids = set()
     impl.lmcache_engine = object()
@@ -789,6 +1875,9 @@ def test_dsa_cold_compact_generation_mismatch_releases_returned_state() -> None:
     impl._release_shared_worker_retrieve_state.assert_called_once_with(
         state, impl.lmcache_engine
     )
+    impl._release_request_lookup_pins.assert_called_once_with(
+        "cold-stale-generation"
+    )
     assert impl._invalid_block_ids == {100}
 
 
@@ -802,19 +1891,27 @@ def test_dsa_cold_compact_failed_state_releases_after_sync_retry() -> None:
     error = RuntimeError("load failed")
     error._lmcache_dsa_cold_state = state
     future.set_exception(error)
-    impl._dsa_cold_load_futures = {
-        "cold-sync-retry": (1, future, request, {100, 101}, 0.0)
+    impl._get_cold_load_coordinator().futures = {
+        "cold-sync-retry": (
+            1,
+            future,
+            request,
+            {100, 101},
+            0.0,
+            _completed_future(),
+        )
     }
     impl._synchronize_dsa_cold_dense_load = MagicMock(
         side_effect=[RuntimeError("still active"), None]
     )
     impl._release_unadopted_shared_request_objects = MagicMock()
     impl._release_shared_worker_retrieve_state = MagicMock()
+    impl._release_request_lookup_pins = MagicMock()
     impl._invalid_block_ids = set()
     impl.lmcache_engine = object()
 
     assert impl._drain_dsa_cold_load_futures() is None
-    assert "cold-sync-retry" in impl._dsa_cold_load_futures
+    assert "cold-sync-retry" in impl._get_cold_load_coordinator().futures
     impl._release_shared_worker_retrieve_state.assert_not_called()
 
     assert impl._drain_dsa_cold_load_futures() == {"cold-sync-retry"}
@@ -824,7 +1921,43 @@ def test_dsa_cold_compact_failed_state_releases_after_sync_retry() -> None:
     impl._release_shared_worker_retrieve_state.assert_called_once_with(
         state, impl.lmcache_engine
     )
+    impl._release_request_lookup_pins.assert_called_once_with("cold-sync-retry")
     assert impl._invalid_block_ids == {100, 101}
+
+
+def test_direct_hbm_known_failure_skips_legacy_dense_stream_sync() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    future = Future()
+    future.set_exception(RuntimeError("direct load failed"))
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(
+            dsa_cold_load_generation=1,
+            dsa_group1_direct_hbm=True,
+            lmcache_cached_tokens=8192,
+        )
+    )
+    impl._get_cold_load_coordinator().futures = {
+        "direct-failed": (
+            1,
+            future,
+            request,
+            {100, 101},
+            0.0,
+            _completed_future(),
+        )
+    }
+    impl._synchronize_dsa_cold_dense_load = MagicMock(
+        side_effect=AssertionError("legacy stream must not be touched")
+    )
+    impl._release_request_lookup_pins = MagicMock()
+    impl._invalid_block_ids = set()
+    impl.lmcache_engine = object()
+
+    assert impl._drain_dsa_cold_load_futures() == {"direct-failed"}
+    impl._synchronize_dsa_cold_dense_load.assert_not_called()
+    impl._release_request_lookup_pins.assert_called_once_with("direct-failed")
+    assert impl._invalid_block_ids == {100, 101}
+    assert not impl._get_cold_load_coordinator().futures
 
 
 def test_dsa_cold_ready_state_survives_cross_rank_completion_gap() -> None:
@@ -870,10 +2003,17 @@ def test_dsa_cold_compact_abort_releases_unpublished_cpu_state() -> None:
     )
     state = WorkerRetrieveState(req_id="cold-aborted")
     future.set_result(state)
-    impl._dsa_cold_load_futures = {
-        "cold-aborted": (1, future, request, {100, 101}, 0.0)
+    impl._get_cold_load_coordinator().futures = {
+        "cold-aborted": (
+            1,
+            future,
+            request,
+            {100, 101},
+            0.0,
+            _completed_future(),
+        )
     }
-    impl._dsa_cold_aborted_req_ids = {"cold-aborted"}
+    impl._get_cold_load_coordinator().aborted = {"cold-aborted"}
     impl.lmcache_engine = object()
     impl._publish_worker_retrieve_state = MagicMock()
     impl._release_unadopted_shared_request_objects = MagicMock()
@@ -888,7 +2028,7 @@ def test_dsa_cold_compact_abort_releases_unpublished_cpu_state() -> None:
     )
     impl._release_shared_worker_retrieve_state.assert_called_once()
     impl._release_request_lookup_pins.assert_called_once_with("cold-aborted")
-    assert not hasattr(impl, "_dsa_cold_aborted_req_ids")
+    assert not impl._get_cold_load_coordinator().aborted
 
 
 def test_dsa_cold_compact_failure_does_not_mark_request_ready() -> None:
@@ -915,6 +2055,38 @@ def test_dsa_cold_compact_failure_does_not_mark_request_ready() -> None:
     )
 
     assert impl._dsa_cold_loaded_req_ids == {"cold-ready"}
+    assert not hasattr(impl, "_dsa_cold_failed_req_ids")
+    assert not hasattr(impl, "_dsa_cold_indexer_block_ids")
+
+
+def test_dsa_cold_compact_invalid_blocks_stick_until_finished_recving() -> None:
+    impl = _make_scheduler_impl()
+    impl._dsa_cold_loaded_req_ids = set()
+    impl._dsa_cold_indexer_block_ids = {"cold-failed": {100, 101}}
+    impl.load_specs["cold-failed"] = LoadSpec(
+        vllm_cached_tokens=0,
+        lmcache_cached_tokens=8192,
+        can_load=True,
+    )
+    impl.load_specs["cold-failed"].dsa_cold_compact_load = True
+
+    impl.update_connector_output(
+        SimpleNamespace(
+            finished_recving=set(),
+            invalid_block_ids={100},
+            completed_decode_window_saves={},
+        )
+    )
+    impl.update_connector_output(
+        SimpleNamespace(
+            finished_recving={"cold-failed"},
+            invalid_block_ids=set(),
+            completed_decode_window_saves={},
+        )
+    )
+
+    assert impl._dsa_cold_loaded_req_ids == set()
+    assert not hasattr(impl, "_dsa_cold_failed_req_ids")
     assert not hasattr(impl, "_dsa_cold_indexer_block_ids")
 
 
@@ -1201,12 +2373,15 @@ class TestDisaggSpecOwnership:
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
     def test_cold_compact_resume_marker_is_one_shot(self) -> None:
         impl = _make_scheduler_impl()
+        impl._manager = SimpleNamespace(lookup_client=MagicMock())
         req_id = "cold-resume"
         prompt_len = 8193
         request = SimpleNamespace(
+            request_id=req_id,
             req_id=req_id,
             prompt_token_ids=list(range(prompt_len)),
             block_ids=list(range(513)),
+            num_tokens=prompt_len,
             num_computed_tokens=prompt_len - 1,
             sampling_params=SimpleNamespace(extra_args=None),
         )
@@ -1220,11 +2395,35 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         impl.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=0,
             lmcache_cached_tokens=prompt_len,
-            can_load=True,
+            can_load=False,
             dsa_committed_end=prompt_len,
             dsa_remap_frontier=prompt_len - 1,
         )
         impl.load_specs[req_id].dsa_cold_compact_load = True
+        cold_meta = SimpleNamespace(req_id=req_id)
+        impl._build_dsa_cold_compact_meta = MagicMock(return_value=cold_meta)
+
+        # The first allocation callback admits the asynchronous full-prefix
+        # load and emits its no-forward worker metadata.
+        impl.update_state_after_alloc(request, prompt_len - 1, object())
+        assert impl.load_specs[req_id].can_load is True
+        initial = impl.build_connector_meta(
+            StubSchedulerOutput(
+                finished_req_ids=set(),
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=StubCachedRequestData([], [], []),
+                num_scheduled_tokens={},
+            )
+        )
+        assert initial.dsa_cold_compact_load_pending is True
+        assert initial.requests == [cold_meta]
+
+        # A completed async load is scheduled a second time with no newly
+        # allocated external tokens. This is the real transition that used to
+        # clear can_load immediately before the first sparse resume.
+        impl._dsa_cold_loaded_req_ids = {req_id}
+        impl.update_state_after_alloc(request, 0)
+        assert impl.load_specs[req_id].can_load is False
 
         first = impl.build_connector_meta(
             StubSchedulerOutput(
@@ -1236,6 +2435,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         ).requests[0]
 
         assert first.is_sparse_decode
+        assert first.load_spec.can_load is True
         assert first.load_spec.dsa_committed_end == prompt_len
         assert first.load_spec.dsa_remap_frontier == prompt_len - 1
         assert first.dsa_nonresident_frontier == prompt_len - 1
@@ -2577,7 +3777,7 @@ class TestDecodeWindowSaveMetadata:
             tracker.req_id: 12288
         }
 
-    def test_two_group_decode_window_save_without_shared_cpu_allows_latent_only(
+    def test_two_group_decode_window_save_without_shared_cpu_requires_indexer(
         self,
     ) -> None:
         impl, tracker, scheduler_output = self._build_decode_window_case(
@@ -2587,18 +3787,10 @@ class TestDecodeWindowSaveMetadata:
 
         meta = impl.build_connector_meta(scheduler_output)
 
-        assert len(meta.requests) == 2
-        req_meta = next(
-            request
-            for request in meta.requests
-            if request.is_decode_window_save
-        )
-        assert req_meta.is_decode_window_save is True
-        assert req_meta.save_spec is not None
-        assert req_meta.save_spec.can_save_indexer is False
-        assert tracker.decode_window_save_next_start == 512
+        assert meta.requests == []
+        assert tracker.decode_window_save_next_start == 256
 
-    def test_deep_window_group_plan_explains_latent_only_commit_groups(
+    def test_deep_window_group_plan_is_not_emitted_for_partial_groups(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         impl, tracker, scheduler_output = self._build_decode_window_case(
@@ -2619,7 +3811,7 @@ class TestDecodeWindowSaveMetadata:
         plans = [
             event for event in events if event.get("event") == "window_group_plan"
         ]
-        assert len(plans) == 1
+        assert plans == []
 
         finished = StubSchedulerOutput(
             finished_req_ids={tracker.req_id},
@@ -2628,13 +3820,7 @@ class TestDecodeWindowSaveMetadata:
             num_scheduled_tokens={},
         )
         impl.build_connector_meta(finished)
-        assert tracker.req_id not in impl._mtp_dw_deep_window_group_planned_reqs
-        assert plans[0]["stage"] == "deep"
-        assert plans[0]["latent_only"] is True
-        assert plans[0]["indexer_disabled"] is True
-        assert plans[0]["kv_group0_save"] is True
-        assert plans[0]["kv_group1_save"] is False
-        assert plans[0]["required_groups"] == [0]
+        assert not hasattr(impl, "_mtp_dw_deep_window_group_planned_reqs")
 
     def test_deep_window_group_plan_requires_both_gates_and_dedupes_request(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2662,7 +3848,7 @@ class TestDecodeWindowSaveMetadata:
         monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
         deep_impl, _, deep_output = self._build_decode_window_case(
             shared_cpu=False,
-            indexer_blocks=False,
+            indexer_blocks=True,
         )
         deep_impl.build_connector_meta(deep_output)
         deep_impl.build_connector_meta(deep_output)

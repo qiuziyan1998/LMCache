@@ -48,3 +48,16 @@ class LookupCleanupMsg(AsyncLookupMsg):
 
     def describe(self) -> str:
         return f"Cleanup memory for lookup_id={self.lookup_id}"
+
+
+class LookupCleanupResponseMsg(AsyncLookupMsg):
+    """Worker acknowledgement after lookup-owned memory is released."""
+
+    lookup_id: str
+    worker_id: int
+
+    def describe(self) -> str:
+        return (
+            f"Cleanup complete for lookup_id={self.lookup_id} "
+            f"on worker_id={self.worker_id}"
+        )

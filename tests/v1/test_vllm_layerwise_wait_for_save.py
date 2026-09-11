@@ -807,9 +807,11 @@ def test_deferred_latent_flush_drains_full_store_layer() -> None:
     connector._refresh_kvcaches_list = lambda: None
     engine.num_layers = 4
     engine.store_steps["req-1"] = 0
+    store_kwargs = []
 
     def _finite_store_layer(_token_ids, **kwargs):
         engine.store_calls.append(kwargs["req_id"])
+        store_kwargs.append(kwargs)
 
         def _storer():
             for _ in range(engine.num_layers + 1):
@@ -824,6 +826,7 @@ def test_deferred_latent_flush_drains_full_store_layer() -> None:
 
     assert engine.store_calls == ["req-1"]
     assert engine.store_steps["req-1"] == engine.num_layers + 1
+    assert store_kwargs[0]["all_layers_ready"] is True
     assert not connector._deferred_latent_pending
 
 
@@ -858,6 +861,74 @@ def test_indexer_save_uses_layer_metadata_slots_not_request_slots() -> None:
         engine.store_kwargs[0]["slot_mapping"],
         request.indexer_slot_mapping[0],
     )
+
+
+def test_indexer_save_missing_mapping_aborts_partial_two_group_store() -> None:
+    request = _make_req("req-1")
+    request.save_spec = SaveSpec(
+        skip_leading_tokens=0,
+        can_save=True,
+        can_save_latent=True,
+        can_save_indexer=True,
+    )
+    connector, _, engine = _make_connector([request])
+    connector.config = SimpleNamespace(dsa_two_groups=True)
+    indexer_layer_name = "model.layers.0.self_attn.indexer.k_cache"
+    connector.kv_caches = {
+        "model.layers.0.self_attn.attn": torch.zeros(1),
+        indexer_layer_name: torch.zeros(1),
+    }
+
+    connector.save_kv_layer(
+        "model.layers.0.self_attn.attn",
+        torch.zeros(1),
+        None,
+    )
+    assert connector._layerwise_save_storers
+
+    with pytest.raises(RuntimeError, match="could not resolve.*Group-1"):
+        connector.save_kv_layer(
+            indexer_layer_name,
+            torch.zeros(1),
+            SimpleNamespace(),
+        )
+
+    assert connector._layerwise_save_storers == {}
+    assert engine.store_calls == ["req-1"]
+
+
+def test_chunked_indexer_save_short_mapping_aborts_request() -> None:
+    request = _make_req("req-1")
+    request.token_ids = list(range(16))
+    request.slot_mapping = [torch.arange(16, dtype=torch.long)]
+    request.save_spec = SaveSpec(
+        skip_leading_tokens=8,
+        can_save=True,
+        can_save_latent=True,
+        can_save_indexer=True,
+    )
+    connector, _, engine = _make_connector([request])
+    connector.kv_role = "kv_both"
+    connector.config = SimpleNamespace(dsa_two_groups=True)
+    indexer_layer_name = "model.layers.0.self_attn.indexer.k_cache"
+    connector.kv_caches = {
+        "model.layers.0.self_attn.attn": torch.zeros(1),
+        indexer_layer_name: torch.zeros(1),
+    }
+
+    with pytest.raises(RuntimeError, match="incomplete Group-1 slot mapping"):
+        connector.save_kv_layer(
+            indexer_layer_name,
+            torch.zeros(1),
+            {
+                indexer_layer_name: SimpleNamespace(
+                    slot_mapping=torch.arange(4, dtype=torch.long)
+                )
+            },
+        )
+
+    assert connector._layerwise_save_storers == {}
+    assert engine.store_calls == []
 
 
 def test_chunked_indexer_save_pads_layer_metadata_slots() -> None:

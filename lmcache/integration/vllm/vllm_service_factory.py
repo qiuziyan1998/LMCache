@@ -192,12 +192,26 @@ class VllmServiceFactory(BaseServiceFactory):
             tpg = SimpleNamespace()
             tpg.broadcast = lambda tensor, src: tensor
             tpg.broadcast_object = lambda obj, src: obj
+            collective_all_true = bool
             vllm_gpu_connector = None
         else:
             # Third Party
+            import torch
+            import torch.distributed as dist
             from vllm.distributed.parallel_state import get_tp_group
 
             tpg = get_tp_group()
+
+            def collective_all_true(local_ready: bool) -> bool:
+                flag = torch.tensor(
+                    [int(local_ready)], dtype=torch.int32, device="cpu"
+                )
+                dist.all_reduce(
+                    flag,
+                    op=dist.ReduceOp.MIN,
+                    group=tpg.cpu_group,
+                )
+                return bool(flag.item())
             # First Party
             from lmcache.integration.vllm.utils import vllm_layout_hints
 
@@ -215,6 +229,7 @@ class VllmServiceFactory(BaseServiceFactory):
             vllm_gpu_connector,
             tpg.broadcast,
             tpg.broadcast_object,
+            collective_all_true,
         )
         self.lmcache_engine = engine
 

@@ -75,3 +75,7 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
             lookup_id: The lookup ID whose status needs to be cleared.
         """
         return
+
+    def cleanup_lookup(self, lookup_id: str) -> None:
+        """Release worker-side lookup state, if any, and local status."""
+        self.clear_lookup_status(lookup_id)

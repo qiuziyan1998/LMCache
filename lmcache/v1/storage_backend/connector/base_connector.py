@@ -302,11 +302,41 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         buffer_ptrs: List[List[int]],
         buffer_sizes: List[List[int]],
         owners: tuple[Any, ...],
-        ready_event: Any,
+        producer_events: tuple[Any, ...] | Any,
         req_id: str,
     ) -> None:
         """Persist externally owned buffers in the connector's page format."""
         raise NotImplementedError
+
+    async def batched_get_external_pages(
+        self,
+        keys: List[CacheEngineKey],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        owners: tuple[Any, ...],
+        req_id: str,
+    ) -> None:
+        """Retrieve page values directly into externally owned buffers."""
+        raise NotImplementedError
+
+    async def push_external_pages(
+        self,
+        *,
+        remote_session: str,
+        source_plan: Any,
+        destination_descriptors: tuple[Any, ...],
+        activation: Any,
+    ) -> Any:
+        """Push registered source pages into armed remote destinations."""
+        raise NotImplementedError
+
+    async def prepare_remote_fill_source(self, source_plan: Any) -> Any:
+        """Fence and register direct-push sources before destination ARM."""
+        raise NotImplementedError
+
+    def get_remote_fill_destination_session(self) -> str | None:
+        """Return this process's registered native destination session."""
+        return None
 
     def batched_external_pages_exist(
         self, keys: List[CacheEngineKey]

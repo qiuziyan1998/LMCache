@@ -37,6 +37,19 @@ class SharedCPUCacheValidationError(SharedCPUCacheError):
     """Raised before view creation or pointer install when metadata is unsafe."""
 
 
+def chunk_hash_to_int(chunk_hash: Union[int, bytes]) -> int:
+    """Normalize a chunk hash to its full-width integer form.
+
+    Digest-based hash algorithms (e.g. sha256_cbor in this vLLM fork) produce
+    raw digest bytes; builtin/64-bit algorithms produce ints. The shared CPU
+    cache batch wire format carries chunk hashes as integers, so digest bytes
+    are converted losslessly via a big-endian full-width interpretation.
+    """
+    if isinstance(chunk_hash, bytes):
+        return int.from_bytes(chunk_hash, "big")
+    return int(chunk_hash)
+
+
 @dataclass
 class SharedCPURequestLease:
     """Own the shared MemoryObjs retained for one live request."""
@@ -46,6 +59,14 @@ class SharedCPURequestLease:
     is_rank0: bool
     active: bool = False
     groups: dict[int, list[list[MemoryObj]]] = field(default_factory=dict)
+    _owned_objects: dict[int, MemoryObj] = field(
+        default_factory=dict, init=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        self._owned_objects = {
+            id(obj): obj for obj in self._unique_objects(self.groups)
+        }
 
     @staticmethod
     def _unique_objects(
@@ -106,16 +127,15 @@ class SharedCPURequestLease:
             else:
                 replacement.pop(kv_group, None)
 
-        old_objects = self._unique_objects(self.groups)
-        old_ids = {id(memory_obj) for memory_obj in old_objects}
+        old_objects = self._owned_objects
         new_objects = self._unique_objects(replacement)
-        new_ids = {id(memory_obj) for memory_obj in new_objects}
+        new_owned = {id(memory_obj): memory_obj for memory_obj in new_objects}
 
         retained: list[MemoryObj] = []
         if retain:
             try:
                 for memory_obj in new_objects:
-                    if id(memory_obj) in old_ids:
+                    if id(memory_obj) in old_objects:
                         continue
                     memory_obj.ref_count_up()
                     try:
@@ -136,8 +156,11 @@ class SharedCPURequestLease:
                 raise
 
         self.groups = replacement
+        self._owned_objects = new_owned
         self._release(
-            memory_obj for memory_obj in old_objects if id(memory_obj) not in new_ids
+            memory_obj
+            for identity, memory_obj in old_objects.items()
+            if identity not in new_owned
         )
 
     def append_groups(
@@ -181,10 +204,16 @@ class SharedCPURequestLease:
         for current, suffix in updates:
             for layer, layer_suffix in zip(current, suffix, strict=True):
                 layer.extend(layer_suffix)
+                self._owned_objects.update((id(obj), obj) for obj in layer_suffix)
         for kv_group, suffix in additions:
             self.groups[kv_group] = suffix
+            self._owned_objects.update(
+                (id(obj), obj) for layer in suffix for obj in layer
+            )
 
     def object_ids(self, kv_group: Optional[int] = None) -> set[int]:
+        if kv_group is None:
+            return set(self._owned_objects)
         groups = (
             self.groups.values()
             if kv_group is None
@@ -198,10 +227,11 @@ class SharedCPURequestLease:
         }
 
     def close(self) -> None:
-        objects = self._unique_objects(self.groups)
+        objects = self._owned_objects
+        self._owned_objects = {}
         self.groups.clear()
         self.active = False
-        self._release(objects)
+        self._release(objects.values())
 
 
 def _dtype_to_str(dtype: Optional[torch.dtype]) -> Optional[str]:
@@ -1057,6 +1087,11 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
                 "Invalid compact page logical size: "
                 f"logical_size={logical_size}, physical_size={physical_size}"
             )
+        positions = tuple(cached_positions)
+        if not positions:
+            raise SharedCPUCacheValidationError(
+                "Compact layer page must contain at least one token"
+            )
         return LayerPageMemoryObj(
             raw_data=None,
             metadata=MemoryObjMetadata(
@@ -1067,15 +1102,14 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
                 ref_count=1,
                 pin_count=0,
                 fmt=fmt,
-                cached_positions=torch.tensor(
-                    list(cached_positions), dtype=torch.int64
-                ),
+                cached_positions=torch.tensor(positions, dtype=torch.int64),
                 shapes=[shape] * batch.num_layers,
                 dtypes=[dtype] * batch.num_layers,
             ),
             parent_allocator=self,
             num_layers=batch.num_layers,
             raw_view_size=logical_size,
+            valid_tokens=len(positions),
         )
 
     def allocate(

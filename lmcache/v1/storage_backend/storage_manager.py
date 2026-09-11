@@ -34,10 +34,12 @@ from lmcache.utils import (
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.memory_management import (
+    LayerPageMemoryObj,
     MemoryFormat,
     MemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mooncake_layout import mooncake_valid_tokens
 from lmcache.v1.storage_backend import CreateStorageBackends, is_cuda_worker
 from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
@@ -444,13 +446,150 @@ class StorageManager:
 
         return required_futures
 
+    @staticmethod
+    def _supports_layer_page_backends(
+        selected: Sequence[StorageBackendInterface],
+    ) -> bool:
+        return any(
+            isinstance(backend, LocalCPUBackend)
+            and bool(getattr(backend, "use_hot", False))
+            for backend in selected
+        ) and all(
+            isinstance(backend, LocalCPUBackend)
+            or (
+                isinstance(backend, RemoteBackend)
+                and backend.connection is not None
+                and callable(
+                    getattr(backend.connection, "batched_put_external_pages", None)
+                )
+            )
+            for backend in selected
+        )
+
+    def supports_batched_put_layer_pages(
+        self, location: Optional[str] = None
+    ) -> bool:
+        """Whether selected backends accept one physical page for all layers."""
+        return self._supports_layer_page_backends(
+            [
+                backend
+                for _, backend in self.get_active_storage_backends(
+                    location=location
+                )
+            ]
+        )
+
+    def batched_put_layer_pages(
+        self,
+        keys: Sequence[CacheEngineKey],
+        pages: List[LayerPageMemoryObj],
+        location: Optional[str] = None,
+        req_id: str = "",
+    ) -> list[Future]:
+        """Store each physical page once locally and remotely."""
+        if (
+            len(keys) != len(pages)
+            or len(set(keys)) != len(keys)
+            or len({id(page) for page in pages}) != len(pages)
+        ):
+            raise ValueError("Layer-page put requires one unique key and page")
+        if not pages:
+            return []
+        selected = list(self.get_active_storage_backends(location=location))
+        if not self._supports_layer_page_backends(
+            [backend for _, backend in selected]
+        ):
+            raise RuntimeError("Selected storage backends do not support layer pages")
+
+        layer_count = pages[0].num_layers
+        if any(
+            not page.is_valid()
+            or page.num_layers != layer_count
+            or page.get_size() != page.layer_size * layer_count
+            or len(page.metadata.dtypes or ()) != layer_count
+            or any(dtype != key.dtype for dtype in page.metadata.dtypes or ())
+            or page.valid_tokens
+            != mooncake_valid_tokens(key, int(self.config.chunk_size))
+            for key, page in zip(keys, pages, strict=True)
+        ):
+            raise ValueError("Layer-page put metadata does not match its key")
+        local = next(
+            backend
+            for _, backend in selected
+            if isinstance(backend, LocalCPUBackend)
+            and bool(getattr(backend, "use_hot", False))
+        )
+        remote = next(
+            (
+                backend
+                for _, backend in selected
+                if isinstance(backend, RemoteBackend)
+            ),
+            None,
+        )
+        required_futures: list[Future] = []
+        if remote is None:
+            local.batched_submit_layer_pages(keys, pages)
+        else:
+            owner_by_storage = {
+                int(page.raw_data.untyped_storage().data_ptr()): page.raw_data
+                for page in pages
+            }
+            for page in pages:
+                page.ref_count_up()
+            try:
+                future = self.batched_put_external_pages(
+                    keys,
+                    [
+                        [page.layer_data_ptr(layer) for layer in range(layer_count)]
+                        for page in pages
+                    ],
+                    [[page.layer_size] * layer_count for page in pages],
+                    tuple(owner_by_storage.values()),
+                    None,
+                    req_id,
+                )
+            except Exception:
+                for page in pages:
+                    page.ref_count_down()
+                raise
+
+            completion: Future = Future()
+
+            def finish_pages(
+                completed_remote: Future,
+                held=tuple(pages),
+                page_keys=tuple(keys),
+            ) -> None:
+                error = None
+                try:
+                    completed_remote.result()
+                    # A local page hit must also represent a durable remote page.
+                    local.batched_submit_layer_pages(page_keys, list(held))
+                except Exception as caught:
+                    error = caught
+                finally:
+                    for page in held:
+                        page.ref_count_down()
+                if not completion.done():
+                    if error is None:
+                        completion.set_result(None)
+                    else:
+                        completion.set_exception(error)
+
+            future.add_done_callback(finish_pages)
+            required_futures.append(completion)
+        for page in pages:
+            page.ref_count_down()
+        return required_futures
+
     def batched_put_external_pages(
         self,
         keys: Sequence[CacheEngineKey],
         buffer_ptrs: List[List[int]],
         buffer_sizes: List[List[int]],
         owners: tuple[Any, ...],
-        ready_event: Any,
+        producer_events: tuple[Any, ...] | Any,
         req_id: str,
     ) -> Future:
         """Forward registered external page or legacy buffers to RemoteBackend."""
@@ -465,8 +604,27 @@ class StorageManager:
             buffer_ptrs,
             buffer_sizes,
             owners,
-            ready_event,
+            producer_events,
             req_id,
+        )
+
+    def batched_get_external_pages(
+        self,
+        keys: Sequence[CacheEngineKey],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        owners: tuple[Any, ...],
+        req_id: str,
+    ) -> None:
+        """Load remote pages directly into externally owned buffers."""
+        backend = self.storage_backends.get("RemoteBackend")
+        if not isinstance(backend, RemoteBackend):
+            raise RuntimeError("Direct page load requires RemoteBackend")
+        with self._bypass_lock:
+            if "RemoteBackend" in self._bypassed_backends:
+                raise RuntimeError("RemoteBackend is bypassed")
+        backend.batched_get_external_pages(
+            keys, buffer_ptrs, buffer_sizes, owners, req_id
         )
 
     def batched_external_pages_exist(
@@ -480,6 +638,48 @@ class StorageManager:
             if "RemoteBackend" in self._bypassed_backends:
                 return [False] * len(keys)
         return backend.batched_external_pages_exist(keys)
+
+    def submit_remote_fill_direct_push(
+        self,
+        *,
+        remote_session: str,
+        source_plan: Any,
+        destination_descriptors: tuple[Any, ...],
+        activation: Any,
+    ) -> Future:
+        """Submit one armed remote fill through the active RemoteBackend."""
+        backend = self.storage_backends.get("RemoteBackend")
+        if not isinstance(backend, RemoteBackend):
+            raise RuntimeError("Remote fill requires RemoteBackend")
+        with self._bypass_lock:
+            if "RemoteBackend" in self._bypassed_backends:
+                raise RuntimeError("RemoteBackend is bypassed")
+        return backend.submit_remote_fill_direct_push(
+            remote_session=remote_session,
+            source_plan=source_plan,
+            destination_descriptors=destination_descriptors,
+            activation=activation,
+        )
+
+    def prepare_remote_fill_source(self, source_plan: Any) -> Future:
+        """Fence and register direct-push sources before destination ARM."""
+        backend = self.storage_backends.get("RemoteBackend")
+        if not isinstance(backend, RemoteBackend):
+            raise RuntimeError("Remote fill requires RemoteBackend")
+        with self._bypass_lock:
+            if "RemoteBackend" in self._bypassed_backends:
+                raise RuntimeError("RemoteBackend is bypassed")
+        return backend.prepare_remote_fill_source(source_plan)
+
+    def get_remote_fill_destination_session(self) -> str | None:
+        """Return TP0's registered native destination session, if enabled."""
+        backend = self.storage_backends.get("RemoteBackend")
+        if not isinstance(backend, RemoteBackend):
+            return None
+        with self._bypass_lock:
+            if "RemoteBackend" in self._bypassed_backends:
+                return None
+        return backend.get_remote_fill_destination_session()
 
     def get(
         self,
@@ -655,8 +855,13 @@ class StorageManager:
             and keys
             and keys[0]
         ):
-            local_backend = self.storage_backends["LocalCPUBackend"]
-            if local_backend.contains(keys[0][0]):
+            local_backend = cast(
+                LocalCPUBackend,
+                self.storage_backends["LocalCPUBackend"],
+            )
+            if local_backend.contains_all_exact(
+                key for layer_keys in keys for key in layer_keys
+            ):
                 location = "LocalCPUBackend"
         backend = self.storage_backends[location]
         use_blocking = self._layerwise_get_prefers_blocking(location, backend)
@@ -691,6 +896,8 @@ class StorageManager:
         lookup_id: str,
         cum_chunk_lengths_total: list[int],
         tier_expected_chunks: list[int],
+        loading_tasks: Optional[list[asyncio.Task]] = None,
+        setup_failed: bool = False,
     ) -> None:
         """
         Callback function when all prefetch tasks
@@ -700,7 +907,21 @@ class StorageManager:
         self.event_manager.update_event_status(
             EventType.LOADING, lookup_id, status=EventStatus.DONE
         )
-        res = task.result()
+        try:
+            res = task.result()
+        except BaseException:
+            logger.exception("Async lookup failed: lookup_id=%s", lookup_id)
+            self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
+            return
+
+        lookup_failed = setup_failed or any(
+            loading_task.cancelled() or loading_task.exception() is not None
+            for loading_task in loading_tasks or ()
+        )
+        if lookup_failed:
+            logger.error("Async lookup failed: lookup_id=%s", lookup_id)
+            self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
+            return
 
         # Calculate total retrieved chunks across all tiers based on actual results
         # from batched_get_non_blocking, not the batched_async_contains results.
@@ -756,7 +977,7 @@ class StorageManager:
             if actual_chunks < expected_chunks:
                 # Release all chunks in subsequent tiers since they won't be used
                 for subsequent_tier in res[tier_idx + 1 :]:
-                    for mem_obj in subsequent_tier:
+                    for _, mem_obj in subsequent_tier:
                         mem_obj.ref_count_down()
                 break
 
@@ -821,52 +1042,59 @@ class StorageManager:
         tier_expected_chunks = []
         # we also keep track of the keys for each tier and each chunk
         loading_task_keys: list[list[CacheEngineKey]] = []
-        for backend_name, backend in self.get_active_storage_backends(
-            search_range=search_range
-        ):
-            num_hit_chunks = await backend.batched_async_contains(lookup_id, keys, pin)
-
-            if num_hit_chunks == 0:
-                continue
-
-            num_total_hit_chunks += num_hit_chunks
-            tier_expected_chunks.append(num_hit_chunks)
-
-            backend_keys = keys[:num_hit_chunks]
-            loading_task_keys.append(backend_keys)
-
-            assert self.async_serializer is not None, (
-                "Async serializer must be initialized via post_init before using "
-                "async_lookup_and_prefetch."
-            )
-            # num_hit_chunks is only used for the multi serializer
-            get_coro = self.async_serializer.run(
-                backend.batched_get_non_blocking(
-                    lookup_id,
-                    backend_keys,
-                    {"cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]},
-                ),
-                num_hit_chunks,
-            )
-            loading_task = asyncio.create_task(get_coro)
-            loading_task.add_done_callback(
-                functools.partial(
-                    self.prefetch_single_done_callback,
-                    keys=keys,
-                    backend_name=backend_name,
+        setup_failed = False
+        try:
+            for backend_name, backend in self.get_active_storage_backends(
+                search_range=search_range
+            ):
+                num_hit_chunks = await backend.batched_async_contains(
+                    lookup_id, keys, pin
                 )
-            )
 
-            loading_tasks.append(loading_task)
+                if num_hit_chunks == 0:
+                    continue
 
-            cum_chunk_lengths = cum_chunk_lengths[num_hit_chunks:]
+                num_total_hit_chunks += num_hit_chunks
+                tier_expected_chunks.append(num_hit_chunks)
 
-            if num_total_hit_chunks == num_total_chunks:
-                break
-            keys = keys[num_hit_chunks:]
+                backend_keys = keys[:num_hit_chunks]
+                loading_task_keys.append(backend_keys)
+
+                assert self.async_serializer is not None, (
+                    "Async serializer must be initialized via post_init before using "
+                    "async_lookup_and_prefetch."
+                )
+                # num_hit_chunks is only used for the multi serializer
+                get_coro = self.async_serializer.run(
+                    backend.batched_get_non_blocking(
+                        lookup_id,
+                        backend_keys,
+                        {"cum_chunk_lengths": cum_chunk_lengths[: num_hit_chunks + 1]},
+                    ),
+                    num_hit_chunks,
+                )
+                loading_task = asyncio.create_task(get_coro)
+                loading_task.add_done_callback(
+                    functools.partial(
+                        self.prefetch_single_done_callback,
+                        keys=keys,
+                        backend_name=backend_name,
+                    )
+                )
+
+                loading_tasks.append(loading_task)
+
+                cum_chunk_lengths = cum_chunk_lengths[num_hit_chunks:]
+
+                if num_total_hit_chunks == num_total_chunks:
+                    break
+                keys = keys[num_hit_chunks:]
+        except BaseException:
+            setup_failed = True
+            logger.exception("Async lookup setup failed: lookup_id=%s", lookup_id)
 
         # If no chunks were hit across all backends, respond immediately and return.
-        if num_total_hit_chunks == 0:
+        if num_total_hit_chunks == 0 and not setup_failed:
             if self.async_lookup_server is not None:
                 self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
             return
@@ -881,9 +1109,13 @@ class StorageManager:
         #  Tuple(loading_task_keys[1][0] : MemoryObj2)
         #  Tuple(loading_task_keys[1][1] : MemoryObj3)
         async def gather_with_keys() -> list[list[tuple[CacheEngineKey, MemoryObj]]]:
-            loading_results = await asyncio.gather(*loading_tasks)
+            loading_results = await asyncio.gather(
+                *loading_tasks, return_exceptions=True
+            )
             return [
-                list(zip(keys, results, strict=False))
+                []
+                if isinstance(results, BaseException)
+                else list(zip(keys, results, strict=False))
                 for keys, results in zip(
                     loading_task_keys, loading_results, strict=False
                 )
@@ -903,6 +1135,8 @@ class StorageManager:
                 lookup_id,
                 cum_chunk_lengths_total,
                 tier_expected_chunks,
+                loading_tasks,
+                setup_failed,
             )
         )
 
@@ -1116,6 +1350,147 @@ class StorageManager:
                 break
             remaining = remaining[hits:]
         return total, mapping
+
+    def batched_contains_two_group_layer_pages(
+        self,
+        group0_keys: Sequence[LayerCacheEngineKey],
+        group1_keys: Sequence[LayerCacheEngineKey],
+        search_range: Optional[List[str]] = None,
+        pin: bool = False,
+        diagnostics: Optional[dict[str, object]] = None,
+    ) -> tuple[int, dict[str, list[CacheEngineKey]]]:
+        """Locate a contiguous prefix of complete two-group physical pages.
+
+        Args:
+            group0_keys: Group 0 representative layer keys in logical order.
+            group1_keys: Aligned Group 1 representative layer keys.
+            search_range: Optional ordered backend filter.
+            pin: Atomically pin complete pairs in pin-capable backends.
+            diagnostics: Optional request-local LocalCPU retention summary.
+                It is populated under the backend's existing lookup lock.
+
+        Returns:
+            The number of complete page pairs and their backend mapping. Each
+            mapping value is interleaved ``g0, g1`` by logical page.
+
+        Raises:
+            ValueError: If the key sequences are not aligned two-group page
+                representatives.
+
+        Notes:
+            A backend can contribute only whole pairs. An isolated Group 0 or
+            Group 1 hit never advances the prefix and is never retained. The
+            LocalCPU backend performs lookup and pair pinning under its single
+            cache lock; persistent backends are rechecked on the exact even
+            prefix before any backend-specific pin is recorded.
+        """
+        if len(group0_keys) != len(group1_keys):
+            raise ValueError("Two-group page lookup requires aligned key counts")
+        for group0, group1 in zip(group0_keys, group1_keys, strict=True):
+            if (
+                group0.kv_group != 0
+                or group1.kv_group != 1
+                or group0.layer_id != group1.layer_id
+                or group0.chunk_hash != group1.chunk_hash
+                or group0.model_name != group1.model_name
+                or group0.world_size != group1.world_size
+                or group0.worker_id != group1.worker_id
+            ):
+                raise ValueError(
+                    "Two-group page lookup requires identical logical page pairs"
+                )
+
+        total_pairs = 0
+        mapping: dict[str, list[CacheEngineKey]] = {}
+        pinned: list[tuple[StorageBackendInterface, list[CacheEngineKey]]] = []
+
+        def rollback() -> None:
+            for backend, keys in reversed(pinned):
+                batched_unpin = getattr(backend, "batched_unpin", None)
+                if callable(batched_unpin):
+                    batched_unpin(keys)
+                else:
+                    for key in keys:
+                        backend.unpin(key)
+
+        try:
+            for name, backend in self.get_active_storage_backends(
+                search_range=search_range
+            ):
+                if total_pairs == len(group0_keys):
+                    break
+                remaining0 = group0_keys[total_pairs:]
+                remaining1 = group1_keys[total_pairs:]
+                if name == "LocalCPUBackend":
+                    physical0 = [key.without_layer() for key in remaining0]
+                    physical1 = [key.without_layer() for key in remaining1]
+                    if diagnostics is None:
+                        pair_hits = backend.batched_contains_two_group_prefix(
+                            physical0,
+                            physical1,
+                            pin=pin,
+                        )
+                    else:
+                        pair_hits = backend.batched_contains_two_group_prefix(
+                            physical0,
+                            physical1,
+                            pin=pin,
+                            diagnostics=diagnostics,
+                        )
+                    if not 0 <= pair_hits <= len(remaining0):
+                        raise RuntimeError(
+                            "LocalCPU returned an invalid two-group page prefix"
+                        )
+                    backend_keys = [
+                        key
+                        for pair in zip(
+                            physical0[:pair_hits],
+                            physical1[:pair_hits],
+                            strict=True,
+                        )
+                        for key in pair
+                    ]
+                else:
+                    contains = getattr(backend, "batched_contains_layer_pages", None)
+                    if not callable(contains):
+                        continue
+                    interleaved = [
+                        key
+                        for pair in zip(remaining0, remaining1, strict=True)
+                        for key in pair
+                    ]
+                    raw_hits = int(contains(interleaved, False))
+                    if not 0 <= raw_hits <= len(interleaved):
+                        raise RuntimeError(
+                            f"{name} returned an invalid layer-page prefix"
+                        )
+                    pair_hits = raw_hits // 2
+                    backend_keys = interleaved[: 2 * pair_hits]
+                    if pin and backend_keys:
+                        retained = int(contains(backend_keys, True))
+                        if retained != len(backend_keys):
+                            if retained > 0:
+                                partial = backend_keys[:retained]
+                                batched_unpin = getattr(backend, "batched_unpin", None)
+                                if callable(batched_unpin):
+                                    batched_unpin(partial)
+                                else:
+                                    for key in partial:
+                                        backend.unpin(key)
+                            return total_pairs, mapping
+
+                if pair_hits <= 0:
+                    continue
+                mapping[name] = backend_keys
+                if pin:
+                    pinned.append((backend, backend_keys))
+                total_pairs += pair_hits
+        except Exception:
+            if pin:
+                rollback()
+            raise
+
+        return total_pairs, mapping
 
     def get_block_mapping(
         self, chunk_infos: List[Tuple[CacheEngineKey, int, int]]
@@ -1363,6 +1738,8 @@ class StorageManager:
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
+                if self._requires_strict_backend_close(backend):
+                    raise
 
             del self.storage_backends[backend_name]
 
@@ -1448,6 +1825,8 @@ class StorageManager:
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
+                if self._requires_strict_backend_close(backend):
+                    raise
             del self.storage_backends[backend_name]
 
             # --- create ---
@@ -1485,14 +1864,21 @@ class StorageManager:
     def close(self):
         logger.info("Closing StorageManager...")
 
-        # Close all backends
-        for name, backend in self.storage_backends.items():
+        # Remote backends may own registrations into the LocalCPU slab, so
+        # close every dependent backend before the allocator that backs it.
+        ordered_backends = sorted(
+            self.storage_backends.items(),
+            key=lambda item: item[0] == "LocalCPUBackend",
+        )
+        for name, backend in ordered_backends:
             try:
                 logger.info(f"Closing storage backend: {name}")
                 backend.close()
                 logger.info(f"Storage backend {name} closed successfully")
             except Exception as e:
                 logger.error(f"Error closing backend {name}: {e}")
+                if self._requires_strict_backend_close(backend):
+                    raise
 
         # Stop event loop
         try:
@@ -1519,3 +1905,17 @@ class StorageManager:
             logger.info("Storage manager thread already stopped")
 
         logger.info("Storage manager closed.")
+
+    @staticmethod
+    def _requires_strict_backend_close(
+        backend: StorageBackendInterface,
+    ) -> bool:
+        checker = getattr(backend, "requires_strict_external_close", None)
+        return bool(callable(checker) and checker())
+
+    def requires_strict_external_close(self) -> bool:
+        """Return whether any backend has accepted external HBM ownership."""
+        return any(
+            self._requires_strict_backend_close(backend)
+            for backend in self.storage_backends.values()
+        )
