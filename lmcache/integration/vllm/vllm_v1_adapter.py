@@ -5860,10 +5860,14 @@ class LMCacheConnectorV1Impl:
             cached_ends = cache["cached_ends"]
             chunk_token_counts = None
             if cached_starts and len(cached_starts) == len(cached_ends):
-                if not self._cached_ranges_cover_prefix(
-                    cached_starts,
-                    cached_ends,
-                    token_count,
+                # Under TP, indexer store completion precedes the deferred
+                # latent flush. Its raw cache can already cover the next
+                # prefill chunk while token_count still follows latent.
+                # Preserve that cache, but publish only an exact-frontier
+                # source; the latent flush will refresh both groups again.
+                if (
+                    self._cached_prefix_covered_token_count(cached_starts, cached_ends)
+                    != token_count
                 ):
                     continue
                 chunk_token_counts = tuple(
