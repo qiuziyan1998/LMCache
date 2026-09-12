@@ -68,9 +68,10 @@ class PendingCheckpoint:
     captured_end: int = 0
     restore_retries: int = 0
 
-    def retry_shorter(self, chunk_size: int) -> None:
+    def retry_shorter(self, chunk_size: int, failed_end: int | None = None) -> None:
         """Permit one strictly shorter local restore, then use ordinary recovery."""
-        shorter = (self.end - 1) // chunk_size * chunk_size
+        end = self.end if failed_end is None else min(self.end, failed_end)
+        shorter = (end - 1) // chunk_size * chunk_size
         if not self.restore_retries and shorter > max(
             self.capture.base, self.capture.prefix_end
         ):

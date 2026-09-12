@@ -123,6 +123,7 @@ def test_ordinary_metadata_keeps_its_original_wire_fields():
         "preemption_captures",
         "preemption_seals",
         "preemption_cancels",
+        "preemption_releases",
     }
 
 

@@ -406,3 +406,46 @@ def test_restore_retry_is_strictly_shorter_and_bounded():
     assert pending.status == "ready" and pending.end == 8
     pending.retry_shorter(4)
     assert pending.status == "failed" and pending.restore_retries == 2
+
+
+def test_failed_restore_retry_is_shorter_than_the_actual_evicted_frontier():
+    req = request()
+    req.kv_resume_checkpoint = (1, 12, 8)
+    pending = control.PendingCheckpoint(
+        control.CaptureSpec("r", 1, 0, 12, 0, ((1,), (2,)), prefix_end=0), "ready", 11
+    )
+    adapter = NS(
+        _preemption_checkpoints={"r": pending},
+        _unfinished_requests={"r": req},
+        _dsa_cold_indexer_block_ids={"r": {7}},
+        _lmcache_chunk_size=4,
+        _resume_lookup_queries={"r": (8, "preemption_checkpoint", 0)},
+        lookup_client=NS(clear_lookup_status=lambda key: None),
+    )
+    method("update_connector_output")(
+        adapter,
+        NS(
+            finished_recving=(), invalid_block_ids={7}, completed_decode_window_saves={}
+        ),
+    )
+    assert pending.end == 4 and pending.status == "ready"
+
+
+def test_all_worker_completion_schedules_release_even_after_request_removal():
+    calls = []
+    adapter = NS(
+        _checkpoint_restore_attempts={"r": (1, 7)},
+        _arm_preemption_controls=lambda: calls.append("arm"),
+        _clear_request_marker=lambda *a: None,
+        _lmcache_chunk_size=4,
+        _preemption_checkpoints={},
+        _unfinished_requests={},
+    )
+    method("update_connector_output")(
+        adapter, NS(finished_recving={"r"}, completed_decode_window_saves={})
+    )
+    assert calls == ["arm"] and not adapter._checkpoint_restore_attempts
+    meta = NS()
+    method("_build_preemption_controls")(adapter, meta, NS(finished_req_ids=set()), [])
+    assert meta.preemption_releases == (("r", 1, 7),)
+    assert "_checkpoint_restore_releases" not in adapter.__dict__

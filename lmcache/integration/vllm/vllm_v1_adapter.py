@@ -1812,6 +1812,7 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
     preemption_captures = ()
     preemption_seals = ()
     preemption_cancels = ()
+    preemption_releases = ()
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -1828,6 +1829,7 @@ class PreemptionConnectorMetadata(LMCacheConnectorMetadata):
     preemption_captures: tuple[CaptureSpec, ...] = ()
     preemption_seals: tuple[SealSpec, ...] = ()
     preemption_cancels: tuple[tuple[str, int], ...] = ()
+    preemption_releases: tuple[tuple[str, int, int], ...] = ()
 
 
 class LMCacheConnectorV1Impl:
@@ -3931,11 +3933,22 @@ class LMCacheConnectorV1Impl:
         completed.clear()
         return drained
 
+    def has_pending_control(self) -> bool:
+        """Return whether all-worker releases still need a control-only dispatch."""
+        return bool(getattr(self, "_checkpoint_restore_releases", ()))
+
     def update_connector_output(self, connector_output: Any) -> None:
         finished_recving = set(
             getattr(connector_output, "finished_recving", None) or ()
         )
         for req_id in finished_recving:
+            attempts = getattr(self, "_checkpoint_restore_attempts", None)
+            attempt = attempts.pop(req_id, None) if attempts else None
+            if attempt is not None:
+                self.__dict__.setdefault("_checkpoint_restore_releases", []).append(
+                    (req_id, *attempt)
+                )
+                self._arm_preemption_controls()
             self._clear_request_marker(
                 "_dsa_group1_direct_hbm_active_req_id", req_id
             )
@@ -3967,7 +3980,10 @@ class LMCacheConnectorV1Impl:
                         # Repeated invalid-block reports must not consume the
                         # bounded retry twice for the same failed read attempt.
                         if request.kv_resume_checkpoint is not None:
-                            checkpoint.retry_shorter(self._lmcache_chunk_size)
+                            checkpoint.retry_shorter(
+                                self._lmcache_chunk_size,
+                                request.kv_resume_checkpoint[2],
+                            )
                         request.kv_resume_checkpoint = None
                         self._resume_lookup_queries.pop(req_id, None)
                         self.lookup_client.clear_lookup_status(req_id)
@@ -10507,6 +10523,13 @@ class LMCacheConnectorV1Impl:
                         load_spec.lmcache_cached_tokens,
                     )
                 )
+        if hasattr(load_spec, "checkpoint_generation"):
+            self.__dict__.setdefault("_checkpoint_restore_attempts", {})[
+                request.request_id
+            ] = (
+                load_spec.checkpoint_generation,
+                load_spec.dsa_cold_load_generation,
+            )
         return req_meta
 
     @_lmcache_nvtx_annotate
@@ -11739,3 +11762,4 @@ class LMCacheConnectorV1Impl:
         meta.preemption_captures = tuple(captures)
         meta.preemption_seals = tuple(seals)
         meta.preemption_cancels = tuple(cancels)
+        meta.preemption_releases = tuple(self.__dict__.pop("_checkpoint_restore_releases", ()))

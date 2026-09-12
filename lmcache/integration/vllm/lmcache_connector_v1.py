@@ -304,6 +304,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         """
         return self._lmcache_engine.build_connector_meta(scheduler_output)
 
+    def has_pending_control(self) -> bool:
+        """Report an acknowledgement waiting for an otherwise idle worker step."""
+        return self._lmcache_engine.has_pending_control()
+
     def update_connector_output(self, connector_output: "KVConnectorOutput"):
         """
         Update scheduler-side LMCache state from worker-side connector output.
