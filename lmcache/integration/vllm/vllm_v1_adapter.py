@@ -45,7 +45,7 @@ from lmcache.integration.vllm.decode_window_commit import (
     publish_delayed_decode_window_commit,
 )
 from lmcache.integration.vllm.preemption_checkpoint import (
-    CaptureSpec, CheckpointResult, PendingCheckpoint, SealSpec, choose_checkpoint_end,
+    CaptureSpec, CheckpointResult, PendingCheckpoint, SealSpec, choose_checkpoint_end, LOCAL_CHECKPOINT_CONFIG,
 )
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
@@ -3964,9 +3964,10 @@ class LMCacheConnectorV1Impl:
                     if checkpoint is not None and request is not None and (
                         checkpoint.capture.generation == request.num_preemptions
                     ):
-                        # This is a failed restore, not a late writer reply.
-                        # Do not retry its generated prefix indefinitely.
-                        checkpoint.status = "failed"
+                        # Repeated invalid-block reports must not consume the
+                        # bounded retry twice for the same failed read attempt.
+                        if request.kv_resume_checkpoint is not None:
+                            checkpoint.retry_shorter(self._lmcache_chunk_size)
                         request.kv_resume_checkpoint = None
                         self._resume_lookup_queries.pop(req_id, None)
                         self.lookup_client.clear_lookup_status(req_id)
@@ -4297,6 +4298,9 @@ class LMCacheConnectorV1Impl:
     def _release_finished_worker_requests(self, req_ids: Iterable[str]) -> None:
         """Release request-owned cache state in the worker process."""
         for req_id in req_ids:
+            forget = getattr(self.lmcache_engine, "forget_checkpoint_request", None)
+            if forget is not None:
+                forget(req_id)
             self._cold_perf_dense_load_started.pop(req_id, None)
             self._cold_perf_dense_load_completed.pop(req_id, None)
             self._drop_layerwise_save_storers(req_id)
@@ -7388,6 +7392,15 @@ class LMCacheConnectorV1Impl:
                 active_req_ids.add(request.req_id)
             if request.resumed_from_preemption:
                 resumed_req_ids.add(request.req_id)
+                if getattr(
+                    request.load_spec, "checkpoint_generation", None
+                ) is not None and self._completed_cold_resume(request):
+                    # This dispatch follows the scheduler's all-worker receive
+                    # completion. No passive TP can still be reading Group 1.
+                    self.lmcache_engine.register_shared_cpu_sparse_request(
+                        request.req_id,
+                        owned_groups={1: []},
+                    )
             load_spec = request.load_spec
             if load_spec is None:
                 continue
@@ -10153,6 +10166,9 @@ class LMCacheConnectorV1Impl:
                 token_ids = _apply_mm_hashes(token_ids, mm_hashes, mm_positions)
 
             request_configs = extract_request_configs(request.sampling_params)
+            if query_scope == "preemption_checkpoint":
+                request_configs = dict(request_configs or {})
+                request_configs[LOCAL_CHECKPOINT_CONFIG] = request.num_preemptions
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
@@ -10172,6 +10188,14 @@ class LMCacheConnectorV1Impl:
             )
             return None
 
+        if (
+            query_scope == "preemption_checkpoint"
+            and num_external_hit_tokens < query_end
+        ):
+            # A local offer is evictable while HBM admission is pending. Treat
+            # the fresh paired frontier as the query result, never the old offer.
+            query_end = lookup_query_tokens = num_external_hit_tokens
+            self._resume_lookup_queries[req_id] = (query_end, query_scope, decode_committed_end)
         lookup_started = self._cold_perf_lookup_started.pop(
             req_id,
             lookup_call_started,
@@ -10258,6 +10282,16 @@ class LMCacheConnectorV1Impl:
                 self, "_dsa_kv_policy_threshold", 0
             )
         )
+        if (
+            query_scope == "preemption_checkpoint"
+            and num_external_hit_tokens > request_prompt_tokens
+            and not dsa_cold_compact_load
+        ):
+            checkpoint.status = "failed"
+            request.kv_resume_checkpoint = None
+            self._resume_lookup_queries.pop(req_id, None)
+            self.lookup_client.clear_lookup_status(req_id)
+            return None
         group1_direct_hbm = bool(
             dsa_cold_compact_load
             and getattr(
@@ -10315,6 +10349,12 @@ class LMCacheConnectorV1Impl:
             can_load=False,
             dsa_current_released_frontier=0,
         )
+        if (
+            query_scope == "preemption_checkpoint"
+            and num_external_hit_tokens > request_prompt_tokens
+        ):
+            self.load_specs[req_id].checkpoint_generation = request.num_preemptions
+            self.load_specs[req_id].checkpoint_prefix_end = request_prompt_tokens
         if dsa_cold_compact_load:
             self.load_specs[req_id].dsa_cold_compact_load = True
             self.load_specs[req_id].dsa_group1_direct_hbm = group1_direct_hbm
@@ -11629,7 +11669,6 @@ class LMCacheConnectorV1Impl:
         cancels = list(getattr(self, "_checkpoint_cancels", ()))
         self._checkpoint_cancels = []
         chunk = self._lmcache_chunk_size
-        limit = max(self._decode_window_save_window_size, chunk) + chunk
         for req_id, generation, blocks, end in snapshots:
             tracker = self._request_trackers.get(req_id)
             if (
@@ -11642,12 +11681,12 @@ class LMCacheConnectorV1Impl:
                 continue
             if not getattr(self.config, "dsa_two_groups", False) or len(blocks) != 2:
                 continue
-            base = (
-                max(tracker.prompt_len, tracker.decode_window_save_committed_end)
-                // chunk
-                * chunk
-            )
-            if not base < end <= base + limit:
+            request = self._unfinished_requests.get(req_id)
+            if request is None:
+                continue
+            prefix_end = len(request.prompt_token_ids or ())
+            base = prefix_end // chunk * chunk
+            if not prefix_end < end:
                 continue
             old = self._preemption_checkpoints.get(req_id)
             if old is not None:
@@ -11660,6 +11699,7 @@ class LMCacheConnectorV1Impl:
                 max(base, tracker.dsa_nonresident_frontier),
                 blocks,
                 tracker.request_configs,
+                prefix_end=prefix_end,
             )
             self._preemption_checkpoints[req_id] = PendingCheckpoint(capture)
             self._resume_lookup_queries.pop(req_id, None)
@@ -11680,7 +11720,7 @@ class LMCacheConnectorV1Impl:
                 pending.cancel_pending = False
             if pending.status != "captured":
                 continue
-            end = choose_checkpoint_end(request.num_tokens, pending.capture)
+            end = choose_checkpoint_end(request.num_tokens, pending.capture, pending.captured_end)
             if not end:
                 pending.status = "failed"
                 cancels.append((req_id, pending.capture.generation))

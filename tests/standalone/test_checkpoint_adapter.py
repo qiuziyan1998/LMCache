@@ -220,6 +220,7 @@ def test_failed_checkpoint_restore_invalidates_its_lookup_proof():
         _preemption_checkpoints={"r": pending},
         _unfinished_requests={"r": req},
         _dsa_cold_indexer_block_ids={"r": {7, 8}},
+        _lmcache_chunk_size=4,
         _resume_lookup_queries={"r": (11, "preemption_checkpoint", 0)},
         lookup_client=NS(clear_lookup_status=lambda key: None),
     )
@@ -229,7 +230,7 @@ def test_failed_checkpoint_restore_invalidates_its_lookup_proof():
             finished_recving=(), invalid_block_ids={8}, completed_decode_window_saves={}
         ),
     )
-    assert pending.status == "failed"
+    assert pending.status == "ready" and pending.end == 8
     assert req.kv_resume_checkpoint is None
     assert "r" not in adapter._resume_lookup_queries
 
@@ -311,3 +312,97 @@ def test_completed_resume_still_checks_shared_cache_generation():
         lmcache_engine=NS(shared_cpu_cache_generation=2),
     )
     assert method("_should_invalidate_worker_retrieve_state")(adapter, req, 11)
+
+
+def test_long_tail_is_offered_without_decode_save_and_partial_capture_is_sealed():
+    req = request()
+    tracker = NS(
+        prompt_len=4,
+        decode_window_save_committed_end=0,
+        dsa_nonresident_frontier=4,
+        skip_save=False,
+        request_configs=None,
+    )
+    adapter = NS(
+        _lmcache_chunk_size=4,
+        _decode_window_save_window_size=0,
+        _request_trackers={"r": tracker},
+        kv_role="kv_both",
+        config=NS(dsa_two_groups=True),
+        _preemption_checkpoints={},
+        _resume_lookup_queries={},
+        _unfinished_requests={"r": req},
+    )
+    output = NS(finished_req_ids=set())
+    meta = NS()
+    method("_build_preemption_controls")(
+        adapter, meta, output, [("r", 1, ((1,), (2,)), 80)]
+    )
+    capture = meta.preemption_captures[0]
+    assert capture.end == 80 and capture.prefix_end == 4
+    pending = adapter._preemption_checkpoints["r"]
+    assert pending.accept(control.CheckpointResult("r", 1, "captured", 9))
+    method("_build_preemption_controls")(adapter, meta, output, [])
+    assert meta.preemption_seals[0].tokens == tuple(range(9))
+    assert pending.end == 9
+
+
+def test_local_lookup_marker_is_only_sent_for_the_checkpoint_generation():
+    req = request()
+    captured = control.CaptureSpec("r", 1, 4, 12, 4, ((1,), (2,)), prefix_end=4)
+    pending = control.PendingCheckpoint(captured, "ready", 11)
+    calls = []
+    adapter = NS(
+        kv_role="kv_both",
+        _preemption_checkpoints={"r": pending},
+        _resume_lookup_queries={},
+        _request_trackers={},
+        _requests_priority={},
+        lookup_client=NS(
+            lookup_cache=lambda **kw: -1, lookup=lambda ids, **kw: calls.append(kw)
+        ),
+        skip_last_n_tokens=0,
+    )
+    assert method("get_num_new_matched_tokens")(adapter, req, 0) is None
+    assert calls[0]["request_configs"][control.LOCAL_CHECKPOINT_CONFIG] == 1
+
+
+@pytest.mark.parametrize("hit", [8, 11])
+def test_partial_local_hit_sets_the_actual_restore_frontier(hit):
+    req = request()
+    captured = control.CaptureSpec("r", 1, 4, 12, 4, ((1,), (2,)), prefix_end=4)
+    adapter = NS(
+        kv_role="kv_both",
+        _preemption_checkpoints={"r": control.PendingCheckpoint(captured, "ready", 11)},
+        _resume_lookup_queries={},
+        _request_trackers={},
+        _requests_priority={},
+        skip_last_n_tokens=0,
+        lookup_client=NS(lookup_cache=lambda **kw: hit),
+        _cold_perf_lookup_started={},
+        _lmcache_chunk_size=4,
+        _block_size=4,
+        _dsa_scratch_capacity=4,
+        _dsa_kv_policy_threshold=4,
+        config=NS(min_retrieve_tokens=0, dsa_group1_load_mode="persistent_direct_hbm"),
+        enable_sparse_attention=True,
+        supports_dsa_cold_compact_load=lambda: True,
+        load_specs={},
+    )
+    matched = method(
+        "get_num_new_matched_tokens", cdiv=lambda a, b: (a + b - 1) // b, LoadSpec=NS
+    )(adapter, req, 0)
+    assert matched == hit
+    spec = adapter.load_specs["r"]
+    assert spec.checkpoint_generation == 1 and spec.checkpoint_prefix_end == 4
+    assert spec.dsa_remap_frontier == hit
+
+
+def test_restore_retry_is_strictly_shorter_and_bounded():
+    pending = control.PendingCheckpoint(
+        control.CaptureSpec("r", 1, 4, 80, 4, ((1,), (2,)), prefix_end=4), "ready", 11
+    )
+    pending.retry_shorter(4)
+    assert pending.status == "ready" and pending.end == 8
+    pending.retry_shorter(4)
+    assert pending.status == "failed" and pending.restore_retries == 2
