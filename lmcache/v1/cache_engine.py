@@ -4233,6 +4233,14 @@ class LMCacheEngine:
                     pages.extend(fetched)
                     owned.extend(fetched)
                 tail_start = local_count + remote_count
+                if tail_start < page_chunks:
+                    # Local-only checkpoint pages can follow a remote prompt.
+                    fetched, count = local.batched_get_layer_page_prefix(
+                        page_keys[tail_start:page_chunks]
+                    )
+                    pages.extend(fetched)
+                    owned.extend(fetched)
+                    tail_start += count
                 legacy_suffix = tail_start < page_chunks
             else:
                 tail_start = page_chunks
