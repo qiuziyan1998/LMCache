@@ -441,6 +441,9 @@ def test_all_worker_completion_schedules_release_even_after_request_removal():
         _preemption_checkpoints={},
         _unfinished_requests={},
     )
+    adapter._complete_checkpoint_restore_miss = lambda *a: method(
+        "_complete_checkpoint_restore_miss"
+    )(adapter, *a)
     method("update_connector_output")(
         adapter, NS(finished_recving={"r"}, completed_decode_window_saves={})
     )
@@ -449,3 +452,43 @@ def test_all_worker_completion_schedules_release_even_after_request_removal():
     method("_build_preemption_controls")(adapter, meta, NS(finished_req_ids=set()), [])
     assert meta.preemption_releases == (("r", 1, 7),)
     assert "_checkpoint_restore_releases" not in adapter.__dict__
+
+
+def test_shorter_cold_resume_does_not_inherit_old_table_remap_frontier():
+    from types import MethodType
+
+    tracker = NS(
+        req_id="r", prompt_len=4, dsa_nonresident_frontier=12, sparse_remap_frontier=12,
+        sparse_token_ids=[], sparse_slot_mapping=[], sparse_indexer_slot_mapping=[],
+        decode_window_save_pending_commits={}, token_ids=list(range(16)),
+        allocated_block_ids=[1, 2, 3, 4], allocated_block_ids_indexer=[5, 6, 7, 8],
+    )
+    split = lambda blocks: (list(blocks[0]), list(blocks[1]))
+    tracker.update = MethodType(method("update", _split_kv_group_block_ids=split), tracker)
+    tracker.seed_sparse_decode_tokens = lambda tokens, count: None
+    adapter = NS(
+        _add_decode_window_save_metas=lambda *a: None,
+        _build_request_meta=lambda tr, spec, **kw: NS(frontier=tr.dsa_nonresident_frontier),
+    )
+    outputs = []
+    request = NS(all_token_ids=list(range(16)))
+    spec = NS(lmcache_cached_tokens=8, vllm_cached_tokens=0, dsa_remap_frontier=8)
+    method("_add_completed_cold_resume")(
+        adapter, NS(add_request=outputs.append), tracker, request, [8], ([21, 22], [31, 32]), spec
+    )
+    assert tracker.dsa_nonresident_frontier == tracker.sparse_remap_frontier == 8
+    assert tracker.decode_window_save_committed_end == 8
+    assert outputs[0].frontier == 8 and outputs[0].resumed_from_preemption
+    assert tracker.allocated_block_ids == [21, 22]
+    assert request.all_token_ids == list(range(16))
+
+
+def test_warm_update_keeps_nonresident_frontier():
+    tracker = NS(
+        prompt_len=4, dsa_nonresident_frontier=12, sparse_remap_frontier=12,
+        allocated_block_ids=[1], allocated_block_ids_indexer=[2], token_ids=list(range(16)),
+    )
+    method("update", _split_kv_group_block_ids=lambda blocks: ([], []))(
+        tracker, [16], ([], []), preempted=False
+    )
+    assert tracker.dsa_nonresident_frontier == tracker.sparse_remap_frontier == 12

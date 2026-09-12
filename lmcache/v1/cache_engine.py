@@ -6544,20 +6544,8 @@ class LMCacheEngine:
             page_candidates: list[tuple[int, int, CacheEngineKey]] = []
             if remote_fill_plan is None and mooncake_page_layout_enabled(self.config):
                 layer_pages = mooncake_layer_pages_enabled(self.config)
-                page_candidates = (
-                    candidates[
-                        : next(
-                            (
-                                index
-                                for index, (start, end, _) in enumerate(candidates)
-                                if end - start != self.config.chunk_size
-                            ),
-                            len(candidates),
-                        )
-                    ]
-                    if layer_pages
-                    else candidates
-                )
+                # Exact-size merged pages include the valid partial tail.
+                page_candidates = candidates
                 if page_candidates:
                     batch_plan = self._shared_page_first_location_plan(
                         [

@@ -968,6 +968,10 @@ class RequestTracker:
             self.sparse_decode_token_mask = None
             self.sparse_decode_ret_mask = None
             self.sparse_meta_frontier = None
+            # These bounds describe the old block table, not durable KV.
+            # A successful compact restore installs its new frontier below.
+            self.dsa_nonresident_frontier = 0
+            self.__dict__.pop("sparse_remap_frontier", None)
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
             self.allocated_block_ids_indexer = new_indexer_block_ids
@@ -3945,6 +3949,7 @@ class LMCacheConnectorV1Impl:
             attempts = getattr(self, "_checkpoint_restore_attempts", None)
             attempt = attempts.pop(req_id, None) if attempts else None
             if attempt is not None:
+                self._complete_checkpoint_restore_miss(req_id, attempt)
                 self.__dict__.setdefault("_checkpoint_restore_releases", []).append(
                     (req_id, *attempt)
                 )
@@ -9785,7 +9790,8 @@ class LMCacheConnectorV1Impl:
                 exc_info=True,
             )
             raise
-        if not request.load_spec.dsa_group1_direct_hbm:
+        retry = self._record_checkpoint_restore_miss(request, generation, exc)
+        if not retry and not request.load_spec.dsa_group1_direct_hbm:
             try:
                 self._synchronize_dsa_cold_dense_load()
             except BaseException:
@@ -9808,18 +9814,27 @@ class LMCacheConnectorV1Impl:
         if failed_state is not None:
             self._release_unadopted_shared_request_objects(failed_state, request)
             self._release_shared_worker_retrieve_state(failed_state, self.lmcache_engine)
-        self._invalid_block_ids.update(indexer_block_ids)
+        if not retry:
+            self._invalid_block_ids.update(indexer_block_ids)
         # A known-terminal failed attempt owns no usable sparse source.
         # Release its lookup plan on both abort and recompute fallback.
         self._release_request_lookup_pins(req_id)
-        logger.exception(
-            "[DSA_COLD_COMPACT] request=%s generation=%d "
-            "status=failed indexer_blocks=%d elapsed_ms=%.3f",
-            req_id,
-            generation,
-            len(indexer_block_ids),
-            ((serving_perf_now() if perf_enabled else 0.0) - submitted_at) * 1000,
-        )
+        if retry:
+            logger.info(
+                "[CHECKPOINT_RESTORE_MISS] request=%s generation=%d action=retry reason=%s",
+                req_id,
+                generation,
+                str(exc),
+            )
+        else:
+            logger.exception(
+                "[DSA_COLD_COMPACT] request=%s generation=%d "
+                "status=failed indexer_blocks=%d elapsed_ms=%.3f",
+                req_id,
+                generation,
+                len(indexer_block_ids),
+                ((serving_perf_now() if perf_enabled else 0.0) - submitted_at) * 1000,
+            )
         # Both workers are terminal and request owners have either
         # retired or moved to the existing readiness retirement queue.
         # Failed futures otherwise retain their request/plan frames in
@@ -9830,6 +9845,12 @@ class LMCacheConnectorV1Impl:
         if coordinator is not None and req_id in (coordinator.aborted or ()):
             self._finish_aborted_cold_load(req_id)
         return True
+
+    def _record_checkpoint_restore_miss(
+        self, request: ReqMeta, generation: int, error: BaseException
+    ) -> bool:
+        """Allow the Ascend checkpoint path to report a terminal cache miss."""
+        return False
 
     def _finish_aborted_cold_load(self, req_id: str) -> None:
         """Acknowledge the connector's delayed cleanup after receive retirement."""
@@ -11597,6 +11618,22 @@ class LMCacheConnectorV1Impl:
         if request is None or request.num_preemptions != result.generation:
             return
         pending = self._preemption_checkpoints.get(result.req_id)
+        if result.status == "restore_miss":
+            attempt = getattr(self, "_checkpoint_restore_attempts", {}).get(
+                result.req_id
+            )
+            if (
+                pending is not None
+                and not request.is_finished()
+                and attempt == (result.generation, result.load_generation)
+            ):
+                if (
+                    type(result.end) is not int
+                    or not 0 <= result.end < request.num_tokens
+                ):
+                    raise ValueError("Invalid checkpoint retry frontier")
+                pending.restore_miss = result
+            return
         if pending is not None and pending.accept(result):
             if pending.status == "captured" or pending.cancel_pending:
                 self._arm_preemption_controls()
@@ -11607,6 +11644,35 @@ class LMCacheConnectorV1Impl:
             self._resume_lookup_queries.pop(result.req_id, None)
             if self.lookup_client is not None:
                 self.lookup_client.clear_lookup_status(result.req_id)
+
+    def _complete_checkpoint_restore_miss(
+        self, req_id: str, attempt: tuple[int, int]
+    ) -> None:
+        """Arm a fresh lookup only after every worker retired the missed restore."""
+        pending = getattr(self, "_preemption_checkpoints", {}).get(req_id)
+        result = pending.restore_miss if pending is not None else None
+        if result is None or attempt != (result.generation, result.load_generation):
+            return
+        pending.restore_miss = None
+        self.__dict__.setdefault("_dsa_cold_failed_req_ids", set()).add(req_id)
+        self._discard_request_set("_dsa_cold_loaded_req_ids", req_id)
+        request = self._unfinished_requests.get(req_id)
+        if (
+            request is None
+            or request.is_finished()
+            or request.num_preemptions != result.generation
+        ):
+            return
+        pending.retry_shorter(
+            self._lmcache_chunk_size,
+            self.load_specs[req_id].lmcache_cached_tokens,
+            available_end=result.end,
+        )
+        request.kv_resume_checkpoint = None
+        request.kv_resume_checkpoint_retry = attempt
+        self._resume_lookup_queries.pop(req_id, None)
+        if self.lookup_client is not None:
+            self.lookup_client.clear_lookup_status(req_id)
 
     def _validate_preemption_checkpoint_setup(self, config: Any, vllm_config: Any) -> None:
         raise ValueError("decode_preemption_checkpoint requires the Ascend checkpoint extension")

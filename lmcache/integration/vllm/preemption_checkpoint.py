@@ -9,6 +9,14 @@ import time
 LOCAL_CHECKPOINT_CONFIG = "lmcache.local_checkpoint_generation"
 
 
+class CheckpointRestoreMiss(ValueError):
+    """Expected loss of evictable local data before any restore device work."""
+
+    def __init__(self, available_end: int, reason: str) -> None:
+        super().__init__(reason)
+        self.available_end = available_end
+
+
 @dataclass(frozen=True)
 class CaptureSpec:
     """Capture [resident_start, end); base is the aligned store boundary."""
@@ -42,6 +50,7 @@ class CheckpointResult:
     end: int = 0
     reason: str = ""
     timings_ms: dict[str, float] | None = None
+    load_generation: int = 0
 
 
 def choose_checkpoint_end(
@@ -67,11 +76,21 @@ class PendingCheckpoint:
     cancel_pending: bool = False
     captured_end: int = 0
     restore_retries: int = 0
+    restore_miss: CheckpointResult | None = None
 
-    def retry_shorter(self, chunk_size: int, failed_end: int | None = None) -> None:
+    def retry_shorter(
+        self,
+        chunk_size: int,
+        failed_end: int | None = None,
+        available_end: int | None = None,
+    ) -> None:
         """Permit one strictly shorter local restore, then use ordinary recovery."""
         end = self.end if failed_end is None else min(self.end, failed_end)
-        shorter = (end - 1) // chunk_size * chunk_size
+        shorter = (
+            (end - 1) // chunk_size * chunk_size
+            if available_end is None
+            else min(end - 1, available_end)
+        )
         if not self.restore_retries and shorter > max(
             self.capture.base, self.capture.prefix_end
         ):
