@@ -377,8 +377,11 @@ class ChunkedTokenDatabase(TokenDatabase):
     def _prefix_hash(
         self,
         token_chunks: Iterable[Union[torch.Tensor, List[int]]],
+        initial_hash: Optional[int] = None,
     ) -> Iterable[int]:
-        prefix_hash = self._get_init_hash()
+        prefix_hash = (
+            self._get_init_hash() if initial_hash is None else initial_hash
+        )
         for token_chunk in token_chunks:
             prefix_hash = self._hash_tokens(token_chunk, prefix_hash)
             yield prefix_hash
@@ -393,6 +396,7 @@ class ChunkedTokenDatabase(TokenDatabase):
         make_key: bool = True,
         request_configs: Optional[dict] = None,
         kv_group: int = 0,
+        initial_hash: Optional[int] = None,
     ) -> Iterable[ProcessTokensResult]:
         """Process the tokens/hashes and return the corresponding cache engine keys.
 
@@ -413,12 +417,19 @@ class ChunkedTokenDatabase(TokenDatabase):
 
         :param Optional[dict] request_configs: The configs of the request.
 
+        :param Optional[int] initial_hash: Seed the rolling chunk-hash chain
+            with this state instead of the initial hash. Callers processing a
+            chunk-aligned suffix of a previously processed token sequence must
+            pass the chain state (the last chunk's hash) so chunk keys match
+            the full-sequence computation. Result indices stay relative to the
+            passed ``tokens``.
+
         :returns: A iterable of tuples with three elements. The first element
             is the start index of the tokens for the key. The second element
             is the end index of the tokens for the key. The third element is
             the cache engine key (or hash) for the tokens.
 
-        :raises: ValueError if the number of Falses in the mask is not a
+        :raises ValueError: if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
         if mask is not None:
@@ -434,7 +445,7 @@ class ChunkedTokenDatabase(TokenDatabase):
         if tokens is not None:
             total_len = len(tokens)
             token_chunks = self._chunk_tokens(tokens)
-            prefix_hashes = self._prefix_hash(token_chunks)
+            prefix_hashes = self._prefix_hash(token_chunks, initial_hash)
             for chunk_id, hash_val in enumerate(prefix_hashes):
                 start_idx = chunk_id * self.chunk_size
                 end_idx = min(start_idx + self.chunk_size, total_len)
