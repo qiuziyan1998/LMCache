@@ -105,6 +105,29 @@ RETRIEVE_STATS_INTERVAL_SECONDS_ENV = (
 LayerwiseSaveKey = tuple[str, str, int, int, int]
 
 
+def _defer_sparse_graph_draft(
+    engine: Any, retrieve_kwargs: dict[str, Any]
+) -> Generator[Any, Any, None]:
+    """Prime only at the first draft payload, after target graph submission.
+
+    Preserve the send/next/close protocol and the source/slot objects selected
+    for this step. Closing an unused draft performs no connector setup at all.
+    The actual retrieval and its stream dependencies remain unchanged.
+    """
+    payload = yield None
+    consumer = engine.retrieve_layer_head_token_wise([], None, **retrieve_kwargs)
+    try:
+        next(consumer)
+        while True:
+            try:
+                result = consumer.send(payload)
+            except StopIteration:
+                return
+            payload = yield result
+    finally:
+        consumer.close()
+
+
 def _clear_terminal_load_tracebacks(
     error: BaseException, completed_futures: tuple[Future, ...] = ()
 ) -> None:
@@ -8372,7 +8395,9 @@ class LMCacheConnectorV1Impl:
 
         Bootstrap advances metadata and loads the top-k-independent index cache
         using empty latent selections. Warm steps do not advance target-layer
-        generators. Any draft suffix keeps its normal layerwise retrieval.
+        generators. Any draft suffix keeps its normal layerwise retrieval, but
+        its connector setup is deferred until its first payload, after target
+        submission. Warm source readiness is resolved once, not checked twice.
         Local non-resumed kv_both requests may reuse their native prefill index
         when start_load_kv explicitly skipped index retrieval under that policy.
         Shared, consumer and restored requests still require materialization.
@@ -8429,12 +8454,14 @@ class LMCacheConnectorV1Impl:
             )
         }
 
+        resolved_sources: dict[str, Optional[PreparedSparseSource]] = {}
+
         def source_ready(req_id: str, frontier: int) -> bool:
             if frontier == 0:
                 return True
             state = self._worker_retrieve_state.get(req_id)
             source = None if state is None else state.prepared_sparse_sources.get(0)
-            return bool(
+            ready = bool(
                 source is not None
                 and source.total_tokens >= frontier
                 and (not shared or state.shared_request_active)
@@ -8442,6 +8469,9 @@ class LMCacheConnectorV1Impl:
                 and not state.indexer_npu_materialization_pending
                 and len(source.layers) == self.num_layers
             )
+            if ready:
+                resolved_sources[req_id] = source
+            return ready
 
         needs_bootstrap = any(
             not source_ready(req_id, frontier)
@@ -8465,7 +8495,9 @@ class LMCacheConnectorV1Impl:
                     target_slot_mapping=slots,
                     selected_token_counts=counts,
                 )
-        if not all(
+            # Bootstrap can publish new snapshots and residency state.
+            resolved_sources.clear()
+        if needs_bootstrap and not all(
             source_ready(req_id, frontier)
             for req_id, frontier in zip(request_ids, frontiers, strict=True)
         ):
@@ -8492,9 +8524,7 @@ class LMCacheConnectorV1Impl:
                 + "; ".join(details)
             )
         sources = tuple(
-            self._worker_retrieve_state[req_id].prepared_sparse_sources[0]
-            if frontier
-            else None
+            resolved_sources[req_id] if frontier else None
             for req_id, frontier in zip(request_ids, frontiers, strict=True)
         )
 
@@ -8506,16 +8536,17 @@ class LMCacheConnectorV1Impl:
             if source is None:
                 continue
             state = self._worker_retrieve_state[request.req_id]
-            suffix = self.lmcache_engine.retrieve_layer_head_token_wise(
-                [],
-                None,
-                kvcaches=self._kvcaches_for_group(0),
-                slot_mapping=state.slot_mapping,
-                kv_group=0,
-                sync=True,
-                prepared_sparse_source=source,
-                prepared_start_layer=target_count,
-                ret_mask=state.decode_ret_mask,
+            suffix = _defer_sparse_graph_draft(
+                self.lmcache_engine,
+                dict(
+                    kvcaches=self._kvcaches_for_group(0),
+                    slot_mapping=state.slot_mapping,
+                    kv_group=0,
+                    sync=True,
+                    prepared_sparse_source=source,
+                    prepared_start_layer=target_count,
+                    ret_mask=state.decode_ret_mask,
+                ),
             )
             next(suffix)
             self.layerwise_retrievers.append((suffix, None))

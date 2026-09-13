@@ -30,7 +30,7 @@ def load_prepare_method(name: str = "prepare_sparse_graph_step") -> Any:
     )
     method = next(
         node
-        for node in cls.body
+        for node in (tree.body if name == "_defer_sparse_graph_draft" else cls.body)
         if isinstance(node, ast.FunctionDef) and node.name == name
     )
     module = ast.Module(
@@ -47,6 +47,13 @@ def load_prepare_method(name: str = "prepare_sparse_graph_step") -> Any:
         "_lmcache_nvtx_annotate": lambda fn: fn,
         "build_prepared_sparse_source": build_prepared_sparse_source,
     }
+    helper = next(
+        node
+        for node in tree.body
+        if getattr(node, "name", "") == "_defer_sparse_graph_draft"
+    )
+    if method is not helper:
+        module.body.insert(1, helper)
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace[name]
 
@@ -108,6 +115,7 @@ class FakeAdapter:
     def retrieve(self, *args: Any, **kwargs: Any) -> Any:
         self.suffix_kwargs = kwargs
         yield None
+        yield None
 
     def _is_dsa_two_groups(self) -> bool:
         return True
@@ -150,6 +158,8 @@ def test_prepare_keeps_draft_suffix_and_avoids_target_loads(
     assert len(adapter.waits) == (0 if warm else adapter.num_layers)
     assert len(adapter.layerwise_retrievers) == int(draft)
     if draft:
+        assert not adapter.suffix_kwargs
+        adapter.layerwise_retrievers[0][0].send("draft payload")
         assert adapter.suffix_kwargs["prepared_start_layer"] == 2
         assert adapter.suffix_kwargs["prepared_sparse_source"] is source
 
@@ -217,6 +227,7 @@ def test_batch_sources_follow_model_order_and_keep_draft_suffixes(
     def retrieve(*args: Any, **kwargs: Any) -> Any:
         calls.append(kwargs)
         yield None
+        yield None
 
     def wait(name: str, **kwargs: Any) -> None:
         assert kwargs["request_ids"] == ["r1", "r2"]
@@ -235,6 +246,9 @@ def test_batch_sources_follow_model_order_and_keep_draft_suffixes(
     )
     assert result == (second_source, None, adapter.source)
     assert len(adapter.waits) == (adapter.num_layers if cold else 0)
+    assert calls == []
+    for suffix, _ in adapter.layerwise_retrievers:
+        suffix.send("draft payload")
     assert len(calls) == 2
     assert all(call["prepared_start_layer"] == 2 for call in calls)
     assert calls[0]["prepared_sparse_source"] is adapter.source
@@ -355,6 +369,91 @@ def test_native_index_requires_all_registered_index_layers() -> None:
             request_ids=("r1",),
             frontiers=(512,),
         )
+
+
+def test_warm_source_resolved_once_and_refreshed_on_next_step() -> None:
+    class SourceMap(dict):
+        reads = 0
+
+        def get(self, key: Any, default: Any = None) -> Any:
+            self.reads += 1
+            return super().get(key, default)
+
+    adapter = FakeAdapter(draft=False)
+    sources = SourceMap({0: adapter.source})
+    adapter.state.prepared_sparse_sources = sources
+    result = adapter.prepare_sparse_graph_step(
+        tuple(adapter._latent_layer_names), request_ids=("r1",), frontiers=(512,)
+    )
+    assert result[0] is adapter.source and sources.reads == 1
+    # Same request ID and frontier, but a replaced/republished source. Do not
+    # memoize source readiness across steps or rely on token count alone.
+    replacement = SimpleNamespace(layers=adapter.source.layers, total_tokens=512)
+    sources[0] = replacement
+    adapter.current_layer = 0
+    adapter._layerwise_requests.append(adapter.request)
+    result = adapter.prepare_sparse_graph_step(
+        tuple(adapter._latent_layer_names), request_ids=("r1",), frontiers=(512,)
+    )
+    assert result[0] is replacement and sources.reads == 2
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_unused_draft_does_not_initialize_connector(cancel: bool) -> None:
+    adapter = FakeAdapter()
+    adapter.prepare_sparse_graph_step(("layers.0.attn", "layers.1.attn"))
+    assert not adapter.suffix_kwargs
+    suffix = adapter.layerwise_retrievers[0][0]
+    if cancel:
+        suffix.close()
+        assert not adapter.suffix_kwargs
+    else:
+        source = adapter.source
+        slots = adapter.state.slot_mapping
+        adapter.state.slot_mapping = torch.ones(1)
+        suffix.send("live topk")
+        assert adapter.suffix_kwargs["prepared_sparse_source"] is source
+        assert adapter.suffix_kwargs["slot_mapping"] is slots
+        suffix.close()
+
+
+@pytest.mark.parametrize("failure", [None, "prime", "send", "close_early"])
+def test_deferred_draft_preserves_payloads_and_closes_consumer(
+    failure: str | None,
+) -> None:
+    defer = load_prepare_method("_defer_sparse_graph_draft")
+    events = []
+
+    def retrieve(*args: Any, **kwargs: Any) -> Any:
+        events.append("setup")
+        try:
+            if failure == "prime":
+                raise ValueError("prime failed")
+            payload = yield "mask"
+            for _ in range(3):
+                events.append(payload)
+                if failure == "send":
+                    raise ValueError("send failed")
+                payload = yield "mask"
+        finally:
+            events.append("closed")
+
+    deferred = defer(SimpleNamespace(retrieve_layer_head_token_wise=retrieve), {})
+    assert next(deferred) is None and not events
+    if failure in ("prime", "send"):
+        with pytest.raises(ValueError, match="failed"):
+            deferred.send("first")
+    else:
+        assert deferred.send("first") == "mask"
+        if failure == "close_early":
+            deferred.close()
+        else:
+            assert deferred.send("second") == "mask"
+            assert deferred.send("third") == "mask"
+            with pytest.raises(StopIteration):
+                next(deferred)
+            assert events == ["setup", "first", "second", "third", "closed"]
+    assert events[-1] == "closed"
 
 
 class SourcePublisher:
