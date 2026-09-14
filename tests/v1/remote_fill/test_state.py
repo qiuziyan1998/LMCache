@@ -45,6 +45,34 @@ def _select_group0_only(harness) -> None:
     harness.state._negotiation = negotiation
 
 
+@pytest.mark.parametrize("harness", [(79, 22)], indirect=True)
+def test_unequal_groups_complete_the_existing_reserve_arm_finish_protocol(harness):
+    pages = tuple(msgspec.structs.replace(page, layer_count=(79, 22)[page.kv_group])
+                  for page in harness.requests.pages())
+    _, reserve, response = _open_and_reserve(harness, pages=pages)
+    assert response.code is ResultCode.OK
+    _arm_and_report(harness, reserve, response)
+    result = harness.client.execute(harness.requests.finish())
+    assert result.terminal_outcome is TerminalOutcome.LOCAL_FULL
+
+
+@pytest.mark.parametrize("harness", [(79, 22)], indirect=True)
+def test_wrong_indexer_count_is_rejected_before_allocating(harness):
+    pages = tuple(msgspec.structs.replace(page, layer_count=21 if page.kv_group else 79)
+                  for page in harness.requests.pages())
+    _, _, response = _open_and_reserve(harness, pages=pages)
+    assert response.code is ResultCode.RESERVATION_REJECTED
+    assert harness.lifecycle.prepare_calls == 0
+
+
+def test_unequal_pages_do_not_pass_legacy_equal_group_negotiation(harness):
+    pages = tuple(msgspec.structs.replace(page, layer_count=22 if page.kv_group else 79)
+                  for page in harness.requests.pages())
+    _, _, response = _open_and_reserve(harness, pages=pages)
+    assert response.code is ResultCode.RESERVATION_REJECTED
+    assert harness.lifecycle.prepare_calls == 0
+
+
 def test_open_conservatively_reports_zero_until_exact_keys_arrive(harness) -> None:
     """Keyless OPEN cannot claim a LocalCPU prefix or create a lease."""
 

@@ -17,6 +17,7 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
+from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, TensorMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
@@ -146,6 +147,7 @@ def _make_mooncake_connector(
         local_worker_id=0,
         kv_dtype=torch.bfloat16,
         kv_shape=(1, 2, 8, 1, 1),
+        runtime_kv_group_layer_counts=(1, 1),
         chunk_size=8,
     )
     local_cpu = SimpleNamespace(
@@ -603,11 +605,13 @@ class _Connection:
         return None
 
 
-def _key(chunk_hash: int) -> CacheEngineKey:
-    return CacheEngineKey("test", 1, 0, chunk_hash, torch.float16)
+def _key(chunk_hash: int, kv_group: int = 0) -> CacheEngineKey:
+    return CacheEngineKey("test", 1, 0, chunk_hash, torch.float16, kv_group=kv_group)
 
 
-def _layer_key(chunk_hash: int, layer_id: int) -> LayerCacheEngineKey:
+def _layer_key(
+    chunk_hash: int, layer_id: int, kv_group: int = 0
+) -> LayerCacheEngineKey:
     return LayerCacheEngineKey(
         "test",
         1,
@@ -615,6 +619,7 @@ def _layer_key(chunk_hash: int, layer_id: int) -> LayerCacheEngineKey:
         chunk_hash,
         torch.float16,
         layer_id=layer_id,
+        kv_group=kv_group,
     )
 
 
@@ -2799,3 +2804,294 @@ def test_mooncake_timeout_keeps_source_buffer_until_native_put_exits() -> None:
 
     asyncio.run(run())
     assert memory_obj.ref_count == 1
+
+
+def _group_manager(*num_layers: int) -> KVLayerGroupsManager:
+    return KVLayerGroupsManager(
+        kv_layer_groups=[
+            KVLayerGroupInfo(
+                layer_names=[f"group-{group}-layer-{layer}" for layer in range(size)],
+                layer_indices=list(range(size)),
+                shape=torch.Size([1, 4, 8]),
+                dtype=torch.float16,
+            )
+            for group, size in enumerate(num_layers)
+        ]
+    )
+
+
+def _configure_page_cardinality(
+    connector: MooncakestoreConnector,
+    model_num_layers: int,
+    *,
+    dsa_two_groups: bool = False,
+    runtime: tuple[int, ...] | None = None,
+    manager: KVLayerGroupsManager | None = None,
+) -> None:
+    backend = getattr(connector, "local_cpu_backend", SimpleNamespace())
+    config = getattr(backend, "config", SimpleNamespace())
+    config.dsa_two_groups = dsa_two_groups
+    config.extra_config = {}
+    metadata = getattr(backend, "metadata", SimpleNamespace())
+    metadata.kv_shape = (model_num_layers,)
+    metadata.chunk_size = getattr(metadata, "chunk_size", 4)
+    metadata.kv_layer_groups_manager = manager or KVLayerGroupsManager()
+    metadata.runtime_kv_group_layer_counts = runtime
+    backend.config = config
+    backend.metadata = metadata
+    connector.local_cpu_backend = backend
+    connector._page_num_layers = model_num_layers
+
+
+def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _PageStore:
+        def __init__(self) -> None:
+            self.args = None
+
+        def batch_get_into_multi_buffers(self, *args):
+            self.args = args
+            return [sum(sizes) for sizes in args[2]]
+
+    class _Backend:
+        def __init__(self) -> None:
+            self.allocator = TensorMemoryAllocator(
+                torch.zeros(16384, dtype=torch.uint8)
+            )
+            self.submitted = None
+
+        def batched_allocate_layer_pages(self, *args, **kwargs):
+            return self.allocator.batched_allocate_layer_pages(*args, **kwargs)
+
+        def batched_submit_layer_pages(self, keys, pages):
+            self.submitted = (keys, pages)
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector._layer_merged_pages = True
+    connector._page_first_multi_buffer = True
+    connector.local_cpu_backend = _Backend()
+    _configure_page_cardinality(
+        connector,
+        3,
+        dsa_two_groups=True,
+        runtime=(3, 2),
+        manager=_group_manager(3, 2),
+    )
+    connector.store = _PageStore()
+    metadata_calls = []
+
+    def metadata_for_raw_key(key):
+        metadata_calls.append(key)
+        return (
+            [torch.Size([8])],
+            [torch.float16],
+            MemoryFormat.KV_MLA_LATENT_FMT,
+            16,
+        )
+
+    connector._metadata_for_raw_key = metadata_for_raw_key
+    keys = [_layer_key(chunk_hash, 0, kv_group=1) for chunk_hash in (1, 2)]
+    events = []
+    monkeypatch.setattr(
+        mooncake_connector, "serving_perf_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        mooncake_connector,
+        "serving_perf_log",
+        lambda _logger, event, **fields: events.append((event, fields)),
+    )
+
+    pages = asyncio.run(connector.batched_get_layer_pages(keys))
+
+    assert len(pages) == 2
+    assert connector.store.args[0] == [
+        "__lmcache_page_v1__@2@test@1@0@1@half@1",
+        "__lmcache_page_v1__@2@test@1@0@2@half@1",
+    ]
+    assert connector.store.args[2] == [[16, 16], [16, 16]]
+    assert connector.store.args[1] == [
+        [page.layer_data_ptr(0), page.layer_data_ptr(1)] for page in pages
+    ]
+    assert len(metadata_calls) == 1
+    submitted_keys, submitted_pages = connector.local_cpu_backend.submitted
+    assert submitted_pages == pages
+    assert submitted_keys == [keys[0].without_layer(), keys[1].without_layer()]
+    event, fields = events.pop()
+    assert event == "mooncake_page_get"
+    assert fields["layout"] == "layer_merged"
+    assert fields["kv_group"] == 1
+    assert fields["kv_groups"] == [1]
+    assert fields["pages"] == 2
+    assert fields["submitted_pages"] == 2
+    assert fields["completed_pages"] == 2
+    assert fields["layers"] == 2
+    assert fields["buffers"] == 4
+    assert fields["bytes"] == 64
+    assert fields["status"] == "ok"
+    assert all(
+        fields[name] >= 0
+        for name in (
+            "metadata_ms",
+            "allocation_ms",
+            "buffer_setup_ms",
+            "transfer_ms",
+            "publish_ms",
+        )
+    )
+    for page in pages:
+        page.ref_count_down()
+
+
+def test_mooncake_page_cardinality_global_fallback(
+) -> None:
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_first_multi_buffer = True
+    _configure_page_cardinality(connector, 3)
+
+    assert connector._page_keys_for([_layer_key(1, 0)]) == [
+        "__lmcache_page_v1__@3@test@1@0@1@half@0"
+    ]
+
+
+def test_mooncake_page_cardinality_rejects_missing_dsa_runtime() -> None:
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_first_multi_buffer = True
+    _configure_page_cardinality(connector, 3, dsa_two_groups=True)
+
+    with pytest.raises(ValueError, match="runtime"):
+        connector._page_keys_for([_layer_key(1, 0, kv_group=1)])
+
+
+def test_mooncake_page_cardinality_reads_registered_groups_live() -> None:
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_first_multi_buffer = True
+    manager = KVLayerGroupsManager()
+    _configure_page_cardinality(
+        connector,
+        3,
+        dsa_two_groups=True,
+        runtime=(3, 2),
+        manager=manager,
+    )
+    key = _layer_key(1, 0, kv_group=1)
+
+    assert connector._page_keys_for([key]) == [
+        "__lmcache_page_v1__@2@test@1@0@1@half@1"
+    ]
+
+    manager.kv_layer_groups = _group_manager(3, 2).kv_layer_groups
+
+    assert connector._page_keys_for([key]) == [
+        "__lmcache_page_v1__@2@test@1@0@1@half@1"
+    ]
+
+
+def test_mooncake_page_cardinality_uses_runtime_metadata() -> None:
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_first_multi_buffer = True
+    _configure_page_cardinality(
+        connector,
+        79,
+        dsa_two_groups=True,
+        runtime=(79, 22),
+    )
+
+    assert connector._page_keys_for([_layer_key(1, 0, kv_group=1)]) == [
+        "__lmcache_page_v1__@22@test@1@0@1@half@1"
+    ]
+
+
+def test_mooncake_unequal_page_groups_use_representative_cardinality() -> None:
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_first_multi_buffer = True
+    _configure_page_cardinality(
+        connector,
+        3,
+        dsa_two_groups=True,
+        runtime=(3, 2),
+        manager=_group_manager(3, 2),
+    )
+    keys = [
+        _layer_key(1, 0, kv_group=0),
+        _layer_key(1, 0, kv_group=1),
+        _layer_key(1, 1, kv_group=0),
+        _layer_key(1, 1, kv_group=1),
+        _layer_key(1, 2, kv_group=0),
+        _layer_key(2, 0, kv_group=1),
+    ]
+
+    groups, legacy_indices = connector._complete_page_groups(keys)
+
+    assert groups == [
+        ("__lmcache_page_v1__@3@test@1@0@1@half@0", [0, 2, 4]),
+        ("__lmcache_page_v1__@2@test@1@0@1@half@1", [1, 3]),
+    ]
+    assert legacy_indices == [5]
+
+
+def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _PageStore:
+        def __init__(self) -> None:
+            self.page_args = None
+            self.legacy_args = None
+
+        def batch_put_from_multi_buffers(self, *args):
+            self.page_args = args
+            return [0]
+
+        def batch_put_from(self, *args):
+            self.legacy_args = args
+            return [0, 0]
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_first_multi_buffer = True
+    connector.config = SimpleNamespace(transfer_timeout=1)
+    connector.replica_config = object()
+    connector._inflight_put_tasks = set()
+    connector.local_cpu_backend = SimpleNamespace(
+        metadata=SimpleNamespace(chunk_size=4)
+    )
+    _configure_page_cardinality(connector, 2)
+    connector._metadata_for_raw_key = lambda _key: ([], [], None, 4)
+    connector.store = _PageStore()
+    events = []
+    monkeypatch.setattr(
+        mooncake_connector, "serving_perf_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        mooncake_connector,
+        "serving_perf_log",
+        lambda _logger, event, **fields: events.append((event, fields)),
+    )
+    keys = [
+        _layer_key(1, 0),
+        _layer_key(2, 0),
+        _layer_key(1, 1),
+        _layer_key(2, 1),
+    ]
+    memory_objs = [
+        _MemoryObj(16, 100),
+        _MemoryObj(8, 200),
+        _MemoryObj(16, 300),
+        _MemoryObj(8, 400),
+    ]
+
+    asyncio.run(connector._batched_put_zero_copy(keys, memory_objs))
+
+    assert connector.store.page_args[1] == [[100, 300]]
+    assert connector.store.page_args[2] == [[16, 16]]
+    assert connector.store.legacy_args[1] == [200, 400]
+    assert connector.store.legacy_args[2] == [8, 8]
+    assert all(memory_obj.ref_count == 1 for memory_obj in memory_objs)
+    event, fields = events[0]
+    assert event == "mooncake_page_put"
+    assert fields["pages"] == 1
+    assert fields["buffers"] == 2
+    assert fields["bytes"] == 32
+    assert fields["kv_groups"] == [0]
+    assert fields["first_page_key"] == connector.store.page_args[0][0]
+    assert fields["last_page_key"] == connector.store.page_args[0][0]
+    assert fields["legacy_objects"] == 2

@@ -1619,7 +1619,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         *,
         min_free_bytes: int,
         min_free_ratio: float,
-        num_layers: int,
+        num_layers: int | tuple[int, int],
         cause: str,
         max_scan_entries: Optional[int] = None,
     ) -> bool:
@@ -1632,7 +1632,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             required_bytes: Incoming allocation size to accommodate.
             min_free_bytes: Absolute free-capacity floor after allocation.
             min_free_ratio: Heap-relative free-capacity floor after allocation.
-            num_layers: Layer count used to expand legacy layerwise keys.
+            num_layers: Scalar or per-group layer counts for legacy layerwise keys.
             cause: Retention-trace cause recorded for removed entries.
             max_scan_entries: Optional LRU candidate-window limit. This mode
                 never waits for the cache lock, and refuses other policies.
@@ -1648,7 +1648,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
             required_bytes < 0
             or min_free_bytes < 0
             or not 0 <= min_free_ratio <= 1
-            or num_layers <= 0
+            or (
+                any(type(n) is not int or n <= 0 for n in num_layers)
+                or len(num_layers) != 2
+                if isinstance(num_layers, tuple)
+                else num_layers <= 0
+            )
             or not cause
             or (max_scan_entries is not None and max_scan_entries <= 0)
         ):
@@ -1729,7 +1734,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return sufficient
 
     def _pop_bounded_reclaim_locked(
-        self, required_bytes: int, num_layers: int, max_entries: int, cause: str
+        self,
+        required_bytes: int,
+        num_layers: int | tuple[int, int],
+        max_entries: int,
+        cause: str,
     ) -> tuple[list[CacheEngineKey], list[MemoryObj], int]:
         """Select a bounded LRU window atomically before removing any entries."""
         if not self.use_hot or type(self.cache_policy) is not LRUCachePolicy:
@@ -1746,7 +1755,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 or not isinstance(key, LayerCacheEngineKey)
                 else [
                     item
-                    for item in key.split_layers(num_layers)
+                    for item in key.split_layers(
+                        num_layers[key.kv_group]
+                        if isinstance(num_layers, tuple)
+                        else num_layers
+                    )
                     if item in self.hot_cache
                 ]
             )
@@ -2143,7 +2156,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
     def _pop_layer_page_evict_candidate_locked(
         self,
-        num_layers: int,
+        num_layers: int | tuple[int, int],
         *,
         cause: str,
         selected_key: Optional[CacheEngineKey] = None,
@@ -2161,7 +2174,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if isinstance(self.hot_cache.get(key), LayerPageMemoryObj)
             or not isinstance(key, LayerCacheEngineKey)
             else [
-                item for item in key.split_layers(num_layers) if item in self.hot_cache
+                item
+                for item in key.split_layers(
+                    num_layers[key.kv_group]
+                    if isinstance(num_layers, tuple)
+                    else num_layers
+                )
+                if item in self.hot_cache
             ]
         )
         objects = []
