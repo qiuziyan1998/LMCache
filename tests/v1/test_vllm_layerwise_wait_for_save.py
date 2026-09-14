@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from copy import deepcopy
 from types import SimpleNamespace
 
 # Third Party
@@ -10,6 +11,9 @@ import torch
 pytest.importorskip("vllm")
 
 # First Party
+from lmcache.integration.vllm.lmcache_connector_v1 import (
+    LMCacheConnectorV1Dynamic,
+)
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorMetadata,
     LMCacheConnectorV1Impl,
@@ -19,6 +23,194 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     SaveSpec,
 )
 from lmcache.v1.cache_engine import LayerwiseStoreResult
+
+
+def test_dynamic_connector_exposes_prefill_transfer_window_contract() -> None:
+    submitted = []
+    finished = []
+    connector = object.__new__(LMCacheConnectorV1Dynamic)
+    connector._lmcache_engine = SimpleNamespace(
+        supports_layerwise_prefill_transfer_window=True,
+        submit_layerwise_prefill_load=submitted.append,
+        finish_layerwise_prefill_save=finished.append,
+    )
+
+    assert connector.supports_layerwise_prefill_transfer_window is True
+    connector.submit_layerwise_prefill_load("model.layers.3.self_attn.attn")
+    connector.finish_layerwise_prefill_save(
+        "model.layers.3.self_attn.attn"
+    )
+    assert submitted == ["model.layers.3.self_attn.attn"]
+    assert finished == ["model.layers.3.self_attn.attn"]
+
+
+def _make_banked_tracker() -> RequestTracker:
+    return RequestTracker(
+        req_id="req-banks",
+        prompt_len=8,
+        token_ids=[0, 1, 2, 3],
+        allocated_block_ids=[2, 3],
+        allocated_block_ids_indexer=[20, 21],
+        allocated_block_ids_by_bank=(
+            ([2, 3], [20, 21]),
+            ([12, 13], [30, 31]),
+        ),
+        block_allocation_mode="prefill_child",
+    )
+
+
+def test_request_tracker_builds_and_extends_two_bank_slot_mappings() -> None:
+    tracker = _make_banked_tracker()
+    tracker.prompt_len = 6
+    tracker.update(
+        [4, 5],
+        ([4], [22]),
+        new_block_ids_by_bank=(
+            ([4], [22]),
+            ([14], [32]),
+        ),
+    )
+
+    meta = ReqMeta.from_request_tracker(
+        tracker,
+        block_size=2,
+        lmcache_chunk_size=2,
+        discard_partial_chunks=False,
+        dsa_two_groups=True,
+    )
+    assert meta is not None
+    assert meta.slot_mappings_by_bank is not None
+    assert meta.block_allocation_mode == "prefill_child"
+    assert len(meta.slot_mappings_by_bank) == 2
+    assert meta.slot_mappings_by_bank[0][0].tolist() == [4, 5, 6, 7, 8, 9]
+    assert meta.slot_mappings_by_bank[1][0].tolist() == [24, 25, 26, 27, 28, 29]
+    assert meta.slot_mappings_by_bank[1][1].tolist() == [60, 61, 62, 63, 64, 65]
+
+
+@pytest.mark.parametrize(
+    ("bank_delta", "mode", "error"),
+    [
+        (
+            (
+                ([4], [22]),
+                ([14], [32]),
+            ),
+            "full_parent",
+            "allocation mode changed",
+        ),
+        (
+            (
+                ([4], [22]),
+            ),
+            "prefill_child",
+            "bank count changed",
+        ),
+        (
+            (
+                ([4], [22]),
+                ([14],),
+            ),
+            "prefill_child",
+            "KV-group count changed",
+        ),
+        (
+            (
+                ([99], [22]),
+                ([14], [32]),
+            ),
+            "prefill_child",
+            "differs from bank 0",
+        ),
+    ],
+)
+def test_request_tracker_rejects_invalid_bank_delta_atomically(
+    bank_delta, mode, error
+) -> None:
+    tracker = _make_banked_tracker()
+    state_before = deepcopy(tracker)
+
+    with pytest.raises(RuntimeError, match=error):
+        tracker.update(
+            [4, 5],
+            ([4], [22]),
+            new_block_ids_by_bank=bank_delta,
+            new_block_allocation_mode=mode,
+        )
+
+    assert tracker.token_ids == state_before.token_ids
+    assert tracker.allocated_block_ids == state_before.allocated_block_ids
+    assert (
+        tracker.allocated_block_ids_indexer
+        == state_before.allocated_block_ids_indexer
+    )
+    assert (
+        tracker.allocated_block_ids_by_bank
+        == state_before.allocated_block_ids_by_bank
+    )
+    assert tracker.block_allocation_mode == state_before.block_allocation_mode
+
+
+def test_request_tracker_rejects_banked_delta_for_ordinary_request() -> None:
+    tracker = _make_banked_tracker()
+    tracker.allocated_block_ids_by_bank = None
+    blocks_before = tracker.allocated_block_ids.copy()
+
+    with pytest.raises(RuntimeError, match="ordinary request"):
+        tracker.update(
+            [4],
+            ([4], [22]),
+            new_block_ids_by_bank=(
+                ([4], [22]),
+                ([14], [32]),
+            ),
+            new_block_allocation_mode="prefill_child",
+        )
+
+    assert tracker.allocated_block_ids == blocks_before
+
+
+def test_request_tracker_preemption_replaces_all_bank_state() -> None:
+    tracker = _make_banked_tracker()
+
+    tracker.update(
+        [6, 7],
+        ([5], [25]),
+        preempted=True,
+        lmcache_cached_tokens=2,
+        vllm_cached_tokens=2,
+        all_token_ids=list(range(8)),
+        new_block_ids_by_bank=(
+            ([5], [25]),
+            ([15], [35]),
+        ),
+        new_block_allocation_mode="prefill_child",
+    )
+
+    assert tracker.allocated_block_ids == [5]
+    assert tracker.allocated_block_ids_indexer == [25]
+    assert tracker.allocated_block_ids_by_bank == (
+        ([5], [25]),
+        ([15], [35]),
+    )
+    assert tracker.block_allocation_mode == "prefill_child"
+    assert tracker.token_ids == [0, 1, 2, 3]
+
+
+def test_request_metadata_requires_exactly_two_banks() -> None:
+    tracker = _make_banked_tracker()
+    assert tracker.allocated_block_ids_by_bank is not None
+    tracker.allocated_block_ids_by_bank = (
+        tracker.allocated_block_ids_by_bank[0],
+    )
+
+    with pytest.raises(RuntimeError, match="exactly two banks"):
+        ReqMeta.from_request_tracker(
+            tracker,
+            block_size=2,
+            lmcache_chunk_size=2,
+            discard_partial_chunks=False,
+            dsa_two_groups=True,
+        )
 
 
 class _FakeParent:
@@ -103,6 +295,8 @@ def _make_connector(requests):
     connector._latent_kvcaches = []
     connector._indexer_kvcaches = []
     connector._layerwise_save_storers = {}
+    connector._layerwise_prefill_pending_store_finishes = {}
+    connector._layerwise_prefill_prepared_storer_keys = set()
     connector._deferred_latent_pending = set()
     # lmcache_ascend patches LMCacheConnectorV1Impl; __new__ skips generic and
     # Ascend worker initialization.
@@ -111,10 +305,294 @@ def _make_connector(requests):
     connector._finished_req_ids_waiting_for_save = set()
     connector._late_finished_sending = set()
     connector._completed_decode_window_saves = {}
+    connector._cold_perf_dense_load_started = {}
+    connector._cold_perf_dense_load_completed = {}
     connector._decode_window_save_completed_groups = set()
     connector._prefill_save_completed_groups = {}
     connector._decode_window_save_expected_start = {}
     return connector, metadata, engine
+
+
+def test_p_node_save_rotates_dynamic_bank_mapping(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request = _make_req("req-p")
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = (
+        (torch.tensor([0, 1, 2, 3]),),
+        (torch.tensor([10, 11, 12, 13]),),
+    )
+    connector, _, engine = _make_connector([request])
+    connector.kv_caches = {
+        "layer0": torch.zeros(1),
+        "layer1": torch.zeros(1),
+        "layer2": torch.zeros(1),
+    }
+    connector._kvcaches_list = []
+    received = []
+
+    def store_layer(_token_ids, **kwargs):
+        engine.store_kwargs.append(dict(kwargs))
+
+        def storer():
+            command = yield
+            for layer_index in range(3):
+                received.append(command)
+                yield
+                if layer_index + 1 < 3:
+                    command = yield
+                else:
+                    yield
+            yield LayerwiseStoreResult(request_id="req-p", kv_group=0)
+
+        return storer()
+
+    engine.store_layer = store_layer
+
+    for layer_name in ("layer0", "layer1", "layer2"):
+        connector.save_kv_layer(
+            layer_name,
+            torch.zeros(1),
+            SimpleNamespace(),
+        )
+        connector.finish_layerwise_prefill_save(layer_name)
+    connector.wait_for_save()
+
+    assert engine.store_kwargs[0]["deferred_layerwise_put"] is True
+    assert engine.store_kwargs[0]["layerwise_prefill_bank_count"] == 2
+    assert [item["slot_mapping"].tolist() for item in received] == [
+        [0, 1, 2, 3],
+        [10, 11, 12, 13],
+        [0, 1, 2, 3],
+    ]
+
+
+def test_p_node_rejects_completion_in_pre_hcom_save_hook(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request = _make_req("req-p")
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = (
+        (torch.tensor([0, 1, 2, 3]),),
+        (torch.tensor([10, 11, 12, 13]),),
+    )
+    connector, _, engine = _make_connector([request])
+
+    def store_layer(_token_ids, **_kwargs):
+        def storer():
+            yield
+            yield LayerwiseStoreResult(
+                request_id="req-p",
+                kv_group=0,
+            )
+
+        return storer()
+
+    engine.store_layer = store_layer
+
+    with pytest.raises(RuntimeError, match="pre-HCOM save hook"):
+        connector.save_kv_layer("layer0", torch.zeros(1), SimpleNamespace())
+
+    assert connector._layerwise_save_storers == {}
+    assert connector._layerwise_prefill_pending_store_finishes == {}
+
+
+def test_p_node_last_index_save_defers_finalize_until_wait_for_save(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request = _make_req("req-p")
+    request.save_spec = SaveSpec(
+        skip_leading_tokens=0,
+        can_save=True,
+        can_save_latent=True,
+        can_save_indexer=True,
+    )
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = (
+        (
+            torch.tensor([0, 1, 2, 3]),
+            torch.tensor([100, 101, 102, 103]),
+        ),
+        (
+            torch.tensor([10, 11, 12, 13]),
+            torch.tensor([110, 111, 112, 113]),
+        ),
+    )
+    # Sparse-attention chunked prefill marks this as a windowed save even for
+    # a producer, whose mapping still covers the complete current prefix.
+    # P-node preparation must accept that normal prefill metadata; only an
+    # actual sparse-decode request is invalid here.
+    request.windowed_sparse_save = True
+    request.indexer_slot_mapping = [
+        torch.tensor([100, 101, 102, 103])
+    ]
+    connector, metadata, engine = _make_connector([request])
+    connector.config = SimpleNamespace(dsa_two_groups=True)
+    connector.enable_sparse_attention = True
+    latent_name = "model.layers.0.self_attn.attn.k_cache"
+    indexer_name = "model.layers.0.self_attn.indexer.k_cache"
+    connector.kv_caches = {
+        latent_name: torch.zeros(1),
+        indexer_name: torch.zeros(1),
+    }
+    created = []
+    primed = []
+    finalized = []
+
+    def store_layer(_token_ids, **kwargs):
+        kv_group = kwargs.get("kv_group", 0)
+        created.append(kv_group)
+
+        def storer():
+            primed.append(kv_group)
+            yield
+            # save_kv_layer submits the dynamic bank mapping and stops here.
+            yield None
+            # The post-HCOM finish hook advances to this drain point.
+            yield None
+            finalized.append(kv_group)
+            yield LayerwiseStoreResult(
+                request_id="req-p",
+                kv_group=kv_group,
+            )
+
+        return storer()
+
+    engine.store_layer = store_layer
+    attn_metadata = {
+        indexer_name: SimpleNamespace(
+            slot_mapping=torch.tensor([200, 201, 202, 203])
+        )
+    }
+
+    connector._refresh_kvcaches_list()
+    connector._materialize_layerwise_prefill_slot_mappings(
+        request,
+        force=True,
+    )
+    connector._prepare_p_node_layerwise_save_storers(metadata)
+
+    assert created == [0, 1]
+    assert primed == [0, 1]
+    assert len(connector._layerwise_save_storers) == 2
+    assert all(
+        kwargs["windowed_sparse_save"] is True
+        for kwargs in engine.store_kwargs
+    )
+
+    connector.save_kv_layer(latent_name, torch.zeros(1), attn_metadata)
+    connector.save_kv_layer(indexer_name, torch.zeros(1), attn_metadata)
+
+    # The layer hooks reuse the pre-primed generators; they do not allocate a
+    # second set of all-layer store objects in the pre-HCOM callback.
+    assert created == [0, 1]
+    assert primed == [0, 1]
+    assert finalized == []
+    assert len(connector._layerwise_save_storers) == 2
+
+    connector.finish_layerwise_prefill_save(latent_name)
+    connector.finish_layerwise_prefill_save(indexer_name)
+    assert finalized == []
+
+    connector.wait_for_save()
+
+    assert finalized == [0, 1]
+    assert connector._layerwise_save_storers == {}
+
+
+def test_p_node_storer_preparation_rejects_sparse_decode(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request = _make_req("req-p-decode")
+    request.is_sparse_decode = True
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = (
+        (torch.tensor([0, 1, 2, 3]),),
+        (torch.tensor([10, 11, 12, 13]),),
+    )
+    connector, metadata, _ = _make_connector([request])
+    connector.kv_caches = {"layer0": torch.zeros(1)}
+    connector._kvcaches_list = []
+    connector._refresh_kvcaches_list()
+    connector._materialize_layerwise_prefill_slot_mappings(
+        request,
+        force=True,
+    )
+
+    with pytest.raises(RuntimeError, match="decode save request"):
+        connector._prepare_p_node_layerwise_save_storers(metadata)
+
+
+@pytest.mark.parametrize(
+    ("layer_index", "expected"),
+    [(0, [0, 1]), (1, [10, 11]), (2, [0, 1]), (3, [10, 11])],
+)
+def test_p_node_slot_mapping_rotates_by_layer(
+    monkeypatch, layer_index, expected
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request = _make_req("req-p")
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = (
+        (torch.tensor([0, 1]),),
+        (torch.tensor([10, 11]),),
+    )
+    connector, _, _ = _make_connector([request])
+
+    mapping = connector._layerwise_prefill_slot_mapping(
+        request, kv_group=0, layer_index=layer_index
+    )
+
+    assert mapping is not None
+    assert mapping.dtype == torch.long
+    assert mapping.tolist() == expected
+
+
+def test_p_node_slot_mapping_materializes_once_and_reuses_device_tensor(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request = _make_req("req-p")
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = (
+        (torch.tensor([0, 1], dtype=torch.int32),),
+        (torch.tensor([10, 11], dtype=torch.int32),),
+    )
+    connector, _, _ = _make_connector([request])
+
+    connector._materialize_layerwise_prefill_slot_mappings(
+        request,
+        force=True,
+    )
+    first = connector._layerwise_prefill_slot_mapping(request, 0, 0)
+    same_bank = connector._layerwise_prefill_slot_mapping(request, 0, 2)
+
+    assert first is same_bank
+    assert first.data_ptr() == same_bank.data_ptr()
+    assert first.dtype == torch.long
+    assert first is request._layerwise_prefill_device_slot_mappings[0][0]
+
+
+def test_p_node_slot_mapping_rejects_invalid_identity(monkeypatch) -> None:
+    request = _make_req("req-p")
+    connector, _, _ = _make_connector([request])
+
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    assert (
+        connector._layerwise_prefill_slot_mapping(request, 0, 0) is None
+    )
+
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request.block_allocation_mode = "full_parent"
+    with pytest.raises(RuntimeError, match="wrong KV block allocation mode"):
+        connector._layerwise_prefill_slot_mapping(request, 0, 0)
+
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = None
+    with pytest.raises(RuntimeError, match="missing banked slot mappings"):
+        connector._layerwise_prefill_slot_mapping(request, 0, 0)
+
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "1")
+    with pytest.raises(ValueError, match="must be 'true' or 'false'"):
+        connector._layerwise_prefill_slot_mapping(request, 0, 0)
 
 
 def test_layerwise_storer_is_request_scoped_across_interleaved_finalize() -> None:

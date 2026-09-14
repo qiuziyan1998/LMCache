@@ -53,6 +53,20 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
     def supports_dsa_compact_external_load(self) -> bool:
         return self._lmcache_engine.supports_dsa_cold_compact_load()
 
+    @property
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        return self._lmcache_engine.supports_layerwise_prefill_transfer_window
+
+    @property
+    def supports_dsa_index_lmcache(self) -> bool:
+        return self._lmcache_engine.supports_dsa_index_lmcache
+
+    @property
+    def supports_layerwise_prefill_dsa_index_transfer_window(self) -> bool:
+        return (
+            self._lmcache_engine.supports_layerwise_prefill_dsa_index_transfer_window
+        )
+
     # ==============================
     # Worker-side methods
     # ==============================
@@ -124,6 +138,16 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             payload_event=payload_event,
             selected_token_counts=selected_token_counts,
         )
+
+    def submit_layerwise_prefill_load(self, layer_name: str) -> None:
+        """Submit the next dense-prefill layer during the current layer's
+        post-attention transfer window.
+        """
+        self._lmcache_engine.submit_layerwise_prefill_load(layer_name)
+
+    def finish_layerwise_prefill_save(self, layer_name: str) -> None:
+        """Run storage publication after the layer's HCOM is submitted."""
+        self._lmcache_engine.finish_layerwise_prefill_save(layer_name)
 
     def save_kv_layer(
         self,
@@ -246,6 +270,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         Update scheduler-side LMCache state from worker-side connector output.
         """
         self._lmcache_engine.update_connector_output(connector_output)
+
+    def get_request_load_failures(self) -> dict[str, str]:
+        """Forward D-node request-level bootstrap admission failures."""
+        return self._lmcache_engine.get_request_load_failures()
 
     def request_finished(
         self,

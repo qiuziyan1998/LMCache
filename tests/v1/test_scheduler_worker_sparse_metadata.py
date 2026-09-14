@@ -157,6 +157,32 @@ def test_dsa_prefix_hit_uses_full_allocation_and_chunk_aligned_committed_end(
     assert not hasattr(request, "dsa_external_tail_chunk_start")
 
 
+@pytest.mark.parametrize(
+    ("supports_reuse", "expected"),
+    [(False, 0), (True, 2999)],
+)
+def test_kv_producer_checks_lookup_client_reuse_capability(
+    supports_reuse: bool,
+    expected: int,
+) -> None:
+    impl = _make_scheduler_impl()
+    impl.kv_role = "kv_producer"
+    impl.config.min_retrieve_tokens = 3001
+    lookup_client = MagicMock()
+    lookup_client.supports_producer_reuse.return_value = supports_reuse
+    lookup_client.lookup_cache.return_value = 3000
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+    request = SimpleNamespace(request_id="producer-reuse", num_tokens=3000)
+
+    assert impl.get_num_new_matched_tokens(request, 0) == expected
+    if supports_reuse:
+        lookup_client.lookup_cache.assert_called_once_with(
+            lookup_id=request.request_id
+        )
+    else:
+        lookup_client.lookup_cache.assert_not_called()
+
+
 def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
     impl = _make_scheduler_impl()
     impl.config.enable_dsa_cold_compact_load = True
