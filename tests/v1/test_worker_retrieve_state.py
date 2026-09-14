@@ -2808,11 +2808,6 @@ class TestWorkerRetrieveState:
 
         latent1 = "model.layers.5.self_attn.attn"
         index1 = "model.layers.5.self_attn.indexer.k_cache"
-        submitted_before_last = list(submitted)
-        impl.submit_layerwise_prefill_load(latent1)
-        assert submitted == submitted_before_last
-        assert impl.current_layer == 1
-
         impl.wait_for_layer_load(latent1)
         assert waits[-1] == (1, 0)
         assert submitted[-1] == ("latent", [10, 11, 12, 13])
@@ -2821,6 +2816,13 @@ class TestWorkerRetrieveState:
         impl.wait_for_layer_load(index1)
         assert waits[-1] == (1, 1)
         assert submitted[-1] == ("indexer", [110, 111, 112, 113])
+        # Both groups have drained their final H2D sources, but the model
+        # execution cursor advances only at the post-attention callbacks.
+        assert impl.current_layer == 1
+        submitted_before_last = list(submitted)
+        impl.submit_layerwise_prefill_load(latent1)
+        impl.submit_layerwise_prefill_load(index1)
+        assert submitted == submitted_before_last
         assert impl.current_layer == 2
         assert impl.layerwise_retrievers == []
 

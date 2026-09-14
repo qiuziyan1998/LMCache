@@ -1807,6 +1807,7 @@ class LMCacheConnectorV1Impl:
         self._layerwise_sparse_shared_ordered: list[bool] = []
         self._layerwise_required_wait_groups_cache: Optional[set[int]] = None
         self._deferred_layerwise_prefill_load_active = False
+        self._deferred_layerwise_prefill_drained_groups: set[int] = set()
         self._layerwise_save_storers: dict[
             LayerwiseSaveKey, Generator[Optional[LayerwiseStoreResult], None, None]
         ] = {}
@@ -2547,8 +2548,15 @@ class LMCacheConnectorV1Impl:
 
     def _layerwise_required_wait_groups(self) -> set[int]:
         required = {0}
+        model_layer = self.current_layer
+        if getattr(self, "_deferred_layerwise_prefill_load_active", False):
+            latent_names = self._latent_layer_names
+            if 0 <= self.current_layer < len(latent_names):
+                model_layer = self._layerwise_layer_id_from_name(
+                    latent_names[self.current_layer]
+                )
         if self._is_dsa_two_groups() and self._layerwise_has_indexer_model_layer(
-            self.current_layer
+            model_layer
         ):
             for idx, (_, indexer_retriever) in enumerate(
                 getattr(self, "layerwise_retrievers", [])
@@ -2675,6 +2683,36 @@ class LMCacheConnectorV1Impl:
             ),
             kv_group=kv_group,
         )
+
+    def _layerwise_prefill_load_position(
+        self, layer_name: str, kv_group: int
+    ) -> tuple[int, int, int]:
+        """Return execution ordinal, group ordinal and the group's last row.
+
+        Shared indexers do not exist at every model layer. For example, model
+        layer 6 executes at LATENT ordinal 6 but loads INDEXER row 3 / bank 1.
+        MTP can also leave a group's last row before the last execution layer.
+        """
+        group_layer = self._layerwise_prefill_transfer_layer_id(
+            layer_name, kv_group
+        )
+        latent_name = (
+            layer_name.removesuffix(".indexer.k_cache") + ".attn"
+            if kv_group == 1
+            else layer_name
+        )
+        execution_layer = self._layerwise_prefill_transfer_layer_id(
+            latent_name, 0
+        )
+        group_names = (
+            self._indexer_layer_names
+            if kv_group == 1
+            else self._latent_layer_names
+        )
+        last_group_layer = (
+            len(group_names) - 1 if group_names else self.num_layers - 1
+        )
+        return execution_layer, group_layer, last_group_layer
 
     def _is_deferred_layerwise_prefill_load_step(
         self,
@@ -3445,6 +3483,7 @@ class LMCacheConnectorV1Impl:
                 self._layerwise_sparse_indexer_sent_layers.clear()
             self._layerwise_required_wait_groups_cache = None
             self._deferred_layerwise_prefill_load_active = False
+            self._deferred_layerwise_prefill_drained_groups = set()
 
     @staticmethod
     def _close_layerwise_retriever(
@@ -7534,7 +7573,9 @@ class LMCacheConnectorV1Impl:
                 includes_model_compute=True,
             )
 
-    def _advance_deferred_layerwise_prefill_load(self, layer_name: str) -> None:
+    def _advance_deferred_layerwise_prefill_load(
+        self, layer_name: str, *, finish_current: bool = False
+    ) -> None:
         """Advance one deferred dense-prefill group and its layer cursor."""
         if not self.layerwise_retrievers:
             return
@@ -7557,27 +7598,37 @@ class LMCacheConnectorV1Impl:
         if wait_group not in required_groups:
             return
         submitted_groups = self._layerwise_waited_groups
-        if wait_group in submitted_groups:
+        drained_groups = getattr(
+            self, "_deferred_layerwise_prefill_drained_groups", None
+        )
+        if drained_groups is None:
+            drained_groups = set()
+            self._deferred_layerwise_prefill_drained_groups = drained_groups
+        if wait_group in submitted_groups or (
+            finish_current and wait_group in drained_groups
+        ):
             return
         next_group = min(required_groups - submitted_groups)
-        if wait_group != next_group:
+        if not finish_current and wait_group != next_group:
             raise RuntimeError(
                 "Layerwise prefill load groups were submitted out of order: "
                 f"layer={layer_name}, expected_group={next_group}, "
                 f"received_group={wait_group}"
             )
 
-        layer_id = self._layerwise_prefill_transfer_layer_id(
-            layer_name,
-            wait_group,
+        execution_layer, layer_id, last_group_layer = (
+            self._layerwise_prefill_load_position(layer_name, wait_group)
         )
-        if layer_id != self.current_layer:
+        if execution_layer != self.current_layer:
             raise RuntimeError(
                 "Layerwise prefill load cursor does not match callback layer: "
-                f"cursor={self.current_layer}, callback_layer={layer_id}, "
+                f"cursor={self.current_layer}, callback_layer={execution_layer}, "
+                f"group_layer={layer_id}, "
                 f"kv_group={wait_group}"
             )
-        transfer_layer = min(layer_id + 1, self.num_layers - 1)
+        if finish_current and layer_id != last_group_layer:
+            raise RuntimeError("Only the last group row may drain its prefill load")
+        transfer_layer = min(layer_id + 1, last_group_layer)
 
         with self._sparse_retrieve_state_guard(layerwise_requests):
             for idx, request in enumerate(layerwise_requests):
@@ -7599,18 +7650,27 @@ class LMCacheConnectorV1Impl:
                         "non-PREFILL_CHILD request: "
                         f"req_id={request.req_id}"
                     )
-                ret_token_mask = self._advance_dense_layerwise_retriever(
-                    request,
-                    self.layerwise_retrievers[idx],
-                    wait_group,
-                    transfer_layer,
-                )
-                if wait_group == 0 and layer_id == self.num_layers - 1:
-                    assert ret_token_mask is not None
-                    logger.info(
-                        "Retrieved %d tokens",
-                        ret_token_mask.sum().item(),
+                if wait_group not in drained_groups:
+                    ret_token_mask = self._advance_dense_layerwise_retriever(
+                        request,
+                        self.layerwise_retrievers[idx],
+                        wait_group,
+                        transfer_layer,
                     )
+                    if wait_group == 0 and layer_id == last_group_layer:
+                        assert ret_token_mask is not None
+                        logger.info(
+                            "Retrieved %d tokens",
+                            ret_token_mask.sum().item(),
+                        )
+
+        if layer_id == last_group_layer:
+            drained_groups.add(wait_group)
+        if finish_current:
+            # Release final H2D sources at this group's entry fence, but do
+            # not advance the model cursor until its post-attention submit.
+            # An indexer's final row can precede LATENT/MTP's last layer.
+            return
 
         self._complete_layerwise_retrieve_group(
             wait_group,
@@ -7627,21 +7687,6 @@ class LMCacheConnectorV1Impl:
             return
         wait_group = self._layerwise_wait_group(layer_name)
         if wait_group not in self._layerwise_required_wait_groups():
-            return
-        layer_id = self._layerwise_prefill_transfer_layer_id(
-            layer_name,
-            wait_group,
-        )
-        if layer_id != self.current_layer:
-            raise RuntimeError(
-                "Layerwise prefill load cursor does not match callback layer: "
-                f"cursor={self.current_layer}, callback_layer={layer_id}, "
-                f"kv_group={wait_group}"
-            )
-        if layer_id >= self.num_layers - 1:
-            # There is no N+1 transfer on the last layer. Generator drain and
-            # metadata finalization run after its entry fence instead of in the
-            # latency-sensitive pre-HCOM callback.
             return
         self._advance_deferred_layerwise_prefill_load(layer_name)
 
@@ -7691,14 +7736,16 @@ class LMCacheConnectorV1Impl:
         if getattr(self, "_deferred_layerwise_prefill_load_active", False):
             # The bank fence above makes the current layer consumable. Advancing
             # N+1 is submitted from the post-attention HCOM window.
-            layer_id = self._layerwise_prefill_transfer_layer_id(
+            _, layer_id, last_group_layer = self._layerwise_prefill_load_position(
                 layer_name,
                 wait_group,
             )
-            if layer_id == self.num_layers - 1:
+            if layer_id == last_group_layer:
                 # No N+1 exists. Finish the suspended generators here, after
                 # the last layer's current-bank fence and before its compute.
-                self._advance_deferred_layerwise_prefill_load(layer_name)
+                self._advance_deferred_layerwise_prefill_load(
+                    layer_name, finish_current=True
+                )
             return
 
         metadata: Optional[LMCacheConnectorMetadata] = None

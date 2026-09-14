@@ -4185,13 +4185,13 @@ class LMCacheEngine:
                 if perf_enabled and not consume_started:
                     consume_started = cold_start_perf_now()
                 if layer_id == 0:
-                    yield torch.sum(ret_mask)
+                    layer_request = yield torch.sum(ret_mask)
                 else:
-                    yield None
+                    layer_request = yield None
 
                 send_started = cold_start_perf_now() if perf_enabled else 0.0
                 try:
-                    mem_obj_consumer.send(
+                    memory_objs_layer = (
                         LayerPageSource(
                             layer_pages,
                             layer_id,
@@ -4199,6 +4199,14 @@ class LMCacheEngine:
                         )
                         if layer_page_chunks
                         else mem_objs_layer
+                    )
+                    mem_obj_consumer.send(
+                        memory_objs_layer
+                        if layer_request is None
+                        else {
+                            "memory_objs": memory_objs_layer,
+                            "layer_request": layer_request,
+                        }
                     )
                 except BaseException:
                     consumer_failed = deferred_layerwise_get
@@ -4461,14 +4469,14 @@ class LMCacheEngine:
                 handles_by_layer.append(layer_handles)
 
                 if layer_id == 0:
-                    yield torch.sum(ret_mask)
+                    layer_request = yield torch.sum(ret_mask)
                 else:
-                    yield None
+                    layer_request = yield None
 
                 assert mem_obj_consumer is not None
                 send_started = cold_start_perf_now() if perf_enabled else 0.0
                 try:
-                    mem_obj_consumer.send(
+                    memory_objs_layer = (
                         LayerPageSource(
                             passive_page_tuple,
                             layer_id,
@@ -4476,6 +4484,14 @@ class LMCacheEngine:
                         )
                         if passive_pages
                         else mem_objs_layer
+                    )
+                    mem_obj_consumer.send(
+                        memory_objs_layer
+                        if layer_request is None
+                        else {
+                            "memory_objs": memory_objs_layer,
+                            "layer_request": layer_request,
+                        }
                     )
                 except BaseException:
                     consumer_failed = deferred_layerwise_get
