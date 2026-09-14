@@ -373,6 +373,24 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 self.cache_policy.update_on_hit(key, self.hot_cache)
             self.keys_in_request = []
 
+    def try_touch_layer_pages(self, keys: Sequence[CacheEngineKey]) -> bool:
+        """Refresh explicit page keys in caller order without waiting or pinning.
+
+        Return False when LRU is disabled or its lock is busy. Missing entries
+        are ignored; references and the ordinary lookup-touch list are unchanged.
+        """
+        if not self.use_hot or type(self.cache_policy) is not LRUCachePolicy:
+            return False
+        if not self.cpu_lock.acquire(blocking=False):
+            return False
+        try:
+            for key in keys:
+                if isinstance(self.hot_cache.get(key), LayerPageMemoryObj):
+                    self.cache_policy.update_on_hit(key, self.hot_cache)
+            return True
+        finally:
+            self.cpu_lock.release()
+
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         """
         contains() and exists_in_put_tasks() should be checked together

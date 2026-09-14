@@ -54,11 +54,12 @@ def backend():
                 "reclaim_evictable_capacity",
                 "_pop_bounded_reclaim_locked",
                 "_pop_layer_page_evict_candidate_locked",
+                "try_touch_layer_pages",
             },
         ),
         (
             ROOT / "lmcache/v1/storage_backend/cache_policy/lru.py",
-            {"get_evict_candidates"},
+            {"get_evict_candidates", "update_on_hit"},
         ),
     ]
     for path, names in paths:
@@ -85,6 +86,8 @@ def backend():
         (),
         {
             "get_evict_candidates": ns["get_evict_candidates"],
+            "update_on_hit": ns["update_on_hit"],
+            "update_chunk_hash_dict": lambda self, key: None,
             "update_on_force_evict": lambda self, key: None,
         },
     )
@@ -240,3 +243,27 @@ def test_candidate_scan_does_not_visit_beyond_the_budget():
     obj.hot_cache = CountedCache((i, LayerPage(pool, pins=1)) for i in range(20))
     assert not reclaim(obj, 10, limit=3)
     assert visited == [0, 1, 2] and not removed
+
+
+def test_checkpoint_touch_preserves_owners_and_lookup_list():
+    obj, pool, _ = backend()
+    obj.hot_cache.update((i, LayerPage(pool, refs=2, pins=i)) for i in range(4))
+    obj.hot_cache[4] = Page(pool)
+    obj.keys_in_request = ["unrelated"]
+    assert obj.try_touch_layer_pages([3, 2, 99, 1, 0, 4])
+    assert list(obj.hot_cache) == [4, 3, 2, 1, 0]
+    assert obj.keys_in_request == ["unrelated"]
+    assert [(obj.hot_cache[i].refs, obj.hot_cache[i].pins) for i in range(4)] == [(2, i) for i in range(4)]
+
+
+def test_checkpoint_touch_does_not_wait_or_override_other_policies():
+    obj, pool, _ = backend()
+    obj.hot_cache.update((i, LayerPage(pool)) for i in range(3))
+    obj.cpu_lock.acquire()
+    try:
+        assert not obj.try_touch_layer_pages([2, 1, 0])
+    finally:
+        obj.cpu_lock.release()
+    obj.cache_policy = object()
+    assert not obj.try_touch_layer_pages([2, 1, 0])
+    assert list(obj.hot_cache) == [0, 1, 2]
