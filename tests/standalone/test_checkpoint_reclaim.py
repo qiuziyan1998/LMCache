@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise LocalCPU reclamation with counted cache ownership and capacity."""
 
-import ast
 from collections import OrderedDict
+from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace as NS
+import ast
+import logging
+import threading
 
 import pytest
 
@@ -221,16 +224,19 @@ def test_no_eviction_if_capacity_already_available():
     assert not removed
 
 
-def test_post_reclaim_capacity_race_is_not_reported_as_success():
+@pytest.mark.parametrize("failed", [False, True])
+def test_post_reclaim_capacity_race_is_not_reported_as_success(failed):
     obj, pool, removed = backend()
     obj.hot_cache[1] = LayerPage(pool)
     # Another allocator consumes the newly freed capacity before the final check.
     obj.get_allocator_capacity_bytes = lambda: (0, pool.total)
-    assert not reclaim(obj, 10)
+    operation = failed_allocation_reclaim if failed else reclaim
+    assert not operation(obj, 10)
     assert removed == [1]
 
 
-def test_candidate_scan_does_not_visit_beyond_the_budget():
+@pytest.mark.parametrize("failed", [False, True])
+def test_candidate_scan_does_not_visit_beyond_the_budget(failed):
     obj, pool, removed = backend()
     visited = []
 
@@ -241,7 +247,8 @@ def test_candidate_scan_does_not_visit_beyond_the_budget():
                 yield key
 
     obj.hot_cache = CountedCache((i, LayerPage(pool, pins=1)) for i in range(20))
-    assert not reclaim(obj, 10, limit=3)
+    operation = failed_allocation_reclaim if failed else reclaim
+    assert not operation(obj, 10, limit=3)
     assert visited == [0, 1, 2] and not removed
 
 
@@ -253,7 +260,9 @@ def test_checkpoint_touch_preserves_owners_and_lookup_list():
     assert obj.try_touch_layer_pages([3, 2, 99, 1, 0, 4])
     assert list(obj.hot_cache) == [4, 3, 2, 1, 0]
     assert obj.keys_in_request == ["unrelated"]
-    assert [(obj.hot_cache[i].refs, obj.hot_cache[i].pins) for i in range(4)] == [(2, i) for i in range(4)]
+    assert [(obj.hot_cache[i].refs, obj.hot_cache[i].pins) for i in range(4)] == [
+        (2, i) for i in range(4)
+    ]
 
 
 def test_checkpoint_touch_does_not_wait_or_override_other_policies():
@@ -267,3 +276,178 @@ def test_checkpoint_touch_does_not_wait_or_override_other_policies():
     obj.cache_policy = object()
     assert not obj.try_touch_layer_pages([2, 1, 0])
     assert list(obj.hot_cache) == [0, 1, 2]
+
+
+def failed_allocation_reclaim(obj, size, limit=16):
+    return obj.reclaim_evictable_capacity(
+        size,
+        min_free_bytes=0,
+        min_free_ratio=0,
+        num_layers=2,
+        cause="checkpoint_capacity_reclaim",
+        max_scan_entries=limit,
+        allocation_failed=True,
+    )
+
+
+def test_allocation_failure_evicts_one_large_idle_page_despite_free_byte_total():
+    obj, pool, removed = backend()
+    pool.free = 100
+    obj.hot_cache.update(
+        [
+            ("pinned", LayerPage(pool, 90, pins=1)),
+            ("borrowed", LayerPage(pool, 90, refs=2)),
+            ("small", LayerPage(pool, 10)),
+            ("large", LayerPage(pool, 80)),
+            ("later", LayerPage(pool, 90)),
+        ]
+    )
+    assert failed_allocation_reclaim(obj, 60)
+    assert removed == ["large"] and pool.free == 180
+    assert obj.hot_cache["pinned"].pins == 1
+    assert obj.hot_cache["borrowed"].refs == 2
+
+
+def test_fragmentation_reclaim_can_free_less_than_request_to_allow_coalescing():
+    obj, pool, removed = backend()
+    pool.free = 60  # Three separated 20-byte free spans; request needs 50.
+    obj.hot_cache["between_free_spans"] = LayerPage(pool, 35)
+    assert failed_allocation_reclaim(obj, 50)
+    assert removed == ["between_free_spans"]
+
+
+def test_fragmentation_scan_and_eviction_are_bounded():
+    obj, pool, removed = backend()
+    pool.free = 100
+    obj.hot_cache.update((i, LayerPage(pool, 20)) for i in range(10))
+    obj.hot_cache["outside_budget"] = LayerPage(pool, 100)
+    assert failed_allocation_reclaim(obj, 30, limit=4)
+    assert removed == [0, 1]  # No whole-cache purge while seeking a large page.
+
+
+def test_failed_allocation_reclaim_keeps_sources_when_capacity_is_impossible():
+    obj, pool, removed = backend()
+    pool.free = 10
+    obj.hot_cache[0] = LayerPage(pool, 20)
+    assert not failed_allocation_reclaim(obj, 50)
+    assert removed == []
+
+
+def test_failed_allocation_reclaim_never_waits_on_cache_lock():
+    obj, pool, removed = backend()
+    pool.free = 100
+    obj.hot_cache[0] = LayerPage(pool, 80)
+    obj.cpu_lock.acquire()
+    try:
+        # Capacity is only advisory; the caller still must retry allocation.
+        assert failed_allocation_reclaim(obj, 60)
+    finally:
+        obj.cpu_lock.release()
+    assert removed == []
+
+
+def test_failed_allocation_reclaim_rejects_unbounded_mode():
+    obj, _, _ = backend()
+    with pytest.raises(ValueError, match="reclaim request"):
+        failed_allocation_reclaim(obj, 60, limit=None)
+
+
+def test_failed_allocation_reclaim_preserves_other_policy_and_legacy_owners():
+    obj, pool, removed = backend()
+    pool.free = 100
+    keys = [LayerKey(("chunk", i)) for i in range(2)]
+    obj.hot_cache[keys[0]] = Page(pool, 60)
+    obj.hot_cache[keys[1]] = Page(pool, 60, refs=2)
+    assert failed_allocation_reclaim(obj, 60)
+    assert removed == []
+    obj.hot_cache["large"] = LayerPage(pool, 80)
+    obj.cache_policy = object()
+    assert failed_allocation_reclaim(obj, 60)
+    assert removed == []
+
+
+def test_real_address_allocator_retries_fragmented_pool_after_page_eviction():
+    # Only the sorted container is a fixture; allocation/coalescing are production.
+    class SortedBlocks(list):
+        def __init__(self, *, key):
+            self.key = key
+
+        def add(self, value):
+            self.append(value)
+            self.sort(key=self.key)
+
+        def bisect_left(self, value):
+            return next(
+                (i for i, old in enumerate(self) if self.key(old) >= self.key(value)),
+                len(self),
+            )
+
+    def synchronized(name):
+        def decorate(method):
+            def call(self, *args, **kwargs):
+                with getattr(self, name):
+                    return method(self, *args, **kwargs)
+
+            return call
+
+        return decorate
+
+    path = ROOT / "lmcache/v1/memory_management.py"
+    nodes = [
+        n
+        for n in ast.parse(path.read_text(encoding="utf-8")).body
+        if isinstance(n, ast.ClassDef) and n.name in {"FreeBlock", "AddressManager"}
+    ]
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            *nodes,
+        ],
+        type_ignores=[],
+    )
+    ns = dict(
+        dataclass=dataclass,
+        threading=threading,
+        SortedList=SortedBlocks,
+        synchronized=synchronized,
+        _lmcache_nvtx_annotate=lambda f: f,
+        logger=logging.getLogger(__name__),
+    )
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
+    manager = ns["AddressManager"](200, align_bytes=1)
+    spans = [manager.allocate(n) for n in (40, 10, 70, 10, 40, 30)]
+    manager.free(*spans[0])
+    manager.free(*spans[4])
+    assert manager.get_capacity_bytes() == (80, 200)
+    with pytest.raises(RuntimeError, match="no enough memory"):
+        manager.batched_allocate(60, 1)
+    obj, pool, removed = backend()
+    obj.get_allocator_capacity_bytes = manager.get_capacity_bytes
+
+    class AllocatedPage(LayerPage):
+        def ref_count_down(self):
+            self.refs -= 1
+            if self.refs == 0:
+                manager.free(*spans[2])
+
+    obj.hot_cache["victim"] = AllocatedPage(pool, 70)
+    assert failed_allocation_reclaim(obj, 60)
+    assert removed == ["victim"]
+    assert manager.batched_allocate(60, 1) == [(50, 60)]
+
+
+def test_failed_allocation_frees_removed_owners_outside_cache_lock():
+    obj, pool, removed = backend()
+    pool.free = 100
+
+    class CheckedPage(LayerPage):
+        def ref_count_down(self):
+            assert not obj.cpu_lock.locked()
+            assert "victim" not in obj.hot_cache
+            super().ref_count_down()
+
+    obj.hot_cache["victim"] = CheckedPage(pool, 80)
+    assert failed_allocation_reclaim(obj, 60)
+    assert removed == ["victim"]

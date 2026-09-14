@@ -1640,6 +1640,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         num_layers: int,
         cause: str,
         max_scan_entries: Optional[int] = None,
+        allocation_failed: bool = False,
     ) -> bool:
         """Evict enough eligible entries to accommodate one allocation.
 
@@ -1654,9 +1655,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
             cause: Retention-trace cause recorded for removed entries.
             max_scan_entries: Optional LRU candidate-window limit. This mode
                 never waits for the cache lock, and refuses other policies.
+            allocation_failed: Reclaim after an actual allocation refusal even
+                when total free bytes suffice. Requires a bounded scan; prefers
+                one eligible merged page large enough for the allocation.
 
         Returns:
-            Whether the allocator reached the required free-capacity target.
+            Whether total capacity suffices. The caller must retry the real
+            allocation; this snapshot does not guarantee a contiguous span.
 
         Raises:
             ValueError: If an argument is invalid.
@@ -1669,6 +1674,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             or num_layers <= 0
             or not cause
             or (max_scan_entries is not None and max_scan_entries <= 0)
+            or (allocation_failed and (required_bytes == 0 or max_scan_entries is None))
         ):
             raise ValueError("invalid LocalCPU capacity-reclaim request")
         started = time.perf_counter() if serving_perf_enabled() else None
@@ -1681,14 +1687,17 @@ class LocalCPUBackend(AllocatorBackendInterface):
         evicted_bytes = 0
         evicted_keys = 0
         removed: list[MemoryObj] = []
-        if free_before < target_free_bytes and max_scan_entries is not None:
+        if (
+            free_before < target_free_bytes or allocation_failed
+        ) and max_scan_entries is not None:
             if self.cpu_lock.acquire(blocking=False):
                 try:
                     keys, removed, evictable_bytes = self._pop_bounded_reclaim_locked(
-                        target_free_bytes - free_before,
+                        max(1, target_free_bytes - free_before),
                         num_layers,
                         max_scan_entries,
                         cause,
+                        allocation_size=required_bytes if allocation_failed else 0,
                     )
                     evicted_keys = len(keys)
                     evicted_bytes = sum(obj.get_physical_size() for obj in removed)
@@ -1737,6 +1746,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 outcome=(
                     "reclaimed"
                     if sufficient and evicted_keys
+                    else "retry_required"
+                    if sufficient and allocation_failed
                     else "not_needed"
                     if sufficient
                     else "raced"
@@ -1747,7 +1758,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return sufficient
 
     def _pop_bounded_reclaim_locked(
-        self, required_bytes: int, num_layers: int, max_entries: int, cause: str
+        self,
+        required_bytes: int,
+        num_layers: int,
+        max_entries: int,
+        cause: str,
+        *,
+        allocation_size: int = 0,
     ) -> tuple[list[CacheEngineKey], list[MemoryObj], int]:
         """Select a bounded LRU window atomically before removing any entries."""
         if not self.use_hot or type(self.cache_policy) is not LRUCachePolicy:
@@ -1755,6 +1772,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         seen = set()
         candidates = []
         evictable_bytes = 0
+        candidate_target = max(required_bytes, allocation_size)
         for key in islice(self.hot_cache, max_entries):
             if key in seen:
                 continue
@@ -1775,11 +1793,19 @@ class LocalCPUBackend(AllocatorBackendInterface):
             # are far apart in LRU order. All must be unpinned/unborrowed.
             if not all(self.hot_cache[item].can_evict for item in keys):
                 continue
-            candidates.append(key)
-            evictable_bytes += sum(
-                self.hot_cache[item].get_physical_size() for item in keys
-            )
-            if evictable_bytes >= required_bytes:
+            size = sum(self.hot_cache[item].get_physical_size() for item in keys)
+            if (
+                allocation_size
+                and len(keys) == 1
+                and isinstance(self.hot_cache[key], LayerPageMemoryObj)
+                and size >= candidate_target
+            ):
+                candidates, evictable_bytes = [key], size
+                break
+            if evictable_bytes < candidate_target:
+                candidates.append(key)
+                evictable_bytes += size
+            if not allocation_size and evictable_bytes >= required_bytes:
                 break
         if evictable_bytes < required_bytes:
             return [], [], evictable_bytes
