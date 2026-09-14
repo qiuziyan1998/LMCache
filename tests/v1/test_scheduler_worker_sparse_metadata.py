@@ -52,6 +52,7 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl.config.save_full_chunk_in_decode = False
     impl.config.dsa_two_groups = False
     impl.config.enable_dsa_cold_compact_load = False
+    impl.config.decode_preemption_checkpoint = False
     impl.config.enable_sparse_attention = True
     impl.config.enable_shared_cpu_cache = False
     impl.config.use_layerwise = True
@@ -84,6 +85,34 @@ def _completed_future(result: Any = None) -> Future:
     future = Future()
     future.set_result(result)
     return future
+
+
+@pytest.mark.parametrize("latent_blocks", [[0, 0, 7], [0, 0, 0], [0]])
+def test_cold_checkpoint_boundary_uses_only_reserved_absolute_slots(latent_blocks):
+    impl = _make_scheduler_impl()
+    impl.config.decode_preemption_checkpoint = True
+    impl._block_size = 4
+    impl._vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(
+        data_parallel_index=0, data_parallel_size=1, tensor_parallel_size=1,
+    ))
+    request = SimpleNamespace(
+        request_id="tail",
+        all_token_ids=list(range(11)),
+        sampling_params=None,
+        mm_features=None,
+        kv_transfer_params={},
+    )
+    spec = LoadSpec(vllm_cached_tokens=0, lmcache_cached_tokens=11, can_load=True,
+                    dsa_committed_end=11, dsa_remap_frontier=8)
+    blocks = [latent_blocks, [1, 2, 3]]
+    if latent_blocks == [0, 0, 7]:
+        meta = impl._build_dsa_cold_compact_meta(request, blocks, spec)
+        assert meta.load_spec.checkpoint_tail_slots.tolist() == [28, 29, 30]
+        assert meta.dsa_nonresident_frontier == 8
+        assert meta.token_ids == list(range(11))
+    else:
+        with pytest.raises(ValueError, match="no resident latent blocks"):
+            impl._build_dsa_cold_compact_meta(request, blocks, spec)
 
 
 def _make_preempted_lookup_request(

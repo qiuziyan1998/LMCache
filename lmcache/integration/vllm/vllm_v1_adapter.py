@@ -7014,6 +7014,7 @@ class LMCacheConnectorV1Impl:
                 "dsa_group1_direct_hbm",
                 False,
             )
+            or getattr(entry[2].load_spec, "checkpoint_tail_slots", None) is not None
         }
         pending_req_ids = [
             req_id
@@ -7091,6 +7092,7 @@ class LMCacheConnectorV1Impl:
         perf_enabled = serving_perf_enabled()
         started = serving_perf_now() if perf_enabled else 0.0
         indexer_readiness = None
+        tail_slots = getattr(request.load_spec, "checkpoint_tail_slots", None)
         predecessor_wait_ms = 0.0
         latent_materialize_ms = 0.0
         latent_materialize_thread_cpu_ms = 0.0
@@ -7223,8 +7225,14 @@ class LMCacheConnectorV1Impl:
                     )
             # Group-0 pointer tables and the CPU-staged Group-1 fallback use
             # this same load stream. One final event covers both submissions.
+            tail_readiness = None
+            if tail_slots is not None:
+                tail_readiness = self.lmcache_engine.load_checkpoint_resident_tail(
+                    state, tail_slots, plan["latent_kvcaches"]
+                )
             self._record_dsa_cold_dense_load_readiness(
                 state,
+                readiness=tail_readiness,
                 additional_owners=tuple(plan.get("indexer_source_owners", ())),
             )
 
@@ -7292,7 +7300,9 @@ class LMCacheConnectorV1Impl:
             }
             combined_owners = tuple(owners_by_id.values())
             try:
-                if state.dense_load_readiness is not None:
+                if tail_slots is not None:
+                    self._synchronize_dsa_cold_dense_load()
+                elif state.dense_load_readiness is not None:
                     self._synchronize_dsa_cold_dense_readiness(
                         state.dense_load_readiness
                     )
@@ -10287,6 +10297,13 @@ class LMCacheConnectorV1Impl:
         compact_remap_frontier = num_external_hit_tokens - int(
             full_request_hit
         )
+        if getattr(self.config, "decode_preemption_checkpoint", False):
+            # Keep the restored boundary readable at its original HBM slots.
+            compact_remap_frontier = (
+                compact_remap_frontier
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
 
         # Check if hit tokens meet the minimum for retrieve
         # If below minimum, skip retrieve but still record hit tokens
@@ -10433,7 +10450,7 @@ class LMCacheConnectorV1Impl:
             block_ids = blocks.get_block_ids()
         else:
             block_ids = blocks
-        _, indexer_block_ids = _split_kv_group_block_ids(block_ids)
+        latent_block_ids, indexer_block_ids = _split_kv_group_block_ids(block_ids)
         if not indexer_block_ids:
             raise ValueError("Cold compact load requires allocated indexer blocks")
         required_indexer_blocks = cdiv(
@@ -10485,6 +10502,25 @@ class LMCacheConnectorV1Impl:
             load_spec=load_spec,
             request_configs=extract_request_configs(request.sampling_params),
         )
+        if getattr(self.config, "decode_preemption_checkpoint", False):
+            start = int(remap_frontier)
+            end = len(token_ids)
+            if start < end:
+                if end > len(latent_block_ids) * self._block_size or any(
+                    latent_block_ids[i // self._block_size] <= 0
+                    for i in range(start, end)
+                ):
+                    raise ValueError(
+                        "Checkpoint boundary has no resident latent blocks"
+                    )
+                load_spec.checkpoint_tail_slots = torch.tensor(
+                    [
+                        latent_block_ids[i // self._block_size] * self._block_size
+                        + i % self._block_size
+                        for i in range(start, end)
+                    ],
+                    dtype=torch.long,
+                )
         params = getattr(request, "kv_transfer_params", None)
         raw_capabilities = (
             params.get("live_split_capabilities", ())

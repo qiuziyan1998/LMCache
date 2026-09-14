@@ -55,6 +55,11 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         """Whether this connector requests pre-overwrite decoder snapshots."""
         return bool(getattr(self._lmcache_engine.config, "decode_preemption_checkpoint", False))
 
+    @property
+    def preemption_checkpoint_chunk_size(self) -> int:
+        """Return the resident-tail alignment for checkpoint-capable schedulers."""
+        return self._lmcache_engine.config.chunk_size
+
     def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
         """Drain source owners before the runner reuses preempted blocks."""
         handle = getattr(self._lmcache_engine, "handle_preemptions", None)

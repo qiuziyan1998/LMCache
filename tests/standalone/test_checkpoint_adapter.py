@@ -368,7 +368,8 @@ def test_local_lookup_marker_is_only_sent_for_the_checkpoint_generation():
 
 
 @pytest.mark.parametrize("hit", [8, 11])
-def test_partial_local_hit_sets_the_actual_restore_frontier(hit):
+@pytest.mark.parametrize("retain_tail", [False, True])
+def test_partial_local_hit_sets_the_actual_restore_frontier(hit, retain_tail):
     req = request()
     captured = control.CaptureSpec("r", 1, 4, 12, 4, ((1,), (2,)), prefix_end=4)
     adapter = NS(
@@ -384,7 +385,8 @@ def test_partial_local_hit_sets_the_actual_restore_frontier(hit):
         _block_size=4,
         _dsa_scratch_capacity=4,
         _dsa_kv_policy_threshold=4,
-        config=NS(min_retrieve_tokens=0, dsa_group1_load_mode="persistent_direct_hbm"),
+        config=NS(min_retrieve_tokens=0, dsa_group1_load_mode="persistent_direct_hbm",
+                  decode_preemption_checkpoint=retain_tail),
         enable_sparse_attention=True,
         supports_dsa_cold_compact_load=lambda: True,
         load_specs={},
@@ -395,7 +397,8 @@ def test_partial_local_hit_sets_the_actual_restore_frontier(hit):
     assert matched == hit
     spec = adapter.load_specs["r"]
     assert spec.checkpoint_generation == 1 and spec.checkpoint_prefix_end == 4
-    assert spec.dsa_remap_frontier == hit
+    assert spec.dsa_remap_frontier == (hit // 4 * 4 if retain_tail else hit)
+    assert spec.lmcache_cached_tokens == hit
 
 
 def test_restore_retry_is_strictly_shorter_and_bounded():
