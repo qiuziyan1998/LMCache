@@ -8545,6 +8545,9 @@ class LMCacheConnectorV1Impl:
                     sync=True,
                     prepared_sparse_source=source,
                     prepared_start_layer=target_count,
+                    registered_destination_layout=getattr(
+                        self, "_sparse_destination_binding", None
+                    ),
                     ret_mask=state.decode_ret_mask,
                 ),
             )

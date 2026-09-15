@@ -417,6 +417,34 @@ def test_unused_draft_does_not_initialize_connector(cancel: bool) -> None:
         suffix.close()
 
 
+@pytest.mark.parametrize("binding_mode", ["missing", "none", "registered"])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_deferred_draft_preserves_destination_binding(
+    binding_mode: str, cancel: bool
+) -> None:
+    adapter = FakeAdapter()
+    caches = [torch.zeros(1)] * adapter.num_layers
+    adapter._kvcaches_for_group = lambda group: caches
+    binding = (
+        SimpleNamespace(kvcaches_ref=caches) if binding_mode == "registered" else None
+    )
+    if binding_mode != "missing":
+        adapter._sparse_destination_binding = binding
+    adapter.prepare_sparse_graph_step(("layers.0.attn", "layers.1.attn"))
+    assert not adapter.suffix_kwargs
+    suffix = adapter.layerwise_retrievers[0][0]
+    try:
+        if not cancel:
+            suffix.send("live topk")
+            assert adapter.suffix_kwargs.get("registered_destination_layout") is binding
+            assert adapter.suffix_kwargs["kvcaches"] is caches
+            assert adapter.suffix_kwargs["prepared_start_layer"] == 2
+    finally:
+        suffix.close()
+    if cancel:
+        assert not adapter.suffix_kwargs
+
+
 @pytest.mark.parametrize("failure", [None, "prime", "send", "close_early"])
 def test_deferred_draft_preserves_payloads_and_closes_consumer(
     failure: str | None,
