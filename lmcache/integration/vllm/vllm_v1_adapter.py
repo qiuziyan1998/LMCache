@@ -4122,11 +4122,32 @@ class LMCacheConnectorV1Impl:
                 // self._lmcache_chunk_size
                 * self._lmcache_chunk_size
             )
+            initial_cached_tokens = tracker.num_lmcache_cached_tokens
+            cold_full_hit = (
+                initial_cached_tokens > 0
+                and initial_cached_tokens == tracker.prompt_len
+                and getattr(tracker, "sparse_remap_frontier", None) is not None
+            )
+            if cold_full_hit:
+                # Cold compact loading recomputes the final prompt token.
+                # Derive its initial release boundary from the original hit,
+                # not the live remap frontier (which advances during decode).
+                # This does not rewind the saved prefix or the save cursor.
+                initial_cached_tokens -= 1
+            initial_cached_end = (
+                initial_cached_tokens
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
             is_initial_frontier = (
                 window_size > 0 and committed_end == prefill_end
             )
             if window_size > 0 and tracker.decode_window_save_next_start is None:
-                if committed_end != prefill_end:
+                if committed_end != prefill_end and not (
+                    cold_full_hit
+                    and initial_cached_end > 0
+                    and committed_end == initial_cached_end
+                ):
                     logger.debug(
                         "Ignoring completion before the initial prefill "
                         "frontier: req_id=%s completed_end=%s expected=%s",
@@ -4142,11 +4163,6 @@ class LMCacheConnectorV1Impl:
                     f"LMCache committed_end={committed_end} exceeds request "
                     f"frontier={len(tracker.token_ids)} for request {req_id}."
                 )
-            initial_cached_end = (
-                tracker.num_lmcache_cached_tokens
-                // self._lmcache_chunk_size
-                * self._lmcache_chunk_size
-            )
             if (
                 window_size > 0
                 and initial_cached_end > 0
@@ -4157,6 +4173,8 @@ class LMCacheConnectorV1Impl:
                 # The first sparse step confirms that the externally loaded
                 # prefix can be released. It may arrive after decode-window
                 # tracking has already advanced to the full appended prompt.
+                # A chunk-aligned cold full hit also retains its final chunk
+                # for last-token recomputation, below the prompt save cursor.
                 tracker.decode_window_save_committed_end = max(
                     tracker.decode_window_save_committed_end,
                     committed_end,
