@@ -123,6 +123,29 @@ def completed_cold_resume_state(request: Any, state: Any) -> bool:
                 and state.prepared_sparse_sources.get(0) is not None)
 
 
+def _defer_sparse_graph_draft(
+    engine: Any, retrieve_kwargs: dict[str, Any]
+) -> Generator[Any, Any, None]:
+    """Prime only at the first draft payload, after target graph submission.
+
+    Preserve the send/next/close protocol and the source/slot objects selected
+    for this step. Closing an unused draft performs no connector setup at all.
+    The actual retrieval and its stream dependencies remain unchanged.
+    """
+    payload = yield None
+    consumer = engine.retrieve_layer_head_token_wise([], None, **retrieve_kwargs)
+    try:
+        next(consumer)
+        while True:
+            try:
+                result = consumer.send(payload)
+            except StopIteration:
+                return
+            payload = yield result
+    finally:
+        consumer.close()
+
+
 def _clear_terminal_load_tracebacks(
     error: BaseException, completed_futures: tuple[Future, ...] = ()
 ) -> None:
@@ -6129,10 +6152,14 @@ class LMCacheConnectorV1Impl:
             cached_ends = cache["cached_ends"]
             chunk_token_counts = None
             if cached_starts and len(cached_starts) == len(cached_ends):
-                if not self._cached_ranges_cover_prefix(
-                    cached_starts,
-                    cached_ends,
-                    token_count,
+                # Under TP, indexer store completion precedes the deferred
+                # latent flush. Its raw cache can already cover the next
+                # prefill chunk while token_count still follows latent.
+                # Preserve that cache, but publish only an exact-frontier
+                # source; the latent flush will refresh both groups again.
+                if (
+                    self._cached_prefix_covered_token_count(cached_starts, cached_ends)
+                    != token_count
                 ):
                     continue
                 chunk_token_counts = tuple(
@@ -8616,6 +8643,198 @@ class LMCacheConnectorV1Impl:
         except BaseException:
             self._abort_layerwise_retrieve_step(requests)
             raise
+
+    @_lmcache_nvtx_annotate
+    def prepare_sparse_graph_step(
+        self,
+        target_layer_names: tuple[str, ...],
+        *,
+        allow_empty: bool = False,
+        request_ids: Optional[tuple[str, ...]] = None,
+        frontiers: Optional[tuple[int, ...]] = None,
+    ) -> Union[
+        Optional[PreparedSparseSource], tuple[Optional[PreparedSparseSource], ...]
+    ]:
+        """Resolve all request sources before target graph replay.
+
+        Args:
+            target_layer_names: Ordered latent layers covered by the target graph.
+            allow_empty: The runner verified a zero committed frontier.
+            request_ids: Unique model request order (omitted for legacy singleton).
+            frontiers: Required historical token coverage per model request.
+
+        Returns:
+            Ordered request-owned sources, with None only for zero frontiers.
+            Legacy callers receive one source or None.
+
+        Raises:
+            RuntimeError: The request, source, or layer layout is unsupported.
+
+        Bootstrap advances metadata and loads the top-k-independent index cache
+        using empty latent selections. Warm steps do not advance target-layer
+        generators. Any draft suffix keeps its normal layerwise retrieval, but
+        its connector setup is deferred until its first payload, after target
+        submission. Warm source readiness is resolved once, not checked twice.
+        Local non-resumed kv_both requests may reuse their native prefill index
+        when start_load_kv explicitly skipped index retrieval under that policy.
+        Shared, consumer and restored requests still require materialization.
+        The caller must finish device work before releasing request ownership.
+        """
+        requests = tuple(self._layerwise_requests)
+        legacy = request_ids is None
+        if legacy:
+            request_ids = tuple(request.req_id for request in requests)
+            frontiers = tuple(
+                int(request.load_spec.lmcache_cached_tokens) for request in requests
+            )
+        target_count = len(target_layer_names)
+        if not self.lmcache_engine.is_healthy():
+            raise RuntimeError("Full SFA graph cannot use an unhealthy LMCache engine")
+        if legacy and not requests and not self.layerwise_retrievers and allow_empty:
+            return None
+        if (
+            (legacy and len(requests) != 1)
+            or len(set(request_ids)) != len(request_ids)
+            or frontiers is None
+            or len(frontiers) != len(request_ids)
+            or any(frontier < 0 for frontier in frontiers)
+            or any(request.req_id not in request_ids for request in requests)
+            or any(not request.is_sparse_decode for request in requests)
+            or not self._is_dsa_two_groups()
+            or not 0 < target_count <= self.num_layers
+            or tuple(self._latent_layer_names[:target_count]) != target_layer_names
+            or self.current_layer != 0
+        ):
+            raise RuntimeError(
+                "Full SFA graph requires unique sparse requests and an "
+                "ordered target-layer prefix; no layerwise fallback was taken."
+            )
+        shared = getattr(self.lmcache_engine, "enable_shared_cpu_cache", False)
+        # Local kv_both intentionally skips group-1 retrieval: the live request
+        # already owns its prefill index in vLLM's NPU cache. start_load_kv marks
+        # that skip and clears LMCache's *materialized* index state. Requiring
+        # indexer_npu_resident unconditionally rejects this supported eager
+        # policy as soon as a decode window needs a positive historical source.
+        # Do not extend that assumption to shared/consumer, resumed, disaggregated
+        # or incompletely registered index caches.
+        native_index_requests = {
+            request.req_id
+            for request in requests
+            if not shared
+            and getattr(self, "kv_role", None) == "kv_both"
+            and getattr(request, "shared_index_skipped", False)
+            and not getattr(request, "resumed_from_preemption", False)
+            and getattr(request, "disagg_spec", None) is None
+            and len(self._kvcaches_for_group(1)) == self.lmcache_engine.num_layers_for_group(1)
+            and not self._sparse_decode_requires_index_materialization(
+                request, shared_cpu_enabled=False
+            )
+        }
+
+        resolved_sources: dict[str, Optional[PreparedSparseSource]] = {}
+
+        def source_ready(req_id: str, frontier: int) -> bool:
+            if frontier == 0:
+                return True
+            state = self._worker_retrieve_state.get(req_id)
+            source = None if state is None else state.prepared_sparse_sources.get(0)
+            ready = bool(
+                source is not None
+                and source.total_tokens >= frontier
+                and (not shared or state.shared_request_active)
+                and (state.indexer_npu_resident or req_id in native_index_requests)
+                and not state.indexer_npu_materialization_pending
+                and len(source.layers) == self.num_layers
+            )
+            if ready:
+                resolved_sources[req_id] = source
+            return ready
+
+        needs_bootstrap = any(
+            not source_ready(req_id, frontier)
+            for req_id, frontier in zip(request_ids, frontiers, strict=True)
+        ) or any(pair[1] is not None for pair in self.layerwise_retrievers)
+        if needs_bootstrap:
+            # Empty explicit payload: prepare/pin CPU sources, but never load
+            # latent history before the model has computed its real top-k.
+            empty = torch.zeros(
+                (len(requests), 1), dtype=torch.int64, device=self.device
+            )
+            slots = torch.full_like(empty, -1)
+            counts = torch.zeros(
+                (len(requests),), dtype=torch.int64, device=self.device
+            )
+            for layer_name in tuple(self._latent_layer_names):
+                self.wait_for_layer_load(
+                    layer_name,
+                    selected_tokens=empty,
+                    request_ids=[request.req_id for request in requests],
+                    target_slot_mapping=slots,
+                    selected_token_counts=counts,
+                )
+            # Bootstrap can publish new snapshots and residency state.
+            resolved_sources.clear()
+        if needs_bootstrap and not all(
+            source_ready(req_id, frontier)
+            for req_id, frontier in zip(request_ids, frontiers, strict=True)
+        ):
+            details = []
+            for req_id, frontier in zip(request_ids, frontiers, strict=True):
+                if source_ready(req_id, frontier):
+                    continue
+                state = self._worker_retrieve_state.get(req_id)
+                source = None if state is None else state.prepared_sparse_sources.get(0)
+                details.append(
+                    f"req_id={req_id} frontier={frontier} "
+                    f"source_tokens={None if source is None else source.total_tokens} "
+                    f"source_layers={0 if source is None else len(source.layers)} "
+                    f"expected_layers={self.num_layers} "
+                    f"native_index={req_id in native_index_requests} "
+                    f"index_resident={getattr(state, 'indexer_npu_resident', False)} "
+                    "index_pending="
+                    f"{getattr(state, 'indexer_npu_materialization_pending', False)} "
+                    f"shared_active={getattr(state, 'shared_request_active', False)}"
+                )
+            raise RuntimeError(
+                "Full SFA graph source/index cache preparation failed: "
+                f"kv_role={getattr(self, 'kv_role', None)} shared_cpu={shared}; "
+                + "; ".join(details)
+            )
+        sources = tuple(
+            resolved_sources[req_id] if frontier else None
+            for req_id, frontier in zip(request_ids, frontiers, strict=True)
+        )
+
+        self._drain_layerwise_retrievers()
+        self.current_layer = target_count
+        for request in requests if target_count < self.num_layers else ():
+            lane = request_ids.index(request.req_id)
+            source = sources[lane]
+            if source is None:
+                continue
+            state = self._worker_retrieve_state[request.req_id]
+            suffix = _defer_sparse_graph_draft(
+                self.lmcache_engine,
+                dict(
+                    kvcaches=self._kvcaches_for_group(0),
+                    slot_mapping=state.slot_mapping,
+                    kv_group=0,
+                    sync=True,
+                    prepared_sparse_source=source,
+                    prepared_start_layer=target_count,
+                    registered_destination_layout=getattr(
+                        self, "_sparse_destination_binding", None
+                    ),
+                    ret_mask=state.decode_ret_mask,
+                ),
+            )
+            next(suffix)
+            self.layerwise_retrievers.append((suffix, None))
+            self._layerwise_requests.append(request)
+            self._layerwise_retriever_is_sparse.append(True)
+            self._layerwise_sparse_req_ids.append(request.req_id)
+            self._layerwise_sparse_shared_ordered.append(False)
+        return sources[0] if legacy else sources
 
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(
