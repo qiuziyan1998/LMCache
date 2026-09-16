@@ -12046,6 +12046,25 @@ class LMCacheConnectorV1Impl:
         is_sparse_decode: bool = False,
     ) -> Optional[ReqMeta]:
         request = self._unfinished_requests.get(tracker.req_id)
+        if (
+            tracker.block_allocation_mode == "prefill_child"
+            and not is_sparse_decode
+            and load_spec is None
+            and request is not None
+            and 0 < request.num_computed_tokens < tracker.prompt_len
+        ):
+            # A running chunked-prefill request does not repeat external cache
+            # lookup. Ordinary layers keep their history in HBM, but P's two
+            # rotating banks now contain other layers' KV from the previous
+            # forward. Restore each layer's entire computed prefix, in both KV
+            # groups, before attention. Keep an unaligned tail: its stored key
+            # includes exactly these tokens. Do not advance the save frontier
+            # or replace an existing lookup/checkpoint load specification.
+            load_spec = LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=request.num_computed_tokens,
+                can_load=True,
+            )
         params = getattr(request, "kv_transfer_params", None)
         live_source_requested = bool(
             params and params.get("do_remote_decode")
