@@ -12548,7 +12548,9 @@ class LMCacheConnectorV1Impl:
                 )
                 if self._take_completed_cold_load(req_id, load_spec):
                     self._add_completed_cold_resume(
-                        meta, request_tracker, request, new_token_ids, new_block_ids, load_spec
+                        meta, request_tracker, request, new_token_ids, new_block_ids, load_spec,
+                        new_block_ids_by_bank=new_block_ids_by_bank,
+                        new_block_allocation_mode=new_block_allocation_mode,
                     )
                     continue
 
@@ -12946,6 +12948,9 @@ class LMCacheConnectorV1Impl:
         new_tokens: list[int],
         new_blocks: Any,
         spec: LoadSpec,
+        *,
+        new_block_ids_by_bank: Any = None,
+        new_block_allocation_mode: Any = None,
     ) -> None:
         """Promote completed loading only inside the existing resumed-request branch."""
         tokens = list(request.all_token_ids)
@@ -12956,6 +12961,8 @@ class LMCacheConnectorV1Impl:
             lmcache_cached_tokens=spec.lmcache_cached_tokens,
             vllm_cached_tokens=spec.vllm_cached_tokens,
             all_token_ids=tokens,
+            new_block_ids_by_bank=new_block_ids_by_bank,
+            new_block_allocation_mode=new_block_allocation_mode,
         )
         frontier = int(spec.dsa_remap_frontier)
         tracker.dsa_nonresident_frontier = max(

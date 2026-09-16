@@ -30,6 +30,8 @@ def api() -> SimpleNamespace:
     """Load actual scheduler/worker definitions, stubbing only service imports."""
     methods = {
         "build_connector_meta",
+        "_add_completed_cold_resume",
+        "_take_completed_cold_load",
         "_build_request_meta",
         "_start_load_kv",
         "_is_decode_window_save_request",
@@ -227,6 +229,94 @@ def test_ordinary_prefill_keeps_resident_history_without_new_load(
     adapter = make_scheduler(api, 9565, banked=False)
     for computed, count in [(0, 4096), (4096, 4096), (8192, 1373)]:
         assert schedule(adapter, computed, count).requests[0].load_spec is None
+
+
+@pytest.mark.parametrize("banked", [False, True])
+def test_cold_resume_preserves_allocation_metadata_until_next_growth(
+    api: SimpleNamespace,
+    banked: bool,
+) -> None:
+    adapter = make_scheduler(api, 256, banked=banked)
+    adapter._decode_window_save_window_size = 0
+    adapter._dsa_scratch_capacity = 128
+    schedule(adapter, 0, 256)
+    tracker = adapter._request_trackers["r"]
+    mode = "prefill_child" if banked else "full_parent"
+    assert tracker.block_allocation_mode == mode
+    request = adapter._unfinished_requests["r"]
+    request.all_token_ids.append(999)
+    request.num_computed_tokens = 256
+    spec = api.LoadSpec(
+        vllm_cached_tokens=0,
+        lmcache_cached_tokens=256,
+        can_load=False,
+        dsa_remap_frontier=256,
+    )
+    adapter.load_specs["r"] = spec
+    del adapter._take_completed_cold_load  # Use the real completion handoff.
+    adapter._dsa_cold_loaded_req_ids = {"r"}
+    # Keep emission lightweight while executing the real scheduler, tracker,
+    # and cold-resume methods all the way through their early-continue branch.
+    adapter._build_request_meta = lambda tr, load, **kw: SimpleNamespace(
+        block_allocation_mode=tr.block_allocation_mode,
+        allocated_block_ids_by_bank=tr.allocated_block_ids_by_bank,
+    )
+    restored = ([21, 22, 23], [31, 32, 33])
+    restored_banks = (restored, ([41, 42, 43], [51, 52, 53])) if banked else None
+    cached = SimpleNamespace(
+        req_ids=["r"],
+        new_block_ids=[restored],
+        new_block_ids_by_bank=[restored_banks],
+        new_block_allocation_modes=[mode],
+        resumed_req_ids={"r"},
+    )
+    output = SimpleNamespace(
+        finished_req_ids=[],
+        scheduled_new_reqs=[],
+        num_scheduled_tokens={"r": 1},
+        scheduled_cached_reqs=cached,
+    )
+    meta = adapter.build_connector_meta(output).requests[0]
+    assert meta.resumed_from_preemption
+    assert meta.block_allocation_mode == mode
+    assert tracker.allocated_block_ids_by_bank == restored_banks
+    assert tracker.allocated_block_ids == restored[0]
+    assert tracker.allocated_block_ids_indexer == restored[1]
+    assert tracker.sparse_remap_frontier == 256
+    assert tracker.token_ids == request.all_token_ids
+    if banked:
+        assert tracker.allocated_block_ids_by_bank[0][0] is not restored[0]
+
+    # Empty block deltas must not erase the mode before the next allocation.
+    cached.resumed_req_ids = set()
+    cached.new_block_ids = [None]
+    cached.new_block_ids_by_bank = [None]
+    cached.new_block_allocation_modes = [None]
+    request.num_computed_tokens = 257
+    request.all_token_ids.append(1000)
+    adapter.build_connector_meta(output)
+    assert tracker.block_allocation_mode == mode
+
+    cached.new_block_ids = [([24], [34])]
+    cached.new_block_ids_by_bank = [(([24], [34]), ([44], [54])) if banked else None]
+    cached.new_block_allocation_modes = [mode]
+    request.num_computed_tokens = 258
+    request.all_token_ids.append(1001)
+    adapter.build_connector_meta(output)
+    assert tracker.block_allocation_mode == mode
+    assert tracker.allocated_block_ids == [21, 22, 23, 24]
+    assert tracker.allocated_block_ids_indexer == [31, 32, 33, 34]
+    if banked:
+        assert tracker.allocated_block_ids_by_bank[1] == (
+            [41, 42, 43, 44],
+            [51, 52, 53, 54],
+        )
+    with pytest.raises(RuntimeError, match="allocation mode changed"):
+        tracker.update(
+            [],
+            None,
+            new_block_allocation_mode="full_parent" if banked else "prefill_child",
+        )
 
 
 @pytest.mark.parametrize("can_load", [False, True])
