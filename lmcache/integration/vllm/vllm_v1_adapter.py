@@ -6586,6 +6586,13 @@ class LMCacheConnectorV1Impl:
                     token_count,
                 ):
                     continue
+                if int(cached_ends[-1]) > token_count:
+                    # Chunked prefill stores publish each KV group separately.
+                    # Indexer may already cover the next chunk while latent
+                    # still defines the previous request frontier. Retain all
+                    # group data, but do not seal it as a shorter source. The
+                    # next promotion rebuilds it when the frontier catches up.
+                    continue
                 chunk_token_counts = tuple(
                     int(end) - int(start)
                     for start, end in zip(
