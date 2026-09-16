@@ -8692,13 +8692,14 @@ class LMCacheConnectorV1Impl:
             raise RuntimeError("Full SFA graph cannot use an unhealthy LMCache engine")
         if legacy and not requests and not self.layerwise_retrievers and allow_empty:
             return None
+        request_lanes = {req_id: lane for lane, req_id in enumerate(request_ids)}
         if (
             (legacy and len(requests) != 1)
-            or len(set(request_ids)) != len(request_ids)
+            or len(request_lanes) != len(request_ids)
             or frontiers is None
             or len(frontiers) != len(request_ids)
             or any(frontier < 0 for frontier in frontiers)
-            or any(request.req_id not in request_ids for request in requests)
+            or any(request.req_id not in request_lanes for request in requests)
             or any(not request.is_sparse_decode for request in requests)
             or not self._is_dsa_two_groups()
             or not 0 < target_count <= self.num_layers
@@ -8808,7 +8809,7 @@ class LMCacheConnectorV1Impl:
         self._drain_layerwise_retrievers()
         self.current_layer = target_count
         for request in requests if target_count < self.num_layers else ():
-            lane = request_ids.index(request.req_id)
+            lane = request_lanes[request.req_id]
             source = sources[lane]
             if source is None:
                 continue

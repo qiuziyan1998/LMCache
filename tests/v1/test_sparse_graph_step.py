@@ -612,3 +612,15 @@ def test_source_publication_keeps_strict_validation(malformed: str) -> None:
     with pytest.raises(ValueError, match="coverage"):
         publisher.refresh_sources(state, 512)
     assert state.prepared_sparse_sources is prior_sources
+
+
+@pytest.mark.parametrize("request_ids", [("r1", "r1"), ("not-r1",)])
+def test_lane_mapping_rejects_duplicates_and_absent_requests(request_ids) -> None:
+    adapter = FakeAdapter()
+    with pytest.raises(RuntimeError, match="unique sparse requests"):
+        adapter.prepare_sparse_graph_step(
+            ("layers.0.attn", "layers.1.attn"),
+            request_ids=request_ids,
+            frontiers=(512,) * len(request_ids),
+        )
+    assert adapter.current_layer == 0 and adapter.waits == []
