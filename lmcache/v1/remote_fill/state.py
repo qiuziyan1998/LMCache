@@ -307,6 +307,7 @@ class RemoteFillStateCore:
         descriptor_verification_key: bytes,
         negotiation: NegotiationSpec,
         page_lifecycle: PageLifecycle,
+        group_layer_counts: tuple[int, int] | None = None,
         limits: ProtocolLimits | None = None,
         reservation_ttl_sec: float = 30.0,
         descriptor_ttl_sec: float | None = None,
@@ -324,6 +325,7 @@ class RemoteFillStateCore:
                 authenticate destination descriptors to the selected prefiller.
             negotiation: Exact static layout expected from prefiller peers.
             page_lifecycle: Decoder-owned opaque page callback.
+            group_layer_counts: Trusted runtime physical rows; defaults to equal groups.
             limits: Protocol bounds, or defaults when omitted.
             reservation_ttl_sec: Lifetime of unarmed reservations only.
             descriptor_ttl_sec: D-local deadline for accepting ARM. Defaults
@@ -361,6 +363,15 @@ class RemoteFillStateCore:
         self._validate_limits(self.limits)
         self._descriptor_verification_key = descriptor_verification_key
         self._negotiation = negotiation
+        counts = ((negotiation.layer_count, negotiation.layer_count)
+                  if group_layer_counts is None else group_layer_counts)
+        if (
+            len(counts) != 2
+            or any(type(value) is not int or value <= 0 for value in counts)
+            or counts[0] != negotiation.layer_count
+        ):
+            raise ValueError("RemoteFill group layer counts disagree with negotiation")
+        self._group_layer_counts = tuple(counts)
         self._lifecycle = page_lifecycle
         self._reservation_ttl_sec = reservation_ttl_sec
         self._descriptor_ttl_sec = min(descriptor_ttl, reservation_ttl_sec)
@@ -1528,7 +1539,7 @@ class RemoteFillStateCore:
         exact_coverage = self._has_exact_direct_group_coverage(
             required_pages,
             request.required_store_end,
-            self._direct_groups,
+            self._direct_groups, self._group_layer_counts,
         )
         if (
             transaction.publication_ineligible
@@ -1877,6 +1888,7 @@ class RemoteFillStateCore:
         pages: tuple[ControlPage, ...],
         required_store_end: int,
         direct_groups: tuple[int, ...],
+        group_layer_counts: tuple[int, int] | None = None,
     ) -> bool:
         if required_store_end == 0:
             return not pages
@@ -1892,13 +1904,18 @@ class RemoteFillStateCore:
                 page.kv_group for page in chunk_pages
             } != expected_groups:
                 return False
+            if group_layer_counts is not None and any(
+                page.layer_count != group_layer_counts[page.kv_group]
+                for page in chunk_pages
+            ):
+                return False
             first = chunk_pages[0]
             metadata = {
                 (
                     page.chunk_start,
                     page.chunk_end,
                     page.valid_tokens,
-                    page.layer_count,
+                    page.layer_count if group_layer_counts is None else 0,
                     page.layout_tag,
                 )
                 for page in chunk_pages
@@ -1927,7 +1944,8 @@ class RemoteFillStateCore:
         expected_groups = set(self._direct_groups)
         return bool(groups_by_chunk) and all(
             page.layout_tag == self._negotiation.layout_tag
-            and page.layer_count == self._negotiation.layer_count
+            and page.kv_group in (0, 1)
+            and page.layer_count == self._group_layer_counts[page.kv_group]
             and page.chunk_end - page.chunk_start == page.valid_tokens
             and 0 < page.valid_tokens <= chunk_size
             and page.chunk_start == page.chunk_index * chunk_size

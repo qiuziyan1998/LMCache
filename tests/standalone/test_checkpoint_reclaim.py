@@ -43,6 +43,34 @@ class LayerPage(Page):
     pass
 
 
+@pytest.mark.parametrize("counts", [(3, 1), (79, 22)])
+def test_fragmented_reclaim_keeps_per_group_layer_counts(counts):
+    class GroupKey(LayerKey):
+        @property
+        def kv_group(self):
+            return self[2]
+
+        def split_layers(self, count):
+            return [GroupKey((self[0], layer, self.kv_group)) for layer in range(count)]
+
+    obj, pool, _ = backend()
+    required = 10 * sum(counts)
+    pool.free, pool.total = required, 4096
+    pages = []
+    for group, count in enumerate(counts):
+        for layer in range(count):
+            page = Page(pool)
+            pages.append(page)
+            obj.hot_cache[GroupKey(("chunk", layer, group))] = page
+    assert obj.reclaim_evictable_capacity(
+        required, min_free_bytes=0, min_free_ratio=0, num_layers=counts,
+        cause="checkpoint", max_scan_entries=sum(counts), allocation_failed=True,
+    )
+    assert not obj.hot_cache
+    assert all(page.refs == 0 for page in pages)
+    assert pool.free == 2 * required
+
+
 def backend():
     ns = dict(
         islice=islice,

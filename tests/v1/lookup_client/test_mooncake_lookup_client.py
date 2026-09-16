@@ -55,6 +55,14 @@ def test_mooncake_lookup_closes_store_after_setup_failure(monkeypatch):
     assert observed == {"protocol": "tcp", "closed": True}
 
 
+def test_mooncake_lookup_rejects_missing_runtime_group_counts():
+    config = SimpleNamespace(dsa_two_groups=True)
+    metadata = SimpleNamespace(runtime_kv_group_layer_counts=None)
+
+    with pytest.raises(ValueError, match="runtime"):
+        MooncakeLookupClient(config, metadata, "master")
+
+
 class _FakeTokenDatabase:
     def __init__(self, kv_group=1):
         self.kv_group = kv_group
@@ -203,7 +211,9 @@ def test_mooncake_lookup_passes_request_configs_to_cache_keys():
 def test_mooncake_lookup_requires_dsa_index_group_before_hit():
     client = MooncakeLookupClient.__new__(MooncakeLookupClient)
     client.config = SimpleNamespace(dsa_two_groups=True, use_layerwise=False)
-    client.metadata = SimpleNamespace(kv_shape=(2, 1, 256, 1, 1))
+    client.metadata = SimpleNamespace(
+        kv_shape=(2, 1, 256, 1, 1), runtime_kv_group_layer_counts=(2, 2)
+    )
     client.store = _FakeStore(rets=[1, 0])
     client.token_database = _FakeTokenDatabase(kv_group=0)
 
@@ -222,7 +232,10 @@ def test_mooncake_lookup_requires_dsa_index_group_before_hit():
 def test_mooncake_lookup_layerwise_checks_all_layers_and_groups():
     client = MooncakeLookupClient.__new__(MooncakeLookupClient)
     client.config = SimpleNamespace(dsa_two_groups=True, use_layerwise=True)
-    client.metadata = SimpleNamespace(kv_shape=(2, 1, 256, 1, 1))
+    client.metadata = SimpleNamespace(
+        kv_shape=(2, 1, 256, 1, 1),
+        runtime_kv_group_layer_counts=(2, 2),
+    )
     client.store = _FakeStore(rets=[1, 1, 1, 0])
     client.token_database = _FakeTokenDatabase(kv_group=0)
 
@@ -238,6 +251,23 @@ def test_mooncake_lookup_layerwise_checks_all_layers_and_groups():
     assert client.lookup([1, 2, 3]) == 3
 
 
+def test_mooncake_lookup_uses_runtime_group_counts():
+    client = MooncakeLookupClient.__new__(MooncakeLookupClient)
+    client.config = SimpleNamespace(dsa_two_groups=True, use_layerwise=True)
+    client.metadata = SimpleNamespace(
+        kv_shape=(79, 1, 256, 1, 1),
+        runtime_kv_group_layer_counts=(79, 22),
+    )
+    client.store = _FakeStore()
+    client.token_database = _FakeTokenDatabase(kv_group=0)
+
+    assert client.lookup([1, 2, 3]) == 3
+    assert len(client.store.keys) == 101
+    assert client.store.keys[78].endswith("@0@78")
+    assert client.store.keys[79].endswith("@1@0")
+    assert client.store.keys[-1].endswith("@1@21")
+
+
 def test_mooncake_sampled_lookup_reverse_scans_first_and_last_layers():
     token_db = _FakeMultiChunkTokenDatabase(kv_group=0)
     first_keys = _sampled_string_keys(token_db, 0)
@@ -248,7 +278,10 @@ def test_mooncake_sampled_lookup_reverse_scans_first_and_last_layers():
         use_layerwise=True,
         experimental_sampled_layerwise_lookup=True,
     )
-    client.metadata = SimpleNamespace(kv_shape=(4, 1, 256, 1, 1))
+    client.metadata = SimpleNamespace(
+        kv_shape=(4, 1, 256, 1, 1),
+        runtime_kv_group_layer_counts=(4, 4),
+    )
     client.store = _PresentStore([*first_keys, *winner_keys])
     client.token_database = token_db
 
@@ -270,7 +303,10 @@ def test_mooncake_page_lookup_uses_pages_for_partial_tail():
         chunk_size=4,
         extra_config={"mooncake_page_first_multi_buffer": True},
     )
-    client.metadata = SimpleNamespace(kv_shape=(4, 1, 4, 1, 1))
+    client.metadata = SimpleNamespace(
+        kv_shape=(4, 1, 4, 1, 1),
+        runtime_kv_group_layer_counts=(4, 4),
+    )
     client.store = _FakeStore()
     client.token_database = token_db
 
@@ -296,7 +332,9 @@ def test_mooncake_page_lookup_expands_only_missing_legacy_page():
         chunk_size=4,
         extra_config={"mooncake_page_first_multi_buffer": True},
     )
-    client.metadata = SimpleNamespace(kv_shape=(4, 1, 4, 1, 1))
+    client.metadata = SimpleNamespace(
+        kv_shape=(4, 1, 4, 1, 1), runtime_kv_group_layer_counts=(4, 4)
+    )
     pages = [
         mooncake_page_key(
             token_db._make_key_by_hash(0x100 + chunk, kv_group=group), 4
@@ -350,7 +388,9 @@ def test_mooncake_partial_page_lookup_strips_tag_for_legacy_tail():
         chunk_size=4,
         extra_config={"mooncake_page_first_multi_buffer": True},
     )
-    client.metadata = SimpleNamespace(kv_shape=(4, 1, 4, 1, 1))
+    client.metadata = SimpleNamespace(
+        kv_shape=(4, 1, 4, 1, 1), runtime_kv_group_layer_counts=(4, 4)
+    )
     client.token_database = token_db
     full_pages = [
         mooncake_page_key(

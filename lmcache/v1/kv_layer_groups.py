@@ -2,7 +2,7 @@
 # Standard
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Sequence
 
 # Third Party
 import torch
@@ -11,6 +11,99 @@ import torch
 from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
+
+
+def validate_two_group_layer_counts(
+    counts: Optional[Sequence[int]],
+) -> tuple[int, int]:
+    """Validate serving-engine runtime cardinalities for DSA groups.
+
+    Args:
+        counts: Runtime layer counts in latent/indexer order.
+
+    Returns:
+        The validated latent and indexer layer counts.
+
+    Raises:
+        ValueError: If runtime metadata is missing or does not describe
+            exactly two non-empty groups.
+    """
+    if counts is None:
+        raise ValueError(
+            "DSA two-group mode requires runtime KV group layer counts from "
+            "the serving engine"
+        )
+    if len(counts) == 2 and all(
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+        for value in counts
+    ):
+        return int(counts[0]), int(counts[1])
+    raise ValueError(
+        "DSA two-group mode requires exactly two positive runtime layer "
+        f"counts, got: {counts!r}"
+    )
+
+
+def resolve_kv_group_num_layers(
+    *,
+    kv_group: int,
+    dsa_two_groups: bool,
+    model_num_layers: int,
+    registered_groups: Sequence["KVLayerGroupInfo"],
+    runtime: Optional[Sequence[int]] = None,
+) -> int:
+    """Resolve the authoritative transfer cardinality of a KV group.
+
+    Shared by the cache engine and standalone lookup clients. Resolution
+    order (fail-closed on disagreement):
+
+    DSA mode requires serving-engine runtime counts. Registered worker groups
+    are then validated against that expected topology before being used.
+
+    Args:
+        kv_group: The KV group index (0 = latent, 1 = indexer).
+        dsa_two_groups: Whether DSA two-group mode is enabled.
+        model_num_layers: The model forward layer count.
+        registered_groups: Registered per-group layer info, if any.
+        runtime: Serving-engine-resolved per-group layer counts, if any.
+
+    Returns:
+        The number of layers in the group.
+
+    Raises:
+        ValueError: If runtime metadata is missing or invalid, kv_group is out
+            of range, or registered cardinalities disagree.
+    """
+    if not dsa_two_groups:
+        return model_num_layers
+    runtime_counts = validate_two_group_layer_counts(runtime)
+    if registered_groups:
+        if len(registered_groups) != 2:
+            raise ValueError(
+                "DSA two-group mode requires exactly two registered KV layer "
+                f"groups, got {len(registered_groups)}"
+            )
+        if kv_group < 0 or kv_group >= len(registered_groups):
+            raise ValueError(
+                "KV group is out of range for registered layer groups: "
+                f"kv_group={kv_group}, num_groups={len(registered_groups)}"
+            )
+        registered = tuple(group.num_layers for group in registered_groups)
+        if registered != runtime_counts:
+            raise ValueError(
+                "Runtime KV group metadata disagrees with the registered KV "
+                f"layer groups: runtime={list(runtime_counts)}, "
+                f"registered={list(registered)}."
+            )
+        return registered[kv_group]
+    if kv_group < 0 or kv_group >= len(runtime_counts):
+        raise ValueError(
+            "KV group is out of range for runtime metadata: "
+            f"kv_group={kv_group}, group_counts={list(runtime_counts)}"
+        )
+    return runtime_counts[kv_group]
 
 
 @dataclass

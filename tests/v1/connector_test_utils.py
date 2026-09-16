@@ -94,6 +94,7 @@ def make_worker_connector(
     connector._cold_perf_load_started = {}
     connector._cold_perf_dense_load_started = {}
     connector._cold_perf_dense_load_completed = {}
+    connector._layerwise_sparse_shared_ordered = []
     connector.kv_caches = {"layer0": torch.zeros(1)}
     connector.config = MagicMock()
     connector.config.get_extra_config_value = lambda key, default=False: default
@@ -107,6 +108,7 @@ def make_worker_impl() -> LMCacheConnectorV1Impl:
     impl._cold_perf_load_started = {}
     impl._cold_perf_dense_load_started = {}
     impl._cold_perf_dense_load_completed = {}
+    impl._layerwise_sparse_shared_ordered = []
     impl.lmcache_engine = None
     impl.kv_role = "kv_both"
     impl._lmcache_chunk_size = 256
