@@ -32,6 +32,10 @@ class PreparedSparseSource:
     pointer_device: Optional[torch.device] = None
     # Only the validating builder sets this. dataclasses.replace resets it.
     validated_chunk_size: Optional[int] = field(default=None, init=False)
+    # Table history may retain this token without retaining source allocations.
+    binding_token: object = field(
+        default_factory=object, init=False, repr=False, compare=False
+    )
 
 
 def build_prepared_sparse_source(

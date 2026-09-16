@@ -178,3 +178,20 @@ def test_prepared_source_rejects_wrong_configured_chunks(
             chunk_token_counts=counts,
             chunk_size=4,
         )
+
+
+def test_binding_token_does_not_retain_source_and_changes_on_replace():
+    import weakref
+    from dataclasses import replace
+    from lmcache.v1.gpu_connector.sparse import (
+        PreparedSparseSource, PreparedSparseSourceLayer,
+    )
+
+    pointers = torch.ones(1, dtype=torch.int64)
+    source = PreparedSparseSource((PreparedSparseSourceLayer((), pointers),), 1, (1,))
+    token = source.binding_token
+    changed = replace(source, total_tokens=1)
+    assert changed.binding_token is not token
+    pointer_ref = weakref.ref(pointers)
+    del pointers, source, changed
+    assert pointer_ref() is None  # A retained token owns no pointer tensor.
