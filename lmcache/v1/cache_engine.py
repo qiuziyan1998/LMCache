@@ -6754,9 +6754,25 @@ class LMCacheEngine:
                     kv_group=kv_group,
                     kwargs=kwargs,
                 )
-                for result in passive_retriever:
-                    yielded_steps += 1
-                    yield result
+                try:
+                    result = next(passive_retriever)
+                    while True:
+                        yielded_steps += 1
+                        try:
+                            layer_request = yield result
+                        except GeneratorExit:
+                            raise
+                        except BaseException as error:
+                            result = passive_retriever.throw(error)
+                        else:
+                            # P-node sends the next layer's bank mapping.
+                            # A for/yield wrapper silently discards it.
+                            result = passive_retriever.send(layer_request)
+                except StopIteration:
+                    pass
+                finally:
+                    # Keep inner source/bank cleanup deterministic on abort.
+                    passive_retriever.close()
             except _RemoteFillMaterializationError as exc:
                 if (
                     yielded_steps >= num_layers + 2
@@ -7065,9 +7081,24 @@ class LMCacheEngine:
                     planned_page_chunks=planned_page_chunks,
                     remote_fill_plan=remote_fill_plan,
                 )
-                for result in rank0_retriever:
-                    yielded_steps += 1
-                    yield result
+                try:
+                    result = next(rank0_retriever)
+                    while True:
+                        yielded_steps += 1
+                        try:
+                            layer_request = yield result
+                        except GeneratorExit:
+                            raise
+                        except BaseException as error:
+                            result = rank0_retriever.throw(error)
+                        else:
+                            # Match the passive-rank protocol, including
+                            # per-layer slot_mapping overrides and yield count.
+                            result = rank0_retriever.send(layer_request)
+                except StopIteration:
+                    pass
+                finally:
+                    rank0_retriever.close()
             except _RemoteFillMaterializationError as exc:
                 if (
                     remote_fill_plan is None
