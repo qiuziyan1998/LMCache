@@ -86,8 +86,9 @@ def _keyed_results(
         (MemoryFormat.KV_DSA_INDEX_FMT, torch.Size([8]), 1),
     ),
 )
+@pytest.mark.parametrize("early", [False, True])
 def test_batched_put_layer_pages_uses_one_local_and_remote_page(
-    monkeypatch, fmt, shape, kv_group
+    monkeypatch, fmt, shape, kv_group, early
 ):
     allocator = TensorMemoryAllocator(torch.zeros(16384, dtype=torch.uint8))
     pages = allocator.batched_allocate_layer_pages(
@@ -147,7 +148,9 @@ def test_batched_put_layer_pages_uses_one_local_and_remote_page(
     manager._freeze = False
     manager._freeze_lock = threading.Lock()
 
-    futures = manager.batched_put_layer_pages(keys, pages, req_id="request")
+    futures = manager.batched_put_layer_pages(
+        keys, pages, req_id="request", publish_local_early=early
+    )
 
     assert len(futures) == 1
     remote_keys, ptrs, sizes, owners, ready_event, req_id = remote_calls[0]
@@ -159,8 +162,9 @@ def test_batched_put_layer_pages_uses_one_local_and_remote_page(
     assert len(owners) == 1
     assert ready_event is None
     assert req_id == "request"
-    assert all(page.get_ref_count() == 1 for page in pages)
-    assert local_calls == []
+    assert all(page.get_ref_count() == (2 if early else 1) for page in pages)
+    assert local_calls == ([(keys, pages)] if early else [])
+    assert not futures[0].done()
     remote_futures[0].set_result(None)
     assert local_calls == [(keys, pages)]
     assert futures[0].result() is None
