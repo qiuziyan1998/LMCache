@@ -121,7 +121,8 @@ def reclaim(obj, size, limit=16):
     )
 
 
-def test_reclaim_skips_pinned_and_borrowed_pages_and_stops_at_target():
+@pytest.mark.parametrize("limit", [None, 16])
+def test_reclaim_skips_pinned_and_borrowed_pages_and_stops_at_target(limit):
     obj, pool, removed = backend()
     obj.hot_cache.update(
         [
@@ -132,7 +133,7 @@ def test_reclaim_skips_pinned_and_borrowed_pages_and_stops_at_target():
             (5, LayerPage(pool)),
         ]
     )
-    assert reclaim(obj, 20)
+    assert reclaim(obj, 20, limit=limit)
     assert removed == [3, 4] and pool.free == 20
     assert list(obj.hot_cache) == [1, 2, 5]
 
@@ -155,13 +156,14 @@ def test_busy_cache_lock_refuses_without_waiting():
     assert not removed
 
 
+@pytest.mark.parametrize("limit", [None, 16])
 @pytest.mark.parametrize("borrowed", [False, True])
-def test_legacy_chunk_requires_every_layer_to_be_evictable(borrowed):
+def test_legacy_chunk_requires_every_layer_to_be_evictable(borrowed, limit):
     obj, pool, removed = backend()
     keys = [LayerKey(("chunk", layer)) for layer in range(2)]
     obj.hot_cache[keys[0]] = Page(pool)
     obj.hot_cache[keys[1]] = Page(pool, refs=2 if borrowed else 1)
-    assert reclaim(obj, 10) is (not borrowed)
+    assert reclaim(obj, 10, limit=limit) is (not borrowed)
     assert removed == ([] if borrowed else keys)
 
 
@@ -184,7 +186,7 @@ def test_layer_major_legacy_entries_can_reclaim_one_complete_chunk():
     assert removed == [LayerKey(("a", 0)), LayerKey(("a", 1))]
 
 
-def test_full_scan_remote_fill_behavior_remains_available():
+def test_remote_fill_retains_the_requested_free_capacity_floor():
     obj, pool, removed = backend()
     obj.hot_cache.update(
         [(1, LayerPage(pool, pins=1)), (2, LayerPage(pool)), (3, LayerPage(pool))]
@@ -207,23 +209,36 @@ def test_other_policy_preserves_bounded_refusal_instead_of_changing_victims():
     assert not removed
 
 
-def test_no_eviction_if_capacity_already_available():
+@pytest.mark.parametrize("limit", [None, 16])
+def test_no_eviction_if_capacity_already_available(limit):
     obj, pool, removed = backend()
+    class NoScan(OrderedDict):
+        def __iter__(self):
+            raise AssertionError("no-pressure path must not scan")
+
+        def items(self):
+            raise AssertionError("no-pressure path must not scan")
+
+        def values(self):
+            raise AssertionError("no-pressure path must not scan")
+
+    obj.hot_cache = NoScan()
     pool.free = 20
     obj.cpu_lock.acquire()
     try:
-        assert reclaim(obj, 10)
+        assert reclaim(obj, 10, limit=limit)
     finally:
         obj.cpu_lock.release()
     assert not removed
 
 
-def test_post_reclaim_capacity_race_is_not_reported_as_success():
+@pytest.mark.parametrize("limit", [None, 16])
+def test_post_reclaim_capacity_race_is_not_reported_as_success(limit):
     obj, pool, removed = backend()
     obj.hot_cache[1] = LayerPage(pool)
     # Another allocator consumes the newly freed capacity before the final check.
     obj.get_allocator_capacity_bytes = lambda: (0, pool.total)
-    assert not reclaim(obj, 10)
+    assert not reclaim(obj, 10, limit=limit)
     assert removed == [1]
 
 
@@ -240,3 +255,115 @@ def test_candidate_scan_does_not_visit_beyond_the_budget():
     obj.hot_cache = CountedCache((i, LayerPage(pool, pins=1)) for i in range(20))
     assert not reclaim(obj, 10, limit=3)
     assert visited == [0, 1, 2] and not removed
+
+
+def test_unbounded_lru_checks_each_candidate_once_and_stops_early():
+    obj, pool, removed = backend()
+    checked = []
+
+    class CountedPage(LayerPage):
+        @property
+        def can_evict(self):
+            checked.append(self)
+            return super().can_evict
+
+    pages = [CountedPage(pool, pins=int(i < 100)) for i in range(1000)]
+    obj.hot_cache.update(enumerate(pages))
+    assert reclaim(obj, 30, limit=None)
+    assert removed == [100, 101, 102]
+    assert checked == pages[:103]
+    assert pool.free == 30
+
+
+def test_unbounded_lru_does_not_refuse_victims_beyond_checkpoint_scan_limit():
+    obj, pool, removed = backend()
+    obj.hot_cache.update((i, LayerPage(pool, pins=1)) for i in range(100))
+    obj.hot_cache[100] = LayerPage(pool)
+    assert reclaim(obj, 10, limit=None)
+    assert removed == [100]
+
+
+def test_unbounded_shortfall_preserves_cache_order_references_and_capacity():
+    obj, pool, removed = backend()
+    pages = [LayerPage(pool), LayerPage(pool, pins=1), LayerPage(pool, refs=2)]
+    obj.hot_cache.update(enumerate(pages))
+    assert not reclaim(obj, 11, limit=None)
+    assert list(obj.hot_cache.items()) == list(enumerate(pages))
+    assert [page.refs for page in pages] == [1, 1, 2]
+    assert not removed and pool.free == 0
+
+
+@pytest.mark.parametrize("blocked_layer", [0, 1])
+def test_unbounded_lru_skips_blocked_legacy_group_for_later_page(blocked_layer):
+    obj, pool, removed = backend()
+    keys = [LayerKey(("chunk", layer)) for layer in range(2)]
+    for layer, key in enumerate(keys):
+        obj.hot_cache[key] = Page(pool, pins=int(layer == blocked_layer))
+    obj.hot_cache["later"] = LayerPage(pool)
+    assert reclaim(obj, 10, limit=None)
+    assert removed == ["later"] and list(obj.hot_cache) == keys
+    assert all(page.refs == 1 for page in obj.hot_cache.values())
+
+
+def test_unbounded_legacy_siblings_are_not_counted_twice():
+    obj, pool, removed = backend()
+    keys = [LayerKey((chunk, layer)) for layer in range(2) for chunk in ("a", "b")]
+    obj.hot_cache.update((key, Page(pool)) for key in keys)
+    assert not reclaim(obj, 41, limit=None)
+    assert not removed
+    assert reclaim(obj, 21, limit=None)
+    assert removed == [keys[0], keys[2], keys[1], keys[3]]
+    assert pool.free == 40
+
+
+def test_non_lru_unbounded_reclaim_preserves_policy_victim_order():
+    obj, pool, removed = backend()
+
+    class NewestFirst(type(obj.cache_policy)):
+        def get_evict_candidates(self, cache, num_candidates=1):
+            eligible = [key for key in reversed(cache) if cache[key].can_evict]
+            return eligible[:num_candidates]
+
+    obj.cache_policy = NewestFirst()
+    obj.hot_cache.update((i, LayerPage(pool)) for i in range(3))
+    assert reclaim(obj, 20, limit=None)
+    assert removed == [2, 1] and list(obj.hot_cache) == [0]
+
+
+@pytest.mark.parametrize("hot", [False, True])
+def test_empty_cache_cannot_reclaim_capacity(hot):
+    obj, pool, removed = backend()
+    obj.use_hot = hot
+    assert not reclaim(obj, 10, limit=None)
+    assert not removed and pool.free == 0
+
+
+def test_unbounded_release_is_outside_cache_lock_and_preserves_ratio_floor():
+    obj, pool, removed = backend()
+
+    class ReleasedPage(LayerPage):
+        def ref_count_down(self):
+            assert not obj.cpu_lock.locked()
+            super().ref_count_down()
+
+    pool.free = 90
+    obj.hot_cache.update((i, ReleasedPage(pool)) for i in range(10))
+    assert obj.reclaim_evictable_capacity(
+        20, min_free_bytes=5, min_free_ratio=0.1, num_layers=2,
+        cause="remote_fill_capacity_reclaim",
+    )
+    assert removed == [0, 1, 2] and pool.free == 120
+
+
+def test_perf_log_distinguishes_selected_bytes_from_total_cache(monkeypatch):
+    obj, pool, _ = backend()
+    obj.hot_cache.update((i, LayerPage(pool)) for i in range(10))
+    scope = obj.reclaim_evictable_capacity.__func__.__globals__
+    logs = []
+    monkeypatch.setitem(scope, "serving_perf_enabled", lambda: True)
+    monkeypatch.setitem(scope, "time", NS(perf_counter=lambda: 1.0))
+    monkeypatch.setitem(scope, "logger", object())
+    monkeypatch.setitem(scope, "serving_perf_log", lambda *args, **kw: logs.append(kw))
+    assert reclaim(obj, 20, limit=None)
+    assert logs[0]["evictable_bytes"] == logs[0]["evicted_bytes"] == 20
+    assert logs[0]["evictable_bytes_scope"] == "eligible_candidates"

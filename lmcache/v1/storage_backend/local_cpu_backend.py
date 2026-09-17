@@ -1625,8 +1625,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
     ) -> bool:
         """Evict enough eligible entries to accommodate one allocation.
 
-        The method scans once and never waits or allocates. If the pressure
-        snapshot proves all eligible entries insufficient, it changes nothing.
+        LRU selection stops once enough eligible candidates are found, without
+        an allocation retry. Insufficient candidates leave the cache unchanged.
+        The unbounded path may wait for the cache lock.
 
         Args:
             required_bytes: Incoming allocation size to accommodate.
@@ -1683,25 +1684,37 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     self.cpu_lock.release()
         elif free_before < target_free_bytes:
             with self.cpu_lock:
-                if self.use_hot:
-                    evictable_bytes = sum(
-                        memory_obj.get_physical_size()
-                        for memory_obj in self.hot_cache.values()
-                        if memory_obj.can_evict
+                if type(self.cache_policy) is LRUCachePolicy:
+                    # Reuse atomic candidate selection without a scan cap:
+                    # RemoteFill must still reach victims beyond pinned entries.
+                    keys, removed, evictable_bytes = self._pop_bounded_reclaim_locked(
+                        target_free_bytes - free_before,
+                        num_layers,
+                        None,
+                        cause,
                     )
-                if free_before + evictable_bytes >= target_free_bytes:
-                    while free_before + evicted_bytes < target_free_bytes:
-                        keys, objects = self._pop_layer_page_evict_candidate_locked(
-                            num_layers,
-                            cause=cause,
+                    evicted_keys = len(keys)
+                    evicted_bytes = sum(obj.get_physical_size() for obj in removed)
+                else:
+                    if self.use_hot:
+                        evictable_bytes = sum(
+                            memory_obj.get_physical_size()
+                            for memory_obj in self.hot_cache.values()
+                            if memory_obj.can_evict
                         )
-                        if not objects:
-                            break
-                        evicted_keys += len(keys)
-                        evicted_bytes += sum(
-                            memory_obj.get_physical_size() for memory_obj in objects
-                        )
-                        removed.extend(objects)
+                    if free_before + evictable_bytes >= target_free_bytes:
+                        while free_before + evicted_bytes < target_free_bytes:
+                            keys, objects = self._pop_layer_page_evict_candidate_locked(
+                                num_layers,
+                                cause=cause,
+                            )
+                            if not objects:
+                                break
+                            evicted_keys += len(keys)
+                            evicted_bytes += sum(
+                                memory_obj.get_physical_size() for memory_obj in objects
+                            )
+                            removed.extend(objects)
 
         for memory_obj in removed:
             memory_obj.ref_count_down()
@@ -1719,6 +1732,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 free_before=free_before,
                 free_after=free_after,
                 evictable_bytes=evictable_bytes,
+                evictable_bytes_scope=(
+                    "eligible_candidates"
+                    if max_scan_entries is not None
+                    or type(self.cache_policy) is LRUCachePolicy
+                    else "cache"
+                ),
                 evicted_bytes=evicted_bytes,
                 evicted_keys=evicted_keys,
                 outcome=(
@@ -1737,16 +1756,33 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self,
         required_bytes: int,
         num_layers: int | tuple[int, int],
-        max_entries: int,
+        max_entries: Optional[int],
         cause: str,
     ) -> tuple[list[CacheEngineKey], list[MemoryObj], int]:
-        """Select a bounded LRU window atomically before removing any entries."""
+        """Select sufficient LRU victims atomically, optionally bounding the scan."""
         if not self.use_hot or type(self.cache_policy) is not LRUCachePolicy:
             return [], [], 0
         seen = set()
         candidates = []
         evictable_bytes = 0
-        for key in islice(self.hot_cache, max_entries):
+        entries = (
+            islice(self.hot_cache, max_entries)
+            if max_entries is not None
+            else (key for key, obj in self.hot_cache.items() if obj.can_evict)
+        )
+        for key in entries:
+            if max_entries is None:
+                memory_obj = self.hot_cache[key]
+                if isinstance(memory_obj, LayerPageMemoryObj) or not isinstance(
+                    key, LayerCacheEngineKey
+                ):
+                    # Canonical pages have no siblings or scan budget to track.
+                    # Pinned pages are filtered without temporary containers.
+                    candidates.append(key)
+                    evictable_bytes += memory_obj.get_physical_size()
+                    if evictable_bytes >= required_bytes:
+                        break
+                    continue
             if key in seen:
                 continue
             keys = (
@@ -1763,7 +1799,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     if item in self.hot_cache
                 ]
             )
-            if len(seen) + sum(item not in seen for item in keys) > max_entries:
+            if max_entries is not None and (
+                len(seen) + sum(item not in seen for item in keys) > max_entries
+            ):
                 break
             seen.update(keys)
             # Count every legacy sibling against the budget, even when layers
