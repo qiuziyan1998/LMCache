@@ -37,14 +37,9 @@ def method(name, **extra):
     prefix = ast.ImportFrom(
         module="__future__", names=[ast.alias(name="annotations")], level=0
     )
-    helpers = [
-        n for n in tree.body
-        if isinstance(n, ast.FunctionDef)
-        and n.name in {"_copy_block_ids_by_bank", "_block_allocation_mode_value"}
-    ]
     exec(
         compile(
-            ast.fix_missing_locations(ast.Module(body=[prefix, *helpers, node], type_ignores=[])),
+            ast.fix_missing_locations(ast.Module(body=[prefix, node], type_ignores=[])),
             str(SOURCE),
             "exec",
         ),

@@ -66,9 +66,6 @@ class LMCacheMetadata:
     kv_connector_extra_config: Optional[dict] = None
     """ vLLM max_model_len; used to cap layerwise GPU staging in two-group DSA """
     max_model_len: Optional[int] = None
-    """Immutable per-group layer counts resolved by the serving engine."""
-    runtime_kv_group_layer_counts: Optional[tuple[int, ...]] = None
-    runtime_kv_group_layer_names: Optional[tuple[tuple[str, ...], ...]] = None
 
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""

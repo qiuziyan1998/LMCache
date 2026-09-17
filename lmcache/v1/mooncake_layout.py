@@ -352,12 +352,6 @@ def mooncake_payload_layout(
             extra_config.get("mooncake_layer_merged_page_objects", False)
         ),
     }
-    counts = getattr(metadata, "runtime_kv_group_layer_counts", None)
-    if counts is not None and len(set(counts)) > 1:
-        names = getattr(metadata, "runtime_kv_group_layer_names", None)
-        if names is None or tuple(map(len, names)) != tuple(counts):
-            raise ValueError("Unequal KV groups require ordered runtime layer names")
-        descriptor["runtime_kv_groups"] = tuple(zip(counts, names, strict=True))
     encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
     return hashlib.blake2b(encoded.encode(), digest_size=8).hexdigest(), descriptor
 

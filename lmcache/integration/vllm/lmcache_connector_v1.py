@@ -44,16 +44,7 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
             )
         else:
             super().__init__(vllm_config=vllm_config, role=role)
-        self._lmcache_engine = LMCacheConnectorV1Impl(
-            vllm_config,
-            role,
-            self,
-            **(
-                {"kv_cache_config": kv_cache_config}
-                if kv_cache_config is not None
-                else {}
-            ),
-        )
+        self._lmcache_engine = LMCacheConnectorV1Impl(vllm_config, role, self)
 
     @property
     def supports_dsa_compact_external_load(self) -> bool:
@@ -113,20 +104,6 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         )
         if callable(configure):
             configure(enabled)
-
-    @property
-    def supports_layerwise_prefill_transfer_window(self) -> bool:
-        return self._lmcache_engine.supports_layerwise_prefill_transfer_window
-
-    @property
-    def supports_dsa_index_lmcache(self) -> bool:
-        return self._lmcache_engine.supports_dsa_index_lmcache
-
-    @property
-    def supports_layerwise_prefill_dsa_index_transfer_window(self) -> bool:
-        return (
-            self._lmcache_engine.supports_layerwise_prefill_dsa_index_transfer_window
-        )
 
     # ==============================
     # Worker-side methods
@@ -211,16 +188,6 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
             payload_event=payload_event,
             selected_token_counts=selected_token_counts,
         )
-
-    def submit_layerwise_prefill_load(self, layer_name: str) -> None:
-        """Submit the next dense-prefill layer during the current layer's
-        post-attention transfer window.
-        """
-        self._lmcache_engine.submit_layerwise_prefill_load(layer_name)
-
-    def finish_layerwise_prefill_save(self, layer_name: str) -> None:
-        """Run storage publication after the layer's HCOM is submitted."""
-        self._lmcache_engine.finish_layerwise_prefill_save(layer_name)
 
     def save_kv_layer(
         self,

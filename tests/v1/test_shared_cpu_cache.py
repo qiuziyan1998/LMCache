@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import defaultdict
-from contextlib import nullcontext
 from dataclasses import replace
+from contextlib import nullcontext
 from types import SimpleNamespace
 import asyncio
 import os
@@ -29,9 +29,9 @@ from lmcache.v1.shared_cpu_cache import (
     SharedChunkHandle,
     SharedCPUCacheError,
     SharedCPUCacheValidationError,
-    SharedCPURequestLease,
     SharedHandleBatch,
     SharedHandleEnvelope,
+    SharedCPURequestLease,
     SharedSlabMapping,
     validate_shared_handle_batch,
 )
@@ -2337,18 +2337,9 @@ def noop_pin_monitor(monkeypatch):
 
 
 class _FakeLayerwiseGPUConnector:
-    def __init__(
-        self,
-        events=None,
-        *,
-        send_error_after_launch: bool = False,
-        terminal_sync_error: bool = False,
-    ):
+    def __init__(self, events=None):
         self.close_count = 0
-        self.final_next_count = 0
         self.sent = []
-        self.send_error_after_launch = send_error_after_launch
-        self.terminal_sync_error = terminal_sync_error
         self.events = events
 
     def synchronize_dense_load_stream(self):
@@ -2361,12 +2352,6 @@ class _FakeLayerwiseGPUConnector:
                 mem_objs = yield
                 if mem_objs is not None:
                     self.sent.append(mem_objs)
-                    if self.send_error_after_launch:
-                        raise RuntimeError("H2D send failed after launch")
-                else:
-                    self.final_next_count += 1
-                    if self.terminal_sync_error:
-                        raise RuntimeError("terminal load-stream sync failed")
         finally:
             self.close_count += 1
 
@@ -2452,14 +2437,12 @@ def _make_passive_shared_retriever(
     request_ordinal: int = 0,
     kv_group: int = 0,
     retain: bool = False,
-    deferred_layerwise_get: bool = False,
 ):
     ret_mask = torch.zeros(4, dtype=torch.bool)
     keys_by_layer = _make_key().split_layers(engine.num_layers)
     kwargs = {
         "shared_cpu_phase": "dense_prefix",
         "shared_cpu_request_ordinal": request_ordinal,
-        "deferred_layerwise_get": deferred_layerwise_get,
     }
     if retain:
         kwargs["_retain_shared_dense_cache"] = True
@@ -2602,7 +2585,6 @@ def test_rank0_post_init_broadcasts_startup_error_on_storage_failure(
     engine.shared_cpu_cache_name = "/lmcache-test"
     engine.shared_cpu_cache_slab_size = None
     engine.shared_cpu_cache_generation = 0
-    engine._shared_cpu_sparse_capacity_sanity_pending = True
     engine.metadata = SimpleNamespace(
         use_mla=True,
         world_size=2,
@@ -2614,12 +2596,8 @@ def test_rank0_post_init_broadcasts_startup_error_on_storage_failure(
         get_lookup_server_worker_ids=lambda use_mla, world_size: [],
     )
     broadcasts = []
-    capacity_reports = []
     engine.broadcast_object_fn = lambda payload, src: broadcasts.append(
         (payload, src)
-    )
-    engine._report_shared_cpu_sparse_capacity_sanity = lambda: (
-        capacity_reports.append("reported")
     )
 
     def fail_storage_manager(*args, **kwargs):
@@ -2633,8 +2611,6 @@ def test_rank0_post_init_broadcasts_startup_error_on_storage_failure(
     with pytest.raises(RuntimeError, match="stale shm segment"):
         engine.post_init()
 
-    assert capacity_reports == ["reported"]
-    assert engine._shared_cpu_sparse_capacity_sanity_pending is False
     assert len(broadcasts) == 1
     envelope, src = broadcasts[0]
     assert src == 0
@@ -5084,10 +5060,7 @@ def test_shared_envelope_reports_bad_payload_type_status_and_handles():
         SharedHandleEnvelope.from_dict(encoded)
 
 
-@pytest.mark.parametrize("deferred_layerwise_get", [False, True])
-def test_dense_prefix_zero_hit_broadcasts_skipped_not_miss(
-    deferred_layerwise_get,
-):
+def test_dense_prefix_zero_hit_broadcasts_skipped_not_miss():
     engine = object.__new__(LMCacheEngine)
     engine.storage_manager = SimpleNamespace()
     engine.gpu_connector = SimpleNamespace()
@@ -5114,10 +5087,7 @@ def test_dense_prefix_zero_hit_broadcasts_skipped_not_miss(
             monitor_req_id=123,
             req_id="req-1",
             kv_group=0,
-            kwargs={
-                "shared_cpu_phase": "dense_prefix",
-                "deferred_layerwise_get": deferred_layerwise_get,
-            },
+            kwargs={"shared_cpu_phase": "dense_prefix"},
         )
     )
 
@@ -5288,9 +5258,8 @@ def test_shared_dense_page_first_publishes_one_compact_batch(
 
 @pytest.mark.parametrize("kv_group", [0, 1])
 @pytest.mark.parametrize("page_first", [False, True])
-@pytest.mark.parametrize("deferred_layerwise_get", [False, True])
 def test_shared_dense_rank0_retriever_releases_before_result_tail(
-    monkeypatch, kv_group, page_first, deferred_layerwise_get
+    monkeypatch, kv_group, page_first
 ):
     import lmcache.v1.cache_engine as cache_engine_module
 
@@ -5301,8 +5270,7 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
     )
     engine = object.__new__(LMCacheEngine)
     engine.config = SimpleNamespace(
-        extra_config={"mooncake_page_first_multi_buffer": page_first},
-        chunk_size=4,
+        extra_config={"mooncake_page_first_multi_buffer": page_first}
     )
     engine.storage_manager = SimpleNamespace()
     engine.gpu_connector = _FakeLayerwiseGPUConnector()
@@ -5349,10 +5317,7 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
         monitor_req_id=123,
         req_id="req-1",
         kv_group=kv_group,
-        kwargs={
-            "shared_cpu_phase": "dense_prefix",
-            "deferred_layerwise_get": deferred_layerwise_get,
-        },
+        kwargs={"shared_cpu_phase": "dense_prefix"},
     )
 
     yielded = [next(retriever) for _ in range(engine.num_layers + 1)]
@@ -5369,14 +5334,9 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
     assert engine.gpu_connector.sent == [[mem_objs[0]], [mem_objs[1]]]
     assert [mem.ref_count_down_count for mem in mem_objs] == [0, 0]
     assert all(mem.is_pinned for mem in mem_objs)
-    assert engine.gpu_connector.final_next_count == int(
-        not deferred_layerwise_get
-    )
-    assert engine.gpu_connector.close_count == int(not deferred_layerwise_get)
+    assert engine.gpu_connector.close_count == 1
 
     assert torch.equal(next(retriever), ret_mask)
-    assert engine.gpu_connector.final_next_count == 1
-    assert engine.gpu_connector.close_count == 1
     assert [mem.ref_count_down_count for mem in mem_objs] == [1, 1]
     assert all(not mem.is_pinned for mem in mem_objs)
     with pytest.raises(StopIteration):
@@ -5410,9 +5370,8 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
 
 
 @pytest.mark.parametrize("kv_group", [0, 1])
-@pytest.mark.parametrize("deferred_layerwise_get", [False, True])
 def test_shared_dense_passive_retriever_releases_before_result_tail(
-    monkeypatch, kv_group, deferred_layerwise_get
+    monkeypatch, kv_group
 ):
     import lmcache.v1.cache_engine as cache_engine_module
 
@@ -5425,7 +5384,6 @@ def test_shared_dense_passive_retriever_releases_before_result_tail(
     retriever, ret_mask = _make_passive_shared_retriever(
         engine,
         kv_group=kv_group,
-        deferred_layerwise_get=deferred_layerwise_get,
     )
 
     yielded = [next(retriever) for _ in range(engine.num_layers + 1)]
@@ -5441,14 +5399,9 @@ def test_shared_dense_passive_retriever_releases_before_result_tail(
         view.ref_count_down_count
         for view in engine.shared_cpu_cache_passive_allocator.views
     ] == [0, 0]
-    assert engine.gpu_connector.final_next_count == int(
-        not deferred_layerwise_get
-    )
-    assert engine.gpu_connector.close_count == int(not deferred_layerwise_get)
+    assert engine.gpu_connector.close_count == 1
 
     assert torch.equal(next(retriever), ret_mask)
-    assert engine.gpu_connector.final_next_count == 1
-    assert engine.gpu_connector.close_count == 1
     assert [
         view.ref_count_down_count
         for view in engine.shared_cpu_cache_passive_allocator.views
@@ -5472,120 +5425,6 @@ def test_shared_dense_passive_retriever_releases_before_result_tail(
         )
     assert events[0] == "sync"
     assert events.count("release") == 2
-
-
-@pytest.mark.parametrize("failure_point", ["send", "terminal_sync"])
-def test_shared_dense_rank0_consumer_failure_retains_sources(
-    monkeypatch,
-    failure_point,
-):
-    import lmcache.v1.cache_engine as cache_engine_module
-
-    monkeypatch.setattr(
-        cache_engine_module,
-        "assert_layerwise_gpu_connector",
-        lambda _connector: None,
-    )
-    engine = object.__new__(LMCacheEngine)
-    engine.config = SimpleNamespace(extra_config={})
-    engine.storage_manager = SimpleNamespace()
-    engine.gpu_connector = _FakeLayerwiseGPUConnector(
-        send_error_after_launch=failure_point == "send",
-        terminal_sync_error=failure_point == "terminal_sync",
-    )
-    engine.num_layers = 2
-    engine.shared_cpu_cache_generation = 9
-    engine.metadata = SimpleNamespace(first_rank=0, worker_id=0)
-    engine.stats_monitor = SimpleNamespace(
-        on_retrieve_finished=lambda monitor_req_id, tokens: None
-    )
-    mem_objs = [_FakeResolvableMemoryObj(), _FakeResolvableMemoryObj()]
-
-    def resolve_layer(**kwargs):
-        mem_obj = mem_objs[kwargs["layer_id"]]
-        mem_obj.pin()
-        return [mem_obj]
-
-    engine._resolve_shared_rank0_layer_mem_objs = resolve_layer
-    engine._make_shared_handles_for_layer = lambda **kwargs: [object()]
-    engine._broadcast_shared_envelope = lambda _envelope: None
-    ret_mask = torch.ones(4, dtype=torch.bool)
-    retriever = engine._retrieve_layer_shared_rank0(
-        starts=[0],
-        ends=[4],
-        keys_layer_major=[[_make_key()], [_make_key()]],
-        chunk_locations_layer_major=[
-            ["LocalCPUBackend"],
-            ["LocalCPUBackend"],
-        ],
-        location="LocalCPUBackend",
-        ret_mask=ret_mask,
-        monitor_req_id=123,
-        req_id="req-sync-failure",
-        kv_group=0,
-        kwargs={
-            "shared_cpu_phase": "dense_prefix",
-            "deferred_layerwise_get": True,
-        },
-    )
-
-    advance_count = 1 if failure_point == "send" else engine.num_layers + 1
-    for _ in range(advance_count):
-        next(retriever)
-    expected_error = (
-        "H2D send failed after launch"
-        if failure_point == "send"
-        else "terminal load-stream sync failed"
-    )
-    with pytest.raises(RuntimeError, match=expected_error):
-        next(retriever)
-
-    launched_count = 1 if failure_point == "send" else 2
-    launched = mem_objs[:launched_count]
-    assert len(engine.gpu_connector.sent) == launched_count
-    assert [mem.ref_count_down_count for mem in launched] == [0] * launched_count
-    assert all(mem.is_pinned for mem in launched)
-    assert engine._unsafe_layerwise_retrieve_sources == launched
-
-
-@pytest.mark.parametrize("failure_point", ["send", "terminal_sync"])
-def test_shared_dense_passive_consumer_failure_retains_sources(
-    monkeypatch,
-    failure_point,
-):
-    import lmcache.v1.cache_engine as cache_engine_module
-
-    monkeypatch.setattr(
-        cache_engine_module,
-        "assert_layerwise_gpu_connector",
-        lambda _connector: None,
-    )
-    engine = _make_passive_shared_retrieve_engine(kv_group=0)
-    engine.gpu_connector = _FakeLayerwiseGPUConnector(
-        send_error_after_launch=failure_point == "send",
-        terminal_sync_error=failure_point == "terminal_sync",
-    )
-    retriever, _ = _make_passive_shared_retriever(
-        engine,
-        deferred_layerwise_get=True,
-    )
-
-    advance_count = 1 if failure_point == "send" else engine.num_layers + 1
-    for _ in range(advance_count):
-        next(retriever)
-    expected_error = (
-        "H2D send failed after launch"
-        if failure_point == "send"
-        else "terminal load-stream sync failed"
-    )
-    with pytest.raises(RuntimeError, match=expected_error):
-        next(retriever)
-
-    views = engine.shared_cpu_cache_passive_allocator.views
-    launched_count = 1 if failure_point == "send" else 2
-    assert len(engine.gpu_connector.sent) == launched_count
-    assert [view.ref_count_down_count for view in views] == [0] * launched_count
-    assert engine._unsafe_layerwise_retrieve_sources == views
 
 
 def test_shared_dense_passive_compact_batch_preserves_layerwise_consumption(

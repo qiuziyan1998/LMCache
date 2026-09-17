@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from functools import cached_property
 from typing import Optional, Union
 
 # Third Party
@@ -9,10 +8,6 @@ import torch
 # First Party
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.kv_layer_groups import (
-    resolve_kv_group_num_layers,
-    validate_two_group_layer_counts,
-)
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_key_trace import trace_mooncake_keys
@@ -33,16 +28,11 @@ class MooncakeLookupClient(LookupClientInterface):
         metadata: LMCacheMetadata,
         master_addr: str,
     ):
-        self.config = config
-        self.metadata = metadata
-        if bool(getattr(config, "dsa_two_groups", False)):
-            validate_two_group_layer_counts(
-                getattr(metadata, "runtime_kv_group_layer_counts", None)
-            )
-
         # Third Party
         from mooncake.store import MooncakeDistributedStore
 
+        self.config = config
+        self.metadata = metadata
         self.store = MooncakeDistributedStore()
         status = self.store.setup(
             "localhost",
@@ -70,26 +60,6 @@ class MooncakeLookupClient(LookupClientInterface):
         )
         self.token_database = ChunkedTokenDatabase(config, metadata)
 
-    @cached_property
-    def _group_layer_counts(self) -> tuple[int, ...]:
-        metadata = getattr(self, "metadata", None)
-        if not getattr(getattr(self, "config", None), "dsa_two_groups", False):
-            return (int(getattr(metadata, "kv_shape", (1,))[0]),)
-        return tuple(
-            resolve_kv_group_num_layers(
-                kv_group=group,
-                dsa_two_groups=True,
-                model_num_layers=self.metadata.kv_shape[0],
-                registered_groups=getattr(
-                    getattr(self.metadata, "kv_layer_groups_manager", None),
-                    "kv_layer_groups",
-                    (),
-                ),
-                runtime=getattr(metadata, "runtime_kv_group_layer_counts", None),
-            )
-            for group in (0, 1)
-        )
-
     def lookup(
         self,
         token_ids: Union[torch.Tensor, list[int]],
@@ -114,11 +84,6 @@ class MooncakeLookupClient(LookupClientInterface):
         num_layers = int(
             getattr(getattr(self, "metadata", None), "kv_shape", (1,))[0]
         )
-        counts = self._group_layer_counts
-
-        def num_layers_for(group_key: CacheEngineKey) -> int:
-            return counts[int(group_key.kv_group)] if dsa_two_groups else num_layers
-
         sampled_lookup = bool(
             use_layerwise
             and getattr(self.config, "experimental_sampled_layerwise_lookup", False)
@@ -169,18 +134,13 @@ class MooncakeLookupClient(LookupClientInterface):
             if sampled:
                 return [
                     serialize(key)
-                    for group_key in group_keys
-                    for key in first_last_layer_keys(
-                        [group_key], num_layers_for(group_key)
-                    )
+                    for key in first_last_layer_keys(group_keys, num_layers)
                 ]
             if use_layerwise:
                 return [
                     serialize(layer_key)
                     for group_key in group_keys
-                    for layer_key in group_key.split_layers(
-                        num_layers_for(group_key)
-                    )
+                    for layer_key in group_key.split_layers(num_layers)
                 ]
             return [serialize(group_key) for group_key in group_keys]
 
@@ -201,7 +161,7 @@ class MooncakeLookupClient(LookupClientInterface):
 
         if page_first:
             page_keys_by_chunk = [
-                [mooncake_page_key(key, num_layers_for(key)) for key in group_keys]
+                [mooncake_page_key(key, num_layers) for key in group_keys]
                 for group_keys in chunk_group_keys
             ]
 
