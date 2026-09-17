@@ -363,7 +363,7 @@ class Harness:
 
 
 @pytest.fixture
-def harness() -> Harness:
+def harness(request) -> Harness:
     """Create a fully connected deterministic remote-fill harness."""
 
     limits = ProtocolLimits()
@@ -389,6 +389,7 @@ def harness() -> Harness:
         python_hash_seed="0",
     )
     state = RemoteFillStateCore(
+        group_layer_counts=getattr(request, "param", None),
         destination_engine_epoch=7,
         shared_cache_generation=11,
         descriptor_verification_key=b"test descriptor verification key",

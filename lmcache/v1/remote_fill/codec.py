@@ -284,7 +284,7 @@ def _validate_reserve(
     seen: set[tuple[int, int]] = set()
     seen_keys: set[str] = set()
     groups_by_chunk: dict[int, set[int]] = {}
-    metadata_by_chunk: dict[int, tuple[int, int, int, int, str]] = {}
+    metadata_by_chunk: dict[int, tuple[int, int, int, str]] = {}
     total_bytes = 0
     for page in request.control_pages:
         _validate_control_page(page, limits)
@@ -300,7 +300,6 @@ def _validate_reserve(
             page.chunk_start,
             page.chunk_end,
             page.valid_tokens,
-            page.layer_count,
             page.layout_tag,
         )
         prior_metadata = metadata_by_chunk.setdefault(page.chunk_index, metadata)

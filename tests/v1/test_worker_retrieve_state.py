@@ -47,6 +47,7 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     impl._cold_perf_load_started = {}
     impl._cold_perf_dense_load_started = {}
     impl._cold_perf_dense_load_completed = {}
+    impl._layerwise_sparse_shared_ordered = []
     impl.kv_role = "kv_both"
     impl._late_finished_sending = set()
     return impl
@@ -166,7 +167,11 @@ def test_cold_submit_and_publish_preserve_async_handoff(
         token_ids=[1, 2, 3, 4, 5],
         sparse_warm_ref=False,
         indexer_slot_mapping=[adapter_mod._build_slot_mapping([7, 2], 4, 5)],
-        load_spec=SimpleNamespace(dsa_cold_load_generation=1, lmcache_cached_tokens=5),
+        load_spec=SimpleNamespace(
+            dsa_cold_load_generation=1,
+            lmcache_cached_tokens=5,
+            dsa_group1_direct_hbm=False,
+        ),
     )
     impl._submit_dsa_cold_compact_load(request)
     assert impl._get_cold_load_coordinator().futures["request"][3] == {7, 2}
@@ -253,7 +258,10 @@ def test_capture_barrier_waits_for_indexer_after_latent_failure() -> None:
     impl._synchronize_dsa_cold_dense_load.assert_called_once_with()
 
 
-def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
+@pytest.mark.parametrize("indexer_layers", [1, 2])
+def test_cold_compact_indexer_uses_dense_retrieve_path(
+    monkeypatch, indexer_layers
+) -> None:
     monkeypatch.setenv("PD_SERVING_PERF", "1")
     monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     impl = _make_impl()
@@ -269,7 +277,7 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
     monkeypatch.setattr(adapter_mod.torch, "npu", npu, raising=False)
 
     def dense_retrieve(_tokens, _mask, **kwargs):
-        kwargs["cached_memory_objs"][:] = [[owner], [owner]]
+        kwargs["cached_memory_objs"][:] = [[owner] for _ in range(indexer_layers)]
         kwargs["_dense_load_readiness_out"].append(readiness)
         assert kwargs["_retain_shared_dense_cache"] is True
         assert kwargs["shared_cpu_phase"] == "dsa_cold_compact_indexer"
@@ -277,9 +285,8 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
         assert "shared_cpu_request_preflight_state" not in kwargs
         assert "direct_external_pages" not in kwargs
         assert "_cold_perf_breakdown" not in kwargs
-        yield None
-        yield None
-        yield None
+        for _ in range(indexer_layers + 1):
+            yield None
         yield torch.ones(4, dtype=torch.bool)
 
     record = MagicMock(return_value=readiness)
@@ -308,7 +315,7 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
         load_spec=SimpleNamespace(
             vllm_cached_tokens=0,
             lmcache_cached_tokens=4,
-        ),
+         dsa_group1_direct_hbm=False),
     )
     plan = {
         "request": request,
@@ -316,7 +323,7 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(monkeypatch) -> None:
         "token_mask": torch.ones(4, dtype=torch.bool),
         "token_count": 4,
         "indexer_slots_cpu": torch.arange(4),
-        "indexer_kvcaches": [object(), object()],
+        "indexer_kvcaches": [object() for _ in range(indexer_layers)],
         "planned_at": adapter_mod.serving_perf_now(),
         "latent_shared_ready": Future(),
     }
@@ -366,7 +373,7 @@ def test_cold_compact_shared_indexer_waits_for_latent_publication() -> None:
     request = SimpleNamespace(
         req_id="request",
         request_configs=None,
-        load_spec=SimpleNamespace(vllm_cached_tokens=0),
+        load_spec=SimpleNamespace(vllm_cached_tokens=0, dsa_group1_direct_hbm=False),
     )
     gate = Future()
     plan = {
@@ -454,7 +461,9 @@ def test_cold_compact_prefetches_before_dense_retrieve() -> None:
         "request": SimpleNamespace(
             req_id="request",
             request_configs=None,
-            load_spec=SimpleNamespace(vllm_cached_tokens=0),
+            load_spec=SimpleNamespace(
+                vllm_cached_tokens=0, dsa_group1_direct_hbm=False
+            ),
         ),
         "tokens": [1, 2, 3, 4],
         "token_mask": torch.ones(4, dtype=torch.bool),
@@ -506,7 +515,11 @@ def test_cold_compact_prefetch_owner_released_when_latent_load_fails() -> None:
         retrieve_layer=retrieve,
     )
     plan = {
-        "request": SimpleNamespace(req_id="request", request_configs=None),
+        "request": SimpleNamespace(
+            req_id="request",
+            request_configs=None,
+            load_spec=SimpleNamespace(dsa_group1_direct_hbm=False),
+        ),
         "tokens": [1],
         "token_mask": torch.ones(1, dtype=torch.bool),
         "token_count": 1,
@@ -564,7 +577,11 @@ def test_cold_compact_prefetch_failure_releases_and_uses_dense_path() -> None:
     gate = Future()
     gate.set_result(None)
     plan = {
-        "request": SimpleNamespace(req_id="request", request_configs=None),
+        "request": SimpleNamespace(
+            req_id="request",
+            request_configs=None,
+            load_spec=SimpleNamespace(dsa_group1_direct_hbm=False),
+        ),
         "tokens": [1],
         "token_mask": torch.ones(1, dtype=torch.bool),
         "token_count": 1,
@@ -690,7 +707,11 @@ def test_cold_compact_dense_failure_releases_prefetch_owner_only() -> None:
     gate = Future()
     gate.set_result(None)
     plan = {
-        "request": SimpleNamespace(req_id="request", request_configs=None),
+        "request": SimpleNamespace(
+            req_id="request",
+            request_configs=None,
+            load_spec=SimpleNamespace(dsa_group1_direct_hbm=False),
+        ),
         "tokens": [1],
         "token_mask": torch.ones(1, dtype=torch.bool),
         "token_count": 1,
@@ -719,7 +740,11 @@ def test_cold_compact_dense_path_requires_source_retention_support() -> None:
         retrieve_layer=retrieve,
     )
     plan = {
-        "request": SimpleNamespace(req_id="request", request_configs=None),
+        "request": SimpleNamespace(
+            req_id="request",
+            request_configs=None,
+            load_spec=SimpleNamespace(dsa_group1_direct_hbm=False),
+        ),
         "tokens": [1],
         "token_mask": torch.ones(1, dtype=torch.bool),
         "token_count": 1,
@@ -792,7 +817,9 @@ def test_failed_cold_indexer_does_not_double_release_adopted_source(
         "request": SimpleNamespace(
             req_id="request",
             request_configs=None,
-            load_spec=SimpleNamespace(vllm_cached_tokens=0),
+            load_spec=SimpleNamespace(
+                vllm_cached_tokens=0, dsa_group1_direct_hbm=False
+            ),
         ),
         "tokens": [1, 2, 3, 4],
         "token_mask": torch.ones(4, dtype=torch.bool),
@@ -1608,8 +1635,11 @@ class TestWorkerRetrieveState:
 
     def test_record_shared_state_rejects_skipped_index_with_index_objs(self):
         impl = _make_impl()
+        impl.num_layers = 1
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=7,
@@ -1633,6 +1663,8 @@ class TestWorkerRetrieveState:
         impl.num_layers = 2
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object(), object()]
+        impl._indexer_kvcaches = [object(), object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=7,
@@ -1709,6 +1741,8 @@ class TestWorkerRetrieveState:
         impl.num_layers = 2
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object(), object()]
+        impl._indexer_kvcaches = [object(), object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=7,
@@ -1741,6 +1775,8 @@ class TestWorkerRetrieveState:
         impl.num_layers = 2
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object(), object()]
+        impl._indexer_kvcaches = [object(), object()]
         register = MagicMock()
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
@@ -1790,6 +1826,53 @@ class TestWorkerRetrieveState:
             },
         )
 
+    def test_record_shared_state_uses_physical_indexer_cardinality(self):
+        impl = _make_impl()
+        impl.num_layers = 79
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object()] * 79
+        impl._indexer_kvcaches = [object()] * 22
+        register = MagicMock()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            shared_cpu_materialize_index_on_decode_cold=True,
+            register_shared_cpu_sparse_request=register,
+        )
+        request = _make_request()
+        state = WorkerRetrieveState(
+            cached_starts=[0],
+            cached_ends=[3],
+            cached_memory_objs=[[f"latent-{layer}"] for layer in range(79)],
+            cached_chunk_ptrs_npu=[f"latent-ptr-{layer}" for layer in range(79)],
+            cached_shared_handles=[
+                [f"latent-handle-{layer}"] for layer in range(79)
+            ],
+            cached_starts_indexer=[0],
+            cached_ends_indexer=[3],
+            cached_memory_objs_indexer=[
+                [f"index-{layer}"] for layer in range(22)
+            ],
+            cached_chunk_ptrs_npu_indexer=[
+                f"index-ptr-{layer}" for layer in range(22)
+            ],
+            cached_shared_handles_indexer=[
+                [f"index-handle-{layer}"] for layer in range(22)
+            ],
+        )
+
+        impl._record_shared_worker_retrieve_state(state, request)
+
+        assert state.shared_index_status == "present"
+        register.assert_called_once_with(
+            "req-1",
+            owned_groups={
+                0: state.cached_memory_objs,
+                1: state.cached_memory_objs_indexer,
+            },
+        )
+
     def test_record_shared_state_rejects_short_latent_pointer_tensor(self):
         impl = _make_impl()
         impl.num_layers = 1
@@ -1816,6 +1899,8 @@ class TestWorkerRetrieveState:
         impl.num_layers = 1
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=7,
@@ -2059,7 +2144,9 @@ class TestWorkerRetrieveState:
         impl._release_shared_worker_retrieve_state = MagicMock()
         request = SimpleNamespace(
             req_id="req-1",
-            load_spec=SimpleNamespace(lmcache_cached_tokens=1),
+            load_spec=SimpleNamespace(
+                lmcache_cached_tokens=1, dsa_group1_direct_hbm=False
+            ),
         )
         plan = {
             "request": request,
@@ -2146,7 +2233,9 @@ class TestWorkerRetrieveState:
         )
         request = SimpleNamespace(
             req_id="req-1",
-            load_spec=SimpleNamespace(lmcache_cached_tokens=1),
+            load_spec=SimpleNamespace(
+                lmcache_cached_tokens=1, dsa_group1_direct_hbm=False
+            ),
         )
         plan = {
             "request": request,
@@ -2477,7 +2566,12 @@ class TestWorkerRetrieveState:
         impl._wait_for_save_impl = MagicMock()
 
         assert impl.get_finished({"req-1"}) == (None, None)
-        impl._release_finished_worker_requests.assert_not_called()
+        # Production may drain an empty retirement set while the save is pending.
+        assert all(
+            not call.args[0]
+            for call in impl._release_finished_worker_requests.call_args_list
+        )
+        impl._release_finished_worker_requests.reset_mock()
         assert impl._finished_req_ids_waiting_for_save == {"req-1"}
 
         impl.wait_for_save()
@@ -3692,13 +3786,15 @@ class TestWorkerRetrieveState:
         assert torch.equal(target_payload, target_slot_mapping[0])
         assert impl.current_layer == 1
 
-    def test_shared_sparse_indexer_first_defers_final_commit(self):
+    @pytest.mark.parametrize("latent_layers", [1, 2])
+    def test_shared_sparse_indexer_first_defers_final_commit(self, latent_layers):
         req = make_sparse_req_meta("req-1", token_count=4)
         impl, _, _ = make_worker_connector([req], use_layerwise=True)
         impl.config.dsa_two_groups = True
         impl._indexer_layer_names = ["model.layers.0.self_attn.indexer.k_cache"]
         impl.current_layer = 0
-        impl.num_layers = 1
+        impl.num_layers = latent_layers
+        impl._last_indexer_model_layer = 0
         impl._layerwise_retriever_is_sparse = [True]
         impl._layerwise_sparse_req_ids = ["req-1"]
         impl._layerwise_sparse_shared_ordered = [True]
@@ -3712,6 +3808,9 @@ class TestWorkerRetrieveState:
             captured.append(("latent-prepare", payload))
             payload = yield None
             captured.append(("latent-commit", payload))
+            if latent_layers == 2:
+                payload = yield None
+                captured.append(("latent-tail", payload))
             yield torch.ones(4, dtype=torch.bool)
 
         def _indexer():
@@ -3733,11 +3832,16 @@ class TestWorkerRetrieveState:
             request_ids=["req-1"],
         )
 
+        if latent_layers == 2:
+            assert "indexer-commit" not in [label for label, _ in captured]
+            impl.wait_for_layer_load(
+                "model.layers.1.self_attn.attn",
+                selected_tokens=torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
+                request_ids=["req-1"],
+            )
         assert [label for label, _ in captured] == [
-            "latent-prepare",
-            "indexer-data",
-            "latent-commit",
-            "indexer-commit",
+            "latent-prepare", "indexer-data", "latent-commit",
+            *(["latent-tail"] if latent_layers == 2 else []), "indexer-commit",
         ]
         assert captured[0][1] == {_SHARED_SPARSE_PREPARE_ONLY: True}
 
@@ -3831,6 +3935,71 @@ class TestWorkerRetrieveState:
 
         assert captured == ["indexer", "latent", "indexer"]
         assert impl.current_layer == 1
+
+    @pytest.mark.parametrize(
+        "physical_group_order",
+        [
+            ("latent", "indexer"),
+            ("indexer", "latent"),
+        ],
+    )
+    def test_dense_79_22_waits_only_on_physical_indexer_layers(
+        self, physical_group_order
+    ):
+        req = ReqMeta(
+            req_id="req-1",
+            token_ids=[1, 2, 3, 4],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=4,
+                can_load=True,
+            ),
+            is_sparse_decode=False,
+        )
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = True
+        indexer_layers = [0, 1, 2] + list(range(6, 79, 4))
+        impl._indexer_layer_names = [
+            f"model.layers.{layer}.self_attn.indexer.k_cache"
+            for layer in indexer_layers
+        ]
+        assert len(impl._indexer_layer_names) == 22
+        impl.current_layer = 5
+        impl.num_layers = 79
+        impl._layerwise_required_wait_groups = impl._shared_indexer_required_wait_groups
+        impl._layerwise_latent_wait_groups = {0}
+        impl._last_indexer_model_layer = max(indexer_layers)
+        impl._layerwise_requests = [req]
+        impl._layerwise_retriever_is_sparse = [False]
+
+        captured = []
+
+        def _retriever(label):
+            while True:
+                captured.append(label)
+                yield torch.ones(4, dtype=torch.bool)
+
+        impl.layerwise_retrievers = [
+            (_retriever("latent"), _retriever("indexer"))
+        ]
+
+        impl.wait_for_layer_load("model.layers.5.self_attn.attn")
+
+        assert captured == ["latent"]
+        assert impl.current_layer == 6
+
+        for group in physical_group_order:
+            layer_name = (
+                "model.layers.6.self_attn.indexer.k_cache"
+                if group == "indexer"
+                else "model.layers.6.self_attn.attn"
+            )
+            impl.wait_for_layer_load(layer_name)
+            if group == physical_group_order[0]:
+                assert impl.current_layer == 6
+
+        assert captured == ["latent", *physical_group_order]
+        assert impl.current_layer == 7
 
     def test_mixed_dense_sparse_wait_supports_staged_graph_order(self):
         dense = ReqMeta(
@@ -4239,6 +4408,107 @@ class TestWorkerRetrieveState:
         with pytest.raises(RuntimeError, match="incomplete MLA latent"):
             _bind_worker_state(impl, request)
 
+    def test_bind_dsa_rejects_missing_registered_latent_topology(self):
+        impl = _make_impl()
+        impl.num_layers = 2
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=2,
+        )
+        impl._num_layers_for_group = lambda _kv_group: 0
+        impl._sparse_decode_requires_index_materialization = lambda *_args: False
+        request = _make_request()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["layer0-key"]],
+            cached_starts=[0],
+            cached_ends=[3],
+            cached_memory_objs=[["latent-view"]],
+            cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
+            metadata_warm=True,
+            shared_latent_status="present",
+            shared_index_status="skipped",
+            shared_generation=2,
+            pointer_cache_generation=2,
+            shared_request_active=True,
+            request_scope_token="req-1:2:3",
+        )
+
+        with pytest.raises(RuntimeError, match="group topology is registered"):
+            _bind_worker_state(impl, request)
+
+    def test_publish_dsa_state_rejects_missing_registered_topology(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._num_layers_for_group = lambda _kv_group: 0
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=2,
+        )
+
+        with pytest.raises(RuntimeError, match="topology is registered"):
+            impl._record_shared_worker_retrieve_state(
+                WorkerRetrieveState(), _make_request()
+            )
+
+    def test_promote_dsa_store_rejects_missing_registered_topology(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._num_layers_for_group = lambda _kv_group: 0
+        request, result = _make_store_request(
+            impl,
+            token_count=3,
+            start=0,
+            end=3,
+            key="k0",
+            tensor="t0",
+        )
+
+        with pytest.raises(RuntimeError, match="topology is registered"):
+            impl._promote_layerwise_store_result(request, result)
+
+    def test_dsa_retrieve_state_rejects_missing_registered_topology(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._num_layers_for_group = lambda _kv_group: 0
+
+        with pytest.raises(RuntimeError, match="topology is registered"):
+            impl._state_has_retrieve_tensor_cache(
+                WorkerRetrieveState(cached_memory_objs=[[object()]])
+            )
+
+    def test_decode_window_pointer_ready_rejects_missing_dsa_topology(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._num_layers_for_group = lambda _kv_group: 0
+        request = _make_request()
+        result = LayerwiseStoreResult(
+            request_id=request.req_id,
+            kv_group=1,
+            starts=[0],
+            ends=[3],
+            memory_objs=[[object()]],
+            chunk_ptrs=[torch.tensor([111], dtype=torch.long)],
+        )
+
+        assert not impl._decode_window_save_group_pointer_ready(request, 1, result)
+
+    def test_decode_save_validation_rejects_missing_dsa_index_topology(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._num_layers_for_group = lambda kv_group: 1 if kv_group == 0 else 0
+        impl._sparse_decode_requires_index_materialization = lambda *_args: True
+        request = _make_request()
+        state = WorkerRetrieveState(
+            cached_starts=[0],
+            cached_ends=[3],
+            cached_memory_objs=[[object()]],
+            cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
+        )
+
+        with pytest.raises(RuntimeError, match="group topology is registered"):
+            impl._validate_decode_save_shared_pointer_cache(state, request)
+
     def test_bind_rejects_missing_strict_shared_index(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
@@ -4268,6 +4538,8 @@ class TestWorkerRetrieveState:
         impl.num_layers = 2
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object(), object()]
+        impl._indexer_kvcaches = [object(), object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=3,
@@ -5145,7 +5417,6 @@ class TestWorkerRetrieveState:
         impl._layerwise_sparse_req_ids = ["req-1"]
         impl._layerwise_waited_groups = {0}
         impl._layerwise_sparse_indexer_sent_layers = {0}
-        impl._layerwise_required_wait_groups_cache = (0,)
 
         with pytest.raises(RuntimeError, match="drain failed"):
             impl._drain_layerwise_retrievers()
@@ -5157,7 +5428,6 @@ class TestWorkerRetrieveState:
         assert impl._layerwise_sparse_req_ids == []
         assert impl._layerwise_waited_groups == set()
         assert impl._layerwise_sparse_indexer_sent_layers == set()
-        assert impl._layerwise_required_wait_groups_cache is None
 
     def test_sparse_retrieve_failure_drops_partially_extended_state(self):
         impl = _make_impl()
@@ -5678,6 +5948,8 @@ class TestWorkerRetrieveState:
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.num_layers = 1
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
         impl._completed_decode_window_saves = {}
         impl._decode_window_save_completed_groups = set()
         impl._decode_window_save_expected_start = {}
@@ -6051,6 +6323,8 @@ class TestWorkerRetrieveState:
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.num_layers = 1
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=5,
@@ -6209,6 +6483,8 @@ class TestWorkerRetrieveState:
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.num_layers = 1
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=5,
@@ -6922,7 +7198,7 @@ class TestWorkerRetrieveState:
             load_spec=SimpleNamespace(
                 dsa_cold_load_generation=1,
                 lmcache_cached_tokens=2,
-            ),
+             dsa_group1_direct_hbm=False),
             token_ids=[1, 2],
             indexer_slot_mapping=[torch.arange(2)],
             request_configs=None,
@@ -6953,7 +7229,7 @@ class TestWorkerRetrieveState:
             load_spec=SimpleNamespace(
                 dsa_cold_load_generation=1,
                 lmcache_cached_tokens=2,
-            ),
+             dsa_group1_direct_hbm=False),
             token_ids=[1, 2],
             indexer_slot_mapping=[torch.arange(2)],
             request_configs=None,
@@ -7072,7 +7348,9 @@ class TestWorkerRetrieveState:
         )
         request = SimpleNamespace(
             req_id="req-live",
-            load_spec=SimpleNamespace(lmcache_cached_tokens=2),
+            load_spec=SimpleNamespace(
+                lmcache_cached_tokens=2, dsa_group1_direct_hbm=False
+            ),
         )
         plan = {
             "request": request,
@@ -7131,7 +7409,9 @@ class TestWorkerRetrieveState:
         )
         request = SimpleNamespace(
             req_id="req-live",
-            load_spec=SimpleNamespace(lmcache_cached_tokens=2),
+            load_spec=SimpleNamespace(
+                lmcache_cached_tokens=2, dsa_group1_direct_hbm=False
+            ),
         )
         plan = {
             "request": request,
@@ -7175,7 +7455,7 @@ class TestWorkerRetrieveState:
             lmcache_cached_tokens=32,
             dsa_committed_end=32,
             dsa_remap_frontier=31,
-        )
+         dsa_group1_direct_hbm=False)
         request = SimpleNamespace(load_spec=load_spec)
         impl._get_cold_load_coordinator().futures = {
             "req-live": (4, latent, request, {9}, 0.0, dependency)
