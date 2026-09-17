@@ -1995,6 +1995,10 @@ class LMCacheConnectorV1Impl:
         self._role = role
         self.device = vllm_config.device_config.device
         self.kv_role = vllm_config.kv_transfer_config.kv_role
+        self._layerwise_prefill_p_node = _layerwise_prefill_p_node_enabled()
+        self._dsa_index_lmcache_disabled = (
+            os.environ.get("VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE", "0") == "1"
+        )
         # Hybrid source capture is a two-sided in-process protocol.  Keep it
         # off until AscendMulti has verified that both the LMCache provider
         # and Mooncake borrower support the same transport.
@@ -2717,6 +2721,11 @@ class LMCacheConnectorV1Impl:
             latent_caches = self._latent_kvcaches
         self._latent_layer_names = latent_names
         self._indexer_layer_names = indexer_names
+        if self._layerwise_prefill_p_node:
+            self._layerwise_group_ordinals = (
+                {name: ordinal for ordinal, name in enumerate(latent_names)},
+                {name: ordinal for ordinal, name in enumerate(indexer_names)},
+            )
         self.__dict__.pop("_indexer_model_layers", None)
         indexer_layers = self._indexer_model_layers
         self._layerwise_required_wait_groups_cache = None
@@ -2869,14 +2878,8 @@ class LMCacheConnectorV1Impl:
         kv_group: int,
         layer_index: int,
     ) -> Optional[torch.Tensor]:
-        if not _layerwise_prefill_p_node_enabled():
+        if not self._layerwise_prefill_p_node:
             return None
-        if request.block_allocation_mode != "prefill_child":
-            raise RuntimeError(
-                "P-node request has the wrong KV block allocation mode: "
-                f"req_id={request.req_id}, "
-                f"mode={request.block_allocation_mode}"
-            )
         mappings = getattr(
             request,
             "_layerwise_prefill_device_slot_mappings",
@@ -2888,11 +2891,8 @@ class LMCacheConnectorV1Impl:
             )
         assert mappings is not None
         bank = layer_index % 2
-        if len(mappings) != 2 or kv_group >= len(mappings[bank]):
-            raise RuntimeError(
-                "P-node layerwise prefill slot-mapping layout is invalid: "
-                f"req_id={request.req_id}, bank={bank}, kv_group={kv_group}"
-            )
+        # Layout/allocation mode was checked when materializing this forward's
+        # maps. Layer callbacks only select their group's physical bank.
         return mappings[bank][kv_group]
 
     def _materialize_layerwise_prefill_slot_mappings(
@@ -2902,7 +2902,7 @@ class LMCacheConnectorV1Impl:
         force: bool = False,
     ) -> Optional[tuple[tuple[torch.Tensor, ...], ...]]:
         """Materialize the two-bank mappings once, before model forward."""
-        if not _layerwise_prefill_p_node_enabled():
+        if not self._layerwise_prefill_p_node:
             return None
         if not force:
             cached = getattr(
@@ -3026,7 +3026,7 @@ class LMCacheConnectorV1Impl:
     @property
     def supports_layerwise_prefill_transfer_window(self) -> bool:
         """Whether this worker can use the P-node post-attention window."""
-        if not _layerwise_prefill_p_node_enabled():
+        if not self._layerwise_prefill_p_node:
             return False
         # The environment variable identifies the P node; these checks only
         # reject an incompatible P-node configuration.  Two rotating banks
@@ -3059,13 +3059,13 @@ class LMCacheConnectorV1Impl:
         connector in this port; the decode node keeps its existing indexer
         residency and cold-load path.
         """
-        if not _layerwise_prefill_p_node_enabled():
+        if not self._layerwise_prefill_p_node:
             return False
         if not getattr(self, "enable_sparse_attention", False):
             return False
         if not self._is_dsa_two_groups():
             return False
-        if os.environ.get("VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE", "0") == "1":
+        if self._dsa_index_lmcache_disabled:
             return False
         return True
 
@@ -3083,14 +3083,9 @@ class LMCacheConnectorV1Impl:
         kv_group: int,
     ) -> int:
         """Resolve the KV-group position used by the rotating-bank layout."""
-        layer_names = (
-            self._indexer_layer_names
-            if kv_group == 1
-            else self._latent_layer_names
-        )
         try:
-            return layer_names.index(layer_name)
-        except ValueError:
+            return self._layerwise_group_ordinals[kv_group][layer_name]
+        except KeyError:
             # Some lightweight connectors do not publish the ordered group
             # layer list. Fall back to the model layer number only then.
             layer_id = self._layerwise_layer_id_from_name(layer_name)
@@ -8105,7 +8100,7 @@ class LMCacheConnectorV1Impl:
         assert len(self.kv_caches) > 0
         if not self._kvcaches_list:
             self._refresh_kvcaches_list()
-        if _layerwise_prefill_p_node_enabled():
+        if self._layerwise_prefill_p_node:
             for request in metadata.requests:
                 if request.block_allocation_mode == "prefill_child":
                     self._materialize_layerwise_prefill_slot_mappings(
@@ -9790,7 +9785,7 @@ class LMCacheConnectorV1Impl:
         return
 
     def _should_defer_latent_save_under_tp(self) -> bool:
-        if _layerwise_prefill_p_node_enabled():
+        if self._layerwise_prefill_p_node:
             return False
         if not getattr(self.config, "dsa_two_groups", False):
             return False
@@ -10058,7 +10053,7 @@ class LMCacheConnectorV1Impl:
         kv_group: int,
     ):
         """Allocate and prime one P-node storer before model forward."""
-        assert _layerwise_prefill_p_node_enabled()
+        assert self._layerwise_prefill_p_node
         self._refresh_kvcaches_list()
         kvcaches = self._kvcaches_for_group(kv_group)
         if not kvcaches:
@@ -10117,7 +10112,7 @@ class LMCacheConnectorV1Impl:
     ) -> None:
         """Prepare all request/group storers before the P-node forward."""
         if (
-            not _layerwise_prefill_p_node_enabled()
+            not self._layerwise_prefill_p_node
             or not self.use_layerwise
             or self.kv_role == "kv_consumer"
         ):
@@ -10337,7 +10332,7 @@ class LMCacheConnectorV1Impl:
                         layerwise_storer = None
             if (
                 layerwise_storer is None
-                and _layerwise_prefill_p_node_enabled()
+                and self._layerwise_prefill_p_node
             ):
                 layerwise_storer = self._create_p_node_layerwise_save_storer(
                     request,
@@ -10455,16 +10450,16 @@ class LMCacheConnectorV1Impl:
                     offset=skip_leading_tokens,
                     sync=sync,
                     deferred_layerwise_put=(
-                        _layerwise_prefill_p_node_enabled()
+                        self._layerwise_prefill_p_node
                     ),
                     layerwise_prefill_bank_count=(
-                        2 if _layerwise_prefill_p_node_enabled() else 1
+                        2 if self._layerwise_prefill_p_node else 1
                     ),
                     req_id=request.req_id,
                     **store_kwargs,
                 )
                 self._layerwise_save_storers[storer_key] = layerwise_storer
-                if _layerwise_prefill_p_node_enabled():
+                if self._layerwise_prefill_p_node:
                     # P-node storers accept a per-layer bank mapping. Prime the
                     # generator once so this layer's mapping can be sent now.
                     next(layerwise_storer)
@@ -10476,12 +10471,7 @@ class LMCacheConnectorV1Impl:
             )
 
             try:
-                layer_names = (
-                    self._indexer_layer_names
-                    if kv_group == 1
-                    else self._latent_layer_names
-                )
-                if _layerwise_prefill_p_node_enabled():
+                if self._layerwise_prefill_p_node:
                     pending_finishes = getattr(
                         self,
                         "_layerwise_prefill_pending_store_finishes",
@@ -10502,8 +10492,8 @@ class LMCacheConnectorV1Impl:
                             f"next_layer={layer_name}"
                         )
                     try:
-                        layer_index = layer_names.index(layer_name)
-                    except ValueError as exc:
+                        layer_index = self._layerwise_group_ordinals[kv_group][layer_name]
+                    except KeyError as exc:
                         raise RuntimeError(
                             "P-node layerwise save received an unknown layer: "
                             f"layer={layer_name}, kv_group={kv_group}"
@@ -10536,7 +10526,7 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_storer)
                 if (
                     indexer_group_last
-                    and not _layerwise_prefill_p_node_enabled()
+                    and not self._layerwise_prefill_p_node
                 ):
                     indexer_completed, store_result = (
                         self._finalize_layerwise_storer(
@@ -10577,7 +10567,7 @@ class LMCacheConnectorV1Impl:
     def finish_layerwise_prefill_save(self, layer_name: str) -> None:
         """Publish source-complete layers after this layer's HCOM submit."""
         if (
-            not _layerwise_prefill_p_node_enabled()
+            not self._layerwise_prefill_p_node
             or not self.use_layerwise
             or self.kv_role == "kv_consumer"
         ):

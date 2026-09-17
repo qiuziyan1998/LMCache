@@ -111,6 +111,7 @@ def api() -> SimpleNamespace:
 def make_scheduler(api: SimpleNamespace, prompt: int, *, banked: bool = True) -> Any:
     """Use real tracking/metadata; preallocate capacity to isolate load intent."""
     adapter = api.LMCacheConnectorV1Impl()
+    adapter._layerwise_prefill_p_node = True
     adapter.kv_role = "kv_producer" if banked else "kv_both"
     adapter.force_skip_save = False
     adapter._block_size = 128
@@ -347,6 +348,7 @@ def test_decode_does_not_get_prefill_history_load(api: SimpleNamespace) -> None:
 
 def make_worker(api: SimpleNamespace, metadata: Any) -> Any:
     worker = api.LMCacheConnectorV1Impl()
+    worker._layerwise_prefill_p_node = True
     worker.kv_role = "kv_producer"
     worker.use_layerwise = True
     worker.enable_sparse_attention = True

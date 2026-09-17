@@ -96,6 +96,11 @@ def make_step(adapter, latent_layers, indexer_layers, *, step=0, requests=2):
         f"model.layers.{i}.self_attn.indexer.k_cache" for i in indexer_layers
     ]
     adapter._indexer_model_layers = set(indexer_layers)
+    adapter._layerwise_prefill_p_node = True
+    adapter._layerwise_group_ordinals = tuple(
+        {name: ordinal for ordinal, name in enumerate(names)}
+        for names in (adapter._latent_layer_names, adapter._indexer_layer_names)
+    )
     adapter.config = SimpleNamespace(dsa_two_groups=True)
     adapter.use_layerwise = True
     adapter.kv_role = "kv_producer"

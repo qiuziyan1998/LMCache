@@ -77,6 +77,7 @@ def adapter():
         "_indexer_model_layers",
         "_layerwise_has_indexer_model_layer",
         "_layerwise_layer_id_from_name",
+        "_layerwise_prefill_transfer_layer_id",
         "_layerwise_wait_should_advance",
         "_build_kv_layer_groups",
         "_normalize_dsa_kv_layer_groups",
@@ -98,6 +99,7 @@ def adapter():
         ns,
     )
     obj = ns[cls.name]()
+    obj._layerwise_prefill_p_node = True
     obj.config = NS(dsa_two_groups=True)
     obj._layerwise_retriever_is_sparse = [False]
     obj._layerwise_waited_groups = set()
@@ -159,3 +161,23 @@ def test_reregistration_cannot_advertise_old_row_order_for_new_buffers():
     obj.kv_caches = dict(reversed(list(obj.kv_caches.items())))
     with pytest.raises(ValueError, match="layer order"):
         obj._build_kv_layer_groups()
+
+
+def test_cached_group_ordinals_include_mtp_and_refresh_with_registration():
+    obj = adapter()
+    latent = [f"model.layers.{i}.self_attn.attn" for i in range(80)]
+    indexer = [
+        f"model.layers.{i}.self_attn.indexer.k_cache"
+        for i in [0, 1, 2] + list(range(6, 79, 4)) + [79]
+    ]
+    obj.kv_caches = {name: object() for name in latent + indexer}
+    obj._refresh_kvcaches_list()
+    # Draft physical indexer row is not its model layer id or latent ordinal.
+    obj._layerwise_layer_id_from_name = lambda _: pytest.fail("hot-path name parse")
+    assert obj._layerwise_prefill_transfer_layer_id(latent[-1], 0) == 79
+    assert obj._layerwise_prefill_transfer_layer_id(indexer[-1], 1) == len(indexer) - 1
+    del obj._layerwise_layer_id_from_name
+    obj.kv_caches = {name: object() for name in reversed(latent + indexer)}
+    obj._refresh_kvcaches_list()
+    assert obj._layerwise_prefill_transfer_layer_id(latent[-1], 0) == 0
+    assert obj._layerwise_prefill_transfer_layer_id(indexer[-1], 1) == 0
