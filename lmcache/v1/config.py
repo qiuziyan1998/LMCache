@@ -249,6 +249,16 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "remote_fill_prefix_hole_repair": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": (
+            "Prefiller policy: repair missing decoder LocalCPU prefix pages "
+            "from resident NPU KV during RemoteFill. False keeps prefix-hole "
+            "fallback; normal RemoteFill is unchanged. Set on the sender."
+        ),
+    },
     "remote_fill_submission_mode": {
         "type": str,
         "default": "per_chunk",
