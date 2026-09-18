@@ -180,6 +180,7 @@ def test_early_preflight_failure_has_a_phase_marker_without_changing_failure(cap
     engine.post_inited = False
     engine.config = NS(get_lookup_server_worker_ids=lambda *a: [0])
     engine.metadata = NS(worker_id=0, use_mla=True, world_size=8)
+    engine.enable_shared_cpu_cache = False
     engine._shared_cpu_sparse_capacity_sanity_pending = False
 
     def preflight():

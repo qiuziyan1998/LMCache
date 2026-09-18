@@ -2138,6 +2138,7 @@ def _make_engine_for_sparse_capacity(
     )
     engine.metadata = SimpleNamespace(
         world_size=8,
+        worker_id=0,
         is_first_rank=lambda: True,
         max_model_len=1024,
         kv_dtype=torch.float16,
@@ -2612,6 +2613,7 @@ def test_rank0_post_init_broadcasts_startup_error_on_storage_failure(
     )
     engine.config = SimpleNamespace(
         get_lookup_server_worker_ids=lambda use_mla, world_size: [],
+        max_local_cpu_size=1,
     )
     broadcasts = []
     capacity_reports = []
@@ -2621,6 +2623,7 @@ def test_rank0_post_init_broadcasts_startup_error_on_storage_failure(
     engine._report_shared_cpu_sparse_capacity_sanity = lambda: (
         capacity_reports.append("reported")
     )
+    engine._preflight_shared_cpu_shm_capacity = lambda: None
 
     def fail_storage_manager(*args, **kwargs):
         raise RuntimeError("stale shm segment")

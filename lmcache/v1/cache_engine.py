@@ -894,13 +894,33 @@ class LMCacheEngine:
         ):
             kv_groups.append(1)
 
-        bytes_per_chunk_all_layers = sum(
-            self._estimate_shared_cpu_chunk_bytes_per_layer(kv_group)
-            * self.num_layers_for_group(kv_group)
-            for kv_group in kv_groups
+        registered_groups = getattr(
+            getattr(self.metadata, "kv_layer_groups_manager", None),
+            "kv_layer_groups",
+            (),
         )
+        if registered_groups:
+            # Startup precedes the connector's lazy layout initialization.
+            # Its generic get_shape() fallback has a K/V factor of two even
+            # for MLA. Registered metadata already describes the real layout.
+            shapes = self.metadata.get_shapes(chunk_size)
+            bytes_per_chunk_all_layers = sum(
+                math.prod(shapes[kv_group])
+                * self._shared_cpu_dtype_for_kv_group(kv_group).itemsize
+                for kv_group in kv_groups
+            )
+        else:
+            # Preserve the legacy path for callers without registered groups.
+            bytes_per_chunk_all_layers = sum(
+                self._estimate_shared_cpu_chunk_bytes_per_layer(kv_group)
+                * self.num_layers_for_group(kv_group)
+                for kv_group in kv_groups
+            )
         one_request_bytes = bytes_per_chunk_all_layers * chunks_per_seq
         slab_bytes = self._effective_shared_cpu_cache_size_bytes()
+        max_single_request_tokens = (
+            slab_bytes // bytes_per_chunk_all_layers * chunk_size
+        )
         estimate: dict[str, Any] = {
             "slab_bytes": slab_bytes,
             "max_model_len": max_model_len,
@@ -910,16 +930,32 @@ class LMCacheEngine:
             "kv_groups": kv_groups,
             "bytes_per_chunk_all_layers": bytes_per_chunk_all_layers,
             "one_max_request_bytes": one_request_bytes,
+            "max_single_request_tokens": max_single_request_tokens,
+            "max_full_length_requests": slab_bytes // one_request_bytes,
+            "scope": "KV payload only; excludes transfer buffers and fragmentation",
         }
         if max_num_seqs is not None:
             estimate["configured_worst_case_bytes"] = (
                 one_request_bytes * int(max_num_seqs)
             )
+            if int(max_num_seqs) > 0:
+                estimate["max_tokens_per_request_at_max_num_seqs"] = (
+                    slab_bytes
+                    // (bytes_per_chunk_all_layers * int(max_num_seqs))
+                    * chunk_size
+                )
         if self.config.extra_config is None:
             self.config.extra_config = {}
         self.config.extra_config[
             "shared_cpu_sparse_startup_capacity_estimate"
         ] = estimate
+        logger.info(
+            "[LMCACHE_CAPACITY] rank=%s estimate=%s. These are empty-pool "
+            "KV payload upper bounds, not runtime admission guarantees; "
+            "prompt plus output must also fit vLLM max_model_len.",
+            self.metadata.worker_id,
+            estimate,
+        )
 
         if one_request_bytes > slab_bytes:
             raise ValueError(
@@ -932,9 +968,9 @@ class LMCacheEngine:
         if configured_worst_case is not None and configured_worst_case > slab_bytes:
             logger.warning(
                 "Shared CPU sparse configured worst-case active set exceeds "
-                "the rank0 slab: estimate=%s. Runtime admission uses actual "
-                "active prompt lengths, but this configuration can still hit "
-                "strict capacity failures at decode.",
+                "the rank0 slab: estimate=%s. Reduce max_num_seqs or prompt "
+                "lengths, or increase the pool; this estimate does not reserve "
+                "capacity for concurrent requests.",
                 estimate,
             )
         else:
@@ -5978,41 +6014,49 @@ class LMCacheEngine:
     def post_init(self, **kwargs) -> None:
         if not self.post_inited:
             logger.info("Post initializing LMCacheEngine")
-            with startup_phase("lookup_worker_ids", rank=self.metadata.worker_id):
-                lookup_server_worker_ids = self.config.get_lookup_server_worker_ids(
-                    self.metadata.use_mla, self.metadata.world_size
+            phase = "lookup_worker_ids"
+            try:
+                with startup_phase(phase, rank=self.metadata.worker_id):
+                    lookup_server_worker_ids = (
+                        self.config.get_lookup_server_worker_ids(
+                            self.metadata.use_mla, self.metadata.world_size
+                        )
+                    )
+                if getattr(
+                    self, "_shared_cpu_sparse_capacity_sanity_pending", False
+                ):
+                    phase = "capacity_check"
+                    with startup_phase(phase, rank=self.metadata.worker_id):
+                        self._report_shared_cpu_sparse_capacity_sanity()
+                    self._shared_cpu_sparse_capacity_sanity_pending = False
+                phase = "shm_space_check"
+                with startup_phase(phase, rank=self.metadata.worker_id):
+                    self._preflight_shared_cpu_shm_capacity()
+                shared_passive_rank = (
+                    self.enable_shared_cpu_cache
+                    and self._is_passive()
+                    and self.metadata.world_size > 1
                 )
-            if getattr(
-                self,
-                "_shared_cpu_sparse_capacity_sanity_pending",
-                False,
-            ):
-                with startup_phase("capacity_check", rank=self.metadata.worker_id):
-                    self._report_shared_cpu_sparse_capacity_sanity()
-                self._shared_cpu_sparse_capacity_sanity_pending = False
-            with startup_phase("shm_space_check", rank=self.metadata.worker_id):
-                self._preflight_shared_cpu_shm_capacity()
-            shared_passive_rank = (
-                self.enable_shared_cpu_cache
-                and self._is_passive()
-                and self.metadata.world_size > 1
-            )
-            need_layerwise_storage = self.use_layerwise and not shared_passive_rank
-            if (
-                self.lmcache_worker is not None
-                or need_layerwise_storage
-                or not self.save_only_first_rank
-                or self.metadata.is_first_rank()
-                or len(lookup_server_worker_ids) == 0
-                or self.metadata.worker_id in lookup_server_worker_ids
-            ):
-                logger.info(
-                    f"Initialize storage manager on rank {self.metadata.worker_id}, "
-                    f"use layerwise: {self.use_layerwise},"
-                    f"save only first rank: {self.save_only_first_rank}"
+                need_layerwise_storage = (
+                    self.use_layerwise and not shared_passive_rank
                 )
-                async_lookup_server = kwargs.get("async_lookup_server", None)
-                try:
+                if (
+                    self.lmcache_worker is not None
+                    or need_layerwise_storage
+                    or not self.save_only_first_rank
+                    or self.metadata.is_first_rank()
+                    or len(lookup_server_worker_ids) == 0
+                    or self.metadata.worker_id in lookup_server_worker_ids
+                ):
+                    phase = "StorageManager"
+                    logger.info(
+                        "Initialize storage manager on rank %s, "
+                        "use layerwise: %s, save only first rank: %s",
+                        self.metadata.worker_id,
+                        self.use_layerwise,
+                        self.save_only_first_rank,
+                    )
+                    async_lookup_server = kwargs.get("async_lookup_server", None)
                     with startup_phase(
                         "storage_manager",
                         rank=self.metadata.worker_id,
@@ -6025,29 +6069,38 @@ class LMCacheEngine:
                             lmcache_worker=self.lmcache_worker,
                             async_lookup_server=async_lookup_server,
                         )
-                except Exception as exc:
-                    if (
-                        self.enable_shared_cpu_cache
-                        and self.metadata.world_size > 1
-                        and self.metadata.is_first_rank()
-                        and callable(getattr(self, "broadcast_object_fn", None))
-                    ):
-                        try:
+            except Exception as exc:
+                # Passive ranks are already waiting for the startup envelope.
+                # Capacity/shm failures must reach them just like allocator
+                # failures; do not leave them waiting on a success-only path.
+                if (
+                    self.enable_shared_cpu_cache
+                    and self.metadata.world_size > 1
+                    and self.metadata.is_first_rank()
+                    and callable(getattr(self, "broadcast_object_fn", None))
+                ):
+                    message = (
+                        f"Shared CPU cache rank0 startup failed in {phase}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    logger.error("[LMCACHE_INIT_FAILED] %s", message)
+                    try:
+                        with startup_phase(
+                            "shared_startup_failure_broadcast",
+                            rank=self.metadata.worker_id,
+                            failed_stage=phase,
+                        ):
                             self.broadcast_object_fn(
                                 self._shared_cpu_cache_startup_envelope(
-                                    "error",
-                                    "Shared CPU cache rank0 failed while "
-                                    "initializing shm-backed StorageManager: "
-                                    f"{exc}",
+                                    "error", message
                                 ),
                                 self.metadata.first_rank,
                             )
-                        except Exception:
-                            logger.exception(
-                                "Failed to broadcast shared CPU cache startup "
-                                "error after rank0 StorageManager failure"
-                            )
-                    raise
+                    except Exception:
+                        logger.exception(
+                            "Failed to broadcast shared CPU cache startup error"
+                        )
+                raise
             with startup_phase("shared_cache_setup", rank=self.metadata.worker_id):
                 self._post_init_shared_cpu_cache()
             self.post_inited = True
