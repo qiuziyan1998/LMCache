@@ -20,6 +20,14 @@ class Page:
     pass
 
 
+class TensorObject:
+    def __init__(self, offset: int, size: int) -> None:
+        self.meta = NS(address=offset, phy_size=size)
+
+    def get_size(self) -> int:
+        return self.meta.phy_size
+
+
 @pytest.fixture(scope="module")
 def engine_type():
     tree = ast.parse(PATH.read_text(encoding="utf-8"))
@@ -33,6 +41,7 @@ def engine_type():
         "_retrieve_layer_shared_passive",
         "_prepare_shared_prefill_sources",
         "_submit_prepared_shared_prefill_layers",
+        "_make_shared_handle_batch",
     }
     cls.body = [n for n in cls.body if getattr(n, "name", None) in names]
     cls.bases, cls.decorator_list = [], []
@@ -46,6 +55,9 @@ def engine_type():
         LayerPageMemoryObj=Page,
         LayerCacheEngineKey=type("LayerKey", (), {}),
         SharedHandleEnvelope=NS,
+        SharedHandleBatch=NS,
+        TensorMemoryObj=TensorObject,
+        chunk_hash_to_int=int,
         LayerPageSource=lambda pages, layer, suffix: NS(
             pages=pages, layer_id=layer, suffix=suffix
         ),
@@ -95,7 +107,9 @@ def build(engine_type, layers, group, *, pages=False):
 
     engine._resolve_shared_rank0_layer_mem_objs = resolve
     engine._resolve_shared_rank0_layer_pages = lambda **kw: (sources, 2)
-    engine._make_shared_handle_batch = lambda *a, **kw: NS(num_chunks=2)
+    engine._make_shared_handle_batch = lambda rows, *a, **kw: NS(
+        num_chunks=2, sources=rows
+    )
     engine._make_shared_handles_for_layer = lambda **kw: kw["mem_objs_layer"]
     engine._broadcast_shared_envelope = lambda envelope: (
         events.append(("broadcast", envelope.layer_id)),
@@ -106,7 +120,9 @@ def build(engine_type, layers, group, *, pages=False):
         wire.pop(0),
     )[1]
     engine._validate_shared_layerwise_envelope = lambda envelope, **kw: None
-    engine._make_passive_layer_page_views = lambda *a, **kw: tuple(sources[0])
+    engine._make_passive_layer_page_views = lambda batch, **kw: (
+        tuple(batch.sources[0]) if pages else ()
+    )
     engine._expected_shared_cpu_chunk_metadata = lambda **kw: (
         (kw["num_tokens"],),
         "bf16",
@@ -116,7 +132,11 @@ def build(engine_type, layers, group, *, pages=False):
         create_view=lambda obj, **kw: (
             events.append(("view", kw["expected_layer_id"])),
             obj,
-        )[1]
+        )[1],
+        create_batch_view=lambda batch, **kw: (
+            events.append(("batch_view", kw["layer_id"])),
+            batch.sources[kw["layer_id"]][kw["chunk_index"]],
+        )[1],
     )
 
     def prepare(rows, host, device, *, kv_group):
@@ -152,7 +172,9 @@ def retrieve(
     kwargs = {} if kwargs is None else kwargs
     kwargs["deferred_layerwise_get"] = deferred
     common = dict(
-        keys_layer_major=[[object(), object()] for _ in range(layers)],
+        keys_layer_major=[
+            [NS(chunk_hash=11), NS(chunk_hash=22)] for _ in range(layers)
+        ],
         ret_mask=torch.zeros(5, dtype=torch.bool)
         if passive
         else torch.ones(5, dtype=torch.bool),
@@ -199,6 +221,8 @@ def test_all_metadata_prepared_before_first_yield_bank_commands_stay_lazy(
     assert copies0 == copies1 == []
     assert len(host) == len(device) == layers  # caller's lists, not replacements
     assert not wire
+    assert [event for event in events0 if event[0] == "broadcast"] == [("broadcast", 0)]
+    assert [event for event in events1 if event[0] == "receive"] == [("receive", 0)]
     for events in (events0, events1):
         assert events[-1] == ("pointer_table", layers)
         events.clear()
@@ -207,6 +231,7 @@ def test_all_metadata_prepared_before_first_yield_bank_commands_stay_lazy(
         assert gen0.send(command) is gen1.send(command) is None
         assert copies0[-1][1]["layer_request"] is command
         assert copies1[-1][1]["layer_request"] is command
+        assert copies0[-1][1]["memory_objs"] == copies1[-1][1]["memory_objs"]
         assert events0 == events1 == [("copy", row) for row in range(layer + 1)]
     # No sources released and no CPU wait until the existing final drain.
     assert next(gen0).all() and next(gen1).all()
@@ -230,7 +255,32 @@ def test_legacy_non_p_path_still_resolves_one_layer_at_a_time(engine_type):
     gen.close()
 
 
-@pytest.mark.parametrize("fail_stage", ["resolve", "pointer_table"])
+@pytest.mark.parametrize("group,layers", [(0, 79), (1, 22)])
+def test_plain_cpu_objects_use_real_compact_builder_with_tail(
+    engine_type, group, layers
+):
+    engine, _, wire, copies = build(engine_type, layers, group)
+    del engine._make_shared_handle_batch  # execute the production builder
+    engine.shared_cpu_cache_name = "/prefill-test"
+    rows = [
+        [TensorObject(layer * 128, 64), TensorObject(layer * 128 + 64, 16)]
+        for layer in range(layers)
+    ]
+    engine._resolve_shared_rank0_layer_mem_objs = lambda **kw: rows[kw["layer_id"]]
+    gen = retrieve(engine, group, layers)
+    next(gen)
+    assert len(wire) == 1 and copies == []
+    batch = wire[0].batch
+    assert wire[0].handles == []
+    assert batch.num_layers == layers and batch.num_chunks == 2
+    assert batch.chunk_hashes == [11, 22]
+    assert batch.physical_sizes == [64, 16]  # partial tail is not padded away
+    assert batch.offsets == [obj.meta.address for row in rows for obj in row]
+    assert batch.page_offsets == batch.page_physical_sizes == []
+    gen.close()
+
+
+@pytest.mark.parametrize("fail_stage", ["resolve", "compact_batch", "pointer_table"])
 def test_preparation_error_releases_objects_without_launching_payload(
     engine_type, fail_stage
 ):
@@ -244,6 +294,10 @@ def test_preparation_error_releases_objects_without_launching_payload(
             return original(**kw)
 
         engine._resolve_shared_rank0_layer_mem_objs = resolve
+    elif fail_stage == "compact_batch":
+        engine._make_shared_handle_batch = Mock(
+            side_effect=ValueError("injected failure")
+        )
     else:
         engine.gpu_connector.append_sparse_chunk_ptr_cache_for_layers = Mock(
             side_effect=ValueError("injected failure")
@@ -253,8 +307,30 @@ def test_preparation_error_releases_objects_without_launching_payload(
     assert copies == []
     assert ("release", 4 if fail_stage == "resolve" else 8) in events
     assert not any(event[0] == "retain_unsafe" for event in events)
-    if fail_stage == "resolve":
-        assert wire[-1].status == "error"
+    if fail_stage != "pointer_table":
+        assert len(wire) == 1 and wire[0].status == "error"
+        assert wire[0].layer_id == 0  # no success published before preparation
+
+
+def test_noncompact_sources_keep_legacy_wire_protocol(engine_type):
+    rank0, events0, wire, copies0 = build(engine_type, 4, 0)
+    passive, _, _, copies1 = build(engine_type, 4, 0)
+    rank0._make_shared_handle_batch = lambda *a, **kw: None
+    passive._receive_matching_shared_envelope = lambda **kw: wire.pop(0)
+    gen0 = retrieve(rank0, 0, 4)
+    gen1 = retrieve(passive, 0, 4, passive=True)
+    next(gen0)
+    assert len(wire) == 4 and all(item.batch is None for item in wire)
+    next(gen1)
+    assert not wire
+    assert len([event for event in events0 if event[0] == "resolve"]) == 4
+    for _ in range(4):
+        command = {"slot_mapping": torch.arange(5)}
+        gen0.send(command)
+        gen1.send(command)
+        assert copies0[-1][1] == copies1[-1][1]
+    gen0.close()
+    gen1.close()
 
 
 def test_closing_after_submission_fences_before_releasing(engine_type):

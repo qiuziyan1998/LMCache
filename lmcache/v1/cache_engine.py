@@ -5083,10 +5083,32 @@ class LMCacheEngine:
             for layer_id in range(self.num_layers_for_group(kv_group)):
                 envelope_required = compact_batch is None
                 try:
-                    if page_first_resolve:
+                    if page_first_resolve or deferred_layerwise_get:
                         if pre_resolved_layers is None:
                             full_chunks = planned_page_chunks
-                            if (
+                            if not page_first_resolve:
+                                # P-node preparation already resolves every
+                                # layer before forward. Publish their offsets
+                                # as one existing compact batch even without
+                                # Mooncake pages; do not pay one TP broadcast
+                                # per layer. Keep the original tier selection.
+                                pre_resolved_layers = []
+                                for row_id, row_keys in enumerate(keys_layer_major):
+                                    row = self._resolve_shared_rank0_layer_mem_objs(
+                                        req_id=req_id,
+                                        phase=phase,
+                                        layer_id=row_id,
+                                        kv_group=kv_group,
+                                        keys_layer=row_keys,
+                                        chunk_locations=chunk_locations_layer_major[
+                                            row_id
+                                        ],
+                                    )
+                                    pre_resolved_layers.append(row)
+                                    # Own each resolved row immediately so a
+                                    # later failure releases its refs/pins too.
+                                    to_release.extend(row)
+                            elif (
                                 mooncake_layer_pages_enabled(self.config)
                                 and full_chunks
                             ):
@@ -5136,12 +5158,13 @@ class LMCacheEngine:
                                         keys_layer_major=keys_layer_major,
                                     )
                                 )
-                            unique = {
-                                id(mem_obj): mem_obj
-                                for layer in pre_resolved_layers
-                                for mem_obj in layer
-                            }
-                            to_release.extend(unique.values())
+                            if page_first_resolve:
+                                unique = {
+                                    id(mem_obj): mem_obj
+                                    for layer in pre_resolved_layers
+                                    for mem_obj in layer
+                                }
+                                to_release.extend(unique.values())
                             compact_batch = self._make_shared_handle_batch(
                                 pre_resolved_layers,
                                 keys_layer_major,
