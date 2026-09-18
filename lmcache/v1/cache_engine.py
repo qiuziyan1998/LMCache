@@ -101,6 +101,7 @@ from lmcache.v1.shared_cpu_cache import (
     chunk_hash_to_int,
     validate_shared_handle_batch,
 )
+from lmcache.v1.startup_trace import startup_phase
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
@@ -995,11 +996,21 @@ class LMCacheEngine:
                     )
                 )
                 if self.shared_cpu_cache_strict:
-                    self.shared_cpu_cache_mapping.preflight_device_ptr()
-                self.broadcast_object_fn(
-                    self._shared_cpu_cache_startup_envelope("ok"),
-                    self.metadata.first_rank,
-                )
+                    with startup_phase(
+                        "shared_device_ptr",
+                        rank=self.metadata.worker_id,
+                        slab_bytes=self.shared_cpu_cache_slab_size,
+                    ):
+                        self.shared_cpu_cache_mapping.preflight_device_ptr()
+                with startup_phase(
+                    "shared_startup_broadcast",
+                    rank=self.metadata.worker_id,
+                    src=self.metadata.first_rank,
+                ):
+                    self.broadcast_object_fn(
+                        self._shared_cpu_cache_startup_envelope("ok"),
+                        self.metadata.first_rank,
+                    )
             except Exception as exc:
                 mapping = getattr(self, "shared_cpu_cache_mapping", None)
                 if mapping is not None:
@@ -1034,7 +1045,12 @@ class LMCacheEngine:
             )
             return
 
-        envelope = self.broadcast_object_fn(None, self.metadata.first_rank)
+        with startup_phase(
+            "shared_startup_receive",
+            rank=self.metadata.worker_id,
+            src=self.metadata.first_rank,
+        ):
+            envelope = self.broadcast_object_fn(None, self.metadata.first_rank)
         if not isinstance(envelope, dict):
             raise ValueError(
                 "Shared CPU cache passive preflight expected dict envelope, "
@@ -1068,14 +1084,26 @@ class LMCacheEngine:
         for writable in writable_attempts:
             mapping = None
             try:
-                mapping = SharedSlabMapping.attach(
+                with startup_phase(
+                    "shared_slab_attach",
+                    rank=self.metadata.worker_id,
+                    slab_bytes=self.shared_cpu_cache_slab_size,
                     shm_name=self.shared_cpu_cache_name,
-                    size=self.shared_cpu_cache_slab_size,
-                    generation=self.shared_cpu_cache_generation,
                     writable=writable,
-                )
+                ):
+                    mapping = SharedSlabMapping.attach(
+                        shm_name=self.shared_cpu_cache_name,
+                        size=self.shared_cpu_cache_slab_size,
+                        generation=self.shared_cpu_cache_generation,
+                        writable=writable,
+                    )
                 if self.shared_cpu_cache_strict:
-                    mapping.preflight_device_ptr()
+                    with startup_phase(
+                        "shared_device_ptr",
+                        rank=self.metadata.worker_id,
+                        slab_bytes=self.shared_cpu_cache_slab_size,
+                    ):
+                        mapping.preflight_device_ptr()
                 self.shared_cpu_cache_mapping = mapping
                 if self.config.extra_config is None:
                     self.config.extra_config = {}
@@ -5950,17 +5978,20 @@ class LMCacheEngine:
     def post_init(self, **kwargs) -> None:
         if not self.post_inited:
             logger.info("Post initializing LMCacheEngine")
-            lookup_server_worker_ids = self.config.get_lookup_server_worker_ids(
-                self.metadata.use_mla, self.metadata.world_size
-            )
+            with startup_phase("lookup_worker_ids", rank=self.metadata.worker_id):
+                lookup_server_worker_ids = self.config.get_lookup_server_worker_ids(
+                    self.metadata.use_mla, self.metadata.world_size
+                )
             if getattr(
                 self,
                 "_shared_cpu_sparse_capacity_sanity_pending",
                 False,
             ):
-                self._report_shared_cpu_sparse_capacity_sanity()
+                with startup_phase("capacity_check", rank=self.metadata.worker_id):
+                    self._report_shared_cpu_sparse_capacity_sanity()
                 self._shared_cpu_sparse_capacity_sanity_pending = False
-            self._preflight_shared_cpu_shm_capacity()
+            with startup_phase("shm_space_check", rank=self.metadata.worker_id):
+                self._preflight_shared_cpu_shm_capacity()
             shared_passive_rank = (
                 self.enable_shared_cpu_cache
                 and self._is_passive()
@@ -5982,13 +6013,18 @@ class LMCacheEngine:
                 )
                 async_lookup_server = kwargs.get("async_lookup_server", None)
                 try:
-                    self.storage_manager = StorageManager(
-                        self.config,
-                        self.metadata,
-                        event_manager=self.event_manager,
-                        lmcache_worker=self.lmcache_worker,
-                        async_lookup_server=async_lookup_server,
-                    )
+                    with startup_phase(
+                        "storage_manager",
+                        rank=self.metadata.worker_id,
+                        cpu_cache_gb=self.config.max_local_cpu_size,
+                    ):
+                        self.storage_manager = StorageManager(
+                            self.config,
+                            self.metadata,
+                            event_manager=self.event_manager,
+                            lmcache_worker=self.lmcache_worker,
+                            async_lookup_server=async_lookup_server,
+                        )
                 except Exception as exc:
                     if (
                         self.enable_shared_cpu_cache
@@ -6012,7 +6048,8 @@ class LMCacheEngine:
                                 "error after rank0 StorageManager failure"
                             )
                     raise
-            self._post_init_shared_cpu_cache()
+            with startup_phase("shared_cache_setup", rank=self.metadata.worker_id):
+                self._post_init_shared_cpu_cache()
             self.post_inited = True
 
     def freeze(self, enabled: bool) -> None:

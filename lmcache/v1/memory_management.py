@@ -21,6 +21,7 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.startup_trace import startup_phase
 from lmcache.v1.system_detection import NUMAMapping
 
 if torch.cuda.is_available():
@@ -534,7 +535,8 @@ def _allocate_cpu_memory(
         shm_interleave_nodes=shm_interleave_nodes,
     )
     alloc_fn, *alloc_args = alloc_info
-    ptr = alloc_fn(size, *alloc_args)
+    with startup_phase("native_pinned_alloc", bytes=size, shm_name=shm_name):
+        ptr = alloc_fn(size, *alloc_args)
 
     array_type = ctypes.c_uint8 * size
     buf = array_type.from_address(ptr)

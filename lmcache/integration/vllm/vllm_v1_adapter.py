@@ -58,6 +58,7 @@ from lmcache.integration.vllm.utils import (
 )
 from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.logging import init_logger
+from lmcache.v1.startup_trace import startup_phase
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
 from lmcache.v1.cache_engine import (
@@ -6892,16 +6893,19 @@ class LMCacheConnectorV1Impl:
             raise RuntimeError("Cannot replace sealed KV caches; restart worker")
         assert len(self.kv_caches) == 0 and len(kv_caches) > 0
         self.kv_caches = kv_caches
-        self._refresh_kvcaches_list()
-        self._build_kv_layer_groups()
-        self._manager.post_init()
+        with startup_phase("kv_layer_groups"):
+            self._refresh_kvcaches_list()
+            self._build_kv_layer_groups()
+        with startup_phase("manager_post_init"):
+            self._manager.post_init()
         preflight = getattr(
             self.lmcache_engine,
             "preflight_group1_direct_hbm",
             None,
         )
         if callable(preflight):
-            preflight(self._kvcaches_for_group(1))
+            with startup_phase("group1_direct_hbm_preflight"):
+                preflight(self._kvcaches_for_group(1))
 
     def seal_sparse_destination_layout(self) -> None:
         """Register fixed Group-0 buffers after successful final staged capture.
