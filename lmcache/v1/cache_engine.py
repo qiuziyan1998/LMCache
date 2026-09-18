@@ -4910,6 +4910,46 @@ class LMCacheEngine:
             raise
         return True
 
+    def _prepare_shared_prefill_sources(
+        self,
+        sources: list[Any],
+        kv_group: int,
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Build P-node load pointer rows before the first forward yield.
+
+        Keep the caller's mutable cache lists for dense-to-sparse adoption.
+        This uses the same registered CPU objects, without copying KV payloads.
+        """
+        self.gpu_connector.append_sparse_chunk_ptr_cache_for_layers(
+            sources,
+            kwargs.setdefault("cached_chunk_dev_ptrs", []),
+            kwargs.setdefault("cached_chunk_ptrs_npu", []),
+            kv_group=kv_group,
+        )
+
+    def _submit_prepared_shared_prefill_layers(
+        self,
+        consumer: Any,
+        sources: list[Any],
+        ret_mask: torch.Tensor,
+        perf_enabled: bool = False,
+    ) -> Generator[Optional[torch.Tensor], Any, float]:
+        """Relay bank commands; no storage lookup, TP broadcast or pointer upload."""
+        send_s = 0.0
+        for layer_id, source in enumerate(sources):
+            command = yield torch.sum(ret_mask) if layer_id == 0 else None
+            if source is not None:
+                started = serving_perf_now() if perf_enabled else 0.0
+                consumer.send(
+                    source
+                    if command is None
+                    else {"memory_objs": source, "layer_request": command}
+                )
+                if started:
+                    send_s += serving_perf_now() - started
+        return send_s
+
     def _retrieve_layer_shared_rank0(
         self,
         *,
@@ -4961,7 +5001,11 @@ class LMCacheEngine:
                         message="no dense prefix shared CPU cache chunks selected",
                     )
                 )
-                yield None
+                if not deferred_layerwise_get:
+                    yield None
+            if deferred_layerwise_get:
+                for _ in range(self.num_layers_for_group(kv_group)):
+                    yield None
             yield None
             self.stats_monitor.on_retrieve_finished(monitor_req_id, 0)
             yield ret_mask
@@ -5007,6 +5051,9 @@ class LMCacheEngine:
             exact_locations = [location for location, _ in remote_fill_plan]
 
         assert_layerwise_gpu_connector(self.gpu_connector)
+        if deferred_layerwise_get:
+            kwargs.setdefault("cached_chunk_dev_ptrs", [])
+            kwargs.setdefault("cached_chunk_ptrs_npu", [])
         mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
         next(mem_obj_consumer)
 
@@ -5027,7 +5074,8 @@ class LMCacheEngine:
         layer_page_chunks = 0
         layer_pages: tuple[LayerPageMemoryObj, ...] = ()
         compact_batch: Optional[SharedHandleBatch] = None
-        sources_safe_to_release = not deferred_layerwise_get
+        sources_safe_to_release = True
+        prepared_sources: list[Any] = []
         consumer_failed = False
         perf_enabled = serving_perf_enabled()
         consume_started = consumer_send_s = consumer_finish_s = 0.0
@@ -5212,6 +5260,18 @@ class LMCacheEngine:
                             "RemoteFill shared pages"
                         )
 
+                if deferred_layerwise_get:
+                    prepared_sources.append(
+                        LayerPageSource(
+                            layer_pages,
+                            layer_id,
+                            tuple(mem_objs_layer[layer_page_chunks:]),
+                        )
+                        if layer_page_chunks
+                        else mem_objs_layer
+                    )
+                    continue
+
                 if perf_enabled and not consume_started:
                     consume_started = serving_perf_now()
                 if layer_id == 0:
@@ -5245,6 +5305,21 @@ class LMCacheEngine:
                     consumer_send_s += serving_perf_now() - send_started
 
             if deferred_layerwise_get:
+                self._prepare_shared_prefill_sources(
+                    prepared_sources, kv_group, kwargs
+                )
+                sources_safe_to_release = False
+                if perf_enabled:
+                    consume_started = serving_perf_now()
+                try:
+                    consumer_send_s = yield from (
+                        self._submit_prepared_shared_prefill_layers(
+                            mem_obj_consumer, prepared_sources, ret_mask, perf_enabled
+                        )
+                    )
+                except Exception:
+                    consumer_failed = True
+                    raise
                 # N-1 returns immediately after the final H2D enqueue. The
                 # last-layer entry resumes this generator to synchronize the
                 # consumer and release shared-source ownership.
@@ -5386,6 +5461,9 @@ class LMCacheEngine:
         deferred_layerwise_get = bool(
             kwargs.get("deferred_layerwise_get", False)
         )
+        if deferred_layerwise_get:
+            kwargs.setdefault("cached_chunk_dev_ptrs", [])
+            kwargs.setdefault("cached_chunk_ptrs_npu", [])
         mem_obj_consumer = None
         to_release: list[MemoryObj] = []
         resolved_layers: list[list[MemoryObj]] = []
@@ -5394,7 +5472,8 @@ class LMCacheEngine:
         compact_batch: Optional[SharedHandleBatch] = None
         passive_pages: list[LayerPageMemoryObj] = []
         passive_page_tuple: tuple[LayerPageMemoryObj, ...] = ()
-        sources_safe_to_release = not deferred_layerwise_get
+        sources_safe_to_release = True
+        prepared_sources: list[Any] = []
         consumer_failed = False
         perf_enabled = serving_perf_enabled()
         consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
@@ -5437,7 +5516,9 @@ class LMCacheEngine:
                             "RemoteFill shared-handle envelope validation failed"
                         ) from exc
                     if envelope.status in ("miss", "skipped"):
-                        if layer_id == 0:
+                        if deferred_layerwise_get:
+                            prepared_sources.append(None)
+                        elif layer_id == 0:
                             yield torch.sum(ret_mask)
                         else:
                             yield None
@@ -5579,6 +5660,18 @@ class LMCacheEngine:
                 resolved_layers.append(mem_objs_layer)
                 handles_by_layer.append(layer_handles)
 
+                if deferred_layerwise_get:
+                    prepared_sources.append(
+                        LayerPageSource(
+                            passive_page_tuple,
+                            layer_id,
+                            tuple(mem_objs_layer[page_chunks:]),
+                        )
+                        if passive_pages
+                        else mem_objs_layer
+                    )
+                    continue
+
                 if layer_id == 0:
                     layer_request = yield torch.sum(ret_mask)
                 else:
@@ -5610,6 +5703,24 @@ class LMCacheEngine:
                 if send_started:
                     consumer_send_s += serving_perf_now() - send_started
 
+            if deferred_layerwise_get:
+                if resolved_layers:
+                    # A skipped group has no consumer. Preserve that protocol;
+                    # ordinary P prefix loads prepare every layer here.
+                    if all(source is not None for source in prepared_sources):
+                        self._prepare_shared_prefill_sources(
+                            prepared_sources, kv_group, kwargs
+                        )
+                    sources_safe_to_release = False
+                try:
+                    consumer_send_s = yield from (
+                        self._submit_prepared_shared_prefill_layers(
+                            mem_obj_consumer, prepared_sources, ret_mask, perf_enabled
+                        )
+                    )
+                except Exception:
+                    consumer_failed = True
+                    raise
             deferred_cleanup_gate_used = bool(
                 deferred_layerwise_get and mem_obj_consumer is not None
             )
