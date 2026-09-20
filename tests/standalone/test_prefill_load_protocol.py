@@ -164,6 +164,14 @@ def make_step(adapter, latent_layers, indexer_layers, *, step=0, requests=2):
         indexer = retrieve(req, 1, len(indexer_layers)) if indexer_layers else None
         adapter.layerwise_retrievers.append((latent, indexer))
         adapter._prime_dense_prefix_retrievers(latent, indexer)
+        if len(latent_layers) > 1:
+            adapter._advance_dense_layerwise_retriever(
+                req, (latent, indexer), 0, 1
+            )
+        if indexer is not None and len(indexer_layers) > 1:
+            adapter._advance_dense_layerwise_retriever(
+                req, (latent, indexer), 1, 1
+            )
     metadata = SimpleNamespace(requests=list(adapter._layerwise_requests))
     adapter._parent = SimpleNamespace(_get_connector_metadata=lambda: metadata)
     return SimpleNamespace(
@@ -219,6 +227,14 @@ def test_two_steps_read_the_right_history_bank_and_drain_each_group_once(
             for _, _, name in names:
                 adapter.submit_layerwise_prefill_load(name)
             assert adapter.current_layer == execution + 1
+            for group, row, _ in names:
+                next_row = row + 2
+                count = len(indexer_layers) if group else len(latent_layers)
+                if next_row < count:
+                    assert all(
+                        (req.req_id, group, next_row) in state.submitted
+                        for req in state.requests
+                    )
         validations = adapter._validate_dense_retrieve_result.call_args_list
         expected_groups = {0, 1} if indexer_layers else {0}
         assert len(validations) == len(state.requests) * len(expected_groups)

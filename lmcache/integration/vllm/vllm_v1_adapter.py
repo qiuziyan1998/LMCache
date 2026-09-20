@@ -1997,6 +1997,10 @@ class LMCacheConnectorV1Impl:
         self.device = vllm_config.device_config.device
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self._layerwise_prefill_p_node = _layerwise_prefill_p_node_enabled()
+        self._layerwise_prefill_dma = (
+            self._layerwise_prefill_p_node
+            and os.environ.get("LMCACHE_LAYERWISE_PREFILL_DMA", "0") == "1"
+        )
         self._dsa_index_lmcache_disabled = (
             os.environ.get("VLLM_ASCEND_DSA_DISABLE_INDEX_LMCACHE", "0") == "1"
         )
@@ -2895,6 +2899,16 @@ class LMCacheConnectorV1Impl:
         # Layout/allocation mode was checked when materializing this forward's
         # maps. Layer callbacks only select their group's physical bank.
         return mappings[bank][kv_group]
+
+    def _layerwise_prefill_dma_cpu_slots(
+        self, request: ReqMeta, kv_group: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if not getattr(self, "_layerwise_prefill_dma", False):
+            return None
+        mappings = request.slot_mappings_by_bank
+        if mappings is None:
+            raise RuntimeError("P-node DMA needs the two original CPU bank maps")
+        return mappings[0][kv_group], mappings[1][kv_group]
 
     def _materialize_layerwise_prefill_slot_mappings(
         self,
@@ -8738,6 +8752,12 @@ class LMCacheConnectorV1Impl:
                         shared_cpu_request_preflight_state=dense_preflight_state,
                         _retain_shared_dense_cache=retain_dense_seed,
                         **deferred_prefill_kwargs,
+                        **(
+                            {"prefill_dma_cpu_slots_by_bank":
+                             self._layerwise_prefill_dma_cpu_slots(request, 0)}
+                            if self._deferred_layerwise_prefill_load_active
+                            and self._layerwise_prefill_dma else {}
+                        ),
                         **(latent_cache if retain_dense_seed else {}),
                     )
                     self.layerwise_retrievers.append(
@@ -8806,6 +8826,12 @@ class LMCacheConnectorV1Impl:
                             ),
                             _retain_shared_dense_cache=retain_dense_seed,
                             **deferred_prefill_kwargs,
+                            **(
+                                {"prefill_dma_cpu_slots_by_bank":
+                                 self._layerwise_prefill_dma_cpu_slots(request, 1)}
+                                if self._deferred_layerwise_prefill_load_active
+                                and self._layerwise_prefill_dma else {}
+                            ),
                             **(indexer_cache if retain_dense_seed else {}),
                         )
                         self.layerwise_retrievers[-1] = (
@@ -8820,6 +8846,25 @@ class LMCacheConnectorV1Impl:
                         layerwise_retriever,
                         indexer_retriever,
                     )
+                    if self._deferred_layerwise_prefill_load_active:
+                        # The two physical banks permit L0 and L1 to be
+                        # loaded before model execution. Post-LN callbacks
+                        # can then enqueue L(N+2) behind save(N), leaving
+                        # L(N+1) compute to cover the transfer.
+                        retriever_pair = (
+                            layerwise_retriever,
+                            indexer_retriever,
+                        )
+                        if len(self._latent_layer_names) > 1:
+                            self._advance_dense_layerwise_retriever(
+                                request, retriever_pair, 0, 1
+                            )
+                        if indexer_retriever is not None and len(
+                            self._indexer_layer_names
+                        ) > 1:
+                            self._advance_dense_layerwise_retriever(
+                                request, retriever_pair, 1, 1
+                            )
 
                     if retain_dense_seed:
                         retrieve_state.location = "LocalCPUBackend"
@@ -9282,7 +9327,11 @@ class LMCacheConnectorV1Impl:
             )
         if finish_current and layer_id != last_group_layer:
             raise RuntimeError("Only the last group row may drain its prefill load")
-        transfer_layer = min(layer_id + 1, last_group_layer)
+        transfer_layer = layer_id + 2
+        should_advance_retriever = (
+            (finish_current and layer_id == last_group_layer)
+            or (not finish_current and transfer_layer <= last_group_layer)
+        )
 
         with self._sparse_retrieve_state_guard(layerwise_requests):
             for idx, request in enumerate(layerwise_requests):
@@ -9301,14 +9350,14 @@ class LMCacheConnectorV1Impl:
                         "non-PREFILL_CHILD request: "
                         f"req_id={request.req_id}"
                     )
-                if wait_group not in drained_groups:
+                if wait_group not in drained_groups and should_advance_retriever:
                     ret_token_mask = self._advance_dense_layerwise_retriever(
                         request,
                         self.layerwise_retrievers[idx],
                         wait_group,
                         transfer_layer,
                     )
-                    if layer_id == last_group_layer:
+                    if finish_current:
                         if ret_token_mask is None:
                             raise RuntimeError(
                                 "Layerwise prefill load finished without a result: "
@@ -9318,7 +9367,7 @@ class LMCacheConnectorV1Impl:
                             request, ret_token_mask, kv_group=wait_group
                         )
 
-        if layer_id == last_group_layer:
+        if finish_current:
             drained_groups.add(wait_group)
         if finish_current:
             # Release final H2D sources at this group's entry fence, but do
@@ -9334,7 +9383,7 @@ class LMCacheConnectorV1Impl:
 
     @_lmcache_nvtx_annotate
     def submit_layerwise_prefill_load(self, layer_name: str) -> None:
-        """Submit layer N+1 after layer N attention enters its HCOM window."""
+        """Submit layer N+2 after layer N attention enters its HCOM window."""
         if not self.layerwise_retrievers:
             return
         if not getattr(self, "_deferred_layerwise_prefill_load_active", False):
@@ -10101,6 +10150,11 @@ class LMCacheConnectorV1Impl:
             sync=sync,
             deferred_layerwise_put=True,
             layerwise_prefill_bank_count=2,
+            **(
+                {"prefill_dma_cpu_slots_by_bank":
+                 self._layerwise_prefill_dma_cpu_slots(request, kv_group)}
+                if self._layerwise_prefill_dma else {}
+            ),
             req_id=request.req_id,
             **store_kwargs,
         )
