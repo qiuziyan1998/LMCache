@@ -259,6 +259,32 @@ def test_two_steps_read_the_right_history_bank_and_drain_each_group_once(
         adapter._abort_layerwise_retrieve_step.assert_not_called()
 
 
+def test_previous_layer_submit_at_next_layer_entry():
+    adapter = load_callbacks()()
+    state = make_step(adapter, list(range(8)), [0, 1, 2, 6])
+    previous_names = []
+    for execution in range(8):
+        # The model submits source layer N at the beginning of N+1, before
+        # N+1's first KV wait. The source name already identifies both group
+        # ordinals; LMCache need not infer it from the current model callback.
+        for name in previous_names:
+            adapter.submit_layerwise_prefill_load(name)
+        assert adapter.current_layer == execution
+        current_names = [adapter._latent_layer_names[execution]]
+        if execution in (0, 1, 2, 6):
+            current_names.append(adapter._indexer_layer_names[(0, 1, 2, 6).index(execution)])
+        for name in current_names:
+            adapter.wait_for_layer_load(name)
+        previous_names = current_names
+
+    # The final layer has no successor, so it submits after its own SFA.
+    for name in previous_names:
+        adapter.submit_layerwise_prefill_load(name)
+    assert adapter.current_layer == 8
+    assert not adapter.layerwise_retrievers
+    assert len(state.submitted) == len(set(state.submitted)) == 2 * (8 + 4)
+
+
 def test_submit_still_rejects_wrong_execution_layer_and_group_order():
     adapter = load_callbacks()()
     make_step(adapter, list(range(8)), [0, 1, 2, 6], requests=1)
