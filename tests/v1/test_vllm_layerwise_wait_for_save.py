@@ -1252,6 +1252,8 @@ def test_finished_worker_request_closes_abandoned_layerwise_storer() -> None:
     request = _make_req("req-1")
     connector, _, engine = _make_connector([request])
     closed = []
+    released = []
+    engine.release_layerwise_prefill_pages = released.append
 
     def _abandoned_storer():
         try:
@@ -1270,6 +1272,7 @@ def test_finished_worker_request_closes_abandoned_layerwise_storer() -> None:
     assert closed == [True]
     assert connector._layerwise_save_storers == {}
     assert engine.unpinned == ["req-1"]
+    assert released == ["req-1"]
 
 
 def test_deferred_latent_flush_drains_full_store_layer() -> None:

@@ -4962,6 +4962,11 @@ class LMCacheConnectorV1Impl:
             self._cold_perf_dense_load_completed.pop(req_id, None)
             self._drop_layerwise_save_storers(req_id)
             self._drop_worker_retrieve_state(req_id, defer_dense_release=True)
+            release_prefill_pages = getattr(
+                self.lmcache_engine, "release_layerwise_prefill_pages", None
+            )
+            if release_prefill_pages is not None:
+                release_prefill_pages(req_id)
         # get_finished calls this even with no new finishes. Poll here once,
         # inside its measured finalization scope, not on every load submission.
         self._drain_dense_load_retirements()
