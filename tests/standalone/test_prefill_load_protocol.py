@@ -45,6 +45,7 @@ def load_callbacks():
         "_layerwise_prefill_slot_mapping",
         "_wait_for_layerwise_prefill_bank",
         "_advance_deferred_layerwise_prefill_load",
+        "_submit_initial_layerwise_prefill_load",
         "_advance_dense_layerwise_retriever",
         "_complete_layerwise_retrieve_group",
         "_sparse_retrieve_state_guard",
@@ -69,6 +70,7 @@ def load_callbacks():
         LMCacheConnectorMetadata=SimpleNamespace,
         serving_perf_now=lambda: 0.0,
         serving_perf_enabled=lambda: False,
+        prefill_start_timing_enabled=lambda: False,
     )
     module = ast.Module(
         body=[
@@ -105,6 +107,7 @@ def make_step(adapter, latent_layers, indexer_layers, *, step=0, requests=2):
     adapter.use_layerwise = True
     adapter.kv_role = "kv_producer"
     adapter._deferred_layerwise_prefill_load_active = True
+    adapter._initial_layerwise_prefill_load_submitted = False
     adapter._layerwise_waited_groups = set()
     adapter._cold_perf_load_started = {}
     adapter._cold_perf_dense_load_started = {}
@@ -164,14 +167,6 @@ def make_step(adapter, latent_layers, indexer_layers, *, step=0, requests=2):
         indexer = retrieve(req, 1, len(indexer_layers)) if indexer_layers else None
         adapter.layerwise_retrievers.append((latent, indexer))
         adapter._prime_dense_prefix_retrievers(latent, indexer)
-        if len(latent_layers) > 1:
-            adapter._advance_dense_layerwise_retriever(
-                req, (latent, indexer), 0, 1
-            )
-        if indexer is not None and len(indexer_layers) > 1:
-            adapter._advance_dense_layerwise_retriever(
-                req, (latent, indexer), 1, 1
-            )
     metadata = SimpleNamespace(requests=list(adapter._layerwise_requests))
     adapter._parent = SimpleNamespace(_get_connector_metadata=lambda: metadata)
     return SimpleNamespace(
@@ -203,6 +198,11 @@ def test_two_steps_read_the_right_history_bank_and_drain_each_group_once(
     adapter = load_callbacks()()
     for step in range(2):
         state = make_step(adapter, latent_layers, indexer_layers, step=step)
+        assert all(row == 0 for _, _, row in state.submitted)
+        adapter.submit_layerwise_prefill_load(-1)
+        initial_submissions = list(state.submitted)
+        adapter.submit_layerwise_prefill_load(-1)
+        assert state.submitted == initial_submissions
         for execution, model_layer in enumerate(latent_layers):
             names = [(0, execution, adapter._latent_layer_names[execution])]
             if model_layer in indexer_layers:
@@ -264,6 +264,8 @@ def test_previous_layer_submit_at_next_layer_entry():
     state = make_step(adapter, list(range(8)), [0, 1, 2, 6])
     previous_names = []
     for execution in range(8):
+        if execution == 0:
+            adapter.submit_layerwise_prefill_load(-1)
         # The model submits source layer N at the beginning of N+1, before
         # N+1's first KV wait. The source name already identifies both group
         # ordinals; LMCache need not infer it from the current model callback.
@@ -288,6 +290,7 @@ def test_previous_layer_submit_at_next_layer_entry():
 def test_submit_still_rejects_wrong_execution_layer_and_group_order():
     adapter = load_callbacks()()
     make_step(adapter, list(range(8)), [0, 1, 2, 6], requests=1)
+    adapter.submit_layerwise_prefill_load(-1)
     with pytest.raises(RuntimeError, match="submitted out of order"):
         adapter.submit_layerwise_prefill_load(adapter._indexer_layer_names[0])
     with pytest.raises(RuntimeError, match="does not match callback"):
@@ -309,6 +312,7 @@ def test_cache_miss_still_fences_banks_without_advancing_generators():
 def test_failed_group_load_resets_banks_and_closes_all_request_generators():
     adapter = load_callbacks()()
     state = make_step(adapter, list(range(8)), [0, 1, 2, 6])
+    adapter.submit_layerwise_prefill_load(-1)
     # Use real abort cleanup for this failure path, not the success-path spy.
     del adapter._abort_layerwise_retrieve_step
     adapter._worker_retrieve_state = {}

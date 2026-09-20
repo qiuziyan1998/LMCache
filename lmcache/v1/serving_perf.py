@@ -18,8 +18,10 @@ import socket
 import time
 
 SERVING_PERF_ENV = "PD_SERVING_PERF"
+PREFILL_START_TIMING_ENV = "LMCACHE_PREFILL_START_TIMING"
 _FALSE_VALUES = {"", "0", "false", "no", "off"}
 _MODE = os.environ.get(SERVING_PERF_ENV, "0").strip().lower()
+_PREFILL_START_TIMING = os.environ.get(PREFILL_START_TIMING_ENV, "0") == "1"
 _PERF_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
     "lmcache_serving_perf_context", default=None
 )
@@ -39,6 +41,26 @@ _HOST, _CLOCK_DOMAIN = _clock_domain()
 
 def serving_perf_enabled() -> bool:
     return _MODE not in _FALSE_VALUES
+
+
+def prefill_start_timing_enabled() -> bool:
+    """Whether opt-in, per-chunk P-node setup timing is enabled."""
+    return _PREFILL_START_TIMING
+
+
+def prefill_start_timing_log(
+    logger: Any, stage: str, started: float, **fields: Any
+) -> None:
+    """Log one host-stage duration without inspecting or syncing NPU tensors."""
+    if not _PREFILL_START_TIMING:
+        return
+    payload = {
+        "stage": stage,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+        "pid": os.getpid(),
+        **fields,
+    }
+    logger.info("[PREFILL_START] %s", json.dumps(payload, separators=(",", ":")))
 
 
 def serving_perf_detailed_enabled() -> bool:

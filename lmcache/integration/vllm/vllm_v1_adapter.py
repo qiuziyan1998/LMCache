@@ -68,6 +68,8 @@ from lmcache.v1.cache_engine import (
     LMCacheEngine,
 )
 from lmcache.v1.serving_perf import (
+    prefill_start_timing_enabled,
+    prefill_start_timing_log,
     serving_perf_enabled,
     serving_perf_log,
     serving_perf_now,
@@ -2185,6 +2187,7 @@ class LMCacheConnectorV1Impl:
         self._layerwise_sparse_shared_ordered: list[bool] = []
         self._layerwise_required_wait_groups_cache: Optional[set[int]] = None
         self._deferred_layerwise_prefill_load_active = False
+        self._initial_layerwise_prefill_load_submitted = False
         self._deferred_layerwise_prefill_drained_groups: set[int] = set()
         self._layerwise_save_storers: dict[
             LayerwiseSaveKey, Generator[Optional[LayerwiseStoreResult], None, None]
@@ -3938,6 +3941,7 @@ class LMCacheConnectorV1Impl:
                 self._layerwise_sparse_indexer_sent_layers.clear()
             self._layerwise_required_wait_groups_cache = None
             self._deferred_layerwise_prefill_load_active = False
+            self._initial_layerwise_prefill_load_submitted = False
             self._deferred_layerwise_prefill_drained_groups = set()
 
     @staticmethod
@@ -6889,14 +6893,33 @@ class LMCacheConnectorV1Impl:
     def _prime_dense_prefix_retrievers(
         layerwise_retriever: Generator[Optional[torch.Tensor], None, None],
         indexer_retriever: Optional[Generator[Optional[torch.Tensor], None, None]],
+        req_id: Optional[str] = None,
+        prefix_tokens: int = 0,
     ) -> None:
         """Prime dense prefix retrievers without breaking two-group ordering."""
-        next(layerwise_retriever)
-        if indexer_retriever is not None:
-            next(indexer_retriever)
-        next(layerwise_retriever)
-        if indexer_retriever is not None:
-            next(indexer_retriever)
+        if req_id is None or not prefill_start_timing_enabled():
+            next(layerwise_retriever)
+            if indexer_retriever is not None:
+                next(indexer_retriever)
+            next(layerwise_retriever)
+            if indexer_retriever is not None:
+                next(indexer_retriever)
+            return
+        for kv_group, layer, retriever in (
+            (0, 0, layerwise_retriever),
+            (1, 0, indexer_retriever),
+            (0, 1, layerwise_retriever),
+            (1, 1, indexer_retriever),
+        ):
+            if retriever is None:
+                continue
+            started = time.perf_counter()
+            next(retriever)
+            prefill_start_timing_log(
+                logger, "prime_retriever", started,
+                req_id=req_id, prefix_tokens=prefix_tokens,
+                kv_group=kv_group, step=layer,
+            )
 
     @_lmcache_nvtx_annotate
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -8006,9 +8029,16 @@ class LMCacheConnectorV1Impl:
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start this step's KV loads and atomically discard partial setup."""
+        started = (
+            time.perf_counter()
+            if self._layerwise_prefill_p_node and prefill_start_timing_enabled()
+            else 0.0
+        )
+        status = "ok"
         try:
             self._start_load_kv(forward_context, **kwargs)
         except BaseException:
+            status = "error"
             metadata = self._parent._get_connector_metadata()
             assert isinstance(metadata, LMCacheConnectorMetadata)
             self._abort_layerwise_retrieve_step(
@@ -8020,6 +8050,11 @@ class LMCacheConnectorV1Impl:
                 )
             )
             raise
+        finally:
+            if started:
+                prefill_start_timing_log(
+                    logger, "start_load_kv_total", started, status=status,
+                )
 
     def _start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -8036,6 +8071,7 @@ class LMCacheConnectorV1Impl:
         self.current_layer = 0
         self._wait_for_save_done = False
         self._deferred_layerwise_prefill_load_active = False
+        self._initial_layerwise_prefill_load_submitted = False
 
         attn_metadata = forward_context.attn_metadata
         metadata = self._parent._get_connector_metadata()
@@ -8119,12 +8155,23 @@ class LMCacheConnectorV1Impl:
         if not self._kvcaches_list:
             self._refresh_kvcaches_list()
         if self._layerwise_prefill_p_node:
+            mapping_started = (
+                time.perf_counter() if prefill_start_timing_enabled() else 0.0
+            )
             for request in metadata.requests:
                 if request.block_allocation_mode == "prefill_child":
                     self._materialize_layerwise_prefill_slot_mappings(
                         request,
                         force=True,
                     )
+            if mapping_started:
+                prefill_start_timing_log(
+                    logger, "materialize_bank_maps", mapping_started,
+                    requests=len(metadata.requests),
+                    max_tokens=max(
+                        (len(r.token_ids) for r in metadata.requests), default=0
+                    ),
+                )
         kvcaches = self._kvcaches_list
 
         assert self.lmcache_engine is not None
@@ -8149,6 +8196,11 @@ class LMCacheConnectorV1Impl:
             self._stats_monitor.update_interval_prompt_tokens(prompt_tokens)
 
         for load_idx, (idx, request) in enumerate(loadable_requests):
+            prefill_request_started = (
+                time.perf_counter()
+                if self._layerwise_prefill_p_node and prefill_start_timing_enabled()
+                else 0.0
+            )
             request_perf_started = (
                 serving_perf_now() if serving_perf_enabled() else 0.0
             )
@@ -8839,33 +8891,24 @@ class LMCacheConnectorV1Impl:
                             indexer_retriever,
                         )
 
-                    # Prime the same two-step window as the legacy dense path,
-                    # but interleave groups so shared-cache collectives remain
-                    # layer-major: latent L0, index L0, latent L1, index L1.
+                    # The first two generator resumes prepare and submit L0.
+                    # L1 is submitted by the virtual N=-1 callback at the
+                    # first SFA entry, so its DMA can overlap L0 compute.
+                    if prefill_request_started:
+                        prefill_start_timing_log(
+                            logger, "retrieve_setup_before_prime",
+                            prefill_request_started,
+                            req_id=request.req_id,
+                            prefix_tokens=len(retrieve_tokens),
+                        )
                     self._prime_dense_prefix_retrievers(
                         layerwise_retriever,
                         indexer_retriever,
+                        req_id=(
+                            request.req_id if self._layerwise_prefill_p_node else None
+                        ),
+                        prefix_tokens=len(retrieve_tokens),
                     )
-                    if self._deferred_layerwise_prefill_load_active:
-                        # The two physical banks permit L0 and L1 to be
-                        # loaded before model execution. Post-LN callbacks
-                        # can then enqueue L(N+2) behind save(N), leaving
-                        # L(N+1) compute to cover the transfer.
-                        retriever_pair = (
-                            layerwise_retriever,
-                            indexer_retriever,
-                        )
-                        if len(self._latent_layer_names) > 1:
-                            self._advance_dense_layerwise_retriever(
-                                request, retriever_pair, 0, 1
-                            )
-                        if indexer_retriever is not None and len(
-                            self._indexer_layer_names
-                        ) > 1:
-                            self._advance_dense_layerwise_retriever(
-                                request, retriever_pair, 1, 1
-                            )
-
                     if retain_dense_seed:
                         retrieve_state.location = "LocalCPUBackend"
                         retrieve_state.token_count = len(retrieve_tokens)
@@ -8933,7 +8976,20 @@ class LMCacheConnectorV1Impl:
                     recalc_last_applied=recalc_last_applied,
                 )
 
+        store_setup_started = (
+            time.perf_counter()
+            if self._layerwise_prefill_p_node and prefill_start_timing_enabled()
+            else 0.0
+        )
         self._prepare_p_node_layerwise_save_storers(metadata)
+        if store_setup_started:
+            prefill_start_timing_log(
+                logger, "prepare_store_all", store_setup_started,
+                requests=len(metadata.requests),
+                max_tokens=max(
+                    (len(r.token_ids) for r in metadata.requests), default=0
+                ),
+            )
 
     def _validate_dense_retrieve_result(
         self,
@@ -9381,12 +9437,56 @@ class LMCacheConnectorV1Impl:
             metadata,
         )
 
+    def _submit_initial_layerwise_prefill_load(self) -> None:
+        """Virtual N=-1: submit L1 without a save or model-layer advance."""
+        if self._initial_layerwise_prefill_load_submitted:
+            return
+        requests = self._layerwise_requests
+        with self._sparse_retrieve_state_guard(requests):
+            for request, retriever_pair in zip(
+                requests, self.layerwise_retrievers, strict=True
+            ):
+                if len(self._latent_layer_names) > 1:
+                    started = (
+                        time.perf_counter()
+                        if prefill_start_timing_enabled() else 0.0
+                    )
+                    self._advance_dense_layerwise_retriever(
+                        request, retriever_pair, 0, 1
+                    )
+                    if started:
+                        prefill_start_timing_log(
+                            logger, "second_bank_submit", started,
+                            req_id=request.req_id, kv_group=0,
+                            prefix_tokens=len(request.token_ids),
+                        )
+                if retriever_pair[1] is not None and len(
+                    self._indexer_layer_names
+                ) > 1:
+                    started = (
+                        time.perf_counter()
+                        if prefill_start_timing_enabled() else 0.0
+                    )
+                    self._advance_dense_layerwise_retriever(
+                        request, retriever_pair, 1, 1
+                    )
+                    if started:
+                        prefill_start_timing_log(
+                            logger, "second_bank_submit", started,
+                            req_id=request.req_id, kv_group=1,
+                            prefix_tokens=len(request.token_ids),
+                        )
+        self._initial_layerwise_prefill_load_submitted = True
+
     @_lmcache_nvtx_annotate
-    def submit_layerwise_prefill_load(self, layer_name: str) -> None:
-        """Submit layer N+2 after layer N attention enters its HCOM window."""
+    def submit_layerwise_prefill_load(self, layer_name: str | int) -> None:
+        """Submit N+2; N=-1 primes L1 at first-layer SFA entry."""
         if not self.layerwise_retrievers:
             return
         if not getattr(self, "_deferred_layerwise_prefill_load_active", False):
+            return
+        if layer_name == -1:
+            self._submit_initial_layerwise_prefill_load()
             return
         wait_group = self._layerwise_wait_group(layer_name)
         if wait_group not in self._layerwise_required_wait_groups():
@@ -10161,7 +10261,15 @@ class LMCacheConnectorV1Impl:
         # Priming performs token processing, all-layer MemoryObj allocation,
         # and GPU-consumer setup. Doing it here keeps those CPU-side costs out
         # of the first post-attention/HCOM window.
+        store_prime_started = (
+            time.perf_counter() if prefill_start_timing_enabled() else 0.0
+        )
         next(storer)
+        if store_prime_started:
+            prefill_start_timing_log(
+                logger, "prime_storer", store_prime_started,
+                req_id=request.req_id, tokens=len(token_ids), kv_group=kv_group,
+            )
         return storer
 
     def _prepare_p_node_layerwise_save_storers(

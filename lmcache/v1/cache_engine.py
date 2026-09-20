@@ -53,6 +53,8 @@ from lmcache.utils import (
     convert_tokens_to_list,
 )
 from lmcache.v1.serving_perf import (
+    prefill_start_timing_enabled,
+    prefill_start_timing_log,
     serving_perf_enabled,
     serving_perf_log,
     serving_perf_now,
@@ -6494,6 +6496,15 @@ class LMCacheEngine:
         prev_key = 0
         kv_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
         store_fmt = self._memory_format_for_kv_group(kv_group)
+        prefill_plan_started = (
+            time.perf_counter()
+            if deferred_layerwise_put and prefill_start_timing_enabled()
+            else 0.0
+        )
+        lookup_ms = 0.0
+        allocation_ms = 0.0
+        scanned_chunks = 0
+        existing_chunks = 0
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs,
             kv_group=kv_group,
@@ -6501,14 +6512,20 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
             requested_end = end
 
+            lookup_started = time.perf_counter() if prefill_plan_started else 0.0
             keys_multi_layer = key.split_layers(num_layers)
-            if self._layerwise_chunk_fully_stored(
+            fully_stored = self._layerwise_chunk_fully_stored(
                 keys_multi_layer,
                 req_id=req_id,
                 kv_group=kv_group,
                 start=start,
                 end=end,
-            ):
+            )
+            if lookup_started:
+                lookup_ms += (time.perf_counter() - lookup_started) * 1000
+                scanned_chunks += 1
+                existing_chunks += int(fully_stored)
+            if fully_stored:
                 continue
 
             # Allocate the memory object
@@ -6527,6 +6544,7 @@ class LMCacheEngine:
                     ) from exc
                 kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
 
+            allocation_started = time.perf_counter() if prefill_plan_started else 0.0
             memory_objs_multi_layer = self.storage_manager.batched_allocate(
                 kv_shape_single_layer,
                 kv_dtype,
@@ -6534,6 +6552,8 @@ class LMCacheEngine:
                 fmt=store_fmt,
                 busy_loop=self.config.get_extra_config_value("force_store_wait", False),
             )
+            if allocation_started:
+                allocation_ms += (time.perf_counter() - allocation_started) * 1000
 
             if memory_objs_multi_layer is None:
                 logger.warning(
@@ -6573,6 +6593,15 @@ class LMCacheEngine:
                 )
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
+
+        if prefill_plan_started:
+            prefill_start_timing_log(
+                logger, "store_chunk_scan", prefill_plan_started,
+                req_id=req_id, kv_group=kv_group, tokens=len(tokens),
+                scanned_chunks=scanned_chunks, existing_chunks=existing_chunks,
+                new_chunks=len(starts), lookup_ms=round(lookup_ms, 3),
+                allocation_ms=round(allocation_ms, 3),
+            )
 
         if keys:
             # Transpose the keys and memory objects into layer major format

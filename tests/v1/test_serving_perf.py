@@ -10,6 +10,7 @@ import pytest
 
 # First Party
 from lmcache.v1.serving_perf import (
+    PREFILL_START_TIMING_ENV,
     SERVING_PERF_ENV,
     serving_perf_log,
     serving_perf_now,
@@ -61,6 +62,28 @@ class _Logger:
 
     def info(self, message, payload):
         self.records.append((message, payload))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prefill_start_timing_is_opt_in(monkeypatch, enabled):
+    monkeypatch.setenv(PREFILL_START_TIMING_ENV, "1" if enabled else "0")
+    namespace = runpy.run_path(
+        str(Path(__file__).parents[2] / "lmcache/v1/serving_perf.py")
+    )
+    logger = _Logger()
+    namespace["prefill_start_timing_log"](
+        logger, "prime_retriever", namespace["time"].perf_counter(),
+        kv_group=0,
+    )
+    assert namespace["prefill_start_timing_enabled"]() is enabled
+    assert len(logger.records) == int(enabled)
+    if enabled:
+        message, raw = logger.records[0]
+        payload = json.loads(raw)
+        assert message == "[PREFILL_START] %s"
+        assert payload["stage"] == "prime_retriever"
+        assert payload["kv_group"] == 0
+        assert payload["elapsed_ms"] >= 0
 
 
 def test_serving_perf_disabled(monkeypatch):

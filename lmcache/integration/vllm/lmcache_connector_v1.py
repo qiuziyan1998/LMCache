@@ -207,10 +207,8 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
             selected_token_counts=selected_token_counts,
         )
 
-    def submit_layerwise_prefill_load(self, layer_name: str) -> None:
-        """Submit the next dense-prefill layer during the current layer's
-        post-attention transfer window.
-        """
+    def submit_layerwise_prefill_load(self, layer_name: str | int) -> None:
+        """Submit N+2; virtual N=-1 submits L1 at first-layer entry."""
         self._lmcache_engine.submit_layerwise_prefill_load(layer_name)
 
     def finish_layerwise_prefill_save(self, layer_name: str) -> None:
