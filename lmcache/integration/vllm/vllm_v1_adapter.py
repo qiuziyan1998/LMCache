@@ -1260,6 +1260,9 @@ class ReqMeta:
     slot_mappings_by_bank: Optional[
         tuple[tuple[torch.Tensor, ...], ...]
     ] = None
+    # P-node DMA consumes block IDs directly and derives one destination
+    # address per DMA segment; it must not materialize a token-sized map.
+    block_ids_by_bank: Optional[tuple[tuple[list[int], ...], ...]] = None
     block_allocation_mode: Optional[str] = None
     # Save-only mappings for the exact sparse-layerwise write window. Chunk
     # ranges remain absolute; the worker/connector subtracts this base before
@@ -1451,6 +1454,7 @@ class ReqMeta:
         windowed_sparse_layerwise_save: bool = False,
         save_entire_prefix: bool = False,
         live_source_requested: bool = False,
+        layerwise_prefill_dma: bool = False,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -1853,17 +1857,18 @@ class ReqMeta:
                 raise RuntimeError(
                     "Layerwise-prefill request must carry exactly two banks"
                 )
-            slot_mappings_by_bank = tuple(
-                tuple(
-                    _build_slot_mapping(
-                        group_block_ids,
-                        block_size,
-                        len(token_ids),
+            if not layerwise_prefill_dma:
+                slot_mappings_by_bank = tuple(
+                    tuple(
+                        _build_slot_mapping(
+                            group_block_ids,
+                            block_size,
+                            len(token_ids),
+                        )
+                        for group_block_ids in bank_groups
                     )
-                    for group_block_ids in bank_groups
+                    for bank_groups in tracker.allocated_block_ids_by_bank
                 )
-                for bank_groups in tracker.allocated_block_ids_by_bank
-            )
 
         decode_token_mask: Optional[torch.Tensor] = None
         decode_ret_mask: Optional[torch.Tensor] = None
@@ -1922,6 +1927,11 @@ class ReqMeta:
             slot_mapping=slot_mapping,
             indexer_slot_mapping=indexer_slot_mapping,
             slot_mappings_by_bank=slot_mappings_by_bank,
+            block_ids_by_bank=(
+                _copy_block_ids_by_bank(tracker.allocated_block_ids_by_bank)
+                if layerwise_prefill_dma
+                else None
+            ),
             block_allocation_mode=tracker.block_allocation_mode,
             save_slot_mapping=save_slot_mapping,
             save_indexer_slot_mapping=save_indexer_slot_mapping,
@@ -2886,7 +2896,9 @@ class LMCacheConnectorV1Impl:
         kv_group: int,
         layer_index: int,
     ) -> Optional[torch.Tensor]:
-        if not self._layerwise_prefill_p_node:
+        if not self._layerwise_prefill_p_node or getattr(
+            self, "_layerwise_prefill_dma", False
+        ):
             return None
         mappings = getattr(
             request,
@@ -2903,15 +2915,17 @@ class LMCacheConnectorV1Impl:
         # maps. Layer callbacks only select their group's physical bank.
         return mappings[bank][kv_group]
 
-    def _layerwise_prefill_dma_cpu_slots(
+    def _layerwise_prefill_dma_block_ids(
         self, request: ReqMeta, kv_group: int
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Optional[tuple[list[int], list[int]]]:
         if not getattr(self, "_layerwise_prefill_dma", False):
             return None
-        mappings = request.slot_mappings_by_bank
-        if mappings is None:
-            raise RuntimeError("P-node DMA needs the two original CPU bank maps")
-        return mappings[0][kv_group], mappings[1][kv_group]
+        block_ids = request.block_ids_by_bank
+        if block_ids is None or len(block_ids) != 2:
+            raise RuntimeError(
+                "P-node DMA needs the two original bank block-ID lists"
+            )
+        return block_ids[0][kv_group], block_ids[1][kv_group]
 
     def _materialize_layerwise_prefill_slot_mappings(
         self,
@@ -8159,7 +8173,9 @@ class LMCacheConnectorV1Impl:
         assert len(self.kv_caches) > 0
         if not self._kvcaches_list:
             self._refresh_kvcaches_list()
-        if self._layerwise_prefill_p_node:
+        if self._layerwise_prefill_p_node and not getattr(
+            self, "_layerwise_prefill_dma", False
+        ):
             mapping_started = (
                 time.perf_counter() if prefill_start_timing_enabled() else 0.0
             )
@@ -8810,8 +8826,9 @@ class LMCacheConnectorV1Impl:
                         _retain_shared_dense_cache=retain_dense_seed,
                         **deferred_prefill_kwargs,
                         **(
-                            {"prefill_dma_cpu_slots_by_bank":
-                             self._layerwise_prefill_dma_cpu_slots(request, 0)}
+                            {"prefill_dma_block_ids_by_bank":
+                             self._layerwise_prefill_dma_block_ids(request, 0),
+                             "prefill_dma_block_size": self._block_size}
                             if self._deferred_layerwise_prefill_load_active
                             and self._layerwise_prefill_dma else {}
                         ),
@@ -8884,8 +8901,9 @@ class LMCacheConnectorV1Impl:
                             _retain_shared_dense_cache=retain_dense_seed,
                             **deferred_prefill_kwargs,
                             **(
-                                {"prefill_dma_cpu_slots_by_bank":
-                                 self._layerwise_prefill_dma_cpu_slots(request, 1)}
+                                {"prefill_dma_block_ids_by_bank":
+                                 self._layerwise_prefill_dma_block_ids(request, 1),
+                                 "prefill_dma_block_size": self._block_size}
                                 if self._deferred_layerwise_prefill_load_active
                                 and self._layerwise_prefill_dma else {}
                             ),
@@ -10256,8 +10274,9 @@ class LMCacheConnectorV1Impl:
             deferred_layerwise_put=True,
             layerwise_prefill_bank_count=2,
             **(
-                {"prefill_dma_cpu_slots_by_bank":
-                 self._layerwise_prefill_dma_cpu_slots(request, kv_group)}
+                {"prefill_dma_block_ids_by_bank":
+                 self._layerwise_prefill_dma_block_ids(request, kv_group),
+                 "prefill_dma_block_size": self._block_size}
                 if self._layerwise_prefill_dma else {}
             ),
             req_id=request.req_id,
@@ -12249,6 +12268,7 @@ class LMCacheConnectorV1Impl:
             ),
             save_entire_prefix=self.kv_role == "kv_producer",
             live_source_requested=live_source_requested,
+            layerwise_prefill_dma=getattr(self, "_layerwise_prefill_dma", False),
         )
         return metadata
 
