@@ -10087,7 +10087,7 @@ class LMCacheConnectorV1Impl:
     ) -> Optional[
         tuple[
             list[int],
-            torch.Tensor,
+            Optional[torch.Tensor],
             torch.Tensor,
             int,
             dict[str, Any],
@@ -10096,18 +10096,23 @@ class LMCacheConnectorV1Impl:
     ]:
         token_ids = request.token_ids
         assert isinstance(token_ids, list)
-        assert request.slot_mapping is not None and len(request.slot_mapping) > 0
-
-        slot_mapping = request.slot_mapping[0]
-        if request.is_sparse_decode:
-            if (
-                slot_mapping.device.type != torch.device(self.device).type
-                or slot_mapping.dtype != torch.long
-            ):
-                slot_mapping = slot_mapping.to(device=self.device, dtype=torch.long)
-                request.slot_mapping[0] = slot_mapping
-        elif materialize_device_slot_mapping:
-            slot_mapping = slot_mapping.to(device=self.device, dtype=torch.long)
+        slot_mapping: Optional[torch.Tensor] = None
+        if request.is_sparse_decode or materialize_device_slot_mapping:
+            assert request.slot_mapping is not None and len(request.slot_mapping) > 0
+            slot_mapping = request.slot_mapping[0]
+            if request.is_sparse_decode:
+                if (
+                    slot_mapping.device.type != torch.device(self.device).type
+                    or slot_mapping.dtype != torch.long
+                ):
+                    slot_mapping = slot_mapping.to(
+                        device=self.device, dtype=torch.long
+                    )
+                    request.slot_mapping[0] = slot_mapping
+            else:
+                slot_mapping = slot_mapping.to(
+                    device=self.device, dtype=torch.long
+                )
 
         if (
             self.kv_role == "kv_producer"
@@ -10125,10 +10130,14 @@ class LMCacheConnectorV1Impl:
                 * self._lmcache_chunk_size
             )
 
-        windowed_slot_mapping = self._windowed_sparse_save_mapping(
-            request,
-            kv_group=kv_group,
-            expected_base=skip_leading_tokens,
+        windowed_slot_mapping = (
+            self._windowed_sparse_save_mapping(
+                request,
+                kv_group=kv_group,
+                expected_base=skip_leading_tokens,
+            )
+            if slot_mapping is not None
+            else None
         )
         windowed_sparse_save = windowed_slot_mapping is not None
         if windowed_slot_mapping is not None:
