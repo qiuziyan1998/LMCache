@@ -10082,6 +10082,8 @@ class LMCacheConnectorV1Impl:
         request: ReqMeta,
         save_spec: Optional[SaveSpec],
         kv_group: int,
+        *,
+        materialize_device_slot_mapping: bool = True,
     ) -> Optional[
         tuple[
             list[int],
@@ -10104,7 +10106,7 @@ class LMCacheConnectorV1Impl:
             ):
                 slot_mapping = slot_mapping.to(device=self.device, dtype=torch.long)
                 request.slot_mapping[0] = slot_mapping
-        else:
+        elif materialize_device_slot_mapping:
             slot_mapping = slot_mapping.to(device=self.device, dtype=torch.long)
 
         if (
@@ -10238,6 +10240,11 @@ class LMCacheConnectorV1Impl:
             request,
             save_spec,
             kv_group,
+            # DMA save derives contiguous source ranges from block IDs.  The
+            # ordinary slot mapping is not consumed by that path; moving the
+            # full token mapping to NPU here only adds an H2D copy before the
+            # first layer callback.
+            materialize_device_slot_mapping=not self._layerwise_prefill_dma,
         )
         if store_inputs is None:
             return None
@@ -10272,6 +10279,7 @@ class LMCacheConnectorV1Impl:
             offset=skip_leading_tokens,
             sync=sync,
             deferred_layerwise_put=True,
+            layerwise_prefill_incremental=True,
             layerwise_prefill_bank_count=2,
             **(
                 {"prefill_dma_block_ids_by_bank":
