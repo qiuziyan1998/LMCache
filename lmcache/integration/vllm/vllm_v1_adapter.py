@@ -10688,21 +10688,29 @@ class LMCacheConnectorV1Impl:
                             "P-node layerwise save received an unknown layer: "
                             f"layer={layer_name}, kv_group={kv_group}"
                         ) from exc
-                    dynamic_slot_mapping = (
-                        self._layerwise_prefill_slot_mapping(
-                            request,
-                            kv_group,
-                            layer_index,
+                    # The raw-address DMA storer was prepared from the two
+                    # banks' block IDs.  It deliberately has no per-token
+                    # slot mapping to rotate here; the NPU connector selects
+                    # the physical bank from the layer ordinal.  Keep the
+                    # legacy dynamic mapping command only for the non-DMA
+                    # layerwise path.
+                    if self._layerwise_prefill_dma:
+                        layer_command = None
+                    else:
+                        dynamic_slot_mapping = (
+                            self._layerwise_prefill_slot_mapping(
+                                request,
+                                kv_group,
+                                layer_index,
+                            )
                         )
-                    )
-                    assert dynamic_slot_mapping is not None
+                        assert dynamic_slot_mapping is not None
+                        layer_command = {
+                            "slot_mapping": dynamic_slot_mapping,
+                            "slot_mapping_base": 0,
+                        }
                     yielded = self._store_result_from_yield(
-                        layerwise_storer.send(
-                            {
-                                "slot_mapping": dynamic_slot_mapping,
-                                "slot_mapping_base": 0,
-                            }
-                        )
+                        layerwise_storer.send(layer_command)
                     )
                     if yielded is not None:
                         raise RuntimeError(

@@ -297,6 +297,7 @@ def _make_connector(requests):
     connector._layerwise_save_storers = {}
     connector._layerwise_prefill_pending_store_finishes = {}
     connector._layerwise_prefill_prepared_storer_keys = set()
+    connector._layerwise_prefill_dma = False
     connector._deferred_latent_pending = set()
     # lmcache_ascend patches LMCacheConnectorV1Impl; __new__ skips generic and
     # Ascend worker initialization.
@@ -364,6 +365,64 @@ def test_p_node_save_rotates_dynamic_bank_mapping(monkeypatch) -> None:
         [10, 11, 12, 13],
         [0, 1, 2, 3],
     ]
+
+
+def test_p_node_dma_save_uses_block_ids_without_dynamic_mapping(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    request = _make_req("req-p-dma")
+    request.block_allocation_mode = "prefill_child"
+    request.slot_mappings_by_bank = None
+    request.block_ids_by_bank = (
+        ([1, 2],),
+        ([11, 12],),
+    )
+    connector, _, engine = _make_connector([request])
+    connector._layerwise_prefill_dma = True
+    connector._block_size = 2
+    connector.kv_caches = {
+        "layer0": torch.zeros(1),
+        "layer1": torch.zeros(1),
+        "layer2": torch.zeros(1),
+    }
+    connector._kvcaches_list = []
+    received = []
+
+    def store_layer(_token_ids, **kwargs):
+        engine.store_kwargs.append(dict(kwargs))
+
+        def storer():
+            command = yield
+            for layer_index in range(3):
+                received.append(command)
+                yield
+                if layer_index + 1 < 3:
+                    command = yield
+                else:
+                    yield
+            yield LayerwiseStoreResult(request_id="req-p-dma", kv_group=0)
+
+        return storer()
+
+    engine.store_layer = store_layer
+
+    for layer_name in ("layer0", "layer1", "layer2"):
+        connector.save_kv_layer(
+            layer_name,
+            torch.zeros(1),
+            SimpleNamespace(),
+        )
+        connector.finish_layerwise_prefill_save(layer_name)
+    connector.wait_for_save()
+
+    assert received == [None, None, None]
+    assert engine.store_kwargs[0]["slot_mapping"] is None
+    assert engine.store_kwargs[0]["prefill_dma_block_ids_by_bank"] == (
+        [1, 2],
+        [11, 12],
+    )
+    assert engine.store_kwargs[0]["prefill_dma_block_size"] == 2
 
 
 def test_p_node_rejects_completion_in_pre_hcom_save_hook(monkeypatch) -> None:
