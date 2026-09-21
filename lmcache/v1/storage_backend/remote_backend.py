@@ -2,6 +2,7 @@
 # Standard
 from concurrent.futures import CancelledError, Future, TimeoutError
 from enum import Enum
+import json
 from typing import Any, Callable, List, Optional, Sequence, Set, cast
 import asyncio
 import threading
@@ -1141,6 +1142,8 @@ class RemoteExternalPageReader:
             name=f"lmcache-external-page-reader-{metadata.worker_id}",
         )
         self._lock = threading.Lock()
+        self._config = config
+        self._falconkv_logged_req_ids: set[str] = set()
         self._state = _ExternalPageReaderState.OPEN
         self._backend: Optional[RemoteBackend] = None
         self._fatal_error: Optional[BaseException] = None
@@ -1181,6 +1184,51 @@ class RemoteExternalPageReader:
                 self._require_open().batched_get_external_pages(
                     keys, buffer_ptrs, buffer_sizes, owners, req_id
                 )
+                if (
+                    bool(
+                        getattr(
+                            self._config,
+                            "enable_npu_content_diagnostics",
+                            False,
+                        )
+                    )
+                    and req_id not in self._falconkv_logged_req_ids
+                ):
+                    self._falconkv_logged_req_ids.add(req_id)
+                    descriptors = []
+                    for key, sizes in zip(
+                        keys, buffer_sizes, strict=True
+                    ):
+                        request_configs = getattr(key, "request_configs", None)
+                        valid_tokens = (
+                            request_configs.get(
+                                "lmcache.tag.internal.valid_tokens"
+                            )
+                            if isinstance(request_configs, dict)
+                            else None
+                        )
+                        descriptors.append(
+                            {
+                                "kv_group": int(getattr(key, "kv_group", 0)),
+                                "chunk_hash": getattr(
+                                    key, "chunk_hash_hex", None
+                                ),
+                                "valid_tokens": valid_tokens,
+                                "buffers": len(sizes),
+                                "bytes": sum(int(size) for size in sizes),
+                            }
+                        )
+                    logger.info(
+                        "[FALCONKV_EXTERNAL_PAGE_LOAD] %s",
+                        json.dumps(
+                            {
+                                "req_id": str(req_id),
+                                "page_count": len(descriptors),
+                                "pages": descriptors,
+                            },
+                            separators=(",", ":"),
+                        ),
+                    )
             except NativeExternalPageTransferUnknownError as error:
                 self._mark_fatal(error)
                 raise
