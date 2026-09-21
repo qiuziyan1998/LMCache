@@ -488,14 +488,18 @@ class StorageManager:
         req_id: str = "",
         *,
         publish_local_early: bool = False,
+        producer_events: Any = None,
     ) -> list[Future]:
         """Store each physical page once locally and remotely.
 
         publish_local_early is for banked P-node continuation-prefill only:
-        the caller has fenced D2H and owns a sticky-error remote completion
-        queue. Local hits then mean CPU-ready, NOT remotely persisted. The
-        caller MUST fence returned futures before PD handoff or teardown.
-        Other callers retain the original remote-before-local publication.
+        the caller owns a sticky-error remote completion queue. Local hits
+        then mean CPU-ready, NOT remotely persisted. ``producer_events``
+        carries the D2H completion events when publication is intentionally
+        submitted before those copies finish; the external-page backend
+        waits on them before reading the page. The caller MUST fence returned
+        futures before PD handoff or teardown. Other callers retain the
+        original remote-before-local publication.
         """
         if (
             len(keys) != len(pages)
@@ -558,7 +562,7 @@ class StorageManager:
                     ],
                     [[page.layer_size] * layer_count for page in pages],
                     tuple(owner_by_storage.values()),
-                    None,
+                    producer_events,
                     req_id,
                 )
             except Exception as error:

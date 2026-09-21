@@ -147,9 +147,14 @@ def test_batched_put_layer_pages_uses_one_local_and_remote_page(
     manager._bypass_lock = threading.Lock()
     manager._freeze = False
     manager._freeze_lock = threading.Lock()
+    producer_events = ("bank-0", "bank-1")
 
     futures = manager.batched_put_layer_pages(
-        keys, pages, req_id="request", publish_local_early=early
+        keys,
+        pages,
+        req_id="request",
+        publish_local_early=early,
+        producer_events=producer_events,
     )
 
     assert len(futures) == 1
@@ -160,7 +165,7 @@ def test_batched_put_layer_pages_uses_one_local_and_remote_page(
     ]
     assert sizes == [[page.layer_size] * 3 for page in pages]
     assert len(owners) == 1
-    assert ready_event is None
+    assert ready_event == producer_events
     assert req_id == "request"
     assert all(page.get_ref_count() == (2 if early else 1) for page in pages)
     assert local_calls == ([(keys, pages)] if early else [])
