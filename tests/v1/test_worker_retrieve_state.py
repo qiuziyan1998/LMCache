@@ -925,6 +925,35 @@ def _bind_worker_state(impl: LMCacheConnectorV1Impl, request: ReqMeta):
     return impl._worker_retrieve_state_for_request(request)
 
 
+def test_request_owned_prefill_readiness_is_checked_per_kv_group():
+    impl = _make_impl()
+    impl._layerwise_prefill_p_node = True
+    impl._is_dsa_two_groups = lambda: True
+    impl._num_layers_for_group = lambda group: 2 if group == 0 else 1
+    request = ReqMeta(
+        req_id="req-1",
+        token_ids=[0, 0, 0, 0],
+        is_sparse_decode=False,
+    )
+    state = WorkerRetrieveState(
+        req_id="req-1",
+        request_owned_prefill=True,
+        cached_starts=[0],
+        cached_ends=[4],
+        cached_memory_objs=[[object()], [object()]],
+        cached_memory_objs_indexer=[],
+    )
+
+    # Group 0 may be consumed as soon as its request-owned objects exist;
+    # Group 1 is not ready yet and must not force group 0 back through lookup.
+    assert impl._request_owned_prefill_cache_ready(
+        state, request, 4, kv_group=0
+    )
+    assert not impl._request_owned_prefill_cache_ready(
+        state, request, 4, kv_group=1
+    )
+
+
 class TestWorkerRetrieveState:
     def test_p_node_wait_fences_real_bank_without_load_retriever(
         self, monkeypatch

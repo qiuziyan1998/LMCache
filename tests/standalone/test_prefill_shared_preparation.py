@@ -367,3 +367,58 @@ def test_empty_group_broadcasts_all_skips_before_first_yield(engine_type):
     assert len(list(gen0)) == len(list(gen1)) == 5
     assert copies0 == copies1 == []
     assert not any(event[0] == "pointer_table" for event in events0 + events1)
+
+
+def test_request_owned_prefix_does_not_require_passive_local_metadata(engine_type):
+    """Passive ranks consume rank0's request-owned ranges, not local lookup."""
+    rank0, events0, wire, copies0 = build(engine_type, 4, 0)
+    passive, events1, _, copies1 = build(engine_type, 4, 0)
+    passive._receive_matching_shared_envelope = lambda **kw: (
+        events1.append(("receive", kw["layer_id"])),
+        wire.pop(0),
+    )[1]
+
+    owners = [[object(), object()] for _ in range(4)]
+    keys = [[NS(chunk_hash=11), NS(chunk_hash=22)] for _ in range(4)]
+    # Non-compact envelopes carry SharedChunkHandle objects.  Keep the fake
+    # small, but preserve the only field the passive side needs for validation
+    # when it has no local key/index metadata.
+    rank0._make_shared_handles_for_layer = lambda **kw: [
+        NS(key=key) for key in kw["keys_layer"]
+    ]
+    common = dict(
+        req_id="request-owned",
+        monitor_req_id=1,
+        kv_group=0,
+        kwargs={"deferred_layerwise_get": True},
+    )
+    gen0 = rank0._retrieve_layer_shared_rank0(
+        starts=[0, 4],
+        ends=[4, 5],
+        keys_layer_major=keys,
+        chunk_locations_layer_major=[["RequestOwned", "RequestOwned"]] * 4,
+        location="RequestOwned",
+        ret_mask=torch.ones(5, dtype=torch.bool),
+        request_owned_memory_objs=owners,
+        **common,
+    )
+    # Simulate the passive rank before the request-owned prefix has any local
+    # index/backend entry: it has no starts, ends, or keys to provide.
+    gen1 = passive._retrieve_layer_shared_passive(
+        starts_all=[],
+        ends_all=[],
+        keys_layer_major=[],
+        ret_mask=torch.zeros(5, dtype=torch.bool),
+        **common,
+    )
+
+    assert next(gen0).item() == next(gen1).item() == 5
+    for layer in range(4):
+        command = {"slot_mapping": torch.arange(5)}
+        assert gen0.send(command) is gen1.send(command) is None
+    assert next(gen0).all()
+    assert next(gen1).all()
+    assert copies0 and copies1
+    assert all(actual[1]["layer_request"] is not None for actual in copies1)
+    gen0.close()
+    gen1.close()

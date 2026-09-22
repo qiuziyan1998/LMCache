@@ -5873,15 +5873,17 @@ class LMCacheConnectorV1Impl:
         state: Optional[WorkerRetrieveState],
         request: ReqMeta,
         token_count: int,
+        *,
+        kv_group: Optional[int] = None,
     ) -> bool:
         """Return whether a P-node chunk can load from request-owned KV.
 
         The first prefix hit is intentionally excluded by the state marker;
         it must still perform normal LMCache lookup.  Once a deferred P-node
         store has produced a request-owned result, require complete prefix
-        coverage for every active DSA group before bypassing the backend.
-        Partial coverage falls back to the ordinary lookup path rather than
-        mixing request-local and backend sources in one load.
+        coverage for the requested group before bypassing the backend.  The
+        groups are checked independently because the latent and indexer store
+        results can become available on different callbacks.
         """
         if (
             not getattr(self, "_layerwise_prefill_p_node", False)
@@ -5893,7 +5895,13 @@ class LMCacheConnectorV1Impl:
         ):
             return False
 
-        groups = (0, 1) if self._is_dsa_two_groups() else (0,)
+        groups = (
+            (kv_group,)
+            if kv_group is not None
+            else ((0, 1) if self._is_dsa_two_groups() else (0,))
+        )
+        if any(group not in (0, 1) for group in groups):
+            return False
         for kv_group in groups:
             cache = state.cache_kwargs(
                 kv_group,
@@ -8933,9 +8941,27 @@ class LMCacheConnectorV1Impl:
                             retrieve_state,
                             request,
                             token_count,
+                            kv_group=0,
                         )
                     )
                     dsa_two_groups = self._is_dsa_two_groups()
+                    request_owned_prefill_indexer = (
+                        dsa_two_groups
+                        and self._request_owned_prefill_cache_ready(
+                            retrieve_state,
+                            request,
+                            token_count,
+                            kv_group=1,
+                        )
+                    )
+                    logger.debug(
+                        "Request %s dense prefix source: latent_request_owned=%s "
+                        "indexer_request_owned=%s token_count=%s",
+                        request.req_id,
+                        request_owned_prefill,
+                        request_owned_prefill_indexer,
+                        token_count,
+                    )
                     shared_cpu_enabled = bool(
                         getattr(
                             self.lmcache_engine,
@@ -9090,9 +9116,12 @@ class LMCacheConnectorV1Impl:
                                 dense_preflight_state
                             ),
                             _retain_shared_dense_cache=(
-                                retain_dense_seed and not request_owned_prefill
+                                retain_dense_seed
+                                and not request_owned_prefill_indexer
                             ),
-                            _request_owned_dense_cache=request_owned_prefill,
+                            _request_owned_dense_cache=(
+                                request_owned_prefill_indexer
+                            ),
                             **deferred_prefill_kwargs,
                             **(
                                 {"prefill_dma_block_ids_by_bank":
@@ -9109,7 +9138,7 @@ class LMCacheConnectorV1Impl:
                                         1,
                                         dsa_two_groups=True,
                                     )
-                                    if request_owned_prefill
+                                    if request_owned_prefill_indexer
                                     else {}
                                 )
                             ),

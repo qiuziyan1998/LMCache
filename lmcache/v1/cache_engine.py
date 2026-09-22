@@ -1740,22 +1740,35 @@ class LMCacheEngine:
         allocator = self.shared_cpu_cache_passive_allocator
         if allocator is None:
             raise ValueError("Shared CPU cache passive allocator is not initialized")
-        if not keys_layer_major or not 0 < batch.num_chunks <= min(
-            len(starts), len(ends), len(keys_layer_major[0])
-        ):
+        if not 0 < batch.num_chunks <= min(len(starts), len(ends)):
             raise ValueError(
                 "Shared CPU compact batch chunk count exceeds passive metadata."
             )
+        if keys_layer_major:
+            if len(keys_layer_major[0]) < batch.num_chunks:
+                raise ValueError(
+                    "Shared CPU compact batch chunk count exceeds passive keys."
+                )
+            expected_chunk_hashes = [
+                chunk_hash_to_int(key.chunk_hash)
+                for key in keys_layer_major[0][: batch.num_chunks]
+            ]
+        else:
+            # Request-owned P-node chunks may not have a local key/index entry
+            # on passive ranks.  The compact rank0 envelope already carries
+            # the authoritative chunk hashes.
+            expected_chunk_hashes = list(batch.chunk_hashes[: batch.num_chunks])
+            if len(expected_chunk_hashes) != batch.num_chunks:
+                raise ValueError(
+                    "Shared CPU compact batch is missing chunk hashes."
+                )
         validate_shared_handle_batch(
             batch,
             expected_shm_name=allocator.shm_name,
             expected_producer_rank=self.metadata.first_rank,
             expected_num_layers=self.num_layers_for_group(kv_group),
             expected_num_chunks=batch.num_chunks,
-            expected_chunk_hashes=[
-                chunk_hash_to_int(key.chunk_hash)
-                for key in keys_layer_major[0][: batch.num_chunks]
-            ],
+            expected_chunk_hashes=expected_chunk_hashes,
             slab_size=allocator.slab_size,
         )
         pages: list[LayerPageMemoryObj] = []
@@ -5478,6 +5491,13 @@ class LMCacheEngine:
                                 [] if compact_batch is not None else handles
                             ),
                             batch=compact_batch,
+                            # Passive ranks must not perform an independent
+                            # prefix lookup.  Rank0 is authoritative for the
+                            # selected ranges, including request-owned
+                            # chunks that have not been published to the
+                            # backend yet.
+                            chunk_starts=list(starts),
+                            chunk_ends=list(ends),
                         )
                     )
                     if (
@@ -5711,6 +5731,8 @@ class LMCacheEngine:
         sources_safe_to_release = True
         prepared_sources: list[Any] = []
         consumer_failed = False
+        envelope_ranges: Optional[tuple[list[int], list[int]]] = None
+        envelope_metadata_only = False
         perf_enabled = serving_perf_enabled()
         consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
 
@@ -5762,6 +5784,45 @@ class LMCacheEngine:
                     if envelope.batch is not None:
                         compact_batch = envelope.batch
 
+                    # Rank0 is the source of truth for the logical ranges.
+                    # In particular, a P-node request-owned prefix is not in
+                    # StorageManager yet, so passive ranks cannot reconstruct
+                    # these ranges through _dense_retrieve_token_results().
+                    if (
+                        envelope.chunk_starts is not None
+                        or envelope.chunk_ends is not None
+                    ):
+                        if (
+                            envelope.chunk_starts is None
+                            or envelope.chunk_ends is None
+                            or len(envelope.chunk_starts) != len(envelope.chunk_ends)
+                            or not envelope.chunk_starts
+                        ):
+                            raise ValueError(
+                                "Shared CPU passive received incomplete chunk "
+                                "range metadata from rank0."
+                            )
+                        envelope_ranges = (
+                            list(envelope.chunk_starts),
+                            list(envelope.chunk_ends),
+                        )
+                        if any(
+                            int(start) >= int(end)
+                            or (
+                                index
+                                and int(start)
+                                != int(envelope.chunk_ends[index - 1])
+                            )
+                            for index, (start, end) in enumerate(
+                                zip(*envelope_ranges, strict=True)
+                            )
+                        ):
+                            raise ValueError(
+                                "Shared CPU passive received non-contiguous "
+                                "chunk ranges from rank0."
+                            )
+                        envelope_metadata_only = not starts_all or not keys_layer_major
+
                 if expected_handle_count is None:
                     assert envelope is not None
                     expected_handle_count = (
@@ -5769,8 +5830,20 @@ class LMCacheEngine:
                         if compact_batch is not None
                         else len(envelope.handles)
                     )
-                    starts = starts_all[:expected_handle_count]
-                    ends = ends_all[:expected_handle_count]
+                    if envelope_ranges is not None:
+                        starts = envelope_ranges[0][:expected_handle_count]
+                        ends = envelope_ranges[1][:expected_handle_count]
+                    else:
+                        starts = starts_all[:expected_handle_count]
+                        ends = ends_all[:expected_handle_count]
+                    if (
+                        len(starts) != expected_handle_count
+                        or len(ends) != expected_handle_count
+                    ):
+                        raise ValueError(
+                            "Shared CPU passive received handles without enough "
+                            "logical chunk ranges."
+                        )
                     for start, end in zip(starts, ends, strict=False):
                         ret_mask[start:end] = True
                     mem_obj_consumer = self.gpu_connector.batched_to_gpu(
@@ -5785,14 +5858,12 @@ class LMCacheEngine:
                         )
                         view_error: Exception | None = None
                         try:
-                            passive_page_tuple = (
-                                self._make_passive_layer_page_views(
-                                    compact_batch,
-                                    starts=starts_all,
-                                    ends=ends_all,
-                                    keys_layer_major=keys_layer_major,
-                                    kv_group=kv_group,
-                                )
+                            passive_page_tuple = self._make_passive_layer_page_views(
+                                compact_batch,
+                                starts=starts,
+                                ends=ends,
+                                keys_layer_major=keys_layer_major,
+                                kv_group=kv_group,
                             )
                         except Exception as exc:
                             if not remote_fill_load:
@@ -5848,14 +5919,27 @@ class LMCacheEngine:
                         self._expected_shared_cpu_chunk_metadata(
                             kv_group=kv_group,
                             num_tokens=int(
-                                ends_all[chunk_index] - starts_all[chunk_index]
+                                ends[chunk_index] - starts[chunk_index]
                             ),
                         )
                     )
                     positions = range(
-                        int(starts_all[chunk_index]),
-                        int(ends_all[chunk_index]),
+                        int(starts[chunk_index]),
+                        int(ends[chunk_index]),
                     )
+                    expected_key = None
+                    if (
+                        layer_id < len(keys_layer_major)
+                        and chunk_index < len(keys_layer_major[layer_id])
+                    ):
+                        expected_key = keys_layer_major[layer_id][chunk_index]
+                    elif handle is not None:
+                        expected_key = handle.key
+                    if expected_key is None and compact_batch is None:
+                        raise ValueError(
+                            "Shared CPU passive cannot validate a handle without "
+                            "rank0 key metadata."
+                        )
                     try:
                         mem_obj = (
                             self.shared_cpu_cache_passive_allocator.create_batch_view(
@@ -5875,7 +5959,7 @@ class LMCacheEngine:
                                 expected_layer_id=layer_id,
                                 expected_kv_group=kv_group,
                                 expected_chunk_index=chunk_index,
-                                expected_key=keys_layer_major[layer_id][chunk_index],
+                                expected_key=expected_key,
                                 expected_shape=expected_shape,
                                 expected_dtype=expected_dtype,
                                 expected_fmt=expected_fmt,
@@ -5975,20 +6059,22 @@ class LMCacheEngine:
                 if finish_started:
                     consumer_finish_s += serving_perf_now() - finish_started
             if resolved_layers:
-                adopted = self._adopt_dense_shared_retrieve_cache(
-                    req_id=req_id,
-                    starts=starts,
-                    ends=ends,
-                    keys_layer_major=keys_layer_major,
-                    memory_objs=resolved_layers,
-                    handles=handles_by_layer,
-                    kv_group=kv_group,
-                    kwargs=kwargs,
-                )
-                if adopted:
-                    to_release.clear()
-                elif kwargs.get("_retain_shared_dense_cache"):
-                    raise RuntimeError("Dense shared source retention failed")
+                adopted = False
+                if not envelope_metadata_only or keys_layer_major:
+                    adopted = self._adopt_dense_shared_retrieve_cache(
+                        req_id=req_id,
+                        starts=starts,
+                        ends=ends,
+                        keys_layer_major=keys_layer_major,
+                        memory_objs=resolved_layers,
+                        handles=handles_by_layer,
+                        kv_group=kv_group,
+                        kwargs=kwargs,
+                    )
+                    if adopted:
+                        to_release.clear()
+                    elif kwargs.get("_retain_shared_dense_cache"):
+                        raise RuntimeError("Dense shared source retention failed")
 
             retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -7247,17 +7333,10 @@ class LMCacheEngine:
             return
 
         if shared_layerwise_retrieve and self._is_passive():
-            for start, end, key in self._dense_retrieve_token_results(
-                tokens,
-                mask,
-                request_configs,
-                kv_group,
-                kwargs,
-            ):
-                assert isinstance(key, CacheEngineKey)
-                starts.append(start)
-                ends.append(end)
-                keys.append(key.split_layers(num_layers))
+            # Rank0 owns prefix matching and broadcasts the authoritative
+            # ranges/handles.  Passive ranks must not repeat a local lookup:
+            # request-owned P-node chunks are intentionally not published to
+            # StorageManager between chunked-prefill forwards.
 
             yielded_steps = 0
             try:

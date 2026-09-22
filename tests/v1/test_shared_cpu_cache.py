@@ -4968,6 +4968,25 @@ def test_skipped_index_envelope_round_trips_without_handles():
     assert decoded.message is not None
 
 
+def test_shared_envelope_round_trips_rank0_chunk_ranges():
+    envelope = SharedHandleEnvelope(
+        request_id="req-1",
+        phase="dense_prefix",
+        request_ordinal=0,
+        layer_id=0,
+        kv_group=0,
+        status="ok",
+        generation=9,
+        handles=[],
+        chunk_starts=[0, 4096],
+        chunk_ends=[4096, 8192],
+    )
+
+    decoded = SharedHandleEnvelope.from_dict(envelope.to_dict())
+    assert decoded.chunk_starts == [0, 4096]
+    assert decoded.chunk_ends == [4096, 8192]
+
+
 def test_compact_shared_handle_batch_round_trip_and_view():
     batch = SharedHandleBatch(
         shm_name="/lmcache-test",

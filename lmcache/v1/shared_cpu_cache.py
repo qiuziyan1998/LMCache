@@ -588,6 +588,11 @@ class SharedHandleEnvelope:
     message: Optional[str] = None
     error_details: Optional[dict[str, Any]] = None
     batch: Optional["SharedHandleBatch"] = None
+    # Request-owned dense retrieves may select a suffix of the request that
+    # passive ranks cannot reconstruct from their local token metadata.  Rank0
+    # publishes the exact logical ranges with the handles in that case.
+    chunk_starts: Optional[list[int]] = None
+    chunk_ends: Optional[list[int]] = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -602,6 +607,9 @@ class SharedHandleEnvelope:
             "message": self.message,
             "error_details": self.error_details,
         }
+        if self.chunk_starts is not None or self.chunk_ends is not None:
+            payload["chunk_starts"] = self.chunk_starts
+            payload["chunk_ends"] = self.chunk_ends
         if self.batch is not None:
             payload["batch"] = self.batch.to_dict()
         return payload
@@ -661,6 +669,16 @@ class SharedHandleEnvelope:
             batch=SharedHandleBatch.from_dict(data["batch"])
             if data.get("batch") is not None
             else None,
+            chunk_starts=(
+                [int(value) for value in data["chunk_starts"]]
+                if data.get("chunk_starts") is not None
+                else None
+            ),
+            chunk_ends=(
+                [int(value) for value in data["chunk_ends"]]
+                if data.get("chunk_ends") is not None
+                else None
+            ),
         )
 
 
