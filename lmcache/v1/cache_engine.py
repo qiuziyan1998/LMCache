@@ -329,6 +329,16 @@ class LMCacheEngine:
 
         self.async_loading = config.enable_async_loading
         self.event_manager = EventManager()
+        # Layerwise P-node stores expose their mutable result as soon as the
+        # chunk is primed.  The adapter keeps that result request-local while
+        # the storer remains alive, then pops it after the final prefill drain.
+        self._layerwise_store_results: dict[Any, LayerwiseStoreResult] = {}
+        self._layerwise_store_result_chunks: dict[
+            tuple[str, int, int, int], LayerwiseStoreResult
+        ] = {}
+        self._layerwise_store_result_chunk_keys: dict[
+            int, set[tuple[str, int, int, int]]
+        ] = {}
 
         self.use_layerwise = config.use_layerwise
 
@@ -1919,6 +1929,17 @@ class LMCacheEngine:
         end: int,
         allow_legacy_fallback: bool = True,
     ) -> bool:
+        # A prior cumulative chunk can remain request-owned until the final
+        # prefill step.  It is already a valid source for the next chunk even
+        # though it has not been published to StorageManager yet.
+        pending_chunks = getattr(self, "_layerwise_store_result_chunks", {})
+        if (
+            req_id,
+            int(kv_group),
+            int(start),
+            int(end),
+        ) in pending_chunks:
+            return True
         return (
             self._layerwise_chunk_location_if_fully_stored(
                 keys_multi_layer,
@@ -6400,10 +6421,16 @@ class LMCacheEngine:
             request_id=str(kwargs.get("req_id", "unspecified")),
             kv_group=int(kwargs.get("kv_group", 0) or 0),
         )
+        result_key = kwargs.get("layerwise_store_key")
+        if result_key is not None:
+            self._layerwise_store_results[result_key] = store_result
         kv_group = store_result.kv_group
         num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
         deferred_layerwise_put = bool(
             kwargs.get("deferred_layerwise_put", False)
+        )
+        defer_layerwise_publish = bool(
+            kwargs.get("defer_layerwise_publish", False)
         )
 
         # Health check: block operation if LMCache is unhealthy
@@ -6611,6 +6638,7 @@ class LMCacheEngine:
             store_result.ends = ends
             store_result.keys = keys
             store_result.memory_objs = memory_objs
+            self._index_layerwise_store_result_chunks(store_result)
             pending_store_release: dict[int, MemoryObj] = {
                 id(mem_obj): mem_obj
                 for layer_objs in memory_objs
@@ -6636,6 +6664,11 @@ class LMCacheEngine:
                 next(mem_obj_generator)
 
                 def persist_layer(layer_id: int) -> None:
+                    if defer_layerwise_publish:
+                        return
+                    publish_layer(layer_id)
+
+                def publish_layer(layer_id: int) -> None:
                     put_futures = self.storage_manager.batched_put(
                         keys[layer_id],
                         memory_objs[layer_id],
@@ -6701,6 +6734,9 @@ class LMCacheEngine:
                         next(mem_obj_generator)
                     except StopIteration:
                         pass
+                    if defer_layerwise_publish:
+                        for layer_id in range(num_layers):
+                            publish_layer(layer_id)
                     for future in pending_persist_futures:
                         future.result()
                     pending_persist_futures.clear()
@@ -6751,6 +6787,52 @@ class LMCacheEngine:
         if store_complete:
             store_result.committed_end = requested_end
         yield store_result
+
+    def peek_layerwise_store_result(
+        self,
+        result_key: Any,
+    ) -> Optional[LayerwiseStoreResult]:
+        """Return a primed layerwise result without publishing it."""
+        return self._layerwise_store_results.get(result_key)
+
+    def pop_layerwise_store_result(
+        self,
+        result_key: Any,
+    ) -> Optional[LayerwiseStoreResult]:
+        """Drop a layerwise result after finalization or request abort."""
+        result = self._layerwise_store_results.pop(result_key, None)
+        if result is None:
+            return None
+        for chunk_key in self._layerwise_store_result_chunk_keys.pop(
+            id(result), set()
+        ):
+            if self._layerwise_store_result_chunks.get(chunk_key) is result:
+                self._layerwise_store_result_chunks.pop(chunk_key, None)
+        return result
+
+    def _index_layerwise_store_result_chunks(
+        self,
+        result: LayerwiseStoreResult,
+    ) -> None:
+        """Index one request-owned result for incremental chunk reuse."""
+        if not result.starts:
+            return
+        if not hasattr(self, "_layerwise_store_result_chunk_keys"):
+            self._layerwise_store_result_chunk_keys = {}
+        if not hasattr(self, "_layerwise_store_result_chunks"):
+            self._layerwise_store_result_chunks = {}
+        chunk_keys = {
+            (
+                result.request_id,
+                int(result.kv_group),
+                int(start),
+                int(end),
+            )
+            for start, end in zip(result.starts, result.ends, strict=True)
+        }
+        self._layerwise_store_result_chunk_keys[id(result)] = chunk_keys
+        for chunk_key in chunk_keys:
+            self._layerwise_store_result_chunks[chunk_key] = result
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -8326,6 +8408,9 @@ class LMCacheEngine:
                 logger.error(f"Error closing lmcache_worker: {e}")
 
         self._release_all_shared_cpu_request_leases()
+        self._layerwise_store_results.clear()
+        self._layerwise_store_result_chunks.clear()
+        self._layerwise_store_result_chunk_keys.clear()
         try:
             logger.info("Closing storage_manager...")
             if self.storage_manager is not None:

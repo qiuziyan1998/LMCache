@@ -2208,6 +2208,14 @@ class LMCacheConnectorV1Impl:
         self._layerwise_prefill_pending_store_finishes: dict[
             LayerwiseSaveKey, str
         ] = {}
+        # Keep per-chunk storers alive until the request's final prefill
+        # step.  Their MemoryObjs are request-owned while the request is
+        # active; draining/publishing them after every chunk adds a host
+        # fence to the critical path and defeats layerwise overlap.
+        self._layerwise_prefill_pending_storers: dict[
+            str, list[tuple[LayerwiseSaveKey, Generator]]
+        ] = {}
+        self._layerwise_prefill_provisional_results: set[int] = set()
         # Under dsa_two_groups + TP>1, latent store_layer is deferred until
         # after all indexer layers in a forward to avoid interleaved latent/
         # indexer GPU transfers on store_stream (MTE OOB on chunk 2+).
@@ -4302,6 +4310,18 @@ class LMCacheConnectorV1Impl:
             self._close_layerwise_storer(
                 self._layerwise_save_storers.pop(storer_key, None)
             )
+            engine = getattr(self, "lmcache_engine", None)
+            pop_result = getattr(
+                engine,
+                "pop_layerwise_store_result",
+                None,
+            )
+            if callable(pop_result):
+                result = pop_result(storer_key)
+                if result is not None:
+                    self._layerwise_prefill_provisional_results.discard(
+                        id(result)
+                    )
         pending_finishes = getattr(
             self,
             "_layerwise_prefill_pending_store_finishes",
@@ -4310,12 +4330,77 @@ class LMCacheConnectorV1Impl:
         for storer_key in list(pending_finishes):
             if storer_key[0] == req_id:
                 pending_finishes.pop(storer_key, None)
+        pending_storers = getattr(
+            self,
+            "_layerwise_prefill_pending_storers",
+            {},
+        )
+        for storer_key, storer in pending_storers.pop(req_id, []):
+            self._close_layerwise_storer(storer)
+            engine = getattr(self, "lmcache_engine", None)
+            pop_result = getattr(
+                engine,
+                "pop_layerwise_store_result",
+                None,
+            )
+            if callable(pop_result):
+                result = pop_result(storer_key)
+                if result is not None:
+                    self._layerwise_prefill_provisional_results.discard(
+                        id(result)
+                    )
         self._clear_decode_window_save_groups_for_req(req_id)
         self._clear_prefill_save_groups_for_req(req_id)
 
         for pending_key in list(self._deferred_latent_pending):
             if pending_key[0] == req_id:
                 self._deferred_latent_pending.discard(pending_key)
+
+    def _defer_layerwise_prefill_storer(
+        self,
+        request: ReqMeta,
+        storer_key: LayerwiseSaveKey,
+        storer,
+    ) -> None:
+        """Retain one completed chunk without publishing it yet.
+
+        ``store_layer`` has already allocated the MemoryObjs and populated its
+        mutable ``LayerwiseStoreResult`` when it is primed.  Promote that
+        request-local result now so the next chunk can load the old prefix,
+        but leave the generator open: its D2H/backend publication is drained
+        only once, when the request reaches its final prefill chunk.
+        """
+        pending_storers = getattr(
+            self,
+            "_layerwise_prefill_pending_storers",
+            None,
+        )
+        if pending_storers is None:
+            pending_storers = {}
+            self._layerwise_prefill_pending_storers = pending_storers
+        pending = pending_storers.setdefault(
+            request.req_id, []
+        )
+        pending.append((storer_key, storer))
+        pending_finishes = getattr(
+            self,
+            "_layerwise_prefill_pending_store_finishes",
+            None,
+        )
+        if pending_finishes is not None:
+            # The final layer deliberately remains suspended after its DMA
+            # submission.  It will be resumed by the request-boundary drain,
+            # not by the next chunk's setup.
+            pending_finishes.pop(storer_key, None)
+        engine = getattr(self, "lmcache_engine", None)
+        peek_result = getattr(engine, "peek_layerwise_store_result", None)
+        result = peek_result(storer_key) if callable(peek_result) else None
+        if result is not None:
+            self._promote_layerwise_store_result(
+                request,
+                result,
+                provisional=True,
+            )
 
     def _abort_save_step(self, requests: Iterable[ReqMeta]) -> None:
         """Discard partial stores without advancing decode-window progress."""
@@ -6465,6 +6550,8 @@ class LMCacheConnectorV1Impl:
         self,
         request: ReqMeta,
         result: Optional[LayerwiseStoreResult],
+        *,
+        provisional: bool = False,
     ) -> None:
         """Promote completed store output into request-owned retrieve state."""
         if result is None:
@@ -6484,6 +6571,14 @@ class LMCacheConnectorV1Impl:
             or not self._store_result_has_retrieve_data(result)
         ):
             return
+        provisional_results = getattr(
+            self,
+            "_layerwise_prefill_provisional_results",
+            None,
+        )
+        if provisional_results is None:
+            provisional_results = set()
+            self._layerwise_prefill_provisional_results = provisional_results
 
         if (
             self._is_decode_window_save_request(request)
@@ -6536,12 +6631,21 @@ class LMCacheConnectorV1Impl:
             else self._snapshot_worker_retrieve_cache_state(state)
         )
         try:
-            if self._merge_store_result_into_worker_state(
+            merged = self._merge_store_result_into_worker_state(
                 state,
                 result,
                 request,
-            ) == 0:
+            )
+            if merged == 0 and not (
+                not provisional
+                and id(result) in provisional_results
+            ):
                 return
+            if provisional:
+                provisional_results.add(id(result))
+                self._set_worker_retrieve_state(request.req_id, state)
+                return
+            provisional_results.discard(id(result))
 
             # An index result may arrive before latent under two-group DSA.
             # Keep it request-owned but invisible to retrieve until latent is
@@ -10238,6 +10342,7 @@ class LMCacheConnectorV1Impl:
         request: ReqMeta,
         save_spec: Optional[SaveSpec],
         kv_group: int,
+        storer_key: Optional[LayerwiseSaveKey] = None,
     ):
         """Allocate and prime one P-node storer before model forward."""
         assert self._layerwise_prefill_p_node
@@ -10288,6 +10393,7 @@ class LMCacheConnectorV1Impl:
             offset=skip_leading_tokens,
             sync=sync,
             deferred_layerwise_put=True,
+            defer_layerwise_publish=True,
             layerwise_prefill_incremental=True,
             layerwise_prefill_bank_count=2,
             **(
@@ -10297,6 +10403,10 @@ class LMCacheConnectorV1Impl:
                 if self._layerwise_prefill_dma else {}
             ),
             req_id=request.req_id,
+            **(
+                {"layerwise_store_key": storer_key}
+                if storer_key is not None else {}
+            ),
             **store_kwargs,
         )
         # Priming performs token processing, all-layer MemoryObj allocation,
@@ -10375,20 +10485,14 @@ class LMCacheConnectorV1Impl:
                             stale_key
                         )
                         prepared_keys.discard(stale_key)
-                        completed, store_result = (
-                            self._finalize_layerwise_storer(stale_storer)
+                        self._defer_layerwise_prefill_storer(
+                            request, stale_key, stale_storer
                         )
-                        if stale_key == storer_key:
-                            self._consume_completed_layerwise_store(
-                                request,
-                                kv_group,
-                                completed,
-                                store_result,
-                            )
                     storer = self._create_p_node_layerwise_save_storer(
                         request,
                         save_spec,
                         kv_group,
+                        storer_key,
                     )
                     if storer is None:
                         continue
@@ -10525,16 +10629,9 @@ class LMCacheConnectorV1Impl:
                         stale_storer = self._layerwise_save_storers.pop(
                             stale_key
                         )
-                        completed, store_result = (
-                            self._finalize_layerwise_storer(stale_storer)
+                        self._defer_layerwise_prefill_storer(
+                            request, stale_key, stale_storer
                         )
-                        if stale_key == storer_key:
-                            self._consume_completed_layerwise_store(
-                                request,
-                                kv_group,
-                                completed,
-                                store_result,
-                            )
                     if stale_keys:
                         layerwise_storer = None
             if (
@@ -10545,6 +10642,7 @@ class LMCacheConnectorV1Impl:
                     request,
                     save_spec,
                     kv_group,
+                    storer_key,
                 )
                 if layerwise_storer is None:
                     continue
@@ -10659,10 +10757,17 @@ class LMCacheConnectorV1Impl:
                     deferred_layerwise_put=(
                         self._layerwise_prefill_p_node
                     ),
+                    defer_layerwise_publish=(
+                        self._layerwise_prefill_p_node
+                    ),
                     layerwise_prefill_bank_count=(
                         2 if self._layerwise_prefill_p_node else 1
                     ),
                     req_id=request.req_id,
+                    **(
+                        {"layerwise_store_key": storer_key}
+                        if self._layerwise_prefill_p_node else {}
+                    ),
                     **store_kwargs,
                 )
                 self._layerwise_save_storers[storer_key] = layerwise_storer
@@ -10817,6 +10922,19 @@ class LMCacheConnectorV1Impl:
                     f"request={request.req_id}, kv_group={kv_group}, "
                     f"layer={layer_name}"
                 )
+            group_ordinals = self._layerwise_group_ordinals.get(kv_group, {})
+            if (
+                not self._is_decode_window_save_request(request)
+                and group_ordinals
+                and group_ordinals.get(layer_name) == len(group_ordinals) - 1
+            ):
+                # Leave the storer suspended immediately after the final
+                # layer's DMA submission.  Advancing it here would enter the
+                # drain path, synchronize all bank events, and publish the
+                # whole chunk before the next chunk can run.  The request
+                # boundary finalizer advances this pending last-layer point
+                # and performs the one required drain/publish.
+                continue
             try:
                 yielded = self._store_result_from_yield(next(storer))
                 if yielded is not None:
@@ -10919,6 +11037,14 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
+            pending_storer_map = getattr(
+                self,
+                "_layerwise_prefill_pending_storers",
+                None,
+            )
+            if pending_storer_map is None:
+                pending_storer_map = {}
+                self._layerwise_prefill_pending_storers = pending_storer_map
             if self._should_defer_latent_save_under_tp():
                 for request in connector_metadata.requests:
                     if (
@@ -10930,6 +11056,7 @@ class LMCacheConnectorV1Impl:
                             request.save_spec,
                         )
             for request in connector_metadata.requests:
+                is_last_prefill = bool(getattr(request, "is_last_prefill", False))
                 for kv_group in (0, 1):
                     storer_key = self._layerwise_save_storer_key(
                         request,
@@ -10940,34 +11067,67 @@ class LMCacheConnectorV1Impl:
                         "_layerwise_prefill_pending_store_finishes",
                         {},
                     ).get(storer_key)
-                    if pending_layer is not None:
-                        raise RuntimeError(
-                            "wait_for_save reached a P-node storer before its "
-                            "post-HCOM finish hook: "
-                            f"request={request.req_id}, kv_group={kv_group}, "
-                            f"layer={pending_layer}"
-                        )
-                    layerwise_storer = self._layerwise_save_storers.pop(
-                        storer_key,
-                        None,
-                    )
+                    if is_last_prefill and pending_layer is not None:
+                        # The final layer intentionally has no post-HCOM
+                        # advance here.  Its storer is resumed by the single
+                        # request-boundary drain below.
+                        getattr(
+                            self,
+                            "_layerwise_prefill_pending_store_finishes",
+                            {},
+                        ).pop(storer_key, None)
                     getattr(
                         self,
                         "_layerwise_prefill_prepared_storer_keys",
                         set(),
                     ).discard(storer_key)
-                    if layerwise_storer is not None:
-                        save_completed, store_result = (
-                            self._finalize_layerwise_storer(
-                                layerwise_storer,
+                    if is_last_prefill:
+                        # All earlier chunk storers are still holding their
+                        # request-owned MemoryObjs.  Drain and publish them
+                        # only at the request boundary; doing this per chunk
+                        # inserts a host-side fence before the next forward.
+                        pending_storers = pending_storer_map.get(
+                            request.req_id, []
+                        )
+                        to_finalize = [
+                            (key, storer)
+                            for key, storer in pending_storers
+                            if key[2] == kv_group
+                        ]
+                        current_storer = self._layerwise_save_storers.pop(
+                            storer_key,
+                            None,
+                        )
+                        if current_storer is not None:
+                            to_finalize.append((storer_key, current_storer))
+                        for finalize_key, storer in to_finalize:
+                            save_completed, store_result = (
+                                self._finalize_layerwise_storer(storer)
                             )
-                        )
-                        self._consume_completed_layerwise_store(
-                            request,
-                            kv_group,
-                            save_completed,
-                            store_result,
-                        )
+                            pop_result = getattr(
+                                self.lmcache_engine,
+                                "pop_layerwise_store_result",
+                                None,
+                            )
+                            if callable(pop_result):
+                                pop_result(finalize_key)
+                            self._consume_completed_layerwise_store(
+                                request,
+                                kv_group,
+                                save_completed,
+                                store_result,
+                            )
+                        remaining = [
+                            (key, storer)
+                            for key, storer in pending_storers
+                            if key[2] != kv_group
+                        ]
+                        if remaining:
+                            pending_storer_map[request.req_id] = remaining
+                        else:
+                            pending_storer_map.pop(
+                                request.req_id, None
+                            )
                 if self._is_decode_window_save_request(request):
                     save_context.setdefault("decode_window_saves", []).append(
                         request
