@@ -584,6 +584,116 @@ def test_layer_page_location_plan_probes_one_remote_key_per_chunk():
     pages[0].ref_count_down()
 
 
+def test_request_owned_dense_retrieve_bypasses_backend_contains():
+    """A later P-node chunk must load its retained objects directly."""
+    engine = object.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(
+        enable_shared_cpu_cache=True,
+        use_layerwise=True,
+        remote_url="mooncakestore://metadata/",
+        extra_config={},
+    )
+    engine.metadata = SimpleNamespace(worker_id=0)
+    engine.shared_cpu_cache_strict = True
+    engine.gpu_connector = object()
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _group: True
+    engine._is_passive = lambda: False
+    engine.stats_monitor = SimpleNamespace(on_retrieve_request=lambda _n: 1)
+
+    class _ContainsMustNotRun:
+        def contains(self, *_args, **_kwargs):
+            raise AssertionError("request-owned retrieve consulted backend")
+
+    engine.storage_manager = _ContainsMustNotRun()
+    keys = [
+        [replace(_make_key(), chunk_hash=10), replace(_make_key(), chunk_hash=11)],
+        [replace(_make_key(), chunk_hash=20), replace(_make_key(), chunk_hash=21)],
+    ]
+    memory_objs = [
+        [_LeaseMemoryObj(), _LeaseMemoryObj()],
+        [_LeaseMemoryObj(), _LeaseMemoryObj()],
+    ]
+    captured = {}
+
+    def retrieve(**kwargs):
+        captured.update(kwargs)
+        yield kwargs["ret_mask"]
+
+    engine._retrieve_layer_shared_rank0 = retrieve
+
+    list(
+        engine.retrieve_layer(
+            list(range(8)),
+            req_id="req-owned",
+            kv_group=0,
+            _request_owned_dense_cache=True,
+            cached_starts=[0, 4],
+            cached_ends=[4, 8],
+            cached_keys=keys,
+            cached_memory_objs=memory_objs,
+        )
+    )
+
+    assert captured["request_owned_memory_objs"] == memory_objs
+    assert captured["starts"] == [0, 4]
+    assert captured["ends"] == [4, 8]
+    assert captured["chunk_locations_layer_major"] == [
+        ["RequestOwned", "RequestOwned"],
+        ["RequestOwned", "RequestOwned"],
+    ]
+
+
+def test_request_owned_dense_retrieve_rejects_partial_frontier():
+    engine = object.__new__(LMCacheEngine)
+    plan = engine._request_owned_dense_cache_plan(
+        list(range(6)),
+        0,
+        {
+            "_request_owned_dense_cache": True,
+            "cached_starts": [0, 4],
+            "cached_ends": [4, 8],
+            "cached_keys": [[], []],
+            "cached_memory_objs": [[], []],
+        },
+        2,
+    )
+    assert plan is None
+
+
+def test_request_owned_dense_retrieve_skips_resident_prefix_chunks():
+    engine = object.__new__(LMCacheEngine)
+    keys = [
+        [replace(_make_key(), chunk_hash=10), replace(_make_key(), chunk_hash=11)],
+        [replace(_make_key(), chunk_hash=20), replace(_make_key(), chunk_hash=21)],
+    ]
+    owners = [
+        [_LeaseMemoryObj(), _LeaseMemoryObj()],
+        [_LeaseMemoryObj(), _LeaseMemoryObj()],
+    ]
+    plan = engine._request_owned_dense_cache_plan(
+        list(range(8)),
+        0,
+        {
+            "_request_owned_dense_cache": True,
+            "cached_starts": [0, 4],
+            "cached_ends": [4, 8],
+            "cached_keys": keys,
+            "cached_memory_objs": owners,
+        },
+        2,
+        torch.tensor([False] * 4 + [True] * 4),
+    )
+
+    assert plan is not None
+    starts, ends, selected_keys, selected_owners = plan
+    assert starts == [4]
+    assert ends == [8]
+    assert selected_keys == [[keys[0][1]], [keys[1][1]]]
+    assert selected_owners == [[owners[0][1]], [owners[1][1]]]
+
+
 def test_layer_page_location_plan_accepts_base_keys_without_layer_expansion():
     engine = object.__new__(LMCacheEngine)
     engine.config = SimpleNamespace(

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 # Standard
 import asyncio
+from bisect import bisect_right
 import gc
 import json
 import math
@@ -4915,6 +4916,108 @@ class LMCacheEngine:
 
         return record_plan()
 
+    def _request_owned_dense_cache_plan(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        kv_group: int,
+        kwargs: dict[str, Any],
+        num_layers: int,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Optional[
+        tuple[
+            list[int],
+            list[int],
+            list[list[CacheEngineKey]],
+            list[list[MemoryObj]],
+        ]
+    ]:
+        """Build a dense load plan from a live request-owned cache.
+
+        This path is used only after the P-node has stored a complete prefix
+        for the request.  It intentionally does not consult the storage
+        backends: the request lease already owns the MemoryObjs and keeps them
+        valid until request cleanup.  A partial or malformed cache returns
+        ``None`` so the caller can use the normal lookup path safely.
+        """
+        if not kwargs.get("_request_owned_dense_cache"):
+            return None
+
+        starts = kwargs.get("cached_starts")
+        ends = kwargs.get("cached_ends")
+        keys_layer_major = kwargs.get("cached_keys")
+        memory_objs = kwargs.get("cached_memory_objs")
+        if not (
+            isinstance(starts, list)
+            and isinstance(ends, list)
+            and isinstance(keys_layer_major, list)
+            and isinstance(memory_objs, list)
+        ):
+            return None
+        if not starts or len(starts) != len(ends):
+            return None
+
+        target_tokens = len(tokens)
+        if target_tokens <= 0:
+            return None
+
+        # Dense prefill can ask LMCache to load only the suffix that is not
+        # already resident in vLLM.  Keep the same request-owned fast path in
+        # that case: skip complete chunks covered by the leading false mask,
+        # instead of forcing a backend lookup for the whole prefix.
+        required_start = 0
+        if mask is not None:
+            if mask.numel() != target_tokens:
+                return None
+            false_tokens = target_tokens - int(mask.long().sum().item())
+            if false_tokens < 0 or (
+                false_tokens
+                and (
+                    bool(mask[:false_tokens].any())
+                    or not bool(mask[false_tokens:].all())
+                )
+            ):
+                return None
+            required_start = false_tokens
+        if required_start == target_tokens:
+            return None
+
+        first_chunk = bisect_right(ends, required_start)
+        chunk_count = bisect_right(ends, target_tokens)
+        if (
+            chunk_count <= first_chunk
+            or ends[chunk_count - 1] != target_tokens
+            or first_chunk >= len(starts)
+            or starts[first_chunk] != required_start
+        ):
+            return None
+        if starts[0] != 0 or any(
+            left != right
+            for left, right in zip(
+                starts[1:chunk_count], ends[: chunk_count - 1], strict=True
+            )
+        ):
+            return None
+        if len(keys_layer_major) != num_layers or len(memory_objs) != num_layers:
+            return None
+        if any(
+            len(layer) < chunk_count
+            for layer in (*keys_layer_major, *memory_objs)
+        ):
+            return None
+
+        selected_keys = [
+            list(layer[first_chunk:chunk_count]) for layer in keys_layer_major
+        ]
+        selected_memory_objs = [
+            list(layer[first_chunk:chunk_count]) for layer in memory_objs
+        ]
+        return (
+            list(starts[first_chunk:chunk_count]),
+            list(ends[first_chunk:chunk_count]),
+            selected_keys,
+            selected_memory_objs,
+        )
+
     def _adopt_dense_shared_retrieve_cache(
         self,
         *,
@@ -5052,6 +5155,7 @@ class LMCacheEngine:
         kwargs: dict[str, Any],
         planned_page_chunks: int = 0,
         remote_fill_plan: Optional[list[tuple[str, bool]]] = None,
+        request_owned_memory_objs: Optional[list[list[MemoryObj]]] = None,
     ) -> Generator[Optional[torch.Tensor], None, None]:
         assert self.storage_manager is not None
         assert self.gpu_connector is not None
@@ -5073,6 +5177,20 @@ class LMCacheEngine:
             )
             is not None
         )
+        request_owned_source = request_owned_memory_objs is not None
+        if request_owned_source and (
+            len(request_owned_memory_objs) != self.num_layers_for_group(kv_group)
+            or any(
+                len(layer) != len(starts)
+                for layer in request_owned_memory_objs
+            )
+        ):
+            raise ValueError(
+                "Request-owned dense retrieve cache shape does not match "
+                f"the planned prefix: req_id={req_id}, kv_group={kv_group}, "
+                f"layers={len(request_owned_memory_objs)}, "
+                f"chunks={len(starts)}"
+            )
         if not keys_layer_major:
             for layer_id in range(self.num_layers_for_group(kv_group)):
                 self._broadcast_shared_envelope(
@@ -5170,7 +5288,14 @@ class LMCacheEngine:
             for layer_id in range(self.num_layers_for_group(kv_group)):
                 envelope_required = compact_batch is None
                 try:
-                    if page_first_resolve or deferred_layerwise_get:
+                    if request_owned_source:
+                        if pre_resolved_layers is None:
+                            pre_resolved_layers = [
+                                list(layer)
+                                for layer in request_owned_memory_objs
+                            ]
+                        mem_objs_layer = pre_resolved_layers[layer_id]
+                    elif page_first_resolve or deferred_layerwise_get:
                         if pre_resolved_layers is None:
                             full_chunks = planned_page_chunks
                             if not page_first_resolve:
@@ -5415,9 +5540,10 @@ class LMCacheEngine:
                     consumer_send_s += serving_perf_now() - send_started
 
             if deferred_layerwise_get:
-                self._prepare_shared_prefill_sources(
-                    prepared_sources, kv_group, kwargs
-                )
+                if not request_owned_source:
+                    self._prepare_shared_prefill_sources(
+                        prepared_sources, kv_group, kwargs
+                    )
                 sources_safe_to_release = False
                 if perf_enabled:
                     consume_started = serving_perf_now()
@@ -7059,6 +7185,66 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+
+        # Once a P-node chunk has produced a complete request-owned prefix,
+        # rank0 can load those MemoryObjs directly.  Passive TP ranks still
+        # follow the normal envelope path below; rank0's handles make the
+        # source visible to them without a backend contains/get.
+        request_owned_plan = None
+        if shared_layerwise_retrieve and not self._is_passive():
+            request_owned_plan = self._request_owned_dense_cache_plan(
+                tokens,
+                kv_group,
+                kwargs,
+                num_layers,
+                mask,
+            )
+        if request_owned_plan is not None:
+            owned_starts, owned_ends, owned_keys, owned_memory_objs = (
+                request_owned_plan
+            )
+            ret_mask[owned_starts[0] : owned_ends[-1]] = True
+            owned_locations = [
+                ["RequestOwned"] * len(owned_starts)
+                for _ in range(num_layers)
+            ]
+            rank0_retriever = self._retrieve_layer_shared_rank0(
+                starts=owned_starts,
+                ends=owned_ends,
+                keys_layer_major=owned_keys,
+                chunk_locations_layer_major=owned_locations,
+                location="RequestOwned",
+                ret_mask=ret_mask,
+                monitor_req_id=monitor_req_id,
+                req_id=req_id,
+                kv_group=kv_group,
+                kwargs=kwargs,
+                request_owned_memory_objs=owned_memory_objs,
+            )
+            logger.debug(
+                "Request %s KV group %s using request-owned prefix: "
+                "tokens=%s chunks=%s",
+                req_id,
+                kv_group,
+                owned_ends[-1],
+                len(owned_starts),
+            )
+            try:
+                result = next(rank0_retriever)
+                while True:
+                    try:
+                        layer_request = yield result
+                    except GeneratorExit:
+                        raise
+                    except BaseException as error:
+                        result = rank0_retriever.throw(error)
+                    else:
+                        result = rank0_retriever.send(layer_request)
+            except StopIteration:
+                pass
+            finally:
+                rank0_retriever.close()
+            return
 
         if shared_layerwise_retrieve and self._is_passive():
             for start, end, key in self._dense_retrieve_token_results(

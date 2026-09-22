@@ -1188,6 +1188,11 @@ class WorkerRetrieveState:
     request_scope_token: Optional[str] = None
     shared_validation_signature: Optional[tuple[Any, ...]] = None
     dense_prefix_seed: bool = False
+    # True after the P-node has produced request-local KV objects.  This is
+    # deliberately separate from ``dense_prefix_seed``: a first prefix hit
+    # must still use the normal lookup path, while later chunked-prefill
+    # loads may consume the request-owned objects directly.
+    request_owned_prefill: bool = False
     location: Optional[str] = None
     metadata_warm: bool = False
     token_count: int = 0
@@ -5475,6 +5480,7 @@ class LMCacheConnectorV1Impl:
             "request_scope_token": state.request_scope_token,
             "shared_validation_signature": state.shared_validation_signature,
             "dense_prefix_seed": state.dense_prefix_seed,
+            "request_owned_prefill": state.request_owned_prefill,
             "prepared_sparse_sources": dict(state.prepared_sparse_sources),
             "dense_load_readiness": state.dense_load_readiness,
             "dense_load_readiness_consumed": (
@@ -5700,6 +5706,7 @@ class LMCacheConnectorV1Impl:
             )
         state.shared_request_active = True
         state.dense_prefix_seed = False
+        state.request_owned_prefill = False
         state.shared_validation_signature = validation_signature
 
     def _worker_retrieve_state_can_extend(
@@ -5860,6 +5867,52 @@ class LMCacheConnectorV1Impl:
             return None
         self._validate_shared_worker_retrieve_state(state, request)
         return state
+
+    def _request_owned_prefill_cache_ready(
+        self,
+        state: Optional[WorkerRetrieveState],
+        request: ReqMeta,
+        token_count: int,
+    ) -> bool:
+        """Return whether a P-node chunk can load from request-owned KV.
+
+        The first prefix hit is intentionally excluded by the state marker;
+        it must still perform normal LMCache lookup.  Once a deferred P-node
+        store has produced a request-owned result, require complete prefix
+        coverage for every active DSA group before bypassing the backend.
+        Partial coverage falls back to the ordinary lookup path rather than
+        mixing request-local and backend sources in one load.
+        """
+        if (
+            not getattr(self, "_layerwise_prefill_p_node", False)
+            or request.is_sparse_decode
+            or state is None
+            or state.req_id != request.req_id
+            or not state.request_owned_prefill
+            or token_count <= 0
+        ):
+            return False
+
+        groups = (0, 1) if self._is_dsa_two_groups() else (0,)
+        for kv_group in groups:
+            cache = state.cache_kwargs(
+                kv_group,
+                dsa_two_groups=self._is_dsa_two_groups(),
+            )
+            starts = cache["cached_starts"]
+            ends = cache["cached_ends"]
+            memory_objs = cache["cached_memory_objs"]
+            if not starts or not ends or not memory_objs:
+                return False
+            if not self._cached_ranges_cover_prefix(starts, ends, token_count):
+                return False
+            chunk_count = sum(int(end) <= token_count for end in ends)
+            num_layers = self._num_layers_for_group(kv_group)
+            if num_layers <= 0 or len(memory_objs) != num_layers:
+                return False
+            if any(len(layer) < chunk_count for layer in memory_objs):
+                return False
+        return True
 
     def _worker_retrieve_state_for_warm_ref(
         self, request: ReqMeta
@@ -6642,10 +6695,20 @@ class LMCacheConnectorV1Impl:
             ):
                 return
             if provisional:
+                # The P-node storer owns these objects for the lifetime of
+                # the request.  Mark the state so a later chunk can load
+                # them directly instead of probing the shared backend.
+                state.request_owned_prefill = True
                 provisional_results.add(id(result))
                 self._set_worker_retrieve_state(request.req_id, state)
                 return
             provisional_results.discard(id(result))
+
+            # A deferred P-node storer can be finalized after one or more
+            # provisional merges.  Keep the direct-retrieve eligibility when
+            # the final result arrives as well.
+            if self._layerwise_prefill_p_node:
+                state.request_owned_prefill = True
 
             # An index result may arrive before latent under two-group DSA.
             # Keep it request-owned but invisible to retrieve until latent is
@@ -6660,9 +6723,16 @@ class LMCacheConnectorV1Impl:
                 self._set_worker_retrieve_state(request.req_id, state)
                 return
 
-            state.location = (
-                self._resolve_store_retrieve_location(state) or state.location
-            )
+            if state.request_owned_prefill and self._layerwise_prefill_p_node:
+                # The request-owned source is already the authoritative local
+                # cache.  Resolving its location through StorageManager would
+                # reintroduce the backend contains() probe that later chunks
+                # are deliberately avoiding.
+                state.location = state.location or "LocalCPUBackend"
+            else:
+                state.location = (
+                    self._resolve_store_retrieve_location(state) or state.location
+                )
             state.metadata_warm = True
             state.token_count = max(
                 state.token_count,
@@ -8858,6 +8928,13 @@ class LMCacheConnectorV1Impl:
                     )
                     if retrieve_state is None:
                         retrieve_state = WorkerRetrieveState(req_id=request.req_id)
+                    request_owned_prefill = (
+                        self._request_owned_prefill_cache_ready(
+                            retrieve_state,
+                            request,
+                            token_count,
+                        )
+                    )
                     dsa_two_groups = self._is_dsa_two_groups()
                     shared_cpu_enabled = bool(
                         getattr(
@@ -8877,7 +8954,7 @@ class LMCacheConnectorV1Impl:
                         and callable(supports_dense_retention)
                         and supports_dense_retention()
                     )
-                    if retain_dense_seed and (
+                    if retain_dense_seed and not request_owned_prefill and (
                         retrieve_state.shared_request_active
                         or retrieve_state.dense_prefix_seed
                         or retrieve_state.group_has_data(0, dsa_two_groups)
@@ -8915,6 +8992,9 @@ class LMCacheConnectorV1Impl:
                         if self._deferred_layerwise_prefill_load_active
                         else {}
                     )
+                    request_owned_cache_kwargs = (
+                        latent_cache if request_owned_prefill else {}
+                    )
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         retrieve_tokens,
                         token_mask,
@@ -8927,7 +9007,10 @@ class LMCacheConnectorV1Impl:
                         request_configs=request.request_configs,
                         shared_cpu_request_ordinal=idx,
                         shared_cpu_request_preflight_state=dense_preflight_state,
-                        _retain_shared_dense_cache=retain_dense_seed,
+                        _retain_shared_dense_cache=(
+                            retain_dense_seed and not request_owned_prefill
+                        ),
+                        _request_owned_dense_cache=request_owned_prefill,
                         **deferred_prefill_kwargs,
                         **(
                             {"prefill_dma_block_ids_by_bank":
@@ -8936,7 +9019,11 @@ class LMCacheConnectorV1Impl:
                             if self._deferred_layerwise_prefill_load_active
                             and self._layerwise_prefill_dma else {}
                         ),
-                        **(latent_cache if retain_dense_seed else {}),
+                        **(
+                            latent_cache
+                            if retain_dense_seed
+                            else request_owned_cache_kwargs
+                        ),
                     )
                     self.layerwise_retrievers.append(
                         (layerwise_retriever, None)
@@ -9002,7 +9089,10 @@ class LMCacheConnectorV1Impl:
                             shared_cpu_request_preflight_state=(
                                 dense_preflight_state
                             ),
-                            _retain_shared_dense_cache=retain_dense_seed,
+                            _retain_shared_dense_cache=(
+                                retain_dense_seed and not request_owned_prefill
+                            ),
+                            _request_owned_dense_cache=request_owned_prefill,
                             **deferred_prefill_kwargs,
                             **(
                                 {"prefill_dma_block_ids_by_bank":
@@ -9011,7 +9101,18 @@ class LMCacheConnectorV1Impl:
                                 if self._deferred_layerwise_prefill_load_active
                                 and self._layerwise_prefill_dma else {}
                             ),
-                            **(indexer_cache if retain_dense_seed else {}),
+                            **(
+                                indexer_cache
+                                if retain_dense_seed
+                                else (
+                                    retrieve_state.cache_kwargs(
+                                        1,
+                                        dsa_two_groups=True,
+                                    )
+                                    if request_owned_prefill
+                                    else {}
+                                )
+                            ),
                         )
                         self.layerwise_retrievers[-1] = (
                             layerwise_retriever,
@@ -9036,8 +9137,15 @@ class LMCacheConnectorV1Impl:
                         ),
                         prefix_tokens=len(retrieve_tokens),
                     )
-                    if retain_dense_seed:
-                        retrieve_state.location = "LocalCPUBackend"
+                    if retain_dense_seed or request_owned_prefill:
+                        if request_owned_prefill:
+                            # The direct path already has the complete
+                            # request-owned source.  Do not perform a second
+                            # metadata/backend probe after priming it.
+                            retrieve_state.location = "LocalCPUBackend"
+                            retrieve_state.metadata_warm = True
+                        else:
+                            retrieve_state.location = "LocalCPUBackend"
                         retrieve_state.token_count = len(retrieve_tokens)
                         self._set_worker_retrieve_state(
                             request.req_id,
