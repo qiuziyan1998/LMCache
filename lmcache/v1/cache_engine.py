@@ -122,10 +122,35 @@ def _shared_cpu_trace(logger: Any, event: str, **fields: Any) -> None:
 
     The trace is deliberately disabled by default so the production path does
     not pay for extra formatting or logging.  Set
-    ``LMCACHE_SHARED_CPU_TRACE=1`` when diagnosing a shared-envelope miss.
+    ``LMCACHE_SHARED_CPU_TRACE=1`` for the compact request-level summary, or
+    ``LMCACHE_SHARED_CPU_TRACE=verbose`` to include the per-layer protocol
+    trace.  Summary mode keeps rank0 and one passive rank; set
+    ``LMCACHE_SHARED_CPU_TRACE_RANKS=all`` to include every rank.
     """
-    if os.environ.get("LMCACHE_SHARED_CPU_TRACE", "0") != "1":
+    trace_mode = os.environ.get("LMCACHE_SHARED_CPU_TRACE", "0").lower()
+    if trace_mode not in ("1", "summary", "verbose", "all"):
         return
+    if trace_mode not in ("verbose", "all") and event not in {
+        "owned_plan_skip",
+        "owned_plan_ready",
+        "retrieve_layer_owned_plan_result",
+        "rank0_retrieve_start",
+        "rank0_no_keys_broadcast_skipped",
+        "passive_retrieve_finish",
+    }:
+        return
+    if trace_mode not in ("verbose", "all") and os.environ.get(
+        "LMCACHE_SHARED_CPU_TRACE_RANKS", "summary"
+    ).lower() not in ("all", "*"):
+        rank = fields.get("rank")
+        first_rank = fields.get("first_rank")
+        if first_rank is None:
+            first_rank = 0
+        allowed_rank = (
+            first_rank + 1 if event.startswith("passive_") else first_rank
+        )
+        if rank is not None and rank != allowed_rank:
+            return
     logger.warning("[SHARED_CPU_TRACE] event=%s fields=%s", event, fields)
 
 # Private generator controls used by the vLLM adapter to keep the two shared
@@ -5059,6 +5084,7 @@ class LMCacheEngine:
         """
         trace_base = {
             "rank": getattr(getattr(self, "metadata", None), "worker_id", None),
+            "first_rank": getattr(getattr(self, "metadata", None), "first_rank", 0),
             "req_id": self._get_req_id(kwargs),
             "kv_group": kv_group,
             "target_tokens": len(tokens),
@@ -6397,6 +6423,7 @@ class LMCacheEngine:
                 logger,
                 "passive_retrieve_finish",
                 rank=getattr(self.metadata, "worker_id", None),
+                first_rank=getattr(self.metadata, "first_rank", 0),
                 req_id=req_id,
                 phase=phase,
                 ordinal=request_ordinal,

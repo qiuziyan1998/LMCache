@@ -100,9 +100,32 @@ logger = init_logger(__name__)
 
 
 def _shared_cpu_adapter_trace(event: str, **fields: Any) -> None:
-    """Opt-in request-state trace for shared CPU layerwise retrieval."""
-    if os.environ.get("LMCACHE_SHARED_CPU_TRACE", "0") != "1":
+    """Opt-in compact request-state trace for shared CPU retrieval.
+
+    ``1``/``summary`` keeps only request-level decisions and store frontiers;
+    ``verbose``/``all`` restores the per-layer protocol trace.  Summary mode
+    keeps the first rank only; set ``LMCACHE_SHARED_CPU_TRACE_RANKS=all`` to
+    include every rank.
+    """
+    trace_mode = os.environ.get("LMCACHE_SHARED_CPU_TRACE", "0").lower()
+    if trace_mode not in ("1", "summary", "verbose", "all"):
         return
+    if trace_mode not in ("verbose", "all") and event not in {
+        "request_owned_store",
+        "request_owned_not_ready",
+        "request_owned_ready",
+        "dense_prefix_source",
+    }:
+        return
+    if trace_mode not in ("verbose", "all") and os.environ.get(
+        "LMCACHE_SHARED_CPU_TRACE_RANKS", "summary"
+    ).lower() not in ("all", "*"):
+        rank = fields.get("rank")
+        first_rank = fields.get("first_rank")
+        if first_rank is None:
+            first_rank = 0
+        if rank is not None and rank != first_rank:
+            return
     logger.warning("[SHARED_CPU_TRACE] event=%s fields=%s", event, fields)
 
 SPARSE_DECODE_RETRIEVE_TOKENS = int(
@@ -5895,6 +5918,7 @@ class LMCacheConnectorV1Impl:
         engine_metadata = getattr(getattr(self, "lmcache_engine", None), "metadata", None)
         trace_base = {
             "rank": getattr(engine_metadata, "worker_id", None),
+            "first_rank": getattr(engine_metadata, "first_rank", None),
             "req_id": request.req_id,
             "token_count": token_count,
             "kv_group": kv_group,
@@ -5954,10 +5978,17 @@ class LMCacheConnectorV1Impl:
                     memory_layers=len(memory_objs),
                 )
             if not self._cached_ranges_cover_prefix(starts, ends, token_count):
+                covered_end = self._cached_prefix_covered_token_count(starts, ends)
                 return not_ready(
                     "range_not_covering_prefix",
                     checked_group=kv_group,
-                    ranges=list(zip(starts, ends, strict=False))[-8:],
+                    required_end=token_count,
+                    covered_end=covered_end,
+                    range_count=len(starts),
+                    first_range=(starts[0], ends[0]) if starts and ends else None,
+                    last_range=(starts[-1], ends[-1]) if starts and ends else None,
+                    memory_layers=len(memory_objs),
+                    memory_chunks=(len(memory_objs[0]) if memory_objs else 0),
                 )
             chunk_count = sum(int(end) <= token_count for end in ends)
             num_layers = self._num_layers_for_group(kv_group)
@@ -5976,26 +6007,26 @@ class LMCacheConnectorV1Impl:
                     chunk_count=chunk_count,
                     layer_chunk_counts=[len(layer) for layer in memory_objs[:4]],
                 )
+        group_summary = {}
+        for group in groups:
+            group_cache = state.cache_kwargs(
+                group,
+                dsa_two_groups=self._is_dsa_two_groups(),
+            )
+            group_starts = group_cache["cached_starts"]
+            group_ends = group_cache["cached_ends"]
+            group_memory = group_cache["cached_memory_objs"]
+            group_summary[group] = {
+                "range_count": len(group_starts),
+                "first": group_starts[0] if group_starts else None,
+                "covered_end": group_ends[-1] if group_ends else None,
+                "memory_layers": len(group_memory),
+                "memory_chunks": len(group_memory[0]) if group_memory else 0,
+            }
         _shared_cpu_adapter_trace(
             "request_owned_ready",
             **trace_base,
-            groups=groups,
-            ranges={
-                group: list(
-                    zip(
-                        state.cache_kwargs(
-                            group,
-                            dsa_two_groups=self._is_dsa_two_groups(),
-                        )["cached_starts"],
-                        state.cache_kwargs(
-                            group,
-                            dsa_two_groups=self._is_dsa_two_groups(),
-                        )["cached_ends"],
-                        strict=False,
-                    )
-                )[-8:]
-                for group in groups
-            },
+            groups=group_summary,
         )
         return True
 
@@ -6773,6 +6804,44 @@ class LMCacheConnectorV1Impl:
                 state,
                 result,
                 request,
+            )
+            cache = state.cache_kwargs(
+                result.kv_group,
+                dsa_two_groups=self._is_dsa_two_groups(),
+            )
+            _shared_cpu_adapter_trace(
+                "request_owned_store",
+                rank=getattr(
+                    getattr(self.lmcache_engine, "metadata", None),
+                    "worker_id",
+                    None,
+                ),
+                first_rank=getattr(
+                    getattr(self.lmcache_engine, "metadata", None),
+                    "first_rank",
+                    None,
+                ),
+                req_id=request.req_id,
+                kv_group=result.kv_group,
+                provisional=provisional,
+                merged_chunks=merged,
+                result_range=(
+                    (result.starts[0], result.ends[-1])
+                    if result.starts and result.ends
+                    else None
+                ),
+                state_range=(
+                    (cache["cached_starts"][0], cache["cached_ends"][-1])
+                    if cache["cached_starts"] and cache["cached_ends"]
+                    else None
+                ),
+                state_range_count=len(cache["cached_starts"]),
+                state_memory_layers=len(cache["cached_memory_objs"]),
+                state_memory_chunks=(
+                    len(cache["cached_memory_objs"][0])
+                    if cache["cached_memory_objs"]
+                    else 0
+                ),
             )
             if merged == 0 and not (
                 not provisional
@@ -9059,29 +9128,25 @@ class LMCacheConnectorV1Impl:
                         indexer_request_owned=request_owned_prefill_indexer,
                         state_req_id=getattr(retrieve_state, "req_id", None),
                         state_token_count=getattr(retrieve_state, "token_count", None),
-                        latent_ranges=(
-                            list(
-                                zip(
-                                    retrieve_state.cached_starts,
-                                    retrieve_state.cached_ends,
-                                    strict=False,
-                                )
-                            )[-4:]
-                        ),
-                        indexer_ranges=(
-                            list(
-                                zip(
-                                    retrieve_state.cached_starts_indexer,
-                                    retrieve_state.cached_ends_indexer,
-                                    strict=False,
-                                )
-                            )[-4:]
+                        latent_range_count=len(retrieve_state.cached_starts),
+                        latent_covered_end=(
+                            retrieve_state.cached_ends[-1]
+                            if retrieve_state.cached_ends
+                            else None
                         ),
                         latent_memory_layers=len(retrieve_state.cached_memory_objs),
                         latent_memory_chunks=[
                             len(layer)
                             for layer in retrieve_state.cached_memory_objs[:4]
                         ],
+                        indexer_range_count=len(
+                            retrieve_state.cached_starts_indexer
+                        ),
+                        indexer_covered_end=(
+                            retrieve_state.cached_ends_indexer[-1]
+                            if retrieve_state.cached_ends_indexer
+                            else None
+                        ),
                         indexer_memory_layers=len(
                             retrieve_state.cached_memory_objs_indexer
                         ),
