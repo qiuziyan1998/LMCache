@@ -9334,15 +9334,10 @@ class LMCacheConnectorV1Impl:
                             dtype=torch.bool,
                         )
                         latent_slot_mapping = retrieve_slot_mapping[:latent_owned_frontier]
-                    owned_frontiers = getattr(
-                        request,
-                        "_layerwise_prefill_owned_frontier",
-                        None,
+                    owned_frontiers = dense_preflight_state.setdefault(
+                        "request_owned_frontiers", {}
                     )
-                    if owned_frontiers is None:
-                        owned_frontiers = {}
-                        request._layerwise_prefill_owned_frontier = owned_frontiers
-                    owned_frontiers.clear()
+                    request._layerwise_prefill_owned_frontier = owned_frontiers
                     if latent_owned_frontier:
                         owned_frontiers[0] = latent_owned_frontier
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(

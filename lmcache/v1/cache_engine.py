@@ -5775,6 +5775,7 @@ class LMCacheEngine:
                             # backend yet.
                             chunk_starts=list(starts),
                             chunk_ends=list(ends),
+                            request_owned_prefix=request_owned_source,
                         )
                     )
                     if (
@@ -6138,6 +6139,16 @@ class LMCacheEngine:
                                 "chunk ranges from rank0."
                             )
                         envelope_metadata_only = not starts_all or not keys_layer_major
+                        if envelope.request_owned_prefix:
+                            preflight_state = kwargs.get(
+                                "shared_cpu_request_preflight_state"
+                            )
+                            if isinstance(preflight_state, dict):
+                                frontiers = preflight_state.get(
+                                    "request_owned_frontiers"
+                                )
+                                if isinstance(frontiers, dict):
+                                    frontiers[kv_group] = int(envelope_ranges[1][-1])
 
                 if expected_handle_count is None:
                     assert envelope is not None
@@ -6430,6 +6441,11 @@ class LMCacheEngine:
                 kv_group=kv_group,
                 retrieved=int(retrieved_tokens.item()),
                 requested=int(ret_mask.numel()),
+                request_owned_frontier=(
+                    (kwargs.get("shared_cpu_request_preflight_state") or {})
+                    .get("request_owned_frontiers", {})
+                    .get(kv_group)
+                ),
                 resolved_layers=len(resolved_layers),
                 resolved_objects=sum(len(layer) for layer in resolved_layers),
                 compact=compact_batch is not None,

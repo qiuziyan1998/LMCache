@@ -4980,11 +4980,13 @@ def test_shared_envelope_round_trips_rank0_chunk_ranges():
         handles=[],
         chunk_starts=[0, 4096],
         chunk_ends=[4096, 8192],
+        request_owned_prefix=True,
     )
 
     decoded = SharedHandleEnvelope.from_dict(envelope.to_dict())
     assert decoded.chunk_starts == [0, 4096]
     assert decoded.chunk_ends == [4096, 8192]
+    assert decoded.request_owned_prefix is True
 
 
 def test_compact_shared_handle_batch_round_trip_and_view():
@@ -5767,6 +5769,60 @@ def test_shared_dense_passive_compact_batch_preserves_layerwise_consumption(
         [engine.shared_cpu_cache_passive_allocator.views[1]],
     ]
     assert torch.equal(yielded[-1], ret_mask)
+
+
+def test_passive_request_owned_envelope_reports_completed_frontier(monkeypatch):
+    import lmcache.v1.cache_engine as cache_engine_module
+
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+    engine = _make_passive_shared_retrieve_engine(kv_group=0)
+    envelopes = iter(
+        SharedHandleEnvelope(
+            request_id="req-1",
+            phase="dense_prefix",
+            request_ordinal=0,
+            layer_id=layer_id,
+            kv_group=0,
+            status="ok",
+            generation=9,
+            handles=[object()],
+            chunk_starts=[0],
+            chunk_ends=[4],
+            request_owned_prefix=True,
+        )
+        for layer_id in range(engine.num_layers)
+    )
+    engine._receive_shared_envelope = lambda: next(envelopes)
+    frontiers = {}
+    ret_mask = torch.zeros(8, dtype=torch.bool)
+    keys = _make_key().split_layers(engine.num_layers)
+    retriever = engine._retrieve_layer_shared_passive(
+        starts_all=[],
+        ends_all=[],
+        keys_layer_major=[[key] for key in keys],
+        ret_mask=ret_mask,
+        monitor_req_id=123,
+        req_id="req-1",
+        kv_group=0,
+        kwargs={
+            "shared_cpu_phase": "dense_prefix",
+            "shared_cpu_request_preflight_state": {
+                "request_owned_frontiers": frontiers,
+            },
+        },
+    )
+
+    yielded = list(retriever)
+
+    assert frontiers == {0: 4}
+    assert torch.equal(
+        yielded[-1],
+        torch.tensor([True, True, True, True, False, False, False, False]),
+    )
 
 
 def test_passive_layer_page_helper_creates_one_view_per_page():

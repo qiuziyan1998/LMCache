@@ -593,6 +593,7 @@ class SharedHandleEnvelope:
     # publishes the exact logical ranges with the handles in that case.
     chunk_starts: Optional[list[int]] = None
     chunk_ends: Optional[list[int]] = None
+    request_owned_prefix: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -610,6 +611,8 @@ class SharedHandleEnvelope:
         if self.chunk_starts is not None or self.chunk_ends is not None:
             payload["chunk_starts"] = self.chunk_starts
             payload["chunk_ends"] = self.chunk_ends
+        if self.request_owned_prefix:
+            payload["request_owned_prefix"] = True
         if self.batch is not None:
             payload["batch"] = self.batch.to_dict()
         return payload
@@ -679,6 +682,7 @@ class SharedHandleEnvelope:
                 if data.get("chunk_ends") is not None
                 else None
             ),
+            request_owned_prefix=bool(data.get("request_owned_prefix", False)),
         )
 
 

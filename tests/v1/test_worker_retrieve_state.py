@@ -1619,6 +1619,36 @@ class TestWorkerRetrieveState:
 
         assert impl._invalid_block_ids == {10}
 
+    def test_passive_request_owned_prefix_validates_only_completed_chunk(self):
+        impl = _make_impl()
+        impl._block_size = 4
+        impl._lmcache_chunk_size = 4
+        impl._invalid_block_ids = set()
+        request = ReqMeta(
+            req_id="req-1",
+            token_ids=list(range(8)),
+            slot_mapping=[torch.arange(8)],
+            indexer_slot_mapping=[torch.arange(40, 48)],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=8,
+                can_load=True,
+            ),
+        )
+        request._layerwise_prefill_owned_frontier = {0: 4, 1: 4}
+        loaded_prefix = torch.tensor(
+            [True, True, True, True, False, False, False, False]
+        )
+
+        impl._validate_dense_retrieve_result(
+            request, loaded_prefix, kv_group=0
+        )
+        impl._validate_dense_retrieve_result(
+            request, loaded_prefix, kv_group=1
+        )
+
+        assert impl._invalid_block_ids == set()
+
     def test_dense_group0_short_retrieve_uses_indexer_validation_blocks(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
