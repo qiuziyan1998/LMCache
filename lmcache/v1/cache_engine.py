@@ -116,6 +116,18 @@ from lmcache.v1.token_database import (
 
 logger = init_logger(__name__)
 
+
+def _shared_cpu_trace(logger: Any, event: str, **fields: Any) -> None:
+    """Emit opt-in shared-CPU protocol diagnostics.
+
+    The trace is deliberately disabled by default so the production path does
+    not pay for extra formatting or logging.  Set
+    ``LMCACHE_SHARED_CPU_TRACE=1`` when diagnosing a shared-envelope miss.
+    """
+    if os.environ.get("LMCACHE_SHARED_CPU_TRACE", "0") != "1":
+        return
+    logger.warning("[SHARED_CPU_TRACE] event=%s fields=%s", event, fields)
+
 # Private generator controls used by the vLLM adapter to keep the two shared
 # sparse-cache groups on one deterministic collective order.
 _SHARED_SPARSE_PREPARE_ONLY = "_lmcache_shared_sparse_prepare_only"
@@ -1240,12 +1252,44 @@ class LMCacheEngine:
         )
 
     def _broadcast_shared_envelope(self, envelope: SharedHandleEnvelope) -> None:
+        _shared_cpu_trace(
+            logger,
+            "broadcast_begin",
+            rank=getattr(self.metadata, "worker_id", None),
+            first_rank=getattr(self.metadata, "first_rank", None),
+            req_id=envelope.request_id,
+            phase=envelope.phase,
+            ordinal=envelope.request_ordinal,
+            kv_group=envelope.kv_group,
+            layer=envelope.layer_id,
+            generation=envelope.generation,
+            status=envelope.status,
+            handles=len(envelope.handles),
+            batch_offsets=len(envelope.batch.offsets) if envelope.batch else 0,
+            ranges=(
+                len(envelope.chunk_starts or []),
+                (envelope.chunk_starts or [None])[0],
+                (envelope.chunk_ends or [None])[-1],
+            ),
+            message=envelope.message,
+        )
         perf_enabled = serving_perf_enabled()
         started = serving_perf_now() if perf_enabled else None
         thread_started = time.thread_time_ns() if perf_enabled else 0
         condition, _, _ = self._shared_envelope_mailbox()
         with condition:
             self.broadcast_object_fn(envelope.to_dict(), self.metadata.first_rank)
+        _shared_cpu_trace(
+            logger,
+            "broadcast_done",
+            rank=getattr(self.metadata, "worker_id", None),
+            req_id=envelope.request_id,
+            phase=envelope.phase,
+            ordinal=envelope.request_ordinal,
+            kv_group=envelope.kv_group,
+            layer=envelope.layer_id,
+            status=envelope.status,
+        )
         if perf_enabled:
             serving_perf_log(
                 logger,
@@ -1268,6 +1312,12 @@ class LMCacheEngine:
         perf_enabled = serving_perf_enabled()
         started = serving_perf_now() if perf_enabled else None
         thread_started = time.thread_time_ns() if perf_enabled else 0
+        _shared_cpu_trace(
+            logger,
+            "receive_begin",
+            rank=getattr(self.metadata, "worker_id", None),
+            first_rank=getattr(self.metadata, "first_rank", None),
+        )
         raw = self.broadcast_object_fn(None, self.metadata.first_rank)
         if not isinstance(raw, dict):
             raise ValueError(
@@ -1281,6 +1331,27 @@ class LMCacheEngine:
                 "Shared CPU cache received corrupt envelope before view "
                 f"creation: error={exc}, raw={raw!r}"
             ) from exc
+        _shared_cpu_trace(
+            logger,
+            "receive_done",
+            rank=getattr(self.metadata, "worker_id", None),
+            first_rank=getattr(self.metadata, "first_rank", None),
+            req_id=envelope.request_id,
+            phase=envelope.phase,
+            ordinal=envelope.request_ordinal,
+            kv_group=envelope.kv_group,
+            layer=envelope.layer_id,
+            generation=envelope.generation,
+            status=envelope.status,
+            handles=len(envelope.handles),
+            batch_offsets=len(envelope.batch.offsets) if envelope.batch else 0,
+            ranges=(
+                len(envelope.chunk_starts or []),
+                (envelope.chunk_starts or [None])[0],
+                (envelope.chunk_ends or [None])[-1],
+            ),
+            message=envelope.message,
+        )
         if perf_enabled:
             serving_perf_log(
                 logger,
@@ -1362,6 +1433,14 @@ class LMCacheEngine:
         condition, pending, waiters = self._shared_envelope_mailbox()
         with condition:
             waiters[expected] = waiters.get(expected, 0) + 1
+        _shared_cpu_trace(
+            logger,
+            "match_wait_begin",
+            rank=getattr(self.metadata, "worker_id", None),
+            expected=expected,
+            pending=len(pending),
+            active=self._shared_envelope_receive_active,
+        )
 
         try:
             # Async cold-compact and foreground layerwise loads can reach the
@@ -1373,6 +1452,15 @@ class LMCacheEngine:
                     buffered = pending.pop(expected, None)
                     if buffered is not None:
                         outcome = "buffered"
+                        _shared_cpu_trace(
+                            logger,
+                            "match_buffered",
+                            rank=getattr(self.metadata, "worker_id", None),
+                            expected=expected,
+                            status=buffered.status,
+                            handles=len(buffered.handles),
+                            ranges=len(buffered.chunk_starts or []),
+                        )
                         condition.notify_all()
                         return buffered
                     if self._shared_envelope_receive_active:
@@ -1410,10 +1498,27 @@ class LMCacheEngine:
                     raise
 
                 identity = self._shared_envelope_identity(envelope)
+                _shared_cpu_trace(
+                    logger,
+                    "match_received",
+                    rank=getattr(self.metadata, "worker_id", None),
+                    expected=expected,
+                    identity=identity,
+                    status=envelope.status,
+                    handles=len(envelope.handles),
+                    ranges=len(envelope.chunk_starts or []),
+                )
                 with condition:
                     self._shared_envelope_receive_active = False
                     if identity == expected:
                         outcome = "collective"
+                        _shared_cpu_trace(
+                            logger,
+                            "match_return",
+                            rank=getattr(self.metadata, "worker_id", None),
+                            expected=expected,
+                            outcome=outcome,
+                        )
                         condition.notify_all()
                         return envelope
                     if identity in pending:
@@ -4952,7 +5057,16 @@ class LMCacheEngine:
         valid until request cleanup.  A partial or malformed cache returns
         ``None`` so the caller can use the normal lookup path safely.
         """
+        trace_base = {
+            "rank": getattr(getattr(self, "metadata", None), "worker_id", None),
+            "req_id": self._get_req_id(kwargs),
+            "kv_group": kv_group,
+            "target_tokens": len(tokens),
+            "num_layers": num_layers,
+            "flag": bool(kwargs.get("_request_owned_dense_cache")),
+        }
         if not kwargs.get("_request_owned_dense_cache"):
+            _shared_cpu_trace(logger, "owned_plan_skip", reason="flag_off", **trace_base)
             return None
 
         starts = kwargs.get("cached_starts")
@@ -4965,12 +5079,31 @@ class LMCacheEngine:
             and isinstance(keys_layer_major, list)
             and isinstance(memory_objs, list)
         ):
+            _shared_cpu_trace(
+                logger,
+                "owned_plan_skip",
+                reason="missing_or_wrong_types",
+                starts_type=type(starts).__name__,
+                ends_type=type(ends).__name__,
+                keys_type=type(keys_layer_major).__name__,
+                memory_type=type(memory_objs).__name__,
+                **trace_base,
+            )
             return None
         if not starts or len(starts) != len(ends):
+            _shared_cpu_trace(
+                logger,
+                "owned_plan_skip",
+                reason="empty_or_range_length_mismatch",
+                starts=len(starts),
+                ends=len(ends),
+                **trace_base,
+            )
             return None
 
         target_tokens = len(tokens)
         if target_tokens <= 0:
+            _shared_cpu_trace(logger, "owned_plan_skip", reason="no_tokens", **trace_base)
             return None
 
         # Dense prefill can ask LMCache to load only the suffix that is not
@@ -4980,6 +5113,13 @@ class LMCacheEngine:
         required_start = 0
         if mask is not None:
             if mask.numel() != target_tokens:
+                _shared_cpu_trace(
+                    logger,
+                    "owned_plan_skip",
+                    reason="mask_length_mismatch",
+                    mask_tokens=mask.numel(),
+                    **trace_base,
+                )
                 return None
             false_tokens = target_tokens - int(mask.long().sum().item())
             if false_tokens < 0 or (
@@ -4989,9 +5129,23 @@ class LMCacheEngine:
                     or not bool(mask[false_tokens:].all())
                 )
             ):
+                _shared_cpu_trace(
+                    logger,
+                    "owned_plan_skip",
+                    reason="mask_not_prefix_false_suffix_true",
+                    false_tokens=false_tokens,
+                    **trace_base,
+                )
                 return None
             required_start = false_tokens
         if required_start == target_tokens:
+            _shared_cpu_trace(
+                logger,
+                "owned_plan_skip",
+                reason="all_tokens_already_resident",
+                required_start=required_start,
+                **trace_base,
+            )
             return None
 
         first_chunk = bisect_right(ends, required_start)
@@ -5002,6 +5156,17 @@ class LMCacheEngine:
             or first_chunk >= len(starts)
             or starts[first_chunk] != required_start
         ):
+            _shared_cpu_trace(
+                logger,
+                "owned_plan_skip",
+                reason="target_not_exactly_covered",
+                required_start=required_start,
+                first_chunk=first_chunk,
+                chunk_count=chunk_count,
+                starts_preview=starts[:4],
+                ends_preview=ends[:4],
+                **trace_base,
+            )
             return None
         if starts[0] != 0 or any(
             left != right
@@ -5009,13 +5174,38 @@ class LMCacheEngine:
                 starts[1:chunk_count], ends[: chunk_count - 1], strict=True
             )
         ):
+            _shared_cpu_trace(
+                logger,
+                "owned_plan_skip",
+                reason="non_contiguous_ranges",
+                starts_preview=starts[:4],
+                ends_preview=ends[:4],
+                **trace_base,
+            )
             return None
         if len(keys_layer_major) != num_layers or len(memory_objs) != num_layers:
+            _shared_cpu_trace(
+                logger,
+                "owned_plan_skip",
+                reason="layer_count_mismatch",
+                key_layers=len(keys_layer_major),
+                memory_layers=len(memory_objs),
+                **trace_base,
+            )
             return None
         if any(
             len(layer) < chunk_count
             for layer in (*keys_layer_major, *memory_objs)
         ):
+            _shared_cpu_trace(
+                logger,
+                "owned_plan_skip",
+                reason="chunk_coverage_mismatch",
+                chunk_count=chunk_count,
+                key_chunk_counts=[len(layer) for layer in keys_layer_major[:4]],
+                memory_chunk_counts=[len(layer) for layer in memory_objs[:4]],
+                **trace_base,
+            )
             return None
 
         selected_keys = [
@@ -5024,12 +5214,25 @@ class LMCacheEngine:
         selected_memory_objs = [
             list(layer[first_chunk:chunk_count]) for layer in memory_objs
         ]
-        return (
+        plan = (
             list(starts[first_chunk:chunk_count]),
             list(ends[first_chunk:chunk_count]),
             selected_keys,
             selected_memory_objs,
         )
+        _shared_cpu_trace(
+            logger,
+            "owned_plan_ready",
+            first_chunk=first_chunk,
+            chunk_count=len(plan[0]),
+            starts=plan[0][:4],
+            ends=plan[1][-4:],
+            key_layers=len(plan[2]),
+            memory_layers=len(plan[3]),
+            memory_objects=sum(len(layer) for layer in plan[3]),
+            **trace_base,
+        )
+        return plan
 
     def _adopt_dense_shared_retrieve_cache(
         self,
@@ -5191,6 +5394,28 @@ class LMCacheEngine:
             is not None
         )
         request_owned_source = request_owned_memory_objs is not None
+        _shared_cpu_trace(
+            logger,
+            "rank0_retrieve_start",
+            rank=getattr(self.metadata, "worker_id", None),
+            first_rank=getattr(self.metadata, "first_rank", None),
+            req_id=req_id,
+            phase=phase,
+            ordinal=request_ordinal,
+            kv_group=kv_group,
+            location=location,
+            request_owned=request_owned_source,
+            starts=len(starts),
+            range_end=(ends[-1] if ends else None),
+            key_layers=len(keys_layer_major),
+            key_chunks=[len(layer) for layer in keys_layer_major[:4]],
+            memory_layers=(len(request_owned_memory_objs) if request_owned_source else 0),
+            memory_chunks=(
+                [len(layer) for layer in request_owned_memory_objs[:4]]
+                if request_owned_source
+                else []
+            ),
+        )
         if request_owned_source and (
             len(request_owned_memory_objs) != self.num_layers_for_group(kv_group)
             or any(
@@ -5205,6 +5430,16 @@ class LMCacheEngine:
                 f"chunks={len(starts)}"
             )
         if not keys_layer_major:
+            _shared_cpu_trace(
+                logger,
+                "rank0_no_keys_broadcast_skipped",
+                rank=getattr(self.metadata, "worker_id", None),
+                req_id=req_id,
+                phase=phase,
+                ordinal=request_ordinal,
+                kv_group=kv_group,
+                layers=self.num_layers_for_group(kv_group),
+            )
             for layer_id in range(self.num_layers_for_group(kv_group)):
                 self._broadcast_shared_envelope(
                     SharedHandleEnvelope(
@@ -5474,6 +5709,22 @@ class LMCacheEngine:
                     )
                     raise _RemoteFillMaterializationError(message) from exc
                 handles_by_layer.append(handles)
+                _shared_cpu_trace(
+                    logger,
+                    "rank0_layer_ready",
+                    rank=getattr(self.metadata, "worker_id", None),
+                    req_id=req_id,
+                    phase=phase,
+                    ordinal=request_ordinal,
+                    kv_group=kv_group,
+                    layer=layer_id,
+                    request_owned=request_owned_source,
+                    envelope_required=envelope_required,
+                    compact=compact_batch is not None,
+                    memory_objects=len(mem_objs_layer),
+                    handles=len(handles),
+                    ranges=(len(starts), starts[0] if starts else None, ends[-1] if ends else None),
+                )
                 if envelope_required:
                     self._broadcast_shared_envelope(
                         SharedHandleEnvelope(
@@ -5735,6 +5986,21 @@ class LMCacheEngine:
         envelope_metadata_only = False
         perf_enabled = serving_perf_enabled()
         consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
+        _shared_cpu_trace(
+            logger,
+            "passive_retrieve_start",
+            rank=getattr(self.metadata, "worker_id", None),
+            first_rank=getattr(self.metadata, "first_rank", None),
+            req_id=req_id,
+            phase=phase,
+            ordinal=request_ordinal,
+            kv_group=kv_group,
+            starts=len(starts_all),
+            ends=(ends_all[-1] if ends_all else None),
+            key_layers=len(keys_layer_major),
+            key_chunks=[len(layer) for layer in keys_layer_major[:4]],
+            deferred=deferred_layerwise_get,
+        )
 
         try:
             for layer_id in range(self.num_layers_for_group(kv_group)):
@@ -5773,6 +6039,30 @@ class LMCacheEngine:
                         raise _RemoteFillMaterializationError(
                             "RemoteFill shared-handle envelope validation failed"
                         ) from exc
+                    _shared_cpu_trace(
+                        logger,
+                        "passive_envelope_validated",
+                        rank=getattr(self.metadata, "worker_id", None),
+                        first_rank=getattr(self.metadata, "first_rank", None),
+                        req_id=req_id,
+                        phase=phase,
+                        ordinal=request_ordinal,
+                        kv_group=kv_group,
+                        layer=layer_id,
+                        status=envelope.status,
+                        handles=len(envelope.handles),
+                        batch_offsets=(
+                            len(envelope.batch.offsets)
+                            if envelope.batch is not None
+                            else 0
+                        ),
+                        ranges=(
+                            len(envelope.chunk_starts or []),
+                            (envelope.chunk_starts or [None])[0],
+                            (envelope.chunk_ends or [None])[-1],
+                        ),
+                        message=envelope.message,
+                    )
                     if envelope.status in ("miss", "skipped"):
                         if deferred_layerwise_get:
                             prepared_sources.append(None)
@@ -5979,6 +6269,25 @@ class LMCacheEngine:
                     view_build_s += serving_perf_now() - view_started
                 resolved_layers.append(mem_objs_layer)
                 handles_by_layer.append(layer_handles)
+                _shared_cpu_trace(
+                    logger,
+                    "passive_layer_views_ready",
+                    rank=getattr(self.metadata, "worker_id", None),
+                    req_id=req_id,
+                    phase=phase,
+                    ordinal=request_ordinal,
+                    kv_group=kv_group,
+                    layer=layer_id,
+                    compact=compact_batch is not None,
+                    expected_handles=expected_handle_count,
+                    layer_objects=len(mem_objs_layer),
+                    starts=(
+                        len(starts),
+                        starts[0] if starts else None,
+                        ends[-1] if ends else None,
+                    ),
+                    ret_tokens=int(torch.sum(ret_mask).item()),
+                )
 
                 if deferred_layerwise_get:
                     prepared_sources.append(
@@ -6083,6 +6392,23 @@ class LMCacheEngine:
                 req_id,
                 kv_group,
                 retrieved_tokens,
+            )
+            _shared_cpu_trace(
+                logger,
+                "passive_retrieve_finish",
+                rank=getattr(self.metadata, "worker_id", None),
+                req_id=req_id,
+                phase=phase,
+                ordinal=request_ordinal,
+                kv_group=kv_group,
+                retrieved=int(retrieved_tokens.item()),
+                requested=int(ret_mask.numel()),
+                resolved_layers=len(resolved_layers),
+                resolved_objects=sum(len(layer) for layer in resolved_layers),
+                compact=compact_batch is not None,
+                envelope_ranges=(
+                    len(envelope_ranges[0]) if envelope_ranges is not None else 0
+                ),
             )
             if consume_started and resolved_layers:
                 elapsed_s = serving_perf_now() - consume_started
@@ -7254,6 +7580,30 @@ class LMCacheEngine:
             num_required_tokens = torch.sum(mask).item()
         else:
             num_required_tokens = len(tokens)
+        _shared_cpu_trace(
+            logger,
+            "retrieve_layer_enter",
+            rank=getattr(self.metadata, "worker_id", None),
+            first_rank=getattr(self.metadata, "first_rank", None),
+            req_id=req_id,
+            kv_group=kv_group,
+            role=("passive" if self._is_passive() else "rank0_or_active"),
+            shared=shared_layerwise_retrieve,
+            num_layers=num_layers,
+            tokens=len(tokens),
+            required_tokens=int(num_required_tokens),
+            mask_true=(int(mask.long().sum().item()) if mask is not None else None),
+            phase=kwargs.get("shared_cpu_phase", "dense_prefix"),
+            ordinal=int(kwargs.get("shared_cpu_request_ordinal", 0)),
+            owned_flag=bool(kwargs.get("_request_owned_dense_cache")),
+            cached_starts=len(kwargs.get("cached_starts") or []),
+            cached_ends=len(kwargs.get("cached_ends") or []),
+            cached_key_layers=len(kwargs.get("cached_keys") or []),
+            cached_memory_layers=len(kwargs.get("cached_memory_objs") or []),
+            cached_memory_chunks=[
+                len(layer) for layer in (kwargs.get("cached_memory_objs") or [])[:4]
+            ],
+        )
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
@@ -7284,6 +7634,16 @@ class LMCacheEngine:
                 kwargs,
                 num_layers,
                 mask,
+            )
+            _shared_cpu_trace(
+                logger,
+                "retrieve_layer_owned_plan_result",
+                rank=getattr(self.metadata, "worker_id", None),
+                req_id=req_id,
+                kv_group=kv_group,
+                present=request_owned_plan is not None,
+                chunks=(len(request_owned_plan[0]) if request_owned_plan else 0),
+                range_end=(request_owned_plan[1][-1] if request_owned_plan else None),
             )
         if request_owned_plan is not None:
             owned_starts, owned_ends, owned_keys, owned_memory_objs = (
