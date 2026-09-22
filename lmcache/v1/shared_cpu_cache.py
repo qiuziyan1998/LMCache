@@ -459,6 +459,17 @@ class SharedChunkHandle:
                 f"kv_group={kv_group}, chunk_index={chunk_index}"
             )
         meta = memory_obj.metadata
+        offset, physical_size = int(meta.address), int(meta.phy_size)
+        logical_size = int(memory_obj.get_size())
+        shape = torch.Size(memory_obj.get_shape())
+        shapes, dtypes = meta.shapes, meta.dtypes
+        if isinstance(memory_obj, LayerPageMemoryObj):
+            if not 0 <= layer_id < memory_obj.num_layers:
+                raise SharedCPUCacheValidationError("Invalid layer-page handle row")
+            # Individual handles expose one row, not the whole all-layer page.
+            offset += memory_obj.group_prefix_sum[layer_id]
+            physical_size = logical_size = memory_obj.layer_size
+            shapes, dtypes = [shape], [dtype]
         return cls(
             request_id=request_id,
             phase=phase,
@@ -467,16 +478,16 @@ class SharedChunkHandle:
             kv_group=kv_group,
             chunk_index=chunk_index,
             shm_name=shm_name,
-            offset=int(meta.address),
-            physical_size=int(meta.phy_size),
-            logical_size=int(memory_obj.get_size()),
-            shape=torch.Size(memory_obj.get_shape()),
+            offset=offset,
+            physical_size=physical_size,
+            logical_size=logical_size,
+            shape=shape,
             dtype=dtype,
             fmt=memory_obj.get_memory_format(),
             generation=int(generation),
             producer_rank=int(producer_rank),
-            shapes=[torch.Size(s) for s in meta.shapes] if meta.shapes else None,
-            dtypes=list(meta.dtypes) if meta.dtypes else None,
+            shapes=[torch.Size(s) for s in shapes] if shapes else None,
+            dtypes=list(dtypes) if dtypes else None,
             cached_positions=_positions_to_list(meta.cached_positions),
         )
 
