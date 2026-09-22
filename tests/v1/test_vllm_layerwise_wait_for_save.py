@@ -44,7 +44,7 @@ def test_dynamic_connector_exposes_prefill_transfer_window_contract() -> None:
     assert finished == ["model.layers.3.self_attn.attn"]
 
 
-def test_dynamic_connector_forwards_prefill_save_callback_variants() -> None:
+def test_dynamic_connector_only_forwards_prefill_window_save() -> None:
     calls = []
 
     def save(*args, **kwargs):
@@ -64,7 +64,6 @@ def test_dynamic_connector_forwards_prefill_save_callback_variants() -> None:
 
     assert calls == [
         (("latent0", marker, metadata), {"request_id": "req"}),
-        (("latent1", marker, metadata), {"request_id": "req"}),
     ]
 
 

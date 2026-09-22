@@ -264,10 +264,17 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
-        """Forward the legacy/post-window layerwise save callback."""
-        self._lmcache_engine.save_kv_layer(
-            layer_name, kv_layer, attn_metadata, **kwargs
-        )
+        """Handle the post-window callback without duplicating a P-node save.
+
+        The SFA transfer-window path submits the current layer's save at the
+        next layer's entry, then calls this callback after the current layer's
+        projection.  For a connector that advertises the transfer-window
+        capability, forwarding this callback to ``save_kv_layer`` submits the
+        same layer a second time.  That leaves the previous pending finish in
+        place and makes the next layer fail before HCOM.  Legacy connectors do
+        not enter this path, so there is no save work to perform here.
+        """
+        del layer_name, kv_layer, attn_metadata, kwargs
 
     def wait_for_save(self):
         """
