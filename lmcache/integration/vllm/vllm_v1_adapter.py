@@ -10922,7 +10922,11 @@ class LMCacheConnectorV1Impl:
                     f"request={request.req_id}, kv_group={kv_group}, "
                     f"layer={layer_name}"
                 )
-            group_ordinals = self._layerwise_group_ordinals.get(kv_group, {})
+            group_ordinals = (
+                self._layerwise_group_ordinals[kv_group]
+                if kv_group < len(self._layerwise_group_ordinals)
+                else {}
+            )
             if (
                 not self._is_decode_window_save_request(request)
                 and group_ordinals
