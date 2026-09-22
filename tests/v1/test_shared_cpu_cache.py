@@ -492,6 +492,29 @@ def test_shared_rank0_location_checks_page_without_merged_local_pages():
     assert calls == [([key], None)]
 
 
+def test_shared_rank0_location_prefers_scheduler_lookup_pin():
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(extra_config={})
+    engine.retrieve_locations = None
+    base_key = _make_key()
+    key = base_key.get_first_layer()
+    engine.lookup_pins = {"req": {"LocalCPUBackend": [base_key]}}
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        contains=lambda _key: pytest.fail("backend probe should not run"),
+    )
+    engine.storage_manager = SimpleNamespace(
+        contains=lambda *_args: pytest.fail("backend probe should not run"),
+    )
+
+    pinned = engine._shared_lookup_pin_index("req")
+    assert engine._find_shared_rank0_chunk_location(
+        key, pinned_locations=pinned
+    ) == "LocalCPUBackend"
+    # Page-backed lookup stores a layer-free physical key; retrieve uses a
+    # layer key but must resolve it through the same pinned mapping.
+    assert pinned[key.without_layer()] == "LocalCPUBackend"
+
+
 def test_shared_page_first_common_prefix_plan_keeps_ascend_contract():
     locations = [
         ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"],

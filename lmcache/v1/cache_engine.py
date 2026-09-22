@@ -3881,8 +3881,19 @@ class LMCacheEngine:
     def _find_shared_rank0_chunk_location(
         self,
         key: CacheEngineKey,
+        pinned_locations: Optional[dict[CacheEngineKey, str]] = None,
     ) -> Optional[str]:
         assert self.storage_manager is not None
+        # The scheduler lookup already performed the authoritative prefix
+        # check with ``pin=True``. Re-probing the same key can disagree for
+        # page-backed/shared caches, turning a valid hit into an empty rank-0
+        # envelope. Prefer that pinned result when available.
+        if pinned_locations:
+            location = pinned_locations.get(key)
+            if location is None and isinstance(key, LayerCacheEngineKey):
+                location = pinned_locations.get(key.without_layer())
+            if location is not None:
+                return location
         if isinstance(key, LayerCacheEngineKey) and mooncake_page_layout_enabled(
             self.config
         ):
@@ -3895,6 +3906,36 @@ class LMCacheEngine:
         if local_cpu_backend.contains(key):
             return "LocalCPUBackend"
         return self.storage_manager.contains(key, self.retrieve_locations)
+
+    def _shared_lookup_pin_index(
+        self, req_id: Optional[str]
+    ) -> dict[CacheEngineKey, str]:
+        """Index the scheduler's pinned lookup result once per request."""
+        if not req_id:
+            return {}
+        lookup_pins = getattr(self, "lookup_pins", None)
+        if not lookup_pins:
+            return {}
+        mapping = lookup_pins.get(req_id)
+        if not mapping:
+            return {}
+        cache = getattr(self, "_shared_lookup_pin_index_cache", None)
+        if cache is None:
+            cache = {}
+            self._shared_lookup_pin_index_cache = cache
+        entry_count = sum(len(keys) for keys in mapping.values())
+        signature = (id(mapping), entry_count)
+        cached = cache.get(req_id)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        index: dict[CacheEngineKey, str] = {}
+        for location, keys in mapping.items():
+            for key in keys:
+                index[key] = location
+                if isinstance(key, LayerCacheEngineKey):
+                    index[key.without_layer()] = location
+        cache[req_id] = (signature, index)
+        return index
 
     def _shared_page_first_location_plan(
         self,
@@ -7805,6 +7846,7 @@ class LMCacheEngine:
             plan_started = (
                 serving_perf_now() if serving_perf_enabled() else None
             )
+            pinned_locations = self._shared_lookup_pin_index(req_id)
             location = None
             chunk_locations: list[list[str]] = []
             missing_shared_chunks: list[dict[str, Any]] = []
@@ -7934,9 +7976,17 @@ class LMCacheEngine:
                 planned = bool(locations_multi_layer)
                 if not planned:
                     for layer_idx, layer_key in enumerate(keys_multi_layer):
-                        current_location = self._find_shared_rank0_chunk_location(
-                            layer_key
-                        )
+                        if pinned_locations:
+                            current_location = (
+                                self._find_shared_rank0_chunk_location(
+                                    layer_key,
+                                    pinned_locations=pinned_locations,
+                                )
+                            )
+                        else:
+                            current_location = self._find_shared_rank0_chunk_location(
+                                layer_key
+                            )
                         if current_location is None:
                             # A missing layer0 is the normal prefix boundary.
                             if layer_idx != 0:
@@ -8998,6 +9048,9 @@ class LMCacheEngine:
     def _release_lookup_pins(self, lookup_id: str) -> bool:
         """Release retained lookup pins and any paired retrieval plan."""
         getattr(self, "_remote_fill_lookup_plans", {}).pop(lookup_id, None)
+        pin_index_cache = getattr(self, "_shared_lookup_pin_index_cache", None)
+        if pin_index_cache is not None:
+            pin_index_cache.pop(lookup_id, None)
         block_mapping = self.lookup_pins.pop(lookup_id, None)
         if block_mapping is None:
             return False
