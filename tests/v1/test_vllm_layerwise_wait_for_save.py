@@ -44,6 +44,30 @@ def test_dynamic_connector_exposes_prefill_transfer_window_contract() -> None:
     assert finished == ["model.layers.3.self_attn.attn"]
 
 
+def test_dynamic_connector_forwards_prefill_save_callback_variants() -> None:
+    calls = []
+
+    def save(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    connector = object.__new__(LMCacheConnectorV1Dynamic)
+    connector._lmcache_engine = SimpleNamespace(save_kv_layer=save)
+    marker = object()
+    metadata = object()
+
+    connector.save_kv_layer_in_layerwise_prefill_transfer_window(
+        "latent0", marker, metadata, request_id="req"
+    )
+    connector.save_kv_layer_outside_layerwise_prefill_transfer_window(
+        "latent1", marker, metadata, request_id="req"
+    )
+
+    assert calls == [
+        (("latent0", marker, metadata), {"request_id": "req"}),
+        (("latent1", marker, metadata), {"request_id": "req"}),
+    ]
+
+
 def _make_banked_tracker() -> RequestTracker:
     return RequestTracker(
         req_id="req-banks",

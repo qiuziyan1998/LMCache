@@ -238,6 +238,37 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
             layer_name, kv_layer, attn_metadata, **kwargs
         )
 
+    def save_kv_layer_in_layerwise_prefill_transfer_window(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        """Forward the pre-HCOM layerwise save callback.
+
+        vLLM-Ascend uses a separate callback name while the transfer window is
+        active so it can submit save(N) and load(N+2) around the HCOM window.
+        The implementation owns the storer/DMA state; the dynamic wrapper
+        must expose the callback instead of letting the helper treat this
+        connector as unsupported.
+        """
+        self._lmcache_engine.save_kv_layer(
+            layer_name, kv_layer, attn_metadata, **kwargs
+        )
+
+    def save_kv_layer_outside_layerwise_prefill_transfer_window(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        """Forward the legacy/post-window layerwise save callback."""
+        self._lmcache_engine.save_kv_layer(
+            layer_name, kv_layer, attn_metadata, **kwargs
+        )
+
     def wait_for_save(self):
         """
         Block until all the save operations is done. This is called
