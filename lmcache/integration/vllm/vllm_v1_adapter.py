@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from functools import cached_property
+from bisect import bisect_right
 from collections import deque
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import json
@@ -5898,6 +5899,56 @@ class LMCacheConnectorV1Impl:
         self._validate_shared_worker_retrieve_state(state, request)
         return state
 
+    def _request_owned_prefill_cache_frontier(
+        self,
+        state: Optional[WorkerRetrieveState],
+        request: ReqMeta,
+        token_count: int,
+        *,
+        kv_group: int,
+    ) -> int:
+        """Return the completed request-owned prefix usable by this chunk.
+
+        ``token_count`` is the scheduler's current cumulative prefill
+        frontier.  It can be ahead of the last completed P-node store by one
+        chunk, so requiring the whole value here makes the next chunk fall
+        back to the shared backend.  The largest complete range end not past
+        ``token_count`` is the only data that may be loaded now.
+        """
+        if (
+            not getattr(self, "_layerwise_prefill_p_node", False)
+            or request.is_sparse_decode
+            or state is None
+            or state.req_id != request.req_id
+            or not state.request_owned_prefill
+            or token_count <= 0
+        ):
+            return 0
+        cache = state.cache_kwargs(
+            kv_group,
+            dsa_two_groups=self._is_dsa_two_groups(),
+        )
+        starts = cache["cached_starts"]
+        ends = cache["cached_ends"]
+        memory_objs = cache["cached_memory_objs"]
+        if not starts or not ends or not memory_objs:
+            return 0
+        covered_end = self._cached_prefix_covered_token_count(starts, ends)
+        if covered_end <= 0:
+            return 0
+        target = min(int(token_count), int(covered_end))
+        chunk_count = bisect_right(ends, target)
+        if chunk_count <= 0 or int(ends[chunk_count - 1]) != target:
+            return 0
+        num_layers = self._num_layers_for_group(kv_group)
+        if num_layers <= 0 or len(memory_objs) != num_layers:
+            return 0
+        if any(len(layer) < chunk_count for layer in memory_objs):
+            return 0
+        if not self._cached_ranges_cover_prefix(starts, ends, target):
+            return 0
+        return target
+
     def _request_owned_prefill_cache_ready(
         self,
         state: Optional[WorkerRetrieveState],
@@ -5910,10 +5961,10 @@ class LMCacheConnectorV1Impl:
 
         The first prefix hit is intentionally excluded by the state marker;
         it must still perform normal LMCache lookup.  Once a deferred P-node
-        store has produced a request-owned result, require complete prefix
-        coverage for the requested group before bypassing the backend.  The
-        groups are checked independently because the latent and indexer store
-        results can become available on different callbacks.
+        store has produced a request-owned result, consume the completed
+        prefix even when the scheduler has already advanced to the next
+        chunk.  The groups are checked independently because latent and
+        indexer results can become available on different callbacks.
         """
         engine_metadata = getattr(getattr(self, "lmcache_engine", None), "metadata", None)
         trace_base = {
@@ -5977,7 +6028,13 @@ class LMCacheConnectorV1Impl:
                     ends=len(ends),
                     memory_layers=len(memory_objs),
                 )
-            if not self._cached_ranges_cover_prefix(starts, ends, token_count):
+            frontier = self._request_owned_prefill_cache_frontier(
+                state,
+                request,
+                token_count,
+                kv_group=kv_group,
+            )
+            if frontier <= 0:
                 covered_end = self._cached_prefix_covered_token_count(starts, ends)
                 return not_ready(
                     "range_not_covering_prefix",
@@ -5990,7 +6047,7 @@ class LMCacheConnectorV1Impl:
                     memory_layers=len(memory_objs),
                     memory_chunks=(len(memory_objs[0]) if memory_objs else 0),
                 )
-            chunk_count = sum(int(end) <= token_count for end in ends)
+            chunk_count = bisect_right(ends, frontier)
             num_layers = self._num_layers_for_group(kv_group)
             if num_layers <= 0 or len(memory_objs) != num_layers:
                 return not_ready(
@@ -6022,6 +6079,12 @@ class LMCacheConnectorV1Impl:
                 "covered_end": group_ends[-1] if group_ends else None,
                 "memory_layers": len(group_memory),
                 "memory_chunks": len(group_memory[0]) if group_memory else 0,
+                "load_frontier": self._request_owned_prefill_cache_frontier(
+                    state,
+                    request,
+                    token_count,
+                    kv_group=group,
+                ),
             }
         _shared_cpu_adapter_trace(
             "request_owned_ready",
@@ -6853,6 +6916,19 @@ class LMCacheConnectorV1Impl:
                 # the request.  Mark the state so a later chunk can load
                 # them directly instead of probing the shared backend.
                 state.request_owned_prefill = True
+                # Provisional stores are intentionally not published to the
+                # shared backend yet, but their completed frontier is already
+                # valid for the next chunk.  Keep the frontier monotonic so
+                # later request-owned loads do not mistake the state for an
+                # empty/new request.
+                state.token_count = max(
+                    int(state.token_count or 0),
+                    self._cached_prefix_covered_token_count(
+                        cache["cached_starts"],
+                        cache["cached_ends"],
+                    ),
+                )
+                state.metadata_warm = True
                 provisional_results.add(id(result))
                 self._set_worker_retrieve_state(request.req_id, state)
                 return
@@ -6861,7 +6937,7 @@ class LMCacheConnectorV1Impl:
             # A deferred P-node storer can be finalized after one or more
             # provisional merges.  Keep the direct-retrieve eligibility when
             # the final result arrives as well.
-            if self._layerwise_prefill_p_node:
+            if getattr(self, "_layerwise_prefill_p_node", False):
                 state.request_owned_prefill = True
 
             # An index result may arrive before latent under two-group DSA.
@@ -9090,6 +9166,16 @@ class LMCacheConnectorV1Impl:
                             kv_group=0,
                         )
                     )
+                    latent_owned_frontier = (
+                        self._request_owned_prefill_cache_frontier(
+                            retrieve_state,
+                            request,
+                            token_count,
+                            kv_group=0,
+                        )
+                        if request_owned_prefill
+                        else 0
+                    )
                     dsa_two_groups = self._is_dsa_two_groups()
                     request_owned_prefill_indexer = (
                         dsa_two_groups
@@ -9099,6 +9185,16 @@ class LMCacheConnectorV1Impl:
                             token_count,
                             kv_group=1,
                         )
+                    )
+                    indexer_owned_frontier = (
+                        self._request_owned_prefill_cache_frontier(
+                            retrieve_state,
+                            request,
+                            token_count,
+                            kv_group=1,
+                        )
+                        if request_owned_prefill_indexer
+                        else 0
                     )
                     logger.debug(
                         "Request %s dense prefix source: latent_request_owned=%s "
@@ -9173,15 +9269,24 @@ class LMCacheConnectorV1Impl:
                         and callable(supports_dense_retention)
                         and supports_dense_retention()
                     )
-                    if retain_dense_seed and not request_owned_prefill and (
-                        retrieve_state.shared_request_active
-                        or retrieve_state.dense_prefix_seed
-                        or retrieve_state.group_has_data(0, dsa_two_groups)
-                        or (
-                            dsa_two_groups
-                            and retrieve_state.group_has_data(
-                                1,
-                                dsa_two_groups=True,
+                    if (
+                        retain_dense_seed
+                        and not request_owned_prefill
+                        and not getattr(
+                            retrieve_state,
+                            "request_owned_prefill",
+                            False,
+                        )
+                        and (
+                            retrieve_state.shared_request_active
+                            or retrieve_state.dense_prefix_seed
+                            or retrieve_state.group_has_data(0, dsa_two_groups)
+                            or (
+                                dsa_two_groups
+                                and retrieve_state.group_has_data(
+                                    1,
+                                    dsa_two_groups=True,
+                                )
                             )
                         )
                     ):
@@ -9214,11 +9319,37 @@ class LMCacheConnectorV1Impl:
                     request_owned_cache_kwargs = (
                         latent_cache if request_owned_prefill else {}
                     )
+                    latent_retrieve_tokens = retrieve_tokens
+                    latent_token_mask = token_mask
+                    latent_slot_mapping = retrieve_slot_mapping
+                    if latent_owned_frontier:
+                        # The current chunk is not stored yet.  The only
+                        # request-owned data that can be loaded is the
+                        # completed prefix, and it must be presented as a
+                        # complete owned retrieve rather than as a backend
+                        # lookup for the not-yet-computed suffix.
+                        latent_retrieve_tokens = retrieve_tokens[:latent_owned_frontier]
+                        latent_token_mask = torch.ones(
+                            latent_owned_frontier,
+                            dtype=torch.bool,
+                        )
+                        latent_slot_mapping = retrieve_slot_mapping[:latent_owned_frontier]
+                    owned_frontiers = getattr(
+                        request,
+                        "_layerwise_prefill_owned_frontier",
+                        None,
+                    )
+                    if owned_frontiers is None:
+                        owned_frontiers = {}
+                        request._layerwise_prefill_owned_frontier = owned_frontiers
+                    owned_frontiers.clear()
+                    if latent_owned_frontier:
+                        owned_frontiers[0] = latent_owned_frontier
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
-                        retrieve_tokens,
-                        token_mask,
+                        latent_retrieve_tokens,
+                        latent_token_mask,
                         kvcaches=kvcaches,
-                        slot_mapping=retrieve_slot_mapping,
+                        slot_mapping=latent_slot_mapping,
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
                         kv_group=0,
@@ -9294,11 +9425,22 @@ class LMCacheConnectorV1Impl:
                                 "uninitialized index rows."
                             )
                         assert indexer_cache is not None
+                        indexer_retrieve_tokens = retrieve_tokens
+                        indexer_token_mask_for_load = indexer_token_mask
+                        indexer_slot_mapping_for_load = idx_slot
+                        if indexer_owned_frontier:
+                            indexer_retrieve_tokens = retrieve_tokens[:indexer_owned_frontier]
+                            indexer_token_mask_for_load = torch.ones(
+                                indexer_owned_frontier,
+                                dtype=torch.bool,
+                            )
+                            indexer_slot_mapping_for_load = idx_slot[:indexer_owned_frontier]
+                            owned_frontiers[1] = indexer_owned_frontier
                         indexer_retriever = self.lmcache_engine.retrieve_layer(
-                            retrieve_tokens,
-                            indexer_token_mask,
+                            indexer_retrieve_tokens,
+                            indexer_token_mask_for_load,
                             kvcaches=indexer_kvcaches,
-                            slot_mapping=idx_slot,
+                            slot_mapping=indexer_slot_mapping_for_load,
                             vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                             sync=sync,
                             kv_group=1,
@@ -9366,9 +9508,14 @@ class LMCacheConnectorV1Impl:
                             # metadata/backend probe after priming it.
                             retrieve_state.location = "LocalCPUBackend"
                             retrieve_state.metadata_warm = True
+                            retrieve_state.token_count = max(
+                                int(retrieve_state.token_count or 0),
+                                latent_owned_frontier,
+                                indexer_owned_frontier,
+                            )
                         else:
                             retrieve_state.location = "LocalCPUBackend"
-                        retrieve_state.token_count = len(retrieve_tokens)
+                            retrieve_state.token_count = len(retrieve_tokens)
                         self._set_worker_retrieve_state(
                             request.req_id,
                             retrieve_state,
@@ -9473,16 +9620,29 @@ class LMCacheConnectorV1Impl:
                 request.retrieve_token_count(),
                 is_sparse_decode=request.is_sparse_decode,
             )
-        token_count = min(
-            int(load_spec.lmcache_cached_tokens),
-            request.retrieve_token_count(),
+        owned_frontiers = getattr(
+            request,
+            "_layerwise_prefill_owned_frontier",
+            {},
         )
-        if expected_mask is None:
-            expected_mask = self._load_token_mask_for_retrieve(
-                request,
-                token_count,
-                self._lmcache_chunk_size,
+        owned_frontier = int(owned_frontiers.get(kv_group, 0) or 0)
+        if owned_frontier > 0:
+            # A P-node request-owned retrieve intentionally covers only the
+            # completed prefix; the current chunk has not been stored yet and
+            # must not be counted as a failed cache load.
+            token_count = min(owned_frontier, int(ret_mask.numel()))
+            expected_mask = torch.ones(token_count, dtype=torch.bool)
+        else:
+            token_count = min(
+                int(load_spec.lmcache_cached_tokens),
+                request.retrieve_token_count(),
             )
+            if expected_mask is None:
+                expected_mask = self._load_token_mask_for_retrieve(
+                    request,
+                    token_count,
+                    self._lmcache_chunk_size,
+                )
         if expected_mask is None:
             raise RuntimeError(
                 "Dense retrieve validation has no expected token mask: "

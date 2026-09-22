@@ -953,6 +953,21 @@ def test_request_owned_prefill_readiness_is_checked_per_kv_group():
         state, request, 4, kv_group=1
     )
 
+    # The scheduler may already describe the next cumulative chunk while the
+    # P-node has only finished storing the previous one.  That completed
+    # prefix must remain directly consumable; it must not be rejected as an
+    # incomplete cache and trigger a state reset.
+    state.cached_ends = [4096]
+    state.cached_starts = [0]
+    state.cached_memory_objs = [[object()], [object()]]
+    request.token_ids = [0] * 8192
+    assert impl._request_owned_prefill_cache_frontier(
+        state, request, 8192, kv_group=0
+    ) == 4096
+    assert impl._request_owned_prefill_cache_ready(
+        state, request, 8192, kv_group=0
+    )
+
 
 class TestWorkerRetrieveState:
     def test_p_node_wait_fences_real_bank_without_load_retriever(
