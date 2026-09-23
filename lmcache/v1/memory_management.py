@@ -1066,7 +1066,7 @@ class LayerPageMemoryObj(TensorMemoryObj):
             and self.group_prefix_sum[0] == 0
             and all(
                 shape.numel() * dtype.itemsize == self.layer_size_bytes(layer)
-                for layer, (shape, dtype) in enumerate(zip(shapes, dtypes))
+                for layer, (shape, dtype) in enumerate(zip(shapes, dtypes, strict=True))
             )
         )
 

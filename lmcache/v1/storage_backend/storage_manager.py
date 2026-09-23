@@ -544,7 +544,12 @@ class StorageManager:
                         [page.layer_data_ptr(layer) for layer in range(layer_count)]
                         for page in pages
                     ],
-                    [[page.layer_size_bytes(i) for i in range(layer_count)] for page in pages],
+                    [
+                        [page.layer_size_bytes(i) for i in range(layer_count)]
+                        if page.layer_size is None
+                        else [page.layer_size] * layer_count
+                        for page in pages
+                    ],
                     tuple(owner_by_storage.values()),
                     None,
                     req_id,

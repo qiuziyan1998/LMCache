@@ -2448,7 +2448,13 @@ class LMCacheConnectorV1Impl:
             kv_layer_groups_manager = (
                 self.lmcache_engine.metadata.kv_layer_groups_manager
             )
-            kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
+            indexer_layout = self.lmcache_engine.metadata.indexer_c8_layout
+            if indexer_layout is not None and indexer_layout.mixed:
+                kv_layer_groups_manager.build_kv_layer_groups(
+                    self.kv_caches, indexer_c8_layout=indexer_layout
+                )
+            else:
+                kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
             self._normalize_dsa_kv_layer_groups()
             if self._is_dsa_two_groups():
                 engine = self.lmcache_engine

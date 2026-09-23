@@ -80,19 +80,22 @@ def _keyed_results(
 
 
 @pytest.mark.parametrize(
-    "fmt,shape,kv_group",
+    "fmt,shape,kv_group,mixed",
     (
-        (MemoryFormat.KV_MLA_LATENT_FMT, torch.Size([16]), 0),
-        (MemoryFormat.KV_DSA_INDEX_FMT, torch.Size([8]), 1),
+        (MemoryFormat.KV_MLA_LATENT_FMT, torch.Size([16]), 0, False),
+        (MemoryFormat.KV_DSA_INDEX_FMT, torch.Size([8]), 1, False),
+        (MemoryFormat.KV_DSA_INDEX_FMT, torch.Size([2048]), 1, True),
     ),
 )
 def test_batched_put_layer_pages_uses_one_local_and_remote_page(
-    monkeypatch, fmt, shape, kv_group
+    monkeypatch, fmt, shape, kv_group, mixed
 ):
     allocator = TensorMemoryAllocator(torch.zeros(16384, dtype=torch.uint8))
+    dtype = torch.uint8 if mixed else torch.float16
+    shapes = [torch.Size([8 * width]) for width in (256, 130, 256)] if mixed else shape
     pages = allocator.batched_allocate_layer_pages(
-        shape,
-        torch.float16,
+        shapes,
+        [dtype] * 3 if mixed else dtype,
         batch_size=2,
         num_layers=3,
         fmt=fmt,
@@ -103,13 +106,13 @@ def test_batched_put_layer_pages_uses_one_local_and_remote_page(
     assert pages[0].layer_tensor(0).numel() == shape.numel()
     assert pages[1].layer_tensor(0).numel() == shape.numel() * 3 // 8
     keys = [
-        CacheEngineKey("model", 1, 0, 0, torch.float16, kv_group=kv_group),
+        CacheEngineKey("model", 1, 0, 0, dtype, kv_group=kv_group),
         CacheEngineKey(
             "model",
             1,
             0,
             1,
-            torch.float16,
+            dtype,
             {"lmcache.tag.internal.valid_tokens": 3},
             kv_group=kv_group,
         ),
@@ -155,7 +158,12 @@ def test_batched_put_layer_pages_uses_one_local_and_remote_page(
     assert ptrs == [
         [page.layer_data_ptr(layer) for layer in range(3)] for page in pages
     ]
-    assert sizes == [[page.layer_size] * 3 for page in pages]
+    expected_sizes = (
+        [[tokens * width for width in (256, 130, 256)] for tokens in (8, 3)]
+        if mixed
+        else [[page.layer_size] * 3 for page in pages]
+    )
+    assert sizes == expected_sizes
     assert len(owners) == 1
     assert ready_event is None
     assert req_id == "request"
@@ -165,6 +173,9 @@ def test_batched_put_layer_pages_uses_one_local_and_remote_page(
     assert local_calls == [(keys, pages)]
     assert futures[0].result() is None
     assert all(page.get_ref_count() == 1 for page in pages)
+    for page in pages:
+        page.ref_count_down()  # Release the fake local backend's cache ownership.
+    assert allocator.total_allocated_size == 0
 
 
 def test_batched_put_layer_pages_preserves_caller_refs_on_remote_error(monkeypatch):

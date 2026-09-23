@@ -140,3 +140,50 @@ def test_c8_identity_records_equal_sized_physical_layer_maps(metadata):
         mooncake_payload_layout(config, first)[0]
         != mooncake_payload_layout(config, second)[0]
     )
+
+
+def test_mixed_mooncake_layer_and_page_metadata(metadata):
+    from types import SimpleNamespace
+    from lmcache.utils import CacheEngineKey
+    from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
+        MooncakestoreConnector,
+    )
+
+    policy = IndexerC8Layout(c8_layers=(False, True, False))
+    mixed = replace(
+        metadata,
+        indexer_c8_layout=policy,
+        runtime_kv_group_layer_counts=(3, 3),
+        runtime_kv_group_layer_names=(
+            ("a", "b", "c"),
+            ("a.indexer", "b.indexer", "c.indexer"),
+        ),
+    )
+    connector = object.__new__(MooncakestoreConnector)
+    connector._mixed_indexer_layout = policy
+    connector.local_cpu_backend = SimpleNamespace(metadata=mixed)
+    connector._lmcache_chunk_size = lambda: 1024
+    key = CacheEngineKey("model", 1, 0, 7, torch.uint8, kv_group=1)
+    shapes, dtypes, _, width = connector._metadata_for_raw_key(key)
+    assert shapes == mixed.indexer_layer_shapes(1024)
+    assert dtypes == [torch.uint8] * 3
+    assert width == 642
+    for i, layer_key in enumerate(key.split_layers(3)):
+        layer_shapes, layer_dtypes, _, layer_width = connector._metadata_for_raw_key(
+            layer_key
+        )
+        assert layer_shapes == [shapes[i]]
+        assert layer_dtypes == [torch.uint8]
+        assert layer_width == policy.token_bytes_for(i)
+    config = LMCacheEngineConfig.from_defaults(
+        dsa_two_groups=True,
+        remote_fill_model_artifact_id="weights",
+        remote_fill_cache_namespace="test",
+    )
+    other = replace(
+        mixed, indexer_c8_layout=IndexerC8Layout(c8_layers=(True, False, False))
+    )
+    assert (
+        mooncake_payload_layout(config, mixed)[0]
+        != mooncake_payload_layout(config, other)[0]
+    )

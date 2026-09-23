@@ -1443,7 +1443,12 @@ class MooncakestoreConnector(RemoteConnector):
 
         try:
             setup_started = serving_perf_now() if perf_enabled else 0.0
-            sizes = [[page.layer_size_bytes(i) for i in range(page_num_layers)] for page in pages]
+            sizes = [
+                [page.layer_size_bytes(i) for i in range(page_num_layers)]
+                if page.layer_size is None
+                else [page.layer_size] * page_num_layers
+                for page in pages
+            ]
             ptrs = [
                 [page.layer_data_ptr(layer) for layer in range(page_num_layers)]
                 for page in pages
