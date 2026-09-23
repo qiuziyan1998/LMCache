@@ -95,17 +95,22 @@ class LMCacheMetadata:
             counts = self.runtime_kv_group_layer_counts
             if counts is None or len(counts) != 2:
                 raise ValueError("Indexer C8 requires two resolved physical KV groups")
+            if self.indexer_c8_layout.c8_layers and len(self.indexer_c8_layout.c8_layers) != counts[1]:
+                raise ValueError("Indexer precision policy disagrees with physical layer count")
             groups = self.kv_layer_groups_manager.kv_layer_groups
             latent_width = (
                 groups[0].hidden_dim_size
                 if groups
                 else self.kv_shape[3] * self.kv_shape[4]
             )
+            index_shape = (
+                torch.Size([1, 1, num_tokens, sum(self.indexer_c8_layout.token_bytes_for(i) for i in range(counts[1]))])
+                if self.indexer_c8_layout.mixed
+                else torch.Size([1, counts[1], num_tokens, self.indexer_c8_layout.token_bytes])
+            )
             return [
                 torch.Size([1, counts[0], num_tokens, latent_width]),
-                torch.Size(
-                    [1, counts[1], num_tokens, self.indexer_c8_layout.token_bytes]
-                ),
+                index_shape,
             ]
         if self.kv_layer_groups_manager.kv_layer_groups:
             shapes = []
@@ -133,6 +138,13 @@ class LMCacheMetadata:
                     ]
                 )
             ]
+
+    def indexer_layer_shapes(self, num_tokens: int) -> list[torch.Size]:
+        """Exact byte shapes of the physical owners in the indexer group."""
+        if self.indexer_c8_layout is None or self.runtime_kv_group_layer_counts is None:
+            raise ValueError("Indexer byte layout is unavailable")
+        count = self.runtime_kv_group_layer_counts[1]
+        return [torch.Size([self.indexer_c8_layout.layer_bytes(num_tokens, i)]) for i in range(count)]
 
     def get_num_groups(self) -> int:
         if self.indexer_c8_layout is not None:

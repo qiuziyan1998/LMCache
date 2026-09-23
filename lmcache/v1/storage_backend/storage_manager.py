@@ -505,7 +505,7 @@ class StorageManager:
         if any(
             not page.is_valid()
             or page.num_layers != layer_count
-            or page.get_size() != page.layer_size * layer_count
+            or not page.layer_layout_is_valid()
             or len(page.metadata.dtypes or ()) != layer_count
             or any(dtype != key.dtype for dtype in page.metadata.dtypes or ())
             or page.valid_tokens
@@ -544,7 +544,7 @@ class StorageManager:
                         [page.layer_data_ptr(layer) for layer in range(layer_count)]
                         for page in pages
                     ],
-                    [[page.layer_size] * layer_count for page in pages],
+                    [[page.layer_size_bytes(i) for i in range(layer_count)] for page in pages],
                     tuple(owner_by_storage.values()),
                     None,
                     req_id,

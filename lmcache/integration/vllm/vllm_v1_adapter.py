@@ -1889,7 +1889,12 @@ class LMCacheConnectorV1Impl:
         if runtime_group_layer_counts is not None:
             indexer_spec = kv_cache_config.kv_cache_groups[1].kv_cache_spec
             if getattr(indexer_spec, "cache_sparse_c8", False):
-                indexer_c8_layout = IndexerC8Layout(indexer_spec.sparse_head_dim[-1])
+                selected = getattr(indexer_spec, "indexer_c8_layer_names", None)
+                mask = (
+                    tuple(name in selected for name in kv_cache_config.kv_cache_groups[1].layer_names)
+                    if selected is not None else ()
+                )
+                indexer_c8_layout = IndexerC8Layout(indexer_spec.sparse_head_dim[-1], mask)
 
         service_factory = VllmServiceFactory(
             config,

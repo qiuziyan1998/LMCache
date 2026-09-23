@@ -1590,7 +1590,7 @@ class LMCacheEngine:
             page = memory_objs[0][chunk]
             if not isinstance(page, LayerPageMemoryObj):
                 break
-            if page.num_layers != num_layers or any(
+            if page.layer_size is None or page.num_layers != num_layers or any(
                 layer[chunk] is not page for layer in memory_objs
             ):
                 return None

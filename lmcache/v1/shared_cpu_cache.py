@@ -468,7 +468,8 @@ class SharedChunkHandle:
                 raise SharedCPUCacheValidationError("Invalid layer-page handle row")
             # Individual handles expose one row, not the whole all-layer page.
             offset += memory_obj.group_prefix_sum[layer_id]
-            physical_size = logical_size = memory_obj.layer_size
+            physical_size = logical_size = memory_obj.layer_size_bytes(layer_id)
+            shape = torch.Size(memory_obj.get_shapes()[layer_id])
             shapes, dtypes = [shape], [dtype]
         return cls(
             request_id=request_id,

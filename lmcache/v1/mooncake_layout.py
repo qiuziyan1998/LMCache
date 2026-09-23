@@ -98,6 +98,9 @@ def _infer_dsa_raw_token_dims(
             if len(shape) >= 1:
                 inferred[kv_group] = int(shape[-1])
 
+    indexer = getattr(metadata, "indexer_c8_layout", None)
+    if indexer is not None and indexer.mixed:
+        inferred[1] = indexer.head_dim
     model_config, source = _load_model_config_for_dsa_dims(metadata)
     if not model_config:
         return inferred, source if inferred else "no inferable local metadata"
@@ -162,11 +165,12 @@ def resolve_mooncake_dsa_raw_token_dims(
         inferred, source = _infer_dsa_raw_token_dims(config, metadata)
     c8 = getattr(metadata, "indexer_c8_layout", None)
     if c8 is not None:
-        if inferred.get(1, c8.head_dim) not in (c8.head_dim, c8.token_bytes):
+        width = max(c8.token_bytes_for(i) for i in range(len(c8.c8_layers))) if c8.mixed else c8.token_bytes
+        if inferred.get(1, c8.head_dim) not in (c8.head_dim, width):
             raise ValueError(
                 "Indexer C8 raw width conflicts with the runtime key/scale layout"
             )
-        inferred[1] = c8.token_bytes
+        inferred[1] = width
     if override is not None:
         return inferred, source
     if inferred.get(0, 0) > 0 and inferred.get(1, 0) > 0:
