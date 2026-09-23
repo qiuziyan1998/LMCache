@@ -1290,6 +1290,7 @@ class WorkerRetrieveState:
     request_scope_token: Optional[str] = None
     shared_validation_signature: Optional[tuple[Any, ...]] = None
     dense_prefix_seed: bool = False
+    dense_prefix_generation: Optional[int] = None
     location: Optional[str] = None
     metadata_warm: bool = False
     token_count: int = 0
@@ -5244,6 +5245,7 @@ class LMCacheConnectorV1Impl:
         state.request_scope_token = None
         state.shared_validation_signature = None
         state.dense_prefix_seed = False
+        state.dense_prefix_generation = None
         state.metadata_token_ids.clear()
         state.slot_mapping = None
         state.indexer_slot_mapping = None
@@ -5543,6 +5545,7 @@ class LMCacheConnectorV1Impl:
             "request_scope_token": state.request_scope_token,
             "shared_validation_signature": state.shared_validation_signature,
             "dense_prefix_seed": state.dense_prefix_seed,
+            "dense_prefix_generation": state.dense_prefix_generation,
             "prepared_sparse_sources": dict(state.prepared_sparse_sources),
             "dense_load_readiness": state.dense_load_readiness,
             "dense_load_readiness_consumed": (
@@ -5804,6 +5807,11 @@ class LMCacheConnectorV1Impl:
         """Drop only the dense partial tail before sparse full-chunk reuse."""
         if not state.dense_prefix_seed or not state.req_id:
             return False
+        if state.dense_prefix_generation is not None and (
+            state.dense_prefix_generation
+            != int(getattr(self.lmcache_engine, "shared_cpu_cache_generation", 0) or 0)
+        ):
+            return False
         token_count = int(token_count)
         if token_count == state.token_count:
             return True
@@ -5872,6 +5880,12 @@ class LMCacheConnectorV1Impl:
         state = self._worker_retrieve_state.get(request.req_id)
         if state is None:
             return False
+        if request.is_sparse_decode and state.dense_prefix_generation is not None:
+            generation = int(
+                getattr(self.lmcache_engine, "shared_cpu_cache_generation", 0) or 0
+            )
+            if state.dense_prefix_generation != generation:
+                return True
         extending = self._worker_retrieve_state_can_extend(
             state,
             request,
@@ -5926,6 +5940,8 @@ class LMCacheConnectorV1Impl:
         state = self._worker_retrieve_state.get(request.req_id)
         if state is None or not (state.metadata_warm or state.has_cache()):
             return None
+        if request.is_sparse_decode:
+            self._materialize_dense_prefix_for_sparse(state)
         self._validate_shared_worker_retrieve_state(state, request)
         return state
 
@@ -8945,23 +8961,15 @@ class LMCacheConnectorV1Impl:
                         and callable(supports_dense_retention)
                         and supports_dense_retention()
                     )
-                    if retain_dense_seed and (
-                        retrieve_state.shared_request_active
-                        or retrieve_state.dense_prefix_seed
-                        or retrieve_state.group_has_data(0, dsa_two_groups)
-                        or (
-                            dsa_two_groups
-                            and retrieve_state.group_has_data(
-                                1,
-                                dsa_two_groups=True,
-                            )
-                        )
-                    ):
-                        self._release_shared_worker_retrieve_state(
+                    retrieve_state, reuse_dense_prefix = (
+                        self._prepare_dense_prefix_retrieve_state(
+                            request,
                             retrieve_state,
-                            self.lmcache_engine,
+                            retain_dense_seed=retain_dense_seed,
+                            dsa_two_groups=dsa_two_groups,
+                            token_count=len(retrieve_tokens),
                         )
-                        retrieve_state = WorkerRetrieveState(req_id=request.req_id)
+                    )
                     dense_preflight_state: dict[str, Any] = {}
                     latent_cache = retrieve_state.cache_kwargs(
                         0,
@@ -8987,6 +8995,8 @@ class LMCacheConnectorV1Impl:
                         if self._deferred_layerwise_prefill_load_active
                         else {}
                     )
+                    if reuse_dense_prefix:
+                        deferred_prefill_kwargs["_reuse_shared_dense_prefix"] = True
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         retrieve_tokens,
                         token_mask,
@@ -13473,3 +13483,86 @@ class LMCacheConnectorV1Impl:
         meta.preemption_seals = tuple(seals)
         meta.preemption_cancels = tuple(cancels)
         meta.preemption_releases = tuple(self.__dict__.pop("_checkpoint_restore_releases", ()))
+
+    def _prepare_dense_prefix_retrieve_state(
+        self,
+        request: ReqMeta,
+        state: WorkerRetrieveState,
+        *,
+        retain_dense_seed: bool,
+        dsa_two_groups: bool,
+        token_count: int,
+    ) -> tuple[WorkerRetrieveState, bool]:
+        """Keep P-prefill sources for the engine's validated suffix adoption."""
+        reuse_prefix = bool(
+            retain_dense_seed
+            and getattr(self, "_layerwise_prefill_p_node", False)
+            and getattr(self, "_deferred_layerwise_prefill_load_active", False)
+            and self.kv_role != "kv_consumer"
+            and request.block_allocation_mode == "prefill_child"
+            and not request.is_sparse_decode
+        )
+        generation = int(
+            getattr(self.lmcache_engine, "shared_cpu_cache_generation", 0) or 0
+        )
+        preserve = bool(
+            reuse_prefix
+            and state.req_id == request.req_id
+            and state.dense_prefix_generation == generation
+            and not request.resumed_from_preemption
+            and state.token_count <= token_count
+        )
+        if retain_dense_seed and not preserve and (
+            state.shared_request_active
+            or state.dense_prefix_seed
+            or state.group_has_data(0, dsa_two_groups)
+            or (dsa_two_groups and state.group_has_data(1, dsa_two_groups=True))
+        ):
+            self._release_shared_worker_retrieve_state(state, self.lmcache_engine)
+            state = WorkerRetrieveState(req_id=request.req_id)
+        if reuse_prefix:
+            # The engine still consumes and validates every shared envelope.
+            # It preserves unchanged objects and replaces a growing partial
+            # tail before appending new chunks; DMA bank bindings stay separate.
+            state.dense_prefix_generation = generation
+        return state, reuse_prefix
+
+    def _materialize_dense_prefix_for_sparse(self, state: WorkerRetrieveState) -> None:
+        """Install deferred P-prefill pointer rows at their first sparse use."""
+        if state.dense_prefix_generation is None:
+            return
+        engine = self.lmcache_engine
+        generation = int(getattr(engine, "shared_cpu_cache_generation", 0) or 0)
+        if state.dense_prefix_generation != generation:
+            raise RuntimeError("Cannot materialize a stale shared dense prefix")
+        materialize = getattr(
+            getattr(engine, "gpu_connector", None),
+            "materialize_sparse_chunk_ptr_cache",
+            None,
+        )
+        changed = False
+        dsa_two_groups = self._is_dsa_two_groups()
+        for kv_group in ((0, 1) if dsa_two_groups else (0,)):
+            cache = state.cache_kwargs(kv_group, dsa_two_groups)
+            rows = cache["cached_chunk_dev_ptrs"]
+            chunks = len(cache["cached_ends"])
+            if (
+                not chunks
+                or len(rows) != self._num_layers_for_group(kv_group)
+                or any(len(row) != chunks for row in rows)
+            ):
+                continue
+            pointers = cache["cached_chunk_ptrs_npu"]
+            if len(pointers) == len(rows) and all(
+                isinstance(row, torch.Tensor) and row.numel() == chunks
+                for row in pointers
+            ):
+                continue
+            if not callable(materialize):
+                raise RuntimeError(
+                    "P-prefill source pointers need a materialization API"
+                )
+            materialize(rows, pointers, kv_group=kv_group)
+            changed = True
+        if changed:
+            self._refresh_prepared_sparse_sources(state, state.token_count)
