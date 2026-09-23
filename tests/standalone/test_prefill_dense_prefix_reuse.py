@@ -29,6 +29,7 @@ def adapter_types() -> tuple[type, type]:
     )
     methods = {
         "_prepare_dense_prefix_retrieve_state",
+        "_dense_retrieve_slot_mapping",
         "_materialize_dense_prefix_for_sparse",
         "_worker_retrieve_state_for_request",
         "_worker_retrieve_state_for_warm_ref",
@@ -225,6 +226,85 @@ def test_dense_consumption_does_not_materialize_pointers() -> None:
     obj, _, uploads, refreshed = adapter(state)
     assert obj._worker_retrieve_state_for_request(request()) is state
     assert not uploads and not refreshed
+
+
+def test_raw_p_dma_keeps_dense_token_maps_on_cpu() -> None:
+    obj, _, _, _ = adapter(populated_state())
+    obj._layerwise_prefill_dma = True
+    obj.device = "npu"
+    mapping = torch.arange(8, dtype=torch.long)
+    assert obj._dense_retrieve_slot_mapping(mapping) is mapping
+    converted = obj._dense_retrieve_slot_mapping(mapping.to(torch.int32))
+    assert converted.device.type == "cpu" and converted.dtype == torch.long
+    assert torch.equal(converted, mapping)
+
+
+@pytest.mark.parametrize("disabled", ["p_node", "dma", "deferred", "blending"])
+def test_non_raw_dense_paths_still_upload_token_maps(disabled: str) -> None:
+    obj, _, _, _ = adapter(populated_state())
+    obj._layerwise_prefill_dma = True
+    obj.device = "npu:3"
+    names = {
+        "p_node": "_layerwise_prefill_p_node",
+        "dma": "_layerwise_prefill_dma",
+        "deferred": "_deferred_layerwise_prefill_load_active",
+    }
+    if disabled == "blending":
+        obj.enable_blending = True
+    else:
+        setattr(obj, names[disabled], False)
+    calls = []
+    uploaded = object()
+
+    def upload(**kwargs: Any) -> object:
+        calls.append(kwargs)
+        return uploaded
+
+    assert obj._dense_retrieve_slot_mapping(NS(to=upload)) is uploaded
+    assert calls == [dict(device="npu:3", dtype=torch.long)]
+
+
+def test_both_dense_maps_use_the_gate_and_sparse_keeps_its_device_copy() -> None:
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_start_load_kv"
+    )
+    calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_dense_retrieve_slot_mapping"
+    ]
+    assert {ast.unparse(call.args[0]) for call in calls} == {
+        "request.slot_mapping[0]",
+        "request.indexer_slot_mapping[0]",
+    }
+    sparse = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Attribute)
+        and ast.unparse(node.test) == "request.is_sparse_decode"
+        and any(
+            isinstance(child, ast.Assign)
+            and any(
+                ast.unparse(target) == "request.slot_mapping[0]"
+                for target in child.targets
+            )
+            for child in ast.walk(node)
+        )
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "to"
+        and any(keyword.arg == "device" for keyword in node.keywords)
+        for statement in sparse.body
+        for node in ast.walk(statement)
+    )
 
 
 def test_ordinary_sparse_without_opt_in_keeps_original_validation() -> None:

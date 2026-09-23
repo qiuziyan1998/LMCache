@@ -5713,6 +5713,7 @@ class LMCacheEngine:
         deferred_layerwise_get = bool(
             kwargs.get("deferred_layerwise_get", False)
         )
+        prefill_timing = deferred_layerwise_get and prefill_start_timing_enabled()
         if deferred_layerwise_get:
             kwargs.setdefault("cached_chunk_dev_ptrs", [])
             kwargs.setdefault("cached_chunk_ptrs_npu", [])
@@ -6001,9 +6002,20 @@ class LMCacheEngine:
                     # A skipped group has no consumer. Preserve that protocol;
                     # ordinary P prefix loads prepare every layer here.
                     if all(source is not None for source in prepared_sources):
+                        pointer_started = time.perf_counter() if prefill_timing else 0.0
                         self._prepare_shared_prefill_sources(
                             prepared_sources, kv_group, kwargs
                         )
+                        if pointer_started:
+                            prefill_start_timing_log(
+                                logger,
+                                "passive_pointer_prepare",
+                                pointer_started,
+                                req_id=req_id,
+                                kv_group=kv_group,
+                                prefix_tokens=ends[-1] if ends else 0,
+                                chunks=len(starts),
+                            )
                     sources_safe_to_release = False
                 try:
                     consumer_send_s = yield from (
@@ -7160,13 +7172,30 @@ class LMCacheEngine:
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
 
+        prefill_timing = bool(
+            prefill_start_timing_enabled()
+            and deferred_layerwise_get
+            and shared_layerwise_retrieve
+            and self._is_passive()
+        )
+        mask_setup_started = time.perf_counter() if prefill_timing else 0.0
+        prefix_tokens = len(tokens)
         if mask is not None:
             num_required_tokens = torch.sum(mask).item()
         else:
-            num_required_tokens = len(tokens)
+            num_required_tokens = prefix_tokens
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
-        ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+        ret_mask = torch.zeros(prefix_tokens, dtype=torch.bool, device="cpu")
+        if mask_setup_started:
+            prefill_start_timing_log(
+                logger,
+                "passive_mask_setup",
+                mask_setup_started,
+                req_id=req_id,
+                kv_group=kv_group,
+                prefix_tokens=prefix_tokens,
+            )
 
         starts = []
         ends = []
@@ -7183,6 +7212,7 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         if shared_layerwise_retrieve and self._is_passive():
+            token_plan_started = time.perf_counter() if prefill_timing else 0.0
             for start, end, key in self._dense_retrieve_token_results(
                 tokens,
                 mask,
@@ -7195,16 +7225,26 @@ class LMCacheEngine:
                 ends.append(end)
                 keys.append(key.split_layers(num_layers))
 
+            keys_layer_major = (
+                [list(row) for row in zip(*keys, strict=False)] if keys else []
+            )
+            if token_plan_started:
+                prefill_start_timing_log(
+                    logger,
+                    "passive_token_plan",
+                    token_plan_started,
+                    req_id=req_id,
+                    kv_group=kv_group,
+                    prefix_tokens=prefix_tokens,
+                    chunks=len(starts),
+                    layers=num_layers,
+                )
             yielded_steps = 0
             try:
                 passive_retriever = self._retrieve_layer_shared_passive(
                     starts_all=starts,
                     ends_all=ends,
-                    keys_layer_major=[
-                        list(row) for row in zip(*keys, strict=False)
-                    ]
-                    if keys
-                    else [],
+                    keys_layer_major=keys_layer_major,
                     ret_mask=ret_mask,
                     monitor_req_id=monitor_req_id,
                     req_id=req_id,
@@ -7212,7 +7252,19 @@ class LMCacheEngine:
                     kwargs=kwargs,
                 )
                 try:
+                    prepare_started = time.perf_counter() if prefill_timing else 0.0
                     result = next(passive_retriever)
+                    if prepare_started:
+                        prefill_start_timing_log(
+                            logger,
+                            "passive_prepare_first_yield",
+                            prepare_started,
+                            req_id=req_id,
+                            kv_group=kv_group,
+                            prefix_tokens=prefix_tokens,
+                            chunks=len(starts),
+                            layers=num_layers,
+                        )
                     while True:
                         yielded_steps += 1
                         try:

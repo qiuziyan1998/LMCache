@@ -8438,8 +8438,8 @@ class LMCacheConnectorV1Impl:
                 slot_mapping = request.slot_mapping[0]
             else:
                 assert request.slot_mapping
-                slot_mapping = request.slot_mapping[0].to(
-                    device=self.device, dtype=torch.long
+                slot_mapping = self._dense_retrieve_slot_mapping(
+                    request.slot_mapping[0]
                 )
 
             if not request.is_sparse_decode:
@@ -9048,8 +9048,8 @@ class LMCacheConnectorV1Impl:
                             else None
                         )
                         if request.indexer_slot_mapping:
-                            idx_slot = request.indexer_slot_mapping[0].to(
-                                device=self.device, dtype=torch.long
+                            idx_slot = self._dense_retrieve_slot_mapping(
+                                request.indexer_slot_mapping[0]
                             )
                             if lmcache_cached_tokens < len(idx_slot):
                                 idx_slot = idx_slot[:lmcache_cached_tokens]
@@ -13526,6 +13526,17 @@ class LMCacheConnectorV1Impl:
             # tail before appending new chunks; DMA bank bindings stay separate.
             state.dense_prefix_generation = generation
         return state, reuse_prefix
+
+    def _dense_retrieve_slot_mapping(self, slot_mapping: torch.Tensor) -> torch.Tensor:
+        """Avoid uploading token maps when raw P DMA uses bank block IDs."""
+        if (
+            getattr(self, "_layerwise_prefill_p_node", False)
+            and getattr(self, "_layerwise_prefill_dma", False)
+            and getattr(self, "_deferred_layerwise_prefill_load_active", False)
+            and not getattr(self, "enable_blending", False)
+        ):
+            return slot_mapping.to(dtype=torch.long)
+        return slot_mapping.to(device=self.device, dtype=torch.long)
 
     def _materialize_dense_prefix_for_sparse(self, state: WorkerRetrieveState) -> None:
         """Install deferred P-prefill pointer rows at their first sparse use."""
