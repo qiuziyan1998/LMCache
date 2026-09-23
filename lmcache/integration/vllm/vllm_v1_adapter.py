@@ -1372,6 +1372,11 @@ class ReqMeta:
     # P-node DMA consumes block IDs directly and derives one destination
     # address per DMA segment; it must not materialize a token-sized map.
     block_ids_by_bank: Optional[tuple[tuple[list[int], ...], ...]] = None
+    # Physical-bank phase for this chunk.  The P-node rotates the two banks
+    # at every LMCache chunk boundary so the first real lightning-indexer
+    # layer does not reuse the previous chunk's final bank while its D2H save
+    # is still in flight.
+    layerwise_prefill_bank_offset: int = 0
     block_allocation_mode: Optional[str] = None
     # Save-only mappings for the exact sparse-layerwise write window. Chunk
     # ranges remain absolute; the worker/connector subtracts this base before
@@ -1599,6 +1604,21 @@ class ReqMeta:
             elif len(tracker.sparse_token_ids) > sparse_token_count:
                 input_token_ids = tracker.sparse_token_ids[:sparse_token_count]
         input_token_len = len(input_token_ids)
+        layerwise_prefill_bank_offset = 0
+        if layerwise_prefill_dma and lmcache_chunk_size > 0:
+            # num_lmcache_cached_tokens is the durable prefix present before
+            # this worker starts computing.  It must not advance the local
+            # bank phase: the corresponding remote DMA has no live source
+            # bank on this worker.  Only chunks computed by this P node rotate
+            # the resident banks.
+            local_saved_tokens = max(
+                0,
+                tracker.num_saved_tokens
+                - tracker.num_lmcache_cached_tokens,
+            )
+            layerwise_prefill_bank_offset = (
+                local_saved_tokens // lmcache_chunk_size
+            ) % 2
         metadata_current_released_frontier = tracker.dsa_current_released_frontier
         if is_sparse_decode and load_spec is not None:
             metadata_current_released_frontier = min(
@@ -1727,6 +1747,7 @@ class ReqMeta:
                 load_spec=None,
                 disagg_spec=tracker.disagg_spec,
                 request_configs=tracker.request_configs,
+                layerwise_prefill_bank_offset=layerwise_prefill_bank_offset,
             )
 
         # Calculate number of tokens to save based on discard_partial_chunks
@@ -2041,6 +2062,7 @@ class ReqMeta:
                 if layerwise_prefill_dma
                 else None
             ),
+            layerwise_prefill_bank_offset=layerwise_prefill_bank_offset,
             block_allocation_mode=tracker.block_allocation_mode,
             save_slot_mapping=save_slot_mapping,
             save_indexer_slot_mapping=save_indexer_slot_mapping,
@@ -3021,7 +3043,9 @@ class LMCacheConnectorV1Impl:
                 request,
             )
         assert mappings is not None
-        bank = layer_index % 2
+        bank = (
+            layer_index + int(request.layerwise_prefill_bank_offset)
+        ) % 2
         # Layout/allocation mode was checked when materializing this forward's
         # maps. Layer callbacks only select their group's physical bank.
         return mappings[bank][kv_group]
@@ -3256,13 +3280,21 @@ class LMCacheConnectorV1Impl:
                 "GPU connector declares layerwise prefill transfer-window "
                 "support but has no wait_for_layerwise_prefill_load API"
             )
-        wait(
+        offsets = {
+            int(getattr(request, "layerwise_prefill_bank_offset", 0)) & 1
+            for request in getattr(self, "_layerwise_requests", ())
+        }
+        bank_offset = offsets.pop() if len(offsets) == 1 else None
+        wait_kwargs = dict(
             layer_id=self._layerwise_prefill_transfer_layer_id(
                 layer_name,
                 kv_group,
             ),
             kv_group=kv_group,
         )
+        if bank_offset is not None:
+            wait_kwargs["bank_offset"] = bank_offset
+        wait(**wait_kwargs)
 
     def _layerwise_prefill_load_position(
         self, layer_name: str, kv_group: int
@@ -8947,6 +8979,10 @@ class LMCacheConnectorV1Impl:
                         {
                             "deferred_layerwise_get": True,
                             "layerwise_prefill_bank_count": 2,
+                            "layerwise_prefill_bank_offset": (
+                                int(request.layerwise_prefill_bank_offset)
+                                & 1
+                            ),
                         }
                         if self._deferred_layerwise_prefill_load_active
                         else {}
@@ -10219,6 +10255,10 @@ class LMCacheConnectorV1Impl:
             "decode_window_size": getattr(request, "decode_window_size", None),
             "request_configs": request.request_configs,
         }
+        if self._layerwise_prefill_p_node:
+            store_kwargs["layerwise_prefill_bank_offset"] = (
+                int(request.layerwise_prefill_bank_offset) & 1
+            )
         if self._is_dsa_two_groups() and kv_group == 1:
             store_kwargs["kv_group"] = 1
         return store_kwargs
