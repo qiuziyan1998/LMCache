@@ -53,6 +53,8 @@ from lmcache.utils import (
     convert_tokens_to_list,
 )
 from lmcache.v1.serving_perf import (
+    prefill_reuse_debug_enabled,
+    prefill_reuse_debug_log,
     prefill_start_timing_enabled,
     prefill_start_timing_log,
     serving_perf_enabled,
@@ -133,6 +135,7 @@ LayerwiseRetrieveSegment = Tuple[
     List[List[CacheEngineKey]],
 ]
 _SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
+_PREFILL_REUSE_DEBUG_KEY = "_prefill_reuse_debug_stats"
 
 
 @dataclass
@@ -4887,6 +4890,9 @@ class LMCacheEngine:
             if kv_group == 1 and isinstance(state, dict)
             else None
         )
+        debug_stats = kwargs.get(_PREFILL_REUSE_DEBUG_KEY)
+        if debug_stats is not None:
+            debug_stats["hash_source"] = "g0" if plan is not None else "tok"
         if plan is not None:
             generated = self.token_database.process_tokens(
                 hashes=[entry[2] for entry in plan],
@@ -5091,6 +5097,7 @@ class LMCacheEngine:
         """
         host_rows = kwargs.setdefault("cached_chunk_dev_ptrs", [])
         device_rows = kwargs.setdefault("cached_chunk_ptrs_npu", [])
+        debug_stats = kwargs.get(_PREFILL_REUSE_DEBUG_KEY)
         if kwargs.get("_reuse_shared_dense_prefix"):
             old_rows = kwargs.get("cached_memory_objs", ())
             prefix = min((len(row) for row in host_rows), default=0)
@@ -5138,6 +5145,11 @@ class LMCacheEngine:
         prepare = getattr(
             self.gpu_connector, "prepare_layerwise_prefill_source_pointers", None
         )
+        # These are host-list lengths after the existing prefix validation.
+        # Observe the successful append without rescanning any source objects.
+        kept_pointers = (
+            len(host_rows[0]) if debug_stats is not None and host_rows else 0
+        )
         if callable(prepare):
             prepare(
                 sources,
@@ -5155,6 +5167,11 @@ class LMCacheEngine:
                 host_rows,
                 device_rows,
                 kv_group=kv_group,
+            )
+        if debug_stats is not None:
+            debug_stats["ptr_keep"] = kept_pointers
+            debug_stats["ptr_add"] = (
+                len(host_rows[0]) - kept_pointers if host_rows else 0
             )
 
     def _submit_prepared_shared_prefill_layers(
@@ -5735,11 +5752,15 @@ class LMCacheEngine:
             if kwargs.get("_reuse_shared_dense_prefix")
             else set()
         )
+        debug_stats = kwargs.get(_PREFILL_REUSE_DEBUG_KEY)
 
         try:
             for layer_id in range(self.num_layers_for_group(kv_group)):
                 envelope = None
                 if compact_batch is None:
+                    receive_started = (
+                        time.perf_counter() if debug_stats is not None else 0.0
+                    )
                     envelope = self._receive_matching_shared_envelope(
                         req_id=req_id,
                         phase=phase,
@@ -5747,6 +5768,10 @@ class LMCacheEngine:
                         layer_id=layer_id,
                         kv_group=kv_group,
                     )
+                    if debug_stats is not None:
+                        debug_stats["wait_ms"] += (
+                            time.perf_counter() - receive_started
+                        ) * 1000
                     if perf_enabled and not consume_started:
                         consume_started = serving_perf_now()
                     try:
@@ -5783,6 +5808,8 @@ class LMCacheEngine:
                         continue
                     if envelope.batch is not None:
                         compact_batch = envelope.batch
+                        if debug_stats is not None:
+                            debug_stats["compact"] = 1
 
                 if expected_handle_count is None:
                     assert envelope is not None
@@ -5840,11 +5867,13 @@ class LMCacheEngine:
                                 "materialization failed"
                             ) from view_error
                         passive_pages.extend(passive_page_tuple)
-                        to_release.extend(
-                            page
-                            for page in passive_pages
-                            if id(page) not in retained_view_ids
-                        )
+                        for page in passive_pages:
+                            if id(page) not in retained_view_ids:
+                                to_release.append(page)
+                                if debug_stats is not None:
+                                    debug_stats["page_new"] += 1
+                            elif debug_stats is not None:
+                                debug_stats["page_reuse"] += 1
                         if page_view_started:
                             view_build_s += serving_perf_now() - page_view_started
                 elif (
@@ -5949,6 +5978,10 @@ class LMCacheEngine:
                     mem_objs_layer.append(mem_obj)
                     if id(mem_obj) not in retained_view_ids:
                         to_release.append(mem_obj)
+                        if debug_stats is not None:
+                            debug_stats["tail_new"] += 1
+                    elif debug_stats is not None:
+                        debug_stats["tail_reuse"] += 1
                 if view_started:
                     view_build_s += serving_perf_now() - view_started
                 resolved_layers.append(mem_objs_layer)
@@ -7212,7 +7245,27 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         if shared_layerwise_retrieve and self._is_passive():
-            token_plan_started = time.perf_counter() if prefill_timing else 0.0
+            debug_rank = getattr(self.metadata, "worker_id", -1)
+            debug_stats: Optional[dict[str, Any]] = None
+            if deferred_layerwise_get and prefill_reuse_debug_enabled(debug_rank):
+                debug_stats = {
+                    "hash_source": "-",
+                    "keys_new": 0,
+                    "page_reuse": 0,
+                    "page_new": 0,
+                    "tail_reuse": 0,
+                    "tail_new": 0,
+                    "ptr_keep": 0,
+                    "ptr_add": 0,
+                    "compact": 0,
+                    "wait_ms": 0.0,
+                }
+                kwargs[_PREFILL_REUSE_DEBUG_KEY] = debug_stats
+            token_plan_started = (
+                time.perf_counter()
+                if prefill_timing or debug_stats is not None
+                else 0.0
+            )
             for start, end, key in self._dense_retrieve_token_results(
                 tokens,
                 mask,
@@ -7224,11 +7277,17 @@ class LMCacheEngine:
                 starts.append(start)
                 ends.append(end)
                 keys.append(key.split_layers(num_layers))
+                if debug_stats is not None:
+                    debug_stats["keys_new"] += len(keys[-1])
 
             keys_layer_major = (
                 [list(row) for row in zip(*keys, strict=False)] if keys else []
             )
-            if token_plan_started:
+            if debug_stats is not None:
+                debug_stats["plan_ms"] = (
+                    time.perf_counter() - token_plan_started
+                ) * 1000
+            if prefill_timing:
                 prefill_start_timing_log(
                     logger,
                     "passive_token_plan",
@@ -7252,9 +7311,39 @@ class LMCacheEngine:
                     kwargs=kwargs,
                 )
                 try:
-                    prepare_started = time.perf_counter() if prefill_timing else 0.0
+                    prepare_started = (
+                        time.perf_counter()
+                        if prefill_timing or debug_stats is not None
+                        else 0.0
+                    )
                     result = next(passive_retriever)
-                    if prepare_started:
+                    if debug_stats is not None:
+                        prepare_ms = (time.perf_counter() - prepare_started) * 1000
+                        prefill_reuse_debug_log(
+                            debug_rank,
+                            "plan",
+                            req_id=req_id,
+                            p=prefix_tokens,
+                            g=kv_group,
+                            h=debug_stats["hash_source"],
+                            k=debug_stats["keys_new"],
+                            ms=round(debug_stats["plan_ms"], 1),
+                        )
+                        prefill_reuse_debug_log(
+                            debug_rank,
+                            "src",
+                            req_id=req_id,
+                            p=prefix_tokens,
+                            g=kv_group,
+                            v=f"{debug_stats['page_reuse']}/{debug_stats['page_new']}",
+                            t=f"{debug_stats['tail_reuse']}/{debug_stats['tail_new']}",
+                            x=f"{debug_stats['ptr_keep']}/{debug_stats['ptr_add']}",
+                            c=debug_stats["compact"],
+                            w=debug_stats["wait_ms"],
+                            ms=round(prepare_ms, 1),
+                        )
+                        kwargs.pop(_PREFILL_REUSE_DEBUG_KEY, None)
+                    if prefill_timing:
                         prefill_start_timing_log(
                             logger,
                             "passive_prepare_first_yield",

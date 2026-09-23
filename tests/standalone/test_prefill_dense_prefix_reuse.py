@@ -45,7 +45,13 @@ def adapter_types() -> tuple[type, type]:
     module = ast.fix_missing_locations(
         ast.Module(body=[future, state, adapter], type_ignores=[])
     )
-    namespace = dict(dataclass=dataclass, field=field, torch=torch)
+    namespace = dict(
+        dataclass=dataclass,
+        field=field,
+        torch=torch,
+        prefill_reuse_debug_enabled=lambda rank: False,
+        prefill_reuse_debug_log=lambda *args, **kwargs: None,
+    )
     exec(compile(module, str(SOURCE), "exec"), namespace)
     return namespace["LMCacheConnectorV1Impl"], namespace["WorkerRetrieveState"]
 
@@ -374,3 +380,103 @@ def test_both_dense_groups_receive_the_same_reuse_protocol() -> None:
         == "deferred_prefill_kwargs['_reuse_shared_dense_prefix'] = True"
         for node in ast.walk(function)
     )
+
+
+@pytest.mark.parametrize(
+    ("case", "action", "reason"),
+    [
+        ("keep", "keep", "ok"),
+        ("new", "new", "new"),
+        ("generation", "reset", "gen"),
+        ("preemption", "reset", "preempt"),
+        ("shrink", "reset", "shrink"),
+        ("path", "reset", "path"),
+        ("request", "reset", "req"),
+        ("untracked", "reset", "new"),
+    ],
+)
+def test_one_state_debug_line_reports_the_actual_action(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    action: str,
+    reason: str,
+) -> None:
+    state = State(req_id="r") if case == "new" else populated_state()
+    obj, _, uploads, _ = adapter(state)
+    obj._layerwise_prefill_dma = True
+    obj.lmcache_engine.metadata = NS(worker_id=1)
+    req = request()
+    options = dict(state_is_new=case == "new")
+    if case == "generation":
+        obj.lmcache_engine.shared_cpu_cache_generation = 8
+    elif case == "preemption":
+        req.resumed_from_preemption = True
+    elif case == "shrink":
+        options["token_count"] = 4
+    elif case == "path":
+        obj._layerwise_prefill_p_node = False
+    elif case == "request":
+        state.req_id = "previous"
+    elif case == "untracked":
+        state.dense_prefix_generation = None
+    old_tokens = state.token_count
+
+    def release(value: Any, engine: Any) -> None:
+        value.token_count = 0
+        value.dense_prefix_generation = None
+        value.req_id = None
+
+    obj._release_shared_worker_retrieve_state = release
+    logs = []
+    namespace = Adapter._prepare_dense_prefix_retrieve_state.__globals__
+    monkeypatch.setitem(
+        namespace, "prefill_reuse_debug_enabled", lambda rank: rank == 1
+    )
+    monkeypatch.setitem(
+        namespace,
+        "prefill_reuse_debug_log",
+        lambda *args, **kwargs: logs.append((args, kwargs)),
+    )
+    prepare(obj, state, req, **options)
+    assert logs == [
+        (
+            (1, "state"),
+            dict(
+                req_id="r",
+                p=options.get("token_count", 8),
+                a=action,
+                w=reason,
+                old=old_tokens,
+                map="h2d" if case == "path" else "keep",
+                e=case != "path",
+            ),
+        )
+    ]
+    assert not uploads
+
+
+@pytest.mark.parametrize("rank", [0, 2, None])
+def test_state_debug_uses_worker_id_and_filters_other_or_missing_ranks(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int | None,
+) -> None:
+    state = populated_state()
+    obj, _, _, _ = adapter(state)
+    if rank is not None:
+        obj.lmcache_engine.metadata = NS(worker_id=rank)
+    checked, logs = [], []
+
+    def enabled(value: int) -> bool:
+        checked.append(value)
+        return value == 1
+
+    namespace = Adapter._prepare_dense_prefix_retrieve_state.__globals__
+    monkeypatch.setitem(namespace, "prefill_reuse_debug_enabled", enabled)
+    monkeypatch.setitem(
+        namespace,
+        "prefill_reuse_debug_log",
+        lambda *args, **kwargs: logs.append((args, kwargs)),
+    )
+    prepare(obj, state)
+    assert checked == [-1 if rank is None else rank]
+    assert logs == []
