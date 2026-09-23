@@ -9139,6 +9139,12 @@ class LMCacheConnectorV1Impl:
                     recalc_last_applied=recalc_last_applied,
                 )
 
+        # Submit the second bank's initial layer before model execution.  The
+        # first-SFA callback remains idempotent for older callers, but it must
+        # not perform a synchronous retriever advance on the latency path.
+        if self._deferred_layerwise_prefill_load_active:
+            self._submit_initial_layerwise_prefill_load()
+
         store_setup_started = (
             time.perf_counter()
             if self._layerwise_prefill_p_node and prefill_start_timing_enabled()
@@ -9601,7 +9607,7 @@ class LMCacheConnectorV1Impl:
         )
 
     def _submit_initial_layerwise_prefill_load(self) -> None:
-        """Virtual N=-1: submit L1 without a save or model-layer advance."""
+        """Submit L1 before model execution without advancing model layers."""
         if self._initial_layerwise_prefill_load_submitted:
             return
         requests = self._layerwise_requests
