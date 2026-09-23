@@ -26,6 +26,7 @@ from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.offload_server.zmq_server import ZMQOffloadServer
 from lmcache.v1.plugin.runtime_plugin_launcher import RuntimePluginLauncher
+from lmcache.v1.startup_trace import startup_phase
 
 if TYPE_CHECKING:
     # First Party
@@ -186,6 +187,13 @@ class LMCacheManager:
         if self._init_failed:
             if self._lmcache_engine is not None:
                 self._lmcache_engine.mark_init_failed(self._init_failed_reason)
+            if self._shared_cpu_startup_required():
+                logger.error(
+                    "[LMCACHE_INIT_FAILED] Aborting shared CPU cache startup "
+                    "after an earlier initialization failure: %s",
+                    self._init_failed_reason,
+                )
+                raise RuntimeError(self._init_failed_reason)
             logger.warning("Skipping post_init due to previous initialization failure")
             return
 
@@ -205,12 +213,16 @@ class LMCacheManager:
                 assert isinstance(self._lookup_server, LMCacheAsyncLookupServer)
                 async_lookup_server = self._lookup_server
 
-            self._lmcache_engine.post_init(async_lookup_server=async_lookup_server)
+            with startup_phase("engine_post_init"):
+                self._lmcache_engine.post_init(async_lookup_server=async_lookup_server)
 
             # Initialize health monitor after engine post_init completes
-            self._init_health_monitor()
+            with startup_phase("health_monitor"):
+                self._init_health_monitor()
         except Exception as e:
             self._handle_post_init_failure(e)
+            if self._shared_cpu_startup_required():
+                raise
 
     def _init_health_monitor(self) -> None:
         """Initialize the health monitor via the service factory.
@@ -232,10 +244,26 @@ class LMCacheManager:
         self._init_failed_reason = "".join(traceback.format_exception(e))
         if self._lmcache_engine is not None:
             self._lmcache_engine.mark_init_failed(self._init_failed_reason)
+        if self._shared_cpu_startup_required():
+            logger.error(
+                "[LMCACHE_INIT_FAILED] Shared CPU cache startup aborted; "
+                "recompute fallback is unsafe while peer ranks initialize. "
+                "Reason: %s",
+                self._init_failed_reason,
+            )
+            return
         logger.error(
             "Failed during post_init: %s. "
             "System will operate in degraded mode (recompute).",
             self._init_failed_reason,
+        )
+
+    def _shared_cpu_startup_required(self) -> bool:
+        return bool(
+            self._config.get_extra_config_value(
+                "enable_shared_cpu_cache",
+                getattr(self._config, "enable_shared_cpu_cache", False),
+            )
         )
 
     def stop_services(self) -> None:

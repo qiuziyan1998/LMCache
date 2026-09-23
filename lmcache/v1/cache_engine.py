@@ -53,6 +53,8 @@ from lmcache.utils import (
     convert_tokens_to_list,
 )
 from lmcache.v1.serving_perf import (
+    prefill_start_timing_enabled,
+    prefill_start_timing_log,
     serving_perf_enabled,
     serving_perf_log,
     serving_perf_now,
@@ -101,6 +103,7 @@ from lmcache.v1.shared_cpu_cache import (
     chunk_hash_to_int,
     validate_shared_handle_batch,
 )
+from lmcache.v1.startup_trace import startup_phase
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
@@ -366,7 +369,11 @@ class LMCacheEngine:
                 self.fmt = MemoryFormat.KV_T2D
         if metadata.use_mla:
             self.fmt = MemoryFormat.KV_MLA_LATENT_FMT
-        self._report_shared_cpu_sparse_capacity_sanity()
+        # DSA index KV-group shapes are registered by the vLLM adapter after
+        # the engine is constructed.  Run the capacity check from post_init,
+        # once all KV groups are available, but still before StorageManager
+        # allocates the shared-memory slab.
+        self._shared_cpu_sparse_capacity_sanity_pending = True
 
         # NOTE(ApostaC): we haven't support lookup-cache yet
         self.lookup_cache: dict[CacheEngineKey, Any] = {}
@@ -889,13 +896,33 @@ class LMCacheEngine:
         ):
             kv_groups.append(1)
 
-        bytes_per_chunk_all_layers = sum(
-            self._estimate_shared_cpu_chunk_bytes_per_layer(kv_group)
-            * self.num_layers_for_group(kv_group)
-            for kv_group in kv_groups
+        registered_groups = getattr(
+            getattr(self.metadata, "kv_layer_groups_manager", None),
+            "kv_layer_groups",
+            (),
         )
+        if registered_groups:
+            # Startup precedes the connector's lazy layout initialization.
+            # Its generic get_shape() fallback has a K/V factor of two even
+            # for MLA. Registered metadata already describes the real layout.
+            shapes = self.metadata.get_shapes(chunk_size)
+            bytes_per_chunk_all_layers = sum(
+                math.prod(shapes[kv_group])
+                * self._shared_cpu_dtype_for_kv_group(kv_group).itemsize
+                for kv_group in kv_groups
+            )
+        else:
+            # Preserve the legacy path for callers without registered groups.
+            bytes_per_chunk_all_layers = sum(
+                self._estimate_shared_cpu_chunk_bytes_per_layer(kv_group)
+                * self.num_layers_for_group(kv_group)
+                for kv_group in kv_groups
+            )
         one_request_bytes = bytes_per_chunk_all_layers * chunks_per_seq
         slab_bytes = self._effective_shared_cpu_cache_size_bytes()
+        max_single_request_tokens = (
+            slab_bytes // bytes_per_chunk_all_layers * chunk_size
+        )
         estimate: dict[str, Any] = {
             "slab_bytes": slab_bytes,
             "max_model_len": max_model_len,
@@ -905,16 +932,32 @@ class LMCacheEngine:
             "kv_groups": kv_groups,
             "bytes_per_chunk_all_layers": bytes_per_chunk_all_layers,
             "one_max_request_bytes": one_request_bytes,
+            "max_single_request_tokens": max_single_request_tokens,
+            "max_full_length_requests": slab_bytes // one_request_bytes,
+            "scope": "KV payload only; excludes transfer buffers and fragmentation",
         }
         if max_num_seqs is not None:
             estimate["configured_worst_case_bytes"] = (
                 one_request_bytes * int(max_num_seqs)
             )
+            if int(max_num_seqs) > 0:
+                estimate["max_tokens_per_request_at_max_num_seqs"] = (
+                    slab_bytes
+                    // (bytes_per_chunk_all_layers * int(max_num_seqs))
+                    * chunk_size
+                )
         if self.config.extra_config is None:
             self.config.extra_config = {}
         self.config.extra_config[
             "shared_cpu_sparse_startup_capacity_estimate"
         ] = estimate
+        logger.info(
+            "[LMCACHE_CAPACITY] rank=%s estimate=%s. These are empty-pool "
+            "KV payload upper bounds, not runtime admission guarantees; "
+            "prompt plus output must also fit vLLM max_model_len.",
+            self.metadata.worker_id,
+            estimate,
+        )
 
         if one_request_bytes > slab_bytes:
             raise ValueError(
@@ -927,9 +970,9 @@ class LMCacheEngine:
         if configured_worst_case is not None and configured_worst_case > slab_bytes:
             logger.warning(
                 "Shared CPU sparse configured worst-case active set exceeds "
-                "the rank0 slab: estimate=%s. Runtime admission uses actual "
-                "active prompt lengths, but this configuration can still hit "
-                "strict capacity failures at decode.",
+                "the rank0 slab: estimate=%s. Reduce max_num_seqs or prompt "
+                "lengths, or increase the pool; this estimate does not reserve "
+                "capacity for concurrent requests.",
                 estimate,
             )
         else:
@@ -991,11 +1034,21 @@ class LMCacheEngine:
                     )
                 )
                 if self.shared_cpu_cache_strict:
-                    self.shared_cpu_cache_mapping.preflight_device_ptr()
-                self.broadcast_object_fn(
-                    self._shared_cpu_cache_startup_envelope("ok"),
-                    self.metadata.first_rank,
-                )
+                    with startup_phase(
+                        "shared_device_ptr",
+                        rank=self.metadata.worker_id,
+                        slab_bytes=self.shared_cpu_cache_slab_size,
+                    ):
+                        self.shared_cpu_cache_mapping.preflight_device_ptr()
+                with startup_phase(
+                    "shared_startup_broadcast",
+                    rank=self.metadata.worker_id,
+                    src=self.metadata.first_rank,
+                ):
+                    self.broadcast_object_fn(
+                        self._shared_cpu_cache_startup_envelope("ok"),
+                        self.metadata.first_rank,
+                    )
             except Exception as exc:
                 mapping = getattr(self, "shared_cpu_cache_mapping", None)
                 if mapping is not None:
@@ -1030,7 +1083,12 @@ class LMCacheEngine:
             )
             return
 
-        envelope = self.broadcast_object_fn(None, self.metadata.first_rank)
+        with startup_phase(
+            "shared_startup_receive",
+            rank=self.metadata.worker_id,
+            src=self.metadata.first_rank,
+        ):
+            envelope = self.broadcast_object_fn(None, self.metadata.first_rank)
         if not isinstance(envelope, dict):
             raise ValueError(
                 "Shared CPU cache passive preflight expected dict envelope, "
@@ -1064,14 +1122,26 @@ class LMCacheEngine:
         for writable in writable_attempts:
             mapping = None
             try:
-                mapping = SharedSlabMapping.attach(
+                with startup_phase(
+                    "shared_slab_attach",
+                    rank=self.metadata.worker_id,
+                    slab_bytes=self.shared_cpu_cache_slab_size,
                     shm_name=self.shared_cpu_cache_name,
-                    size=self.shared_cpu_cache_slab_size,
-                    generation=self.shared_cpu_cache_generation,
                     writable=writable,
-                )
+                ):
+                    mapping = SharedSlabMapping.attach(
+                        shm_name=self.shared_cpu_cache_name,
+                        size=self.shared_cpu_cache_slab_size,
+                        generation=self.shared_cpu_cache_generation,
+                        writable=writable,
+                    )
                 if self.shared_cpu_cache_strict:
-                    mapping.preflight_device_ptr()
+                    with startup_phase(
+                        "shared_device_ptr",
+                        rank=self.metadata.worker_id,
+                        slab_bytes=self.shared_cpu_cache_slab_size,
+                    ):
+                        mapping.preflight_device_ptr()
                 self.shared_cpu_cache_mapping = mapping
                 if self.config.extra_config is None:
                     self.config.extra_config = {}
@@ -4754,6 +4824,29 @@ class LMCacheEngine:
             synchronize()
         self._release_shared_retrieve_objs(memory_objs, unpin=unpin)
 
+    def _retain_unsafe_layerwise_retrieve_objs(
+        self,
+        memory_objs: list[MemoryObj],
+        *,
+        context: str,
+    ) -> None:
+        """Leak sources deliberately when device completion is unproven."""
+        if not memory_objs:
+            return
+        retained = getattr(self, "_unsafe_layerwise_retrieve_sources", None)
+        if retained is None:
+            retained = []
+            self._unsafe_layerwise_retrieve_sources = retained
+        count = len(memory_objs)
+        retained.extend(memory_objs)
+        memory_objs.clear()
+        logger.critical(
+            "%s could not synchronize its deferred H2D consumer; retaining "
+            "%d source objects",
+            context,
+            count,
+        )
+
     def _dense_retrieve_token_results(
         self,
         tokens: Union[torch.Tensor, list[int]],
@@ -4883,6 +4976,46 @@ class LMCacheEngine:
             raise
         return True
 
+    def _prepare_shared_prefill_sources(
+        self,
+        sources: list[Any],
+        kv_group: int,
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Build P-node load pointer rows before the first forward yield.
+
+        Keep the caller's mutable cache lists for dense-to-sparse adoption.
+        This uses the same registered CPU objects, without copying KV payloads.
+        """
+        self.gpu_connector.append_sparse_chunk_ptr_cache_for_layers(
+            sources,
+            kwargs.setdefault("cached_chunk_dev_ptrs", []),
+            kwargs.setdefault("cached_chunk_ptrs_npu", []),
+            kv_group=kv_group,
+        )
+
+    def _submit_prepared_shared_prefill_layers(
+        self,
+        consumer: Any,
+        sources: list[Any],
+        ret_mask: torch.Tensor,
+        perf_enabled: bool = False,
+    ) -> Generator[Optional[torch.Tensor], Any, float]:
+        """Relay bank commands; no storage lookup, TP broadcast or pointer upload."""
+        send_s = 0.0
+        for layer_id, source in enumerate(sources):
+            command = yield torch.sum(ret_mask) if layer_id == 0 else None
+            if source is not None:
+                started = serving_perf_now() if perf_enabled else 0.0
+                consumer.send(
+                    source
+                    if command is None
+                    else {"memory_objs": source, "layer_request": command}
+                )
+                if started:
+                    send_s += serving_perf_now() - started
+        return send_s
+
     def _retrieve_layer_shared_rank0(
         self,
         *,
@@ -4903,6 +5036,9 @@ class LMCacheEngine:
         assert self.gpu_connector is not None
 
         phase = kwargs.get("shared_cpu_phase", "dense_prefix")
+        deferred_layerwise_get = bool(
+            kwargs.get("deferred_layerwise_get", False)
+        )
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
         # Mirror the passive side's derivation exactly: the TP materialization
         # consensus must be entered by every rank or by none. A prefiller
@@ -4931,7 +5067,11 @@ class LMCacheEngine:
                         message="no dense prefix shared CPU cache chunks selected",
                     )
                 )
-                yield None
+                if not deferred_layerwise_get:
+                    yield None
+            if deferred_layerwise_get:
+                for _ in range(self.num_layers_for_group(kv_group)):
+                    yield None
             yield None
             self.stats_monitor.on_retrieve_finished(monitor_req_id, 0)
             yield ret_mask
@@ -4977,6 +5117,9 @@ class LMCacheEngine:
             exact_locations = [location for location, _ in remote_fill_plan]
 
         assert_layerwise_gpu_connector(self.gpu_connector)
+        if deferred_layerwise_get:
+            kwargs.setdefault("cached_chunk_dev_ptrs", [])
+            kwargs.setdefault("cached_chunk_ptrs_npu", [])
         mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
         next(mem_obj_consumer)
 
@@ -4997,16 +5140,41 @@ class LMCacheEngine:
         layer_page_chunks = 0
         layer_pages: tuple[LayerPageMemoryObj, ...] = ()
         compact_batch: Optional[SharedHandleBatch] = None
+        sources_safe_to_release = True
+        prepared_sources: list[Any] = []
+        consumer_failed = False
         perf_enabled = serving_perf_enabled()
         consume_started = consumer_send_s = consumer_finish_s = 0.0
         try:
             for layer_id in range(self.num_layers_for_group(kv_group)):
                 envelope_required = compact_batch is None
                 try:
-                    if page_first_resolve:
+                    if page_first_resolve or deferred_layerwise_get:
                         if pre_resolved_layers is None:
                             full_chunks = planned_page_chunks
-                            if (
+                            if not page_first_resolve:
+                                # P-node preparation already resolves every
+                                # layer before forward. Publish their offsets
+                                # as one existing compact batch even without
+                                # Mooncake pages; do not pay one TP broadcast
+                                # per layer. Keep the original tier selection.
+                                pre_resolved_layers = []
+                                for row_id, row_keys in enumerate(keys_layer_major):
+                                    row = self._resolve_shared_rank0_layer_mem_objs(
+                                        req_id=req_id,
+                                        phase=phase,
+                                        layer_id=row_id,
+                                        kv_group=kv_group,
+                                        keys_layer=row_keys,
+                                        chunk_locations=chunk_locations_layer_major[
+                                            row_id
+                                        ],
+                                    )
+                                    pre_resolved_layers.append(row)
+                                    # Own each resolved row immediately so a
+                                    # later failure releases its refs/pins too.
+                                    to_release.extend(row)
+                            elif (
                                 mooncake_layer_pages_enabled(self.config)
                                 and full_chunks
                             ):
@@ -5056,12 +5224,13 @@ class LMCacheEngine:
                                         keys_layer_major=keys_layer_major,
                                     )
                                 )
-                            unique = {
-                                id(mem_obj): mem_obj
-                                for layer in pre_resolved_layers
-                                for mem_obj in layer
-                            }
-                            to_release.extend(unique.values())
+                            if page_first_resolve:
+                                unique = {
+                                    id(mem_obj): mem_obj
+                                    for layer in pre_resolved_layers
+                                    for mem_obj in layer
+                                }
+                                to_release.extend(unique.values())
                             compact_batch = self._make_shared_handle_batch(
                                 pre_resolved_layers,
                                 keys_layer_major,
@@ -5180,28 +5349,77 @@ class LMCacheEngine:
                             "RemoteFill shared pages"
                         )
 
+                if deferred_layerwise_get:
+                    prepared_sources.append(
+                        LayerPageSource(
+                            layer_pages,
+                            layer_id,
+                            tuple(mem_objs_layer[layer_page_chunks:]),
+                        )
+                        if layer_page_chunks
+                        else mem_objs_layer
+                    )
+                    continue
+
                 if perf_enabled and not consume_started:
                     consume_started = serving_perf_now()
                 if layer_id == 0:
-                    yield torch.sum(ret_mask)
+                    layer_request = yield torch.sum(ret_mask)
                 else:
-                    yield None
+                    layer_request = yield None
 
                 send_started = serving_perf_now() if perf_enabled else 0.0
-                mem_obj_consumer.send(
-                    LayerPageSource(
-                        layer_pages,
-                        layer_id,
-                        tuple(mem_objs_layer[layer_page_chunks:]),
+                try:
+                    memory_objs_layer = (
+                        LayerPageSource(
+                            layer_pages,
+                            layer_id,
+                            tuple(mem_objs_layer[layer_page_chunks:]),
+                        )
+                        if layer_page_chunks
+                        else mem_objs_layer
                     )
-                    if layer_page_chunks
-                    else mem_objs_layer
-                )
+                    mem_obj_consumer.send(
+                        memory_objs_layer
+                        if layer_request is None
+                        else {
+                            "memory_objs": memory_objs_layer,
+                            "layer_request": layer_request,
+                        }
+                    )
+                except BaseException:
+                    consumer_failed = deferred_layerwise_get
+                    raise
                 if send_started:
                     consumer_send_s += serving_perf_now() - send_started
 
+            if deferred_layerwise_get:
+                self._prepare_shared_prefill_sources(
+                    prepared_sources, kv_group, kwargs
+                )
+                sources_safe_to_release = False
+                if perf_enabled:
+                    consume_started = serving_perf_now()
+                try:
+                    consumer_send_s = yield from (
+                        self._submit_prepared_shared_prefill_layers(
+                            mem_obj_consumer, prepared_sources, ret_mask, perf_enabled
+                        )
+                    )
+                except Exception:
+                    consumer_failed = True
+                    raise
+                # N-1 returns immediately after the final H2D enqueue. The
+                # last-layer entry resumes this generator to synchronize the
+                # consumer and release shared-source ownership.
+                yield None
             finish_started = serving_perf_now() if perf_enabled else 0.0
-            next(mem_obj_consumer)
+            try:
+                next(mem_obj_consumer)
+            except BaseException:
+                consumer_failed = deferred_layerwise_get
+                raise
+            sources_safe_to_release = True
             self._close_shared_retrieve_consumer(mem_obj_consumer)
             mem_obj_consumer = None
             if finish_started:
@@ -5275,20 +5493,30 @@ class LMCacheEngine:
                         3,
                     ),
                 )
-            yield None
+            if not deferred_layerwise_get:
+                yield None
             # Keep request-owned shared objects through the final layer wait,
             # but release them before the result yield can remain suspended.
             self._release_shared_retrieve_objs(to_release, unpin=True)
             yield ret_mask
         finally:
             try:
-                self._close_shared_retrieve_consumer(mem_obj_consumer)
+                if mem_obj_consumer is not None:
+                    self._close_shared_retrieve_consumer(mem_obj_consumer)
+                    if not consumer_failed:
+                        sources_safe_to_release = True
             finally:
-                self._release_retained_dense_retrieve_objs(
-                    to_release,
-                    unpin=True,
-                    kwargs=kwargs,
-                )
+                if sources_safe_to_release:
+                    self._release_retained_dense_retrieve_objs(
+                        to_release,
+                        unpin=True,
+                        kwargs=kwargs,
+                    )
+                else:
+                    self._retain_unsafe_layerwise_retrieve_objs(
+                        to_release,
+                        context="Shared CPU rank0 retrieve",
+                    )
 
     def _retrieve_layer_shared_passive(
         self,
@@ -5319,6 +5547,12 @@ class LMCacheEngine:
             is not None
         )
         assert_layerwise_gpu_connector(self.gpu_connector)
+        deferred_layerwise_get = bool(
+            kwargs.get("deferred_layerwise_get", False)
+        )
+        if deferred_layerwise_get:
+            kwargs.setdefault("cached_chunk_dev_ptrs", [])
+            kwargs.setdefault("cached_chunk_ptrs_npu", [])
         mem_obj_consumer = None
         to_release: list[MemoryObj] = []
         resolved_layers: list[list[MemoryObj]] = []
@@ -5327,6 +5561,9 @@ class LMCacheEngine:
         compact_batch: Optional[SharedHandleBatch] = None
         passive_pages: list[LayerPageMemoryObj] = []
         passive_page_tuple: tuple[LayerPageMemoryObj, ...] = ()
+        sources_safe_to_release = True
+        prepared_sources: list[Any] = []
+        consumer_failed = False
         perf_enabled = serving_perf_enabled()
         consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
 
@@ -5368,7 +5605,9 @@ class LMCacheEngine:
                             "RemoteFill shared-handle envelope validation failed"
                         ) from exc
                     if envelope.status in ("miss", "skipped"):
-                        if layer_id == 0:
+                        if deferred_layerwise_get:
+                            prepared_sources.append(None)
+                        elif layer_id == 0:
                             yield torch.sum(ret_mask)
                         else:
                             yield None
@@ -5510,28 +5749,80 @@ class LMCacheEngine:
                 resolved_layers.append(mem_objs_layer)
                 handles_by_layer.append(layer_handles)
 
+                if deferred_layerwise_get:
+                    prepared_sources.append(
+                        LayerPageSource(
+                            passive_page_tuple,
+                            layer_id,
+                            tuple(mem_objs_layer[page_chunks:]),
+                        )
+                        if passive_pages
+                        else mem_objs_layer
+                    )
+                    continue
+
                 if layer_id == 0:
-                    yield torch.sum(ret_mask)
+                    layer_request = yield torch.sum(ret_mask)
                 else:
-                    yield None
+                    layer_request = yield None
 
                 assert mem_obj_consumer is not None
                 send_started = serving_perf_now() if perf_enabled else 0.0
-                mem_obj_consumer.send(
-                    LayerPageSource(
-                        passive_page_tuple,
-                        layer_id,
-                        tuple(mem_objs_layer[page_chunks:]),
+                try:
+                    memory_objs_layer = (
+                        LayerPageSource(
+                            passive_page_tuple,
+                            layer_id,
+                            tuple(mem_objs_layer[page_chunks:]),
+                        )
+                        if passive_pages
+                        else mem_objs_layer
                     )
-                    if passive_pages
-                    else mem_objs_layer
-                )
+                    mem_obj_consumer.send(
+                        memory_objs_layer
+                        if layer_request is None
+                        else {
+                            "memory_objs": memory_objs_layer,
+                            "layer_request": layer_request,
+                        }
+                    )
+                except BaseException:
+                    consumer_failed = deferred_layerwise_get
+                    raise
                 if send_started:
                     consumer_send_s += serving_perf_now() - send_started
 
+            if deferred_layerwise_get:
+                if resolved_layers:
+                    # A skipped group has no consumer. Preserve that protocol;
+                    # ordinary P prefix loads prepare every layer here.
+                    if all(source is not None for source in prepared_sources):
+                        self._prepare_shared_prefill_sources(
+                            prepared_sources, kv_group, kwargs
+                        )
+                    sources_safe_to_release = False
+                try:
+                    consumer_send_s = yield from (
+                        self._submit_prepared_shared_prefill_layers(
+                            mem_obj_consumer, prepared_sources, ret_mask, perf_enabled
+                        )
+                    )
+                except Exception:
+                    consumer_failed = True
+                    raise
+            deferred_cleanup_gate_used = bool(
+                deferred_layerwise_get and mem_obj_consumer is not None
+            )
+            if deferred_cleanup_gate_used:
+                yield None
             if mem_obj_consumer is not None:
                 finish_started = serving_perf_now() if perf_enabled else 0.0
-                next(mem_obj_consumer)
+                try:
+                    next(mem_obj_consumer)
+                except BaseException:
+                    consumer_failed = deferred_layerwise_get
+                    raise
+                sources_safe_to_release = True
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
                 mem_obj_consumer = None
                 if finish_started:
@@ -5586,20 +5877,30 @@ class LMCacheEngine:
                         3,
                     ),
                 )
-            yield None
+            if not deferred_cleanup_gate_used:
+                yield None
             # Keep request-owned shared objects through the final layer wait,
             # but release them before the result yield can remain suspended.
             self._release_shared_retrieve_objs(to_release, unpin=False)
             yield ret_mask
         finally:
             try:
-                self._close_shared_retrieve_consumer(mem_obj_consumer)
+                if mem_obj_consumer is not None:
+                    self._close_shared_retrieve_consumer(mem_obj_consumer)
+                    if not consumer_failed:
+                        sources_safe_to_release = True
             finally:
-                self._release_retained_dense_retrieve_objs(
-                    to_release,
-                    unpin=False,
-                    kwargs=kwargs,
-                )
+                if sources_safe_to_release:
+                    self._release_retained_dense_retrieve_objs(
+                        to_release,
+                        unpin=False,
+                        kwargs=kwargs,
+                    )
+                else:
+                    self._retain_unsafe_layerwise_retrieve_objs(
+                        to_release,
+                        context="Shared CPU passive retrieve",
+                    )
 
     def skip_shared_layerwise_retrieve(
         self,
@@ -5715,62 +6016,95 @@ class LMCacheEngine:
     def post_init(self, **kwargs) -> None:
         if not self.post_inited:
             logger.info("Post initializing LMCacheEngine")
-            lookup_server_worker_ids = self.config.get_lookup_server_worker_ids(
-                self.metadata.use_mla, self.metadata.world_size
-            )
-            self._preflight_shared_cpu_shm_capacity()
-            shared_passive_rank = (
-                self.enable_shared_cpu_cache
-                and self._is_passive()
-                and self.metadata.world_size > 1
-            )
-            need_layerwise_storage = self.use_layerwise and not shared_passive_rank
-            if (
-                self.lmcache_worker is not None
-                or need_layerwise_storage
-                or not self.save_only_first_rank
-                or self.metadata.is_first_rank()
-                or len(lookup_server_worker_ids) == 0
-                or self.metadata.worker_id in lookup_server_worker_ids
-            ):
-                logger.info(
-                    f"Initialize storage manager on rank {self.metadata.worker_id}, "
-                    f"use layerwise: {self.use_layerwise},"
-                    f"save only first rank: {self.save_only_first_rank}"
-                )
-                async_lookup_server = kwargs.get("async_lookup_server", None)
-                try:
-                    self.storage_manager = StorageManager(
-                        self.config,
-                        self.metadata,
-                        event_manager=self.event_manager,
-                        lmcache_worker=self.lmcache_worker,
-                        async_lookup_server=async_lookup_server,
+            phase = "lookup_worker_ids"
+            try:
+                with startup_phase(phase, rank=self.metadata.worker_id):
+                    lookup_server_worker_ids = (
+                        self.config.get_lookup_server_worker_ids(
+                            self.metadata.use_mla, self.metadata.world_size
+                        )
                     )
-                except Exception as exc:
-                    if (
-                        self.enable_shared_cpu_cache
-                        and self.metadata.world_size > 1
-                        and self.metadata.is_first_rank()
-                        and callable(getattr(self, "broadcast_object_fn", None))
+                if getattr(
+                    self, "_shared_cpu_sparse_capacity_sanity_pending", False
+                ):
+                    phase = "capacity_check"
+                    with startup_phase(phase, rank=self.metadata.worker_id):
+                        self._report_shared_cpu_sparse_capacity_sanity()
+                    self._shared_cpu_sparse_capacity_sanity_pending = False
+                phase = "shm_space_check"
+                with startup_phase(phase, rank=self.metadata.worker_id):
+                    self._preflight_shared_cpu_shm_capacity()
+                shared_passive_rank = (
+                    self.enable_shared_cpu_cache
+                    and self._is_passive()
+                    and self.metadata.world_size > 1
+                )
+                need_layerwise_storage = (
+                    self.use_layerwise and not shared_passive_rank
+                )
+                if (
+                    self.lmcache_worker is not None
+                    or need_layerwise_storage
+                    or not self.save_only_first_rank
+                    or self.metadata.is_first_rank()
+                    or len(lookup_server_worker_ids) == 0
+                    or self.metadata.worker_id in lookup_server_worker_ids
+                ):
+                    phase = "StorageManager"
+                    logger.info(
+                        "Initialize storage manager on rank %s, "
+                        "use layerwise: %s, save only first rank: %s",
+                        self.metadata.worker_id,
+                        self.use_layerwise,
+                        self.save_only_first_rank,
+                    )
+                    async_lookup_server = kwargs.get("async_lookup_server", None)
+                    with startup_phase(
+                        "storage_manager",
+                        rank=self.metadata.worker_id,
+                        cpu_cache_gb=self.config.max_local_cpu_size,
                     ):
-                        try:
+                        self.storage_manager = StorageManager(
+                            self.config,
+                            self.metadata,
+                            event_manager=self.event_manager,
+                            lmcache_worker=self.lmcache_worker,
+                            async_lookup_server=async_lookup_server,
+                        )
+            except Exception as exc:
+                # Passive ranks are already waiting for the startup envelope.
+                # Capacity/shm failures must reach them just like allocator
+                # failures; do not leave them waiting on a success-only path.
+                if (
+                    self.enable_shared_cpu_cache
+                    and self.metadata.world_size > 1
+                    and self.metadata.is_first_rank()
+                    and callable(getattr(self, "broadcast_object_fn", None))
+                ):
+                    message = (
+                        f"Shared CPU cache rank0 startup failed in {phase}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    logger.error("[LMCACHE_INIT_FAILED] %s", message)
+                    try:
+                        with startup_phase(
+                            "shared_startup_failure_broadcast",
+                            rank=self.metadata.worker_id,
+                            failed_stage=phase,
+                        ):
                             self.broadcast_object_fn(
                                 self._shared_cpu_cache_startup_envelope(
-                                    "error",
-                                    "Shared CPU cache rank0 failed while "
-                                    "initializing shm-backed StorageManager: "
-                                    f"{exc}",
+                                    "error", message
                                 ),
                                 self.metadata.first_rank,
                             )
-                        except Exception:
-                            logger.exception(
-                                "Failed to broadcast shared CPU cache startup "
-                                "error after rank0 StorageManager failure"
-                            )
-                    raise
-            self._post_init_shared_cpu_cache()
+                    except Exception:
+                        logger.exception(
+                            "Failed to broadcast shared CPU cache startup error"
+                        )
+                raise
+            with startup_phase("shared_cache_setup", rank=self.metadata.worker_id):
+                self._post_init_shared_cpu_cache()
             self.post_inited = True
 
     def freeze(self, enabled: bool) -> None:
@@ -6041,7 +6375,7 @@ class LMCacheEngine:
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Generator[Optional[LayerwiseStoreResult], None, None]:
+    ) -> Generator[Optional[LayerwiseStoreResult], Any, None]:
         """
         Store the KV cache in a layerwise manner.
 
@@ -6054,15 +6388,13 @@ class LMCacheEngine:
         :param **kwargs: The additional arguments for the storage backend which
             will be passed into the gpu_connector.
 
-        return: A generator that yields None for each layer and a
-            LayerwiseStoreResult after the final layer. In the first iteration,
-            the generator allocates the memory objects for all layers and moves
-            the KV cache of the first layer from GPU to CPU. In the next
-            iterations, it moves the KV cache of layer i from GPU to the memory
-            objects (on CPU) and puts the memory objects of layer i-1 to the
-            storage backends. In the last iteration, it puts the memory objects
-            of the last layer to the storage backends and yields the completed
-            store output.
+        return: A generator that yields around each layer and a
+            LayerwiseStoreResult after the final drain. Deferred P-node mode
+            exposes separate pre-HCOM submission and post-HCOM publication
+            suspension points for every layer. Other modes retain one yield per
+            layer. A connector may delay source completion across multiple
+            layers while rotating physical source banks; the drain phase
+            publishes the remaining layers and yields the completed output.
         """
         store_result = LayerwiseStoreResult(
             request_id=str(kwargs.get("req_id", "unspecified")),
@@ -6070,10 +6402,22 @@ class LMCacheEngine:
         )
         kv_group = store_result.kv_group
         num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
+        deferred_layerwise_put = bool(
+            kwargs.get("deferred_layerwise_put", False)
+        )
 
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
+            if deferred_layerwise_put:
+                yield
+                for _ in range(num_layers):
+                    yield
+                    yield
+            else:
+                for _ in range(num_layers):
+                    yield
+            yield store_result
             return
 
         # Passive rank guard: when save_only_first_rank is enabled, only rank 0
@@ -6084,8 +6428,14 @@ class LMCacheEngine:
             logger.debug(
                 "Passive rank (save_only_first_rank), skipping store_layer"
             )
-            for layer_id in range(num_layers):
+            if deferred_layerwise_put:
                 yield
+                for _ in range(num_layers):
+                    yield
+                    yield
+            else:
+                for _ in range(num_layers):
+                    yield
             # Extra yield consumed by wait_for_save() after the last layer.
             yield store_result
             return
@@ -6121,8 +6471,14 @@ class LMCacheEngine:
                 num_to_store_tokens,
             )
             # Still need to yield to avoid StopIteration
-            for layer_id in range(num_layers):
+            if deferred_layerwise_put:
                 yield
+                for _ in range(num_layers):
+                    yield
+                    yield
+            else:
+                for _ in range(num_layers):
+                    yield
             yield store_result
             return
 
@@ -6140,6 +6496,15 @@ class LMCacheEngine:
         prev_key = 0
         kv_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
         store_fmt = self._memory_format_for_kv_group(kv_group)
+        prefill_plan_started = (
+            time.perf_counter()
+            if deferred_layerwise_put and prefill_start_timing_enabled()
+            else 0.0
+        )
+        lookup_ms = 0.0
+        allocation_ms = 0.0
+        scanned_chunks = 0
+        existing_chunks = 0
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs,
             kv_group=kv_group,
@@ -6147,14 +6512,20 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
             requested_end = end
 
+            lookup_started = time.perf_counter() if prefill_plan_started else 0.0
             keys_multi_layer = key.split_layers(num_layers)
-            if self._layerwise_chunk_fully_stored(
+            fully_stored = self._layerwise_chunk_fully_stored(
                 keys_multi_layer,
                 req_id=req_id,
                 kv_group=kv_group,
                 start=start,
                 end=end,
-            ):
+            )
+            if lookup_started:
+                lookup_ms += (time.perf_counter() - lookup_started) * 1000
+                scanned_chunks += 1
+                existing_chunks += int(fully_stored)
+            if fully_stored:
                 continue
 
             # Allocate the memory object
@@ -6173,6 +6544,7 @@ class LMCacheEngine:
                     ) from exc
                 kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
 
+            allocation_started = time.perf_counter() if prefill_plan_started else 0.0
             memory_objs_multi_layer = self.storage_manager.batched_allocate(
                 kv_shape_single_layer,
                 kv_dtype,
@@ -6180,6 +6552,8 @@ class LMCacheEngine:
                 fmt=store_fmt,
                 busy_loop=self.config.get_extra_config_value("force_store_wait", False),
             )
+            if allocation_started:
+                allocation_ms += (time.perf_counter() - allocation_started) * 1000
 
             if memory_objs_multi_layer is None:
                 logger.warning(
@@ -6220,6 +6594,15 @@ class LMCacheEngine:
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
 
+        if prefill_plan_started:
+            prefill_start_timing_log(
+                logger, "store_chunk_scan", prefill_plan_started,
+                req_id=req_id, kv_group=kv_group, tokens=len(tokens),
+                scanned_chunks=scanned_chunks, existing_chunks=existing_chunks,
+                new_chunks=len(starts), lookup_ms=round(lookup_ms, 3),
+                allocation_ms=round(allocation_ms, 3),
+            )
+
         if keys:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
@@ -6233,6 +6616,7 @@ class LMCacheEngine:
                 for layer_objs in memory_objs
                 for mem_obj in layer_objs
             }
+            pending_persist_futures: list[Any] = []
             mem_obj_generator = None
 
             # Calculate total KV size for logging
@@ -6251,16 +6635,80 @@ class LMCacheEngine:
 
                 next(mem_obj_generator)
 
-                for layer_id in range(num_layers):
-                    yield
-                    next(mem_obj_generator)
-                    self.storage_manager.batched_put(
+                def persist_layer(layer_id: int) -> None:
+                    put_futures = self.storage_manager.batched_put(
                         keys[layer_id],
                         memory_objs[layer_id],
                         location=self.store_location,
                     )
                     for mem_obj in memory_objs[layer_id]:
                         pending_store_release.pop(id(mem_obj), None)
+                    if not deferred_layerwise_put or not put_futures:
+                        return
+                    pending_persist_futures.extend(put_futures)
+
+                if deferred_layerwise_put:
+                    persisted_layers: set[int] = set()
+                    layer_request = yield
+                    for layer_id in range(num_layers):
+                        source_done_layer = mem_obj_generator.send(layer_request)
+                        # Return from the pre-HCOM save hook as soon as the D2H
+                        # has been submitted.  Advancing this suspension point
+                        # is the explicit post-HCOM finish operation below.
+                        yield
+                        if source_done_layer is not None:
+                            if not isinstance(source_done_layer, int):
+                                raise TypeError(
+                                    "Deferred layerwise GPU connector must yield "
+                                    "a completed layer index or None"
+                                )
+                            if source_done_layer in persisted_layers:
+                                raise RuntimeError(
+                                    "Layerwise source completion was reported twice: "
+                                    f"layer={source_done_layer}"
+                                )
+                            persist_layer(source_done_layer)
+                            persisted_layers.add(source_done_layer)
+                        if layer_id + 1 < num_layers:
+                            layer_request = yield
+                        else:
+                            # The last post-HCOM finish stops here.  The final
+                            # D2H and persistence waits stay in wait_for_save().
+                            yield
+                    while len(persisted_layers) < num_layers:
+                        try:
+                            source_done_layer = next(mem_obj_generator)
+                        except StopIteration as exc:
+                            raise RuntimeError(
+                                "Layerwise GPU connector ended before all "
+                                "source buffers completed"
+                            ) from exc
+                        if source_done_layer is None:
+                            continue
+                        if not isinstance(source_done_layer, int):
+                            raise TypeError(
+                                "Deferred layerwise GPU connector must yield "
+                                "a completed layer index or None"
+                            )
+                        if source_done_layer in persisted_layers:
+                            raise RuntimeError(
+                                "Layerwise source completion was reported twice: "
+                                f"layer={source_done_layer}"
+                            )
+                        persist_layer(source_done_layer)
+                        persisted_layers.add(source_done_layer)
+                    try:
+                        next(mem_obj_generator)
+                    except StopIteration:
+                        pass
+                    for future in pending_persist_futures:
+                        future.result()
+                    pending_persist_futures.clear()
+                else:
+                    for layer_id in range(num_layers):
+                        yield
+                        next(mem_obj_generator)
+                        persist_layer(layer_id)
 
                 if store_perf_enabled:
                     tot_time = time.perf_counter() - t_start
@@ -6290,8 +6738,14 @@ class LMCacheEngine:
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
-            for layer_id in range(num_layers):
+            if deferred_layerwise_put:
                 yield
+                for _ in range(num_layers):
+                    yield
+                    yield
+            else:
+                for _ in range(num_layers):
+                    yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
         if store_complete:
@@ -6456,7 +6910,7 @@ class LMCacheEngine:
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Generator[Optional[torch.Tensor], None, None]:
+    ) -> Generator[Optional[torch.Tensor], Any, None]:
         """
         Retrieve the KV cache in a layerwise manner.
 
@@ -6487,6 +6941,9 @@ class LMCacheEngine:
 
         kv_group = kwargs.get("kv_group", 0)
         num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
+        deferred_layerwise_get = bool(
+            kwargs.get("deferred_layerwise_get", False)
+        )
         shared_layerwise_retrieve = self._should_use_shared_layerwise_retrieve(
             kv_group
         )
@@ -6511,6 +6968,7 @@ class LMCacheEngine:
         ends = []
         keys = []
         segments: List[LayerwiseRetrieveSegment] = []
+        deferred_cleanup_gate_used = False
         segment_location: Optional[str] = None
         segment_starts: List[int] = []
         segment_ends: List[int] = []
@@ -6549,9 +7007,25 @@ class LMCacheEngine:
                     kv_group=kv_group,
                     kwargs=kwargs,
                 )
-                for result in passive_retriever:
-                    yielded_steps += 1
-                    yield result
+                try:
+                    result = next(passive_retriever)
+                    while True:
+                        yielded_steps += 1
+                        try:
+                            layer_request = yield result
+                        except GeneratorExit:
+                            raise
+                        except BaseException as error:
+                            result = passive_retriever.throw(error)
+                        else:
+                            # P-node sends the next layer's bank mapping.
+                            # A for/yield wrapper silently discards it.
+                            result = passive_retriever.send(layer_request)
+                except StopIteration:
+                    pass
+                finally:
+                    # Keep inner source/bank cleanup deterministic on abort.
+                    passive_retriever.close()
             except _RemoteFillMaterializationError as exc:
                 if (
                     yielded_steps >= num_layers + 2
@@ -6860,9 +7334,24 @@ class LMCacheEngine:
                     planned_page_chunks=planned_page_chunks,
                     remote_fill_plan=remote_fill_plan,
                 )
-                for result in rank0_retriever:
-                    yielded_steps += 1
-                    yield result
+                try:
+                    result = next(rank0_retriever)
+                    while True:
+                        yielded_steps += 1
+                        try:
+                            layer_request = yield result
+                        except GeneratorExit:
+                            raise
+                        except BaseException as error:
+                            result = rank0_retriever.throw(error)
+                        else:
+                            # Match the passive-rank protocol, including
+                            # per-layer slot_mapping overrides and yield count.
+                            result = rank0_retriever.send(layer_request)
+                except StopIteration:
+                    pass
+                finally:
+                    rank0_retriever.close()
             except _RemoteFillMaterializationError as exc:
                 if (
                     remote_fill_plan is None
@@ -6949,135 +7438,187 @@ class LMCacheEngine:
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
-            mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
-            next(mem_obj_consumer)
-
-            to_count_down = []
+            mem_obj_consumer = None
+            sources_safe_to_release = not deferred_layerwise_get
+            consumer_failed = False
+            pending_gets: list[tuple[str, Any]] = []
+            to_count_down: list[MemoryObj] = []
             retrieved_by_location: dict[str, list[MemoryObj]] = defaultdict(list)
 
-            def release_completed_layers_after_failure(
-                failed_results: list[list[MemoryObj]],
-                failed_segments: list[tuple],
-            ) -> None:
-                for segment, mem_objs in zip(
-                    failed_segments, failed_results, strict=True
-                ):
-                    retrieved_by_location[segment[0]].extend(mem_objs)
-                if to_count_down:
-                    synchronize = getattr(
-                        self.gpu_connector,
-                        "synchronize_dense_load_stream",
-                        None,
-                    )
-                    if callable(synchronize):
-                        synchronize()
+            def release_memory_objs() -> None:
+                while to_count_down:
+                    to_count_down.pop().ref_count_down()
+
+            def unpin_retrieved_objs() -> None:
+                # Preserve the storage-segment order used by the normal path.
+                # Besides keeping cleanup deterministic, some backends expect
+                # their unpin notifications in retrieval order.
+                for location, mem_objs in list(retrieved_by_location.items()):
+                    self._maybe_unpin_retrieved_objs(mem_objs, location)
+                retrieved_by_location.clear()
+
+            try:
+                mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                    starts, ends, **kwargs
+                )
+                next(mem_obj_consumer)
+
+                for layer_id in range(num_layers):
+                    layer_gets = []
+                    for segment, get_generator in zip(
+                        segments, get_generators, strict=True
+                    ):
+                        task = next(get_generator)
+                        assert task is not None
+                        pending_get = (segment[0], task)
+                        pending_gets.append(pending_get)
+                        layer_gets.append((segment, task, pending_get))
+
+                    if layer_id == 0:
+                        # NOTE(Yuwei): For sglang integration we need to provide
+                        # retrieved tokens number in the first layer loading since
+                        # there is no lookup.
+                        layer_request = yield torch.sum(ret_mask)
                     else:
-                        load_stream = getattr(
-                            self.gpu_connector, "load_stream", None
-                        )
-                        stream_synchronize = getattr(
-                            load_stream, "synchronize", None
-                        )
-                        if callable(stream_synchronize):
-                            stream_synchronize()
-                    for mem_obj in to_count_down:
-                        mem_obj.ref_count_down()
-                    to_count_down.clear()
-                for mem_objs in failed_results:
-                    for mem_obj in mem_objs:
-                        mem_obj.ref_count_down()
-                try:
-                    mem_obj_consumer.close()
-                finally:
-                    for location, mem_objs in retrieved_by_location.items():
-                        self._maybe_unpin_retrieved_objs(mem_objs, location)
+                        layer_request = yield None
 
-            for layer_id in range(num_layers):
-                tasks = [next(get_generator) for get_generator in get_generators]
-                for task in tasks:
-                    assert task is not None
+                    mem_objs_layer = []
+                    incomplete_segments = []
+                    for segment, task, pending_get in layer_gets:
+                        segment_mem_objs = task.result()
+                        # Register ownership before removing the future from the
+                        # abort list. If generator.close() lands after result(),
+                        # the objects are therefore released by exactly one path.
+                        to_count_down.extend(segment_mem_objs)
+                        retrieved_by_location[segment[0]].extend(segment_mem_objs)
+                        pending_gets.remove(pending_get)
+                        mem_objs_layer.extend(segment_mem_objs)
+                        if len(segment_mem_objs) != len(segment[1]):
+                            incomplete_segments.append({
+                                "location": segment[0],
+                                "expected_chunks": len(segment[1]),
+                                "retrieved_chunks": len(segment_mem_objs),
+                            })
+                    if incomplete_segments:
+                        raise RuntimeError(
+                            "Layerwise retrieve returned an incomplete layer; "
+                            "refusing to keep the prefix success mask because "
+                            "missing NPU rows would remain stale: "
+                            f"req_id={req_id}, kv_group={kv_group}, "
+                            f"layer_id={layer_id}, segments={incomplete_segments}"
+                        )
+                    try:
+                        if layer_request is None:
+                            mem_obj_consumer.send(mem_objs_layer)
+                        else:
+                            mem_obj_consumer.send(
+                                {
+                                    "memory_objs": mem_objs_layer,
+                                    "layer_request": layer_request,
+                                }
+                            )
+                    except BaseException:
+                        consumer_failed = deferred_layerwise_get
+                        raise
 
-                if layer_id == 0:
-                    # NOTE(Yuwei): For sglang integration we need to provide retrieved
-                    # tokens number in the first layer loading since there is no lookup
-                    yield torch.sum(ret_mask)
-                else:
+                if deferred_layerwise_get:
+                    # The final H2D was only enqueued above. Keep its host
+                    # MemoryObj references alive and return to the N-1
+                    # post-attention callback immediately. The last-layer
+                    # entry fence resumes us here after the load has completed.
+                    deferred_cleanup_gate_used = True
                     yield None
 
-                segment_results: list[list[MemoryObj]] = []
+                if deferred_layerwise_get:
+                    # The last-layer entry bank fence has now been submitted,
+                    # but an event wait alone is device-side. Let the GPU
+                    # consumer host-synchronize the load stream before the
+                    # pinned H2D sources can reach refcount zero.
+                    try:
+                        next(mem_obj_consumer)
+                    except BaseException:
+                        consumer_failed = True
+                        raise
+                    sources_safe_to_release = True
+                    release_memory_objs()
+                else:
+                    release_memory_objs()
+                    next(mem_obj_consumer)
+                mem_obj_consumer.close()
+                mem_obj_consumer = None
+
+                # Unpin disk-loaded staging objects only after H2D is complete.
+                unpin_retrieved_objs()
+            finally:
                 try:
-                    for task in tasks:
-                        segment_results.append(task.result())
-                except BaseException:
-                    # Every task for this layer was already submitted. Drain
-                    # the remainder so successful peer segments do not leak
-                    # their temporary MemoryObj references when one backend
-                    # future fails.
-                    completed_segments = segments[: len(segment_results)]
-                    for pending_index, pending_task in enumerate(
-                        tasks[len(segment_results) :],
-                        start=len(segment_results),
-                    ):
+                    if mem_obj_consumer is not None:
+                        if not deferred_layerwise_get and to_count_down:
+                            # Preserve the existing abort fence for ordinary
+                            # dense loads, including failures of later gets.
+                            sources_safe_to_release = False
+                            synchronize = getattr(
+                                self.gpu_connector,
+                                "synchronize_dense_load_stream",
+                                None,
+                            )
+                            if not callable(synchronize):
+                                synchronize = getattr(
+                                    getattr(self.gpu_connector, "load_stream", None),
+                                    "synchronize", None,
+                                )
+                            if callable(synchronize):
+                                synchronize()
+                        mem_obj_consumer.close()
+                        # Deferred connectors contractually synchronize/cancel
+                        # their load stream on close. This is the abort path.
+                        if not consumer_failed:
+                            sources_safe_to_release = True
+                finally:
+                    for get_generator in get_generators:
                         try:
-                            pending_objs = pending_task.result()
-                        except BaseException:
+                            get_generator.close()
+                        except (GeneratorExit, RuntimeError, ValueError):
+                            pass
+                    # A close can arrive while this layer's asynchronous get is
+                    # still pending. Resolve it here so every returned MemoryObj
+                    # reference has an owner that can release it.
+                    while pending_gets:
+                        location, task = pending_gets.pop()
+                        try:
+                            pending_mem_objs = task.result()
+                        except Exception:
+                            logger.warning(
+                                "Layerwise retrieve cleanup could not resolve a "
+                                "pending get",
+                                exc_info=True,
+                            )
                             continue
-                        segment_results.append(pending_objs)
-                        completed_segments.append(segments[pending_index])
-                    release_completed_layers_after_failure(
-                        segment_results,
-                        completed_segments,
-                    )
-                    raise
-
-                incomplete_segments = [
-                    {
-                        "location": segment[0],
-                        "expected_chunks": len(segment[1]),
-                        "retrieved_chunks": len(segment_mem_objs),
-                    }
-                    for segment, segment_mem_objs in zip(
-                        segments, segment_results, strict=True
-                    )
-                    if len(segment_mem_objs) != len(segment[1])
-                ]
-                if incomplete_segments:
-                    release_completed_layers_after_failure(
-                        segment_results,
-                        segments,
-                    )
-                    raise RuntimeError(
-                        "Layerwise retrieve returned an incomplete layer; "
-                        "refusing to keep the prefix success mask because "
-                        "missing NPU rows would remain stale: "
-                        f"req_id={req_id}, kv_group={kv_group}, "
-                        f"layer_id={layer_id}, segments={incomplete_segments}"
-                    )
-
-                mem_objs_layer = []
-                for segment, segment_mem_objs in zip(
-                    segments, segment_results, strict=True
-                ):
-                    mem_objs_layer.extend(segment_mem_objs)
-                    retrieved_by_location[segment[0]].extend(segment_mem_objs)
-                mem_obj_consumer.send(mem_objs_layer)
-                to_count_down.extend(mem_objs_layer)
-
-            for mem_obj in to_count_down:
-                mem_obj.ref_count_down()
-
-            next(mem_obj_consumer)
-
-            # Unpin disk-loaded staging objects after device-side sync is enqueued.
-            for location, mem_objs in retrieved_by_location.items():
-                self._maybe_unpin_retrieved_objs(mem_objs, location)
+                        to_count_down.extend(pending_mem_objs)
+                        retrieved_by_location[location].extend(
+                            pending_mem_objs
+                        )
+                    if sources_safe_to_release:
+                        try:
+                            release_memory_objs()
+                        finally:
+                            unpin_retrieved_objs()
+                    else:
+                        # A failed stream sync cannot prove the pinned H2D
+                        # sources are idle. Intentionally retain them rather
+                        # than risking a use-after-free on the device.
+                        self._retain_unsafe_layerwise_retrieve_objs(
+                            to_count_down,
+                            context="Layerwise retrieve",
+                        )
+                        retrieved_by_location.clear()
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
             for layer_id in range(num_layers):
                 yield None
 
-        yield None
+        if not deferred_cleanup_gate_used:
+            yield None
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
