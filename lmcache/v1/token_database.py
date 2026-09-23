@@ -110,7 +110,10 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         if (
             config is not None
             and metadata is not None
-            and mooncake_page_layout_enabled(config)
+            and (
+                mooncake_page_layout_enabled(config)
+                or getattr(metadata, "indexer_c8_layout", None) is not None
+            )
         ):
             signature, descriptor = mooncake_payload_layout(config, metadata)
             self.mooncake_payload_layout = signature

@@ -78,6 +78,7 @@ from lmcache.v1.gpu_connector.sparse import (
     PreparedSparseSource,
     build_prepared_sparse_source,
 )
+from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.kv_layer_groups import validate_two_group_layer_counts
 from lmcache.v1.manager import LMCacheManager
 
@@ -489,6 +490,7 @@ def _dsa_debug_minmax_count(value: Any) -> Any:
         return (min(seq), max(seq), len(seq))
     except Exception as exc:
         return f"{type(value).__name__}:minmax_failed:{exc}"
+
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
@@ -1841,6 +1843,7 @@ class PreemptionConnectorMetadata(LMCacheConnectorMetadata):
 
 class LMCacheConnectorV1Impl:
     supports_preemption_checkpoint = False
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -1882,11 +1885,18 @@ class LMCacheConnectorV1Impl:
         self._checkpoint_snapshots: list[tuple] = []
         self._checkpoint_cancels: list[tuple[str, int]] = []
 
+        indexer_c8_layout = None
+        if runtime_group_layer_counts is not None:
+            indexer_spec = kv_cache_config.kv_cache_groups[1].kv_cache_spec
+            if getattr(indexer_spec, "cache_sparse_c8", False):
+                indexer_c8_layout = IndexerC8Layout(indexer_spec.sparse_head_dim[-1])
+
         service_factory = VllmServiceFactory(
             config,
             vllm_config,
             role.name.lower(),
             runtime_kv_group_layer_counts=runtime_group_layer_counts,
+            indexer_c8_layout=indexer_c8_layout,
             runtime_kv_group_layer_names=(
                 tuple(
                     tuple(group.layer_names)

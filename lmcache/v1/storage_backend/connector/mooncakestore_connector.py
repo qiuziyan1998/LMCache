@@ -556,7 +556,11 @@ class MooncakestoreConnector(RemoteConnector):
                 self.single_token_size,
             )
 
-        dtype = self.meta_dtypes[0]
+        dtype = (
+            self.meta_dtypes[key.kv_group]
+            if key.kv_group < len(self.meta_dtypes)
+            else self.meta_dtypes[0]
+        )
         element_size = torch.empty((), dtype=dtype).element_size()
         chunk_size = self._lmcache_chunk_size()
         fmt = (

@@ -8,6 +8,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 
 logger = init_logger(__name__)
@@ -69,6 +70,7 @@ class LMCacheMetadata:
     """Immutable per-group layer counts resolved by the serving engine."""
     runtime_kv_group_layer_counts: Optional[tuple[int, ...]] = None
     runtime_kv_group_layer_names: Optional[tuple[tuple[str, ...], ...]] = None
+    indexer_c8_layout: Optional[IndexerC8Layout] = None
 
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""
@@ -76,6 +78,9 @@ class LMCacheMetadata:
 
     # TODO(chunxiaozheng): some uts do not `build_kv_layer_groups`
     def get_dtypes(self) -> list[torch.dtype]:
+        if self.indexer_c8_layout is not None:
+            groups = self.kv_layer_groups_manager.kv_layer_groups
+            return [groups[0].dtype if groups else self.kv_dtype, torch.uint8]
         if self.kv_layer_groups_manager.kv_layer_groups:
             return [
                 group.dtype for group in self.kv_layer_groups_manager.kv_layer_groups
@@ -86,6 +91,22 @@ class LMCacheMetadata:
         """Get the shapes of the KV cache in LMCache"""
         if num_tokens is None:
             num_tokens = self.chunk_size
+        if self.indexer_c8_layout is not None:
+            counts = self.runtime_kv_group_layer_counts
+            if counts is None or len(counts) != 2:
+                raise ValueError("Indexer C8 requires two resolved physical KV groups")
+            groups = self.kv_layer_groups_manager.kv_layer_groups
+            latent_width = (
+                groups[0].hidden_dim_size
+                if groups
+                else self.kv_shape[3] * self.kv_shape[4]
+            )
+            return [
+                torch.Size([1, counts[0], num_tokens, latent_width]),
+                torch.Size(
+                    [1, counts[1], num_tokens, self.indexer_c8_layout.token_bytes]
+                ),
+            ]
         if self.kv_layer_groups_manager.kv_layer_groups:
             shapes = []
             kv_size = 1 if self.use_mla else 2
@@ -114,6 +135,8 @@ class LMCacheMetadata:
             ]
 
     def get_num_groups(self) -> int:
+        if self.indexer_c8_layout is not None:
+            return 2
         if self.kv_layer_groups_manager.kv_layer_groups:
             return self.kv_layer_groups_manager.num_groups
         return 1
