@@ -4372,10 +4372,7 @@ class LMCacheConnectorV1Impl:
             getattr(self, "_dsa_kv_policy_threshold", 0) or 0
         )
         release_gate = max(self._dsa_scratch_capacity, policy_threshold)
-        sparse_active = bool(
-            tracker.dsa_nonresident_frontier > 0
-            or len(tracker.token_ids) > policy_threshold
-        )
+        sparse_active = self._dsa_kv_policy_is_sparse_managed(tracker)
         if not sparse_active or committed_end <= release_gate:
             return 0
         return int(committed_end)
@@ -11021,7 +11018,7 @@ class LMCacheConnectorV1Impl:
     def _log_dsa_kv_policy(
         self,
         req_id: str,
-        is_sparse_decode: bool,
+        sparse_managed: bool,
         prompt_len: int,
         num_computed_tokens: int,
     ) -> None:
@@ -11032,7 +11029,7 @@ class LMCacheConnectorV1Impl:
         management. Both policies continue to use sparse attention. Controlled
         by ``LMCACHE_DSA_KV_POLICY_LOG=1``.
         """
-        policy = "sparse_managed" if is_sparse_decode else "full_resident"
+        policy = "sparse_managed" if sparse_managed else "full_resident"
         prev = self._dsa_kv_policy_states.get(req_id)
         if prev == policy:
             return
@@ -11046,6 +11043,46 @@ class LMCacheConnectorV1Impl:
             prompt_len,
             num_computed_tokens,
             getattr(self, "_dsa_kv_policy_threshold", 0),
+        )
+
+    def _dsa_kv_policy_is_sparse_managed(
+        self,
+        tracker: RequestTracker,
+    ) -> bool:
+        """Return the KV residency policy for the current context.
+
+        This is intentionally independent from ``is_sparse_decode``. The
+        latter is the connector metadata contract consumed by the Ascend SFA
+        router, while this predicate controls compact-load and release gates.
+        A full-resident decode therefore has a sparse metadata route with a
+        zero remap frontier.
+        """
+        threshold = int(
+            getattr(self, "_dsa_kv_policy_threshold", 0) or 0
+        )
+        return bool(
+            tracker.dsa_nonresident_frontier > 0
+            or len(tracker.token_ids) > threshold
+        )
+
+    def _dsa_decode_route_enabled(
+        self,
+        request: Any,
+        tracker: RequestTracker,
+    ) -> bool:
+        """Return whether a request is in the post-prefill DSA decode phase.
+
+        Every DSA decode step uses the sparse metadata/staged-SFA contract.
+        The remap frontier remains zero while the full latent prefix is
+        resident, so this does not opt the request into LMCache loading or
+        latent block release by itself.
+        """
+        return bool(
+            self.enable_sparse_attention
+            and (
+                request.num_computed_tokens >= tracker.prompt_len
+                or tracker.dsa_nonresident_frontier > 0
+            )
         )
 
     def _build_request_meta(
@@ -11591,26 +11628,21 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
             self._add_decode_window_save_metas(meta, request_tracker)
-            # KV policy (方案 A) follows the CURRENT context length, not the
-            # initial prompt_len. A short prompt that grows past the threshold
-            # switches from full-resident to sparse-managed loading/release;
-            # attention remains sparse under both policies.
-            is_sparse_decode = (
-                self.enable_sparse_attention
-                and (
-                    (
-                        request.num_computed_tokens
-                        >= request_tracker.prompt_len
-                        and len(request_tracker.token_ids)
-                        > getattr(self, "_dsa_kv_policy_threshold", 0)
-                    )
-                    or request_tracker.dsa_nonresident_frontier > 0
-                )
+            # Keep the KV residency policy separate from the SFA metadata
+            # route. ``is_sparse_decode`` is consumed by vLLM-Ascend's staged
+            # SFA admission and must remain true for every post-prefill DSA
+            # step, including a full-resident step whose remap frontier is 0.
+            # The threshold still controls the storage policy below (compact
+            # loading and block release), but must not silently switch the
+            # attention implementation between staged and native paths.
+            is_sparse_decode = self._dsa_decode_route_enabled(
+                request,
+                request_tracker,
             )
             if self._dsa_kv_policy_log:
                 self._log_dsa_kv_policy(
                     req_id,
-                    is_sparse_decode,
+                    self._dsa_kv_policy_is_sparse_managed(request_tracker),
                     request_tracker.prompt_len,
                     request.num_computed_tokens,
                 )

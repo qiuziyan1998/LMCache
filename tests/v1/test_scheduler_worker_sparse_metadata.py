@@ -2494,21 +2494,17 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.is_sparse_decode
         assert req_meta.load_spec is not None
 
-    def test_short_prompt_within_kv_policy_threshold_is_full_resident(
+    def test_short_prompt_within_threshold_keeps_full_resident_policy_but_sparse_route(
         self,
     ) -> None:
-        """方案 A: requests within the KV-policy threshold use the
-        full-resident policy (is_sparse_decode=False).
+        """A resident DSA decode keeps the staged-SFA metadata route.
 
-        Regression: 0806-4. The FIRST compute step (token_ids == prompt_len,
-        is_decode_phase still False, e.g. right after a cold-compact load) must
-        also stay in the connector metadata (is_sparse_decode=False,
-        load_spec=None). Otherwise the step classifies as
-        MISSING_CONNECTOR_METADATA, falls back to the eager path, and the
-        torch_npu fx compiler captures ACL graphs at serving time — which is
-        illegal to overlap with the async cold-compact load thread's
-        synchronized device copies (device error 507057). Keeping every
-        full-resident step staged prevents serving-time graph capture."""
+        The threshold still keeps the request full-resident, so its synthesized
+        sparse load has a zero frontier and cannot release blocks. The sparse
+        metadata is nevertheless required to keep attention on the staged
+        resident path instead of routing the same short decode through native
+        SFA.
+        """
         impl = _make_scheduler_impl()
         impl._dsa_kv_policy_threshold = 2048
         req_id = "short-prompt"
@@ -2519,7 +2515,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         )
 
         impl._unfinished_requests[req_id] = vllm_req
-        impl._request_trackers[req_id] = RequestTracker(
+        tracker = RequestTracker(
             req_id=req_id,
             prompt_len=prompt_len,
             token_ids=list(range(prompt_len)),
@@ -2527,6 +2523,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             num_saved_tokens=prompt_len,
             is_decode_phase=False,
         )
+        impl._request_trackers[req_id] = tracker
         scheduler_output = StubSchedulerOutput(
             finished_req_ids=set(),
             scheduled_new_reqs=[],
@@ -2542,10 +2539,19 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
 
         assert len(meta.requests) == 1
         req_meta = meta.requests[0]
-        assert not req_meta.is_sparse_decode
-        assert req_meta.load_spec is None
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.can_load is False
+        assert req_meta.load_spec.lmcache_cached_tokens == 0
+        assert req_meta.load_spec.dsa_committed_end == 0
         assert req_meta.save_spec is not None
         assert not req_meta.save_spec.can_save
+        assert not impl._dsa_kv_policy_is_sparse_managed(tracker)
+        assert impl._dsa_decode_route_enabled(vllm_req, tracker)
+        assert not impl._dsa_decode_route_enabled(
+            SimpleNamespace(num_computed_tokens=prompt_len - 1),
+            tracker,
+        )
 
     def test_long_prompt_beyond_kv_policy_threshold_is_sparse_managed(
         self,
