@@ -5,6 +5,7 @@ from collections import deque
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
@@ -85,6 +86,7 @@ from lmcache.v1.gpu_connector.sparse import (
 )
 from lmcache.v1.kv_layer_groups import validate_two_group_layer_counts
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.prefill_metadata import PrefillMetadataCache
 
 if TYPE_CHECKING:
     # Third Party
@@ -1293,6 +1295,13 @@ class WorkerRetrieveState:
     shared_validation_signature: Optional[tuple[Any, ...]] = None
     dense_prefix_seed: bool = False
     dense_prefix_generation: Optional[int] = None
+    prefill_metadata_cache: Optional[PrefillMetadataCache] = field(
+        default=None, repr=False
+    )
+    prefill_metadata_scope: Optional[tuple[Any, ...]] = field(default=None, repr=False)
+    prefill_metadata_frontier: int = 0
+    prefill_metadata_step: Optional[Any] = field(default=None, repr=False)
+    shared_source_append_from: dict[int, int] = field(default_factory=dict, repr=False)
     location: Optional[str] = None
     metadata_warm: bool = False
     token_count: int = 0
@@ -1428,6 +1437,8 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # Identity of placeholders already substituted into token_ids by scheduler.
+    prefill_metadata_mm_signature: tuple[Any, ...] = ()
     # Producer-side live P/D handoff requested by the routing connector.
     live_source_requested: bool = False
     live_source_token_ids: list[int] = field(default_factory=list)
@@ -2080,6 +2091,10 @@ class ReqMeta:
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
             decode_token_mask=decode_token_mask,
+            prefill_metadata_mm_signature=(
+                tuple(tracker.mm_hashes or ()),
+                tuple((p.offset, p.length) for p in tracker.mm_positions or ()),
+            ),
             decode_ret_mask=decode_ret_mask,
             live_source_requested=live_source_requested,
             live_source_token_ids=live_source_token_ids,
@@ -5248,6 +5263,11 @@ class LMCacheConnectorV1Impl:
         state.shared_validation_signature = None
         state.dense_prefix_seed = False
         state.dense_prefix_generation = None
+        state.prefill_metadata_cache = None
+        state.prefill_metadata_scope = None
+        state.prefill_metadata_frontier = 0
+        state.prefill_metadata_step = None
+        state.shared_source_append_from.clear()
         state.metadata_token_ids.clear()
         state.slot_mapping = None
         state.indexer_slot_mapping = None
@@ -5548,6 +5568,7 @@ class LMCacheConnectorV1Impl:
             "shared_validation_signature": state.shared_validation_signature,
             "dense_prefix_seed": state.dense_prefix_seed,
             "dense_prefix_generation": state.dense_prefix_generation,
+            "shared_source_append_from": dict(state.shared_source_append_from),
             "prepared_sparse_sources": dict(state.prepared_sparse_sources),
             "dense_load_readiness": state.dense_load_readiness,
             "dense_load_readiness_consumed": (
@@ -6295,6 +6316,7 @@ class LMCacheConnectorV1Impl:
         src_shared_handles: list[list[Any]],
         require_pointer_cache: bool = False,
         pointer_table: Optional[LayerwisePointerTable] = None,
+        append_from: Optional[list[int]] = None,
     ) -> int:
         if not src_starts or not src_ends:
             return 0
@@ -6512,6 +6534,8 @@ class LMCacheConnectorV1Impl:
                 pointer_table.clear()
             if src_chunk_ptrs_npu and not dst_chunk_ptrs_npu:
                 dst_chunk_ptrs_npu.extend(None for _ in range(len(src_chunk_ptrs_npu)))
+        if append_from is not None:
+            append_from.append(cached_prefix_chunks)
         return len(append_indices)
 
     def _merge_store_result_into_worker_state(
@@ -6534,7 +6558,8 @@ class LMCacheConnectorV1Impl:
                 )
             )
         )
-        return self._merge_cache_group_by_ranges(
+        append_from: list[int] = []
+        appended = self._merge_cache_group_by_ranges(
             dst_starts=cache["cached_starts"],
             dst_ends=cache["cached_ends"],
             dst_keys=cache["cached_keys"],
@@ -6555,7 +6580,14 @@ class LMCacheConnectorV1Impl:
             pointer_table=destination.pointer_tables.setdefault(
                 result.kv_group, LayerwisePointerTable()
             ),
+            append_from=append_from,
         )
+        if appended and destination.dense_prefix_generation is not None:
+            previous = destination.shared_source_append_from.get(result.kv_group)
+            destination.shared_source_append_from[result.kv_group] = (
+                append_from[0] if previous is None else min(previous, append_from[0])
+            )
+        return appended
 
     def _warm_request_retrieve_metadata(
         self,
@@ -6630,7 +6662,19 @@ class LMCacheConnectorV1Impl:
         if not groups or not state.req_id:
             return
 
-        engine.retain_shared_cpu_store_seed(state.req_id, groups)
+        if (
+            state.dense_prefix_generation is not None
+            and state.shared_source_append_from
+        ):
+            changed = state.shared_source_append_from
+            engine.retain_shared_cpu_store_seed(
+                state.req_id,
+                {group: layers for group, layers in groups.items() if group in changed},
+                append_from=dict(changed),
+            )
+            changed.clear()
+        else:
+            engine.retain_shared_cpu_store_seed(state.req_id, groups)
 
     def _store_result_has_retrieve_data(
         self,
@@ -9001,6 +9045,17 @@ class LMCacheConnectorV1Impl:
                     )
                     if reuse_dense_prefix:
                         deferred_prefill_kwargs["_reuse_shared_dense_prefix"] = True
+                        if retrieve_state.prefill_metadata_cache is not None:
+                            deferred_prefill_kwargs["_prefill_metadata_cache"] = (
+                                retrieve_state.prefill_metadata_cache
+                            )
+                            deferred_prefill_kwargs["_prefill_skip_tokens"] = (
+                                self._prefill_retrieve_skip_tokens(
+                                    request,
+                                    len(retrieve_tokens),
+                                    self._lmcache_chunk_size,
+                                )
+                            )
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         retrieve_tokens,
                         token_mask,
@@ -10275,6 +10330,18 @@ class LMCacheConnectorV1Impl:
             )
         if self._is_dsa_two_groups() and kv_group == 1:
             store_kwargs["kv_group"] = 1
+        if self._prefill_metadata_cache_enabled(request, deferred=True):
+            state = self._worker_retrieve_state.get(request.req_id)
+            if state is not None and self._prefill_metadata_scope_changed(request, state):
+                self._release_shared_worker_retrieve_state(state, self.lmcache_engine)
+                state = None
+            if state is None:
+                state = WorkerRetrieveState(req_id=request.req_id)
+                self._set_worker_retrieve_state(request.req_id, state)
+            store_kwargs["_prefill_metadata_cache"] = (
+                self._prefill_metadata_cache_for_request(request, state)
+            )
+            store_kwargs["_reuse_shared_dense_prefix"] = True
         return store_kwargs
 
     def _prepare_layerwise_store_inputs(
@@ -10349,6 +10416,8 @@ class LMCacheConnectorV1Impl:
         store_mask = torch.ones(len(token_ids), dtype=torch.bool)
         store_mask[:skip_leading_tokens] = False
         store_kwargs = self._layerwise_store_kwargs(request, kv_group)
+        if "_prefill_metadata_cache" in store_kwargs:
+            store_kwargs["_prefill_skip_tokens"] = skip_leading_tokens
         if windowed_sparse_save:
             store_kwargs["slot_mapping_base"] = skip_leading_tokens
             store_kwargs["windowed_sparse_save"] = True
@@ -13516,6 +13585,7 @@ class LMCacheConnectorV1Impl:
             and state.dense_prefix_generation == generation
             and not request.resumed_from_preemption
             and state.token_count <= token_count
+            and not self._prefill_metadata_scope_changed(request, state)
         )
         rank = int(
             getattr(getattr(self.lmcache_engine, "metadata", None), "worker_id", -1)
@@ -13536,6 +13606,8 @@ class LMCacheConnectorV1Impl:
                 reason = "new"
             elif state.dense_prefix_generation != generation:
                 reason = "gen"
+            elif self._prefill_metadata_scope_changed(request, state):
+                reason = "scope"
             else:
                 reason = "shrink"
         if retain_dense_seed and not preserve and (
@@ -13552,6 +13624,13 @@ class LMCacheConnectorV1Impl:
             # It preserves unchanged objects and replaces a growing partial
             # tail before appending new chunks; DMA bank bindings stay separate.
             state.dense_prefix_generation = generation
+        if reuse_prefix and self._prefill_metadata_cache_enabled(request, deferred=True):
+            self._prefill_metadata_cache_for_request(request, state)
+        else:
+            state.prefill_metadata_cache = None
+            state.prefill_metadata_scope = None
+            state.prefill_metadata_step = None
+            state.prefill_metadata_frontier = 0
         if debug_reuse:
             keep_mapping = bool(
                 getattr(self, "_layerwise_prefill_p_node", False)
@@ -13571,6 +13650,93 @@ class LMCacheConnectorV1Impl:
                 e=reuse_prefix,
             )
         return state, reuse_prefix
+
+    def _prefill_metadata_cache_enabled(
+        self, request: ReqMeta, *, deferred: bool,
+    ) -> bool:
+        """Limit append-only metadata to shared P raw-DMA deferred transfers."""
+        engine = self.lmcache_engine
+        supports = getattr(engine, "supports_dense_sparse_cache_retention", None)
+        return bool(
+            deferred
+            and getattr(self, "_layerwise_prefill_p_node", False)
+            and getattr(self, "_layerwise_prefill_dma", False)
+            and not getattr(self, "enable_blending", False)
+            and self.kv_role != "kv_consumer"
+            and request.block_allocation_mode == "prefill_child"
+            and not request.is_sparse_decode
+            and getattr(engine, "enable_shared_cpu_cache", False)
+            and callable(supports)
+            and supports()
+            and callable(getattr(
+                getattr(engine, "token_database", None),
+                "process_tokens_from_prefix", None,
+            ))
+        )
+
+    @staticmethod
+    def _prefill_retrieve_skip_tokens(
+        request: ReqMeta, token_count: int, chunk_size: int,
+    ) -> int:
+        """Mirror the dense prefix mask without reducing a full token tensor."""
+        if request.load_spec is None:
+            return 0
+        prefix = min(request.load_spec.vllm_cached_tokens, token_count)
+        return prefix // chunk_size * chunk_size
+
+    def _prefill_metadata_cache_for_request(
+        self, request: ReqMeta, state: WorkerRetrieveState,
+    ) -> PrefillMetadataCache:
+        """Trust scheduler append semantics only within a validated request scope."""
+        generation = int(
+            getattr(self.lmcache_engine, "shared_cpu_cache_generation", 0) or 0
+        )
+        scope = (
+            request.req_id, generation,
+            getattr(request, "prefill_metadata_mm_signature", ()),
+            request.request_configs or {},
+        )
+        frontier = len(request.token_ids)
+        if (
+            state.prefill_metadata_cache is None
+            or state.prefill_metadata_scope != scope
+            or frontier < state.prefill_metadata_frontier
+            or (
+                request.resumed_from_preemption
+                and state.prefill_metadata_step is not request
+            )
+        ):
+            state.prefill_metadata_cache = PrefillMetadataCache()
+            state.prefill_metadata_scope = deepcopy(scope)
+        state.prefill_metadata_frontier = frontier
+        state.prefill_metadata_step = request
+        # The first chunk may only store. Its state is already a valid P seed
+        # when the second chunk first loads; do not discard its CPU plan then.
+        state.dense_prefix_generation = generation
+        return state.prefill_metadata_cache
+
+    def _prefill_metadata_scope_changed(
+        self, request: ReqMeta, state: WorkerRetrieveState,
+    ) -> bool:
+        """Invalidate source reuse together with its request-owned token plan."""
+        if state.prefill_metadata_cache is None:
+            return False
+        generation = int(
+            getattr(self.lmcache_engine, "shared_cpu_cache_generation", 0) or 0
+        )
+        scope = (
+            request.req_id, generation,
+            getattr(request, "prefill_metadata_mm_signature", ()),
+            request.request_configs or {},
+        )
+        return bool(
+            state.prefill_metadata_scope != scope
+            or len(request.token_ids) < state.prefill_metadata_frontier
+            or (
+                request.resumed_from_preemption
+                and state.prefill_metadata_step is not request
+            )
+        )
 
     def _dense_retrieve_slot_mapping(self, slot_mapping: torch.Tensor) -> torch.Tensor:
         """Avoid uploading token maps when raw P DMA uses bank block IDs."""

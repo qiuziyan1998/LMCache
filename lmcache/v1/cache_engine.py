@@ -86,6 +86,9 @@ from lmcache.v1.mooncake_layout import (
     mooncake_valid_tokens,
 )
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.prefill_locations import PrefillLocationPlan
+from lmcache.v1.prefill_metadata import PrefillSequenceView
+from lmcache.v1.prefill_sources import SharedPrefillSources, same_chunk_key
 from lmcache.v1.remote_fill.security import content_digest
 from lmcache.v1.remote_fill_diagnostics import log_remote_fill_diagnostic
 from lmcache.v1.kv_layer_groups import (
@@ -136,6 +139,25 @@ LayerwiseRetrieveSegment = Tuple[
 ]
 _SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
 _PREFILL_REUSE_DEBUG_KEY = "_prefill_reuse_debug_stats"
+
+
+def _log_prefill_reuse_preparation(
+    rank: int, req_id: str, prefix_tokens: int, kv_group: int,
+    stats: dict[str, Any], prepare_ms: float,
+) -> None:
+    """Report disjoint planning/preparation spans for either shared rank role."""
+    prefill_reuse_debug_log(
+        rank, "plan", req_id=req_id, p=prefix_tokens, g=kv_group,
+        h=stats["hash_source"], k=stats["keys_new"],
+        ms=stats["plan_ms"],
+    )
+    prefill_reuse_debug_log(
+        rank, "src", req_id=req_id, p=prefix_tokens, g=kv_group,
+        v=f"{stats['page_reuse']}/{stats['page_new']}",
+        t=f"{stats['tail_reuse']}/{stats['tail_new']}",
+        x=f"{stats['ptr_keep']}/{stats['ptr_add']}",
+        c=stats["compact"], w=stats["wait_ms"], ms=prepare_ms,
+    )
 
 
 @dataclass
@@ -1640,6 +1662,8 @@ class LMCacheEngine:
         keys_layer_major: list[list[CacheEngineKey]],
         *,
         kv_group: int = 0,
+        previous: Optional[SharedHandleBatch] = None,
+        reuse_chunks: int = 0,
     ) -> Optional[SharedHandleBatch]:
         """Compact a homogeneous all-layer page-first result."""
         started = serving_perf_now() if serving_perf_enabled() else None
@@ -1658,8 +1682,10 @@ class LMCacheEngine:
             or any(len(layer) != chunks for layer in keys_layer_major)
         ):
             return None
-        page_chunks = 0
-        for chunk in range(chunks):
+        reuse_chunks = min(reuse_chunks, chunks) if previous is not None else 0
+        page_chunks = min(reuse_chunks, len(previous.page_offsets)) if previous else 0
+        for chunk in range(reuse_chunks if page_chunks == reuse_chunks else chunks,
+                           chunks):
             page = memory_objs[0][chunk]
             if not isinstance(page, LayerPageMemoryObj):
                 break
@@ -1668,42 +1694,62 @@ class LMCacheEngine:
             ):
                 return None
             page_chunks += 1
-        tail = [obj for layer in memory_objs for obj in layer[page_chunks:]]
+        tail_start = max(page_chunks, reuse_chunks)
+        tail = [obj for layer in memory_objs for obj in layer[tail_start:]]
         if any(type(obj) is not TensorMemoryObj for obj in tail):
             return None
-        physical_sizes = [
+        physical_sizes = (
+            previous.physical_sizes[:reuse_chunks] if previous else []
+        ) + [
             (
                 memory_objs[0][chunk].layer_size
                 if chunk < page_chunks
                 else int(memory_objs[0][chunk].meta.phy_size)
             )
-            for chunk in range(chunks)
+            for chunk in range(reuse_chunks, chunks)
         ]
         if any(
             int(obj.meta.phy_size) != physical_sizes[chunk]
             or obj.get_size() > physical_sizes[chunk]
             for layer in memory_objs
-            for chunk, obj in enumerate(layer[page_chunks:], page_chunks)
+            for chunk, obj in enumerate(layer[tail_start:], tail_start)
         ):
             return None
+        offsets: list[int] = []
+        previous_tail = (
+            previous.num_chunks - len(previous.page_offsets) if previous else 0
+        )
+        for layer_id, layer in enumerate(memory_objs):
+            if previous is not None:
+                begin = layer_id * previous_tail
+                offsets.extend(
+                    previous.offsets[
+                        begin : begin + max(0, reuse_chunks - page_chunks)
+                    ]
+                )
+            offsets.extend(int(obj.meta.address) for obj in layer[tail_start:])
         batch = SharedHandleBatch(
             shm_name=self.shared_cpu_cache_name,
             producer_rank=self.metadata.worker_id,
             num_layers=num_layers,
             num_chunks=chunks,
             physical_sizes=physical_sizes,
-            chunk_hashes=[
+            chunk_hashes=(previous.chunk_hashes[:reuse_chunks] if previous else []) + [
                 chunk_hash_to_int(key.chunk_hash)
-                for key in keys_layer_major[0][:chunks]
+                for key in keys_layer_major[0][reuse_chunks:chunks]
             ],
-            offsets=[int(obj.meta.address) for obj in tail],
-            page_offsets=[
+            offsets=offsets,
+            page_offsets=(previous.page_offsets[:min(reuse_chunks, page_chunks)]
+                          if previous else []) + [
                 int(memory_objs[0][chunk].meta.address)
-                for chunk in range(page_chunks)
+                for chunk in range(reuse_chunks, page_chunks)
             ],
-            page_physical_sizes=[
+            page_physical_sizes=(
+                previous.page_physical_sizes[:min(reuse_chunks, page_chunks)]
+                if previous else []
+            ) + [
                 int(memory_objs[0][chunk].meta.phy_size)
-                for chunk in range(page_chunks)
+                for chunk in range(reuse_chunks, page_chunks)
             ],
         )
         if started is not None:
@@ -1752,8 +1798,14 @@ class LMCacheEngine:
             slab_size=allocator.slab_size,
         )
         pages: list[LayerPageMemoryObj] = []
+        page_prefix = min(
+            (reuse_kwargs or {}).get("_shared_prefill_reuse_count", 0),
+            len(batch.page_offsets),
+        )
+        if page_prefix:
+            pages.extend(reuse_kwargs["cached_memory_objs"][0][:page_prefix])
         try:
-            for chunk_index in range(len(batch.page_offsets)):
+            for chunk_index in range(page_prefix, len(batch.page_offsets)):
                 shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
                     kv_group=kv_group,
                     num_tokens=int(ends[chunk_index] - starts[chunk_index]),
@@ -3025,6 +3077,15 @@ class LMCacheEngine:
             True,
         )
 
+    def get_shared_cpu_request_lease(
+        self, req_id: str
+    ) -> Optional[SharedCPURequestLease]:
+        """Return the live lease only when it belongs to the current slab epoch."""
+        lease = getattr(self, "_shared_cpu_request_leases", {}).get(req_id)
+        if lease is not None and lease.generation == self.shared_cpu_cache_generation:
+            return lease
+        return None
+
     def supports_dense_sparse_cache_retention(self) -> bool:
         """Return whether dense retrieval can seed complete sparse state."""
         connector = self.gpu_connector
@@ -3042,6 +3103,7 @@ class LMCacheEngine:
         owned_groups: Optional[dict[int, list[list[MemoryObj]]]] = None,
         append_from: Optional[dict[int, int]] = None,
         preserve_replaced: bool = False,
+        replace_from: Optional[dict[int, int]] = None,
     ) -> None:
         """Adopt complete groups or append-only suffixes for a live request.
 
@@ -3058,12 +3120,22 @@ class LMCacheEngine:
             return
         lease, created = self._get_shared_cpu_request_lease(req_id)
         try:
-            if append_from is not None and not created and owned_groups:
+            if replace_from is not None and owned_groups:
+                lease.replace_suffix_groups(owned_groups, replace_from, retain=False)
+            elif append_from is not None and not created and owned_groups:
                 lease.append_groups(owned_groups, append_from)
             elif owned_groups:
                 lease.replace_groups(
                     owned_groups, retain=False, preserve_replaced=preserve_replaced
                 )
+            for group in owned_groups or ():
+                cached = lease.prefill_sources.get(group)
+                if replace_from is not None and cached is not None:
+                    cached.valid_chunks = min(cached.valid_chunks, replace_from[group])
+                elif append_from is None:
+                    # An unrelated sparse replacement carries no proof that
+                    # the old compact descriptors still describe these objects.
+                    lease.prefill_sources.pop(group, None)
             lease.active = True
             self._shared_cpu_request_leases[req_id] = lease
         except Exception:
@@ -3075,12 +3147,39 @@ class LMCacheEngine:
         self,
         req_id: str,
         groups: dict[int, list[list[MemoryObj]]],
+        *,
+        append_from: Optional[dict[int, int]] = None,
     ) -> None:
         if not req_id or not groups or not self.metadata.is_first_rank():
             return
         lease, created = self._get_shared_cpu_request_lease(req_id)
         try:
-            lease.replace_groups(groups, retain=True)
+            if append_from is not None:
+                for group, layers in groups.items():
+                    if group in append_from:
+                        prefix = append_from[group] if group in lease.groups else 0
+                        lease.replace_suffix_groups(
+                            {group: layers}, {group: prefix}, retain=True
+                        )
+                        cached = lease.prefill_sources.get(group)
+                        if cached is not None:
+                            cached.valid_chunks = min(cached.valid_chunks, prefix)
+                        locations = lease.prefill_locations.get(group)
+                        if locations is not None:
+                            locations.valid_chunks = min(
+                                locations.valid_chunks, prefix
+                            )
+                    else:
+                        lease.replace_groups(
+                            {group: layers}, retain=True, preserve_replaced=True
+                        )
+                        lease.prefill_sources.pop(group, None)
+                        lease.prefill_locations.pop(group, None)
+            else:
+                lease.replace_groups(groups, retain=True)
+                for group in groups:
+                    lease.prefill_sources.pop(group, None)
+                    lease.prefill_locations.pop(group, None)
             self._shared_cpu_request_leases[req_id] = lease
         except Exception:
             if created:
@@ -5001,17 +5100,24 @@ class LMCacheEngine:
             pointer_rows.clear()
             return False
 
+        suffix_from = kwargs.get("_shared_prefill_reuse_count")
+        fresh_refs = kwargs.get("_shared_prefill_fresh_refs")
         # Rank0's resolver acquires a fresh reference/pin even for pages which
         # the existing request lease already owns. Reconcile that extra borrow
         # after adoption; passive reused views never acquired another reference.
         lease = getattr(self, "_shared_cpu_request_leases", {}).get(req_id)
         already_owned = (
+            {id(obj) for obj in fresh_refs if lease.owns(obj)}
+            if fresh_refs is not None and lease is not None and lease.is_rank0
+            and lease.generation == self.shared_cpu_cache_generation
+            else (
             lease.object_ids()
             if kwargs.get("_reuse_shared_dense_prefix")
             and lease is not None
             and lease.is_rank0
             and lease.generation == self.shared_cpu_cache_generation
             else set()
+            )
         )
         updates = {
             "cached_starts": list(starts),
@@ -5019,11 +5125,19 @@ class LMCacheEngine:
             "cached_keys": [list(layer) for layer in keys_layer_major],
             "cached_memory_objs": [list(layer) for layer in memory_objs],
             "cached_shared_handles": [list(layer) for layer in handles],
+        } if suffix_from is None else {
+            "cached_starts": starts,
+            "cached_ends": ends,
+            "cached_keys": keys_layer_major,
+            "cached_memory_objs": memory_objs,
+            "cached_shared_handles": handles,
         }
         try:
             self.register_shared_cpu_sparse_request(
                 req_id,
                 owned_groups={kv_group: memory_objs},
+                **({"replace_from": {kv_group: suffix_from}}
+                   if suffix_from is not None else {}),
                 **(
                     {"preserve_replaced": True}
                     if kwargs.get("_reuse_shared_dense_prefix")
@@ -5041,20 +5155,110 @@ class LMCacheEngine:
                     cache.clear()
             raise
         for name, values in updates.items():
-            caches[name][:] = values
+            if suffix_from is None:
+                caches[name][:] = values
+            elif name in ("cached_starts", "cached_ends"):
+                caches[name][suffix_from:] = values[suffix_from:]
+            else:
+                if len(caches[name]) != num_layers:
+                    caches[name][:] = [[] for _ in range(num_layers)]
+                for old, new in zip(caches[name], values, strict=True):
+                    old[suffix_from:] = new[suffix_from:]
+        lease = self.get_shared_cpu_request_lease(req_id)
+        if lease is not None:
+            lease.source_groups[kv_group] = caches["cached_memory_objs"]
         if already_owned:
             self._release_shared_retrieve_objs(
                 list(
                     {
                         id(obj): obj
-                        for row in memory_objs
-                        for obj in row
+                        for obj in (
+                            fresh_refs if fresh_refs is not None
+                            else (obj for row in memory_objs for obj in row)
+                        )
                         if id(obj) in already_owned
                     }.values()
                 ),
                 unpin=True,
             )
         return True
+
+    def _shared_prefill_cached_prefix(
+        self, req_id: str, kv_group: int, candidates: Any, kwargs: dict[str, Any]
+    ) -> int:
+        """Return request-owned matching ranges, inspecting only scalar keys."""
+        if not kwargs.get("_reuse_shared_dense_prefix"):
+            return 0
+        lease = self.get_shared_cpu_request_lease(req_id)
+        objects = kwargs.get("cached_memory_objs")
+        keys = kwargs.get("cached_keys", ())
+        starts, ends = kwargs.get("cached_starts", ()), kwargs.get("cached_ends", ())
+        layers = self.num_layers_for_group(kv_group)
+        if (
+            lease is None
+            or objects is None
+            or lease.source_groups.get(kv_group) is not objects
+            or len(objects) != layers
+            or len(keys) != layers
+            or not keys
+        ):
+            return 0
+        limit = min(len(starts), len(ends), *(len(row) for row in objects),
+                    *(len(row) for row in keys))
+        prefix = 0
+        for index, (start, end, key) in enumerate(candidates):
+            if index == limit or (
+                starts[index] != start or ends[index] != end
+                or not same_chunk_key(keys[0][index], key)
+            ):
+                break
+            prefix += 1
+        return prefix
+
+    def _shared_prefill_source_context(self, kv_group: int) -> tuple[Any, ...]:
+        shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
+            kv_group=kv_group, num_tokens=1
+        )
+        allocator = getattr(self, "shared_cpu_cache_passive_allocator", None)
+        if allocator is None:
+            rank0_context = self._shared_rank0_object_context(kv_group)
+            allocator = (
+                rank0_context.parent_allocator if rank0_context is not None else None
+            )
+        return (
+            self.shared_cpu_cache_generation,
+            getattr(self, "shared_cpu_cache_name", None),
+            id(allocator) if allocator is not None else None,
+            self.num_layers_for_group(kv_group), tuple(shape), dtype, fmt,
+        )
+
+    def _shared_prefill_source_state(
+        self, req_id: str, kv_group: int, kwargs: dict[str, Any]
+    ) -> Optional[SharedPrefillSources]:
+        lease = self.get_shared_cpu_request_lease(req_id)
+        state = lease.prefill_sources.get(kv_group) if lease is not None else None
+        if (
+            kwargs.get("_reuse_shared_dense_prefix")
+            and isinstance(state, SharedPrefillSources)
+            and lease.source_groups.get(kv_group) is kwargs.get("cached_memory_objs")
+            and state.context == self._shared_prefill_source_context(kv_group)
+        ):
+            return state
+        return None
+
+    def _remember_shared_prefill_sources(
+        self, req_id: str, kv_group: int, starts: list[int], ends: list[int],
+        keys: list[list[CacheEngineKey]], batch: Optional[SharedHandleBatch],
+        kwargs: dict[str, Any],
+    ) -> None:
+        if not kwargs.get("_reuse_shared_dense_prefix") or batch is None:
+            return
+        lease = self.get_shared_cpu_request_lease(req_id)
+        if lease is not None:
+            lease.prefill_sources[kv_group] = SharedPrefillSources(
+                self._shared_prefill_source_context(kv_group), batch,
+                tuple(starts), tuple(ends), tuple(keys[0]), len(starts),
+            )
 
     @staticmethod
     def _cached_shared_prefill_source(
@@ -5103,7 +5307,12 @@ class LMCacheEngine:
             prefix = min((len(row) for row in host_rows), default=0)
             if len(old_rows) != len(sources) or len(host_rows) != len(sources):
                 prefix = 0
-            for layer_id, source in enumerate(sources):
+            trusted_prefix = kwargs.get("_shared_prefill_reuse_count")
+            if trusted_prefix is not None:
+                prefix = min(prefix, trusted_prefix)
+            for layer_id, source in enumerate(
+                sources if trusted_prefix is None else ()
+            ):
                 old = old_rows[layer_id] if layer_id < len(old_rows) else ()
                 page_count = (
                     len(source.pages) if isinstance(source, LayerPageSource) else 0
@@ -5195,6 +5404,93 @@ class LMCacheEngine:
                 if started:
                     send_s += serving_perf_now() - started
         return send_s
+
+    def _resolve_shared_rank0_prefill_suffix(
+        self, *, req_id: str, phase: str, kv_group: int,
+        starts: list[int], ends: list[int],
+        keys_layer_major: list[list[CacheEngineKey]],
+        chunk_locations_layer_major: list[list[str]],
+        planned_page_chunks: int, page_first: bool, prefix: int,
+        kwargs: dict[str, Any],
+    ) -> tuple[list[list[MemoryObj]], int, list[MemoryObj], int]:
+        """Borrow the live prefix and resolve only its unowned suffix."""
+        lease = self.get_shared_cpu_request_lease(req_id)
+        assert lease is not None
+        state = self._shared_prefill_source_state(req_id, kv_group, kwargs)
+        validated = state.matching_prefix(
+            starts, ends, keys_layer_major[0], prefix
+        ) if state is not None else 0
+        cached = kwargs["cached_memory_objs"]
+        rows = [list(row[:prefix]) for row in cached]
+        # Store promotion proves ownership, but has not yet validated the slab
+        # transport descriptor. Validate these newly promoted sources once.
+        seen: set[int] = set()
+        for layer_id, row in enumerate(rows):
+            for index in range(validated, prefix):
+                obj = row[index]
+                if id(obj) in seen:
+                    continue
+                if not lease.owns(obj):
+                    raise ValueError("Shared prefill prefix lost request ownership")
+                shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
+                    kv_group=kv_group, num_tokens=ends[index] - starts[index]
+                )
+                if (obj.get_shape() != shape or obj.get_dtype() != dtype
+                        or obj.get_memory_format() != fmt):
+                    raise ValueError("Promoted shared prefill source layout changed")
+                self._validate_rank0_shared_mem_obj(
+                    obj, req_id=req_id, phase=phase, layer_id=layer_id,
+                    kv_group=kv_group, chunk_index=index,
+                )
+                seen.add(id(obj))
+        owned: list[MemoryObj] = []
+        if prefix < len(starts):
+            keys = [list(row[prefix:]) for row in keys_layer_major]
+            try:
+                if (page_first and mooncake_layer_pages_enabled(self.config)
+                        and planned_page_chunks > prefix):
+                    suffix, _ = self._resolve_shared_rank0_layer_pages(
+                        req_id=req_id, phase=phase, kv_group=kv_group,
+                        keys_layer_major=keys,
+                        page_chunks=planned_page_chunks - prefix,
+                        base_page_keys=[
+                            key.without_layer()
+                            if isinstance(key, LayerCacheEngineKey) else key
+                            for key in keys[0]
+                        ],
+                    )
+                    owned.extend(
+                        {id(obj): obj for row in suffix for obj in row}.values()
+                    )
+                elif page_first:
+                    suffix = self._resolve_shared_rank0_page_first_layers(
+                        req_id=req_id, phase=phase, kv_group=kv_group,
+                        keys_layer_major=keys,
+                    )
+                    owned.extend(
+                        {id(obj): obj for row in suffix for obj in row}.values()
+                    )
+                else:
+                    suffix = []
+                    for layer_id, keys_row in enumerate(keys):
+                        row = self._resolve_shared_rank0_layer_mem_objs(
+                            req_id=req_id, phase=phase, layer_id=layer_id,
+                            kv_group=kv_group, keys_layer=keys_row,
+                            chunk_locations=chunk_locations_layer_major[layer_id][prefix:],
+                        )
+                        suffix.append(row)
+                        owned.extend(row)
+                for row, new in zip(rows, suffix, strict=True):
+                    row.extend(new)
+            except Exception:
+                self._release_shared_retrieve_objs(owned, unpin=True)
+                raise
+        pages = 0
+        for obj in rows[0]:
+            if not isinstance(obj, LayerPageMemoryObj):
+                break
+            pages += 1
+        return rows, pages, owned, validated
 
     def _retrieve_layer_shared_rank0(
         self,
@@ -5323,6 +5619,27 @@ class LMCacheEngine:
         sources_safe_to_release = True
         prepared_sources: list[Any] = []
         consumer_failed = False
+        source_state = None
+        source_prefix = descriptor_prefix = 0
+        if deferred_layerwise_get and kwargs.get("_reuse_shared_dense_prefix"):
+            source_prefix = self._shared_prefill_cached_prefix(
+                req_id, kv_group,
+                zip(starts, ends, keys_layer_major[0], strict=True), kwargs,
+            )
+            # The compact protocol represents physical pages before legacy
+            # chunks. Re-resolve a legacy tail if new physical pages precede it.
+            if (source_prefix and planned_page_chunks
+                    and mooncake_layer_pages_enabled(self.config)):
+                for index, obj in enumerate(
+                    kwargs["cached_memory_objs"][0][:source_prefix]
+                ):
+                    if not isinstance(obj, LayerPageMemoryObj):
+                        if index < planned_page_chunks:
+                            source_prefix = index
+                        break
+            kwargs["_shared_prefill_reuse_count"] = source_prefix
+            source_state = self._shared_prefill_source_state(req_id, kv_group, kwargs)
+            kwargs["_shared_prefill_fresh_refs"] = to_release
         perf_enabled = serving_perf_enabled()
         consume_started = consumer_send_s = consumer_finish_s = 0.0
         try:
@@ -5332,7 +5649,24 @@ class LMCacheEngine:
                     if page_first_resolve or deferred_layerwise_get:
                         if pre_resolved_layers is None:
                             full_chunks = planned_page_chunks
-                            if not page_first_resolve:
+                            if source_prefix:
+                                (
+                                    pre_resolved_layers, layer_page_chunks, fresh,
+                                    descriptor_prefix,
+                                ) = self._resolve_shared_rank0_prefill_suffix(
+                                    req_id=req_id, phase=phase, kv_group=kv_group,
+                                    starts=starts, ends=ends,
+                                    keys_layer_major=keys_layer_major,
+                                    chunk_locations_layer_major=chunk_locations_layer_major,
+                                    planned_page_chunks=planned_page_chunks,
+                                    page_first=page_first_resolve, prefix=source_prefix,
+                                    kwargs=kwargs,
+                                )
+                                to_release.extend(fresh)
+                                layer_pages = tuple(
+                                    pre_resolved_layers[0][:layer_page_chunks]
+                                )
+                            elif not page_first_resolve:
                                 # P-node preparation already resolves every
                                 # layer before forward. Publish their offsets
                                 # as one existing compact batch even without
@@ -5404,7 +5738,7 @@ class LMCacheEngine:
                                         keys_layer_major=keys_layer_major,
                                     )
                                 )
-                            if page_first_resolve:
+                            if page_first_resolve and not source_prefix:
                                 unique = {
                                     id(mem_obj): mem_obj
                                     for layer in pre_resolved_layers
@@ -5415,10 +5749,31 @@ class LMCacheEngine:
                                 pre_resolved_layers,
                                 keys_layer_major,
                                 kv_group=kv_group,
+                                previous=source_state.batch if source_state else None,
+                                reuse_chunks=descriptor_prefix,
                             )
                             if layer_page_chunks and compact_batch is None:
                                 raise ValueError(
                                     "Layer pages require compact shared publication"
+                                )
+                            debug_stats = kwargs.get(_PREFILL_REUSE_DEBUG_KEY)
+                            if debug_stats is not None:
+                                pages = (
+                                    len(compact_batch.page_offsets)
+                                    if compact_batch else 0
+                                )
+                                debug_stats["compact"] = int(compact_batch is not None)
+                                debug_stats["page_reuse"] = min(source_prefix, pages)
+                                debug_stats["page_new"] = (
+                                    pages - min(source_prefix, pages)
+                                )
+                                debug_stats["tail_reuse"] = (
+                                    max(0, source_prefix - pages)
+                                    * len(pre_resolved_layers)
+                                )
+                                debug_stats["tail_new"] = (
+                                    (len(starts) - max(pages, source_prefix))
+                                    * len(pre_resolved_layers)
                                 )
                         mem_objs_layer = pre_resolved_layers[layer_id]
                     else:
@@ -5605,16 +5960,29 @@ class LMCacheEngine:
             if finish_started:
                 consumer_finish_s += serving_perf_now() - finish_started
             adoption_keys = keys_layer_major
-            if (
+            preplanned_keys = kwargs.get("_prefill_layer_keys")
+            if preplanned_keys is not None:
+                adoption_keys = tuple(
+                    PrefillSequenceView(row, 0, len(starts))
+                    for row in preplanned_keys
+                )
+            elif (
                 req_id
                 and kwargs.get("_retain_shared_dense_cache")
                 and planned_page_chunks
             ):
                 page_layers = [
                     key.split_layers(self.num_layers_for_group(kv_group))
-                    for key in keys_layer_major[0][:planned_page_chunks]
+                    for key in keys_layer_major[0][source_prefix:planned_page_chunks]
                 ]
                 adoption_keys = [
+                    list(kwargs.get("cached_keys", [])[layer_id][:source_prefix])
+                    + [page[layer_id] for page in page_layers]
+                    + list(keys_layer_major[layer_id][
+                        max(planned_page_chunks, source_prefix):
+                    ])
+                    for layer_id in range(self.num_layers_for_group(kv_group))
+                ] if source_prefix else [
                     [page[layer_id] for page in page_layers]
                     + list(keys_layer_major[layer_id][planned_page_chunks:])
                     for layer_id in range(self.num_layers_for_group(kv_group))
@@ -5631,6 +5999,9 @@ class LMCacheEngine:
             )
             if adopted:
                 to_release.clear()
+                self._remember_shared_prefill_sources(
+                    req_id, kv_group, starts, ends, adoption_keys, compact_batch, kwargs
+                )
             elif kwargs.get("_retain_shared_dense_cache"):
                 raise RuntimeError("Dense shared source retention failed")
             retrieved_tokens = torch.sum(ret_mask)
@@ -5747,11 +6118,14 @@ class LMCacheEngine:
         consumer_failed = False
         perf_enabled = serving_perf_enabled()
         consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
-        retained_view_ids = (
-            {id(obj) for row in kwargs.get("cached_memory_objs", ()) for obj in row}
-            if kwargs.get("_reuse_shared_dense_prefix")
-            else set()
+        retained_lease = (
+            self.get_shared_cpu_request_lease(req_id)
+            if kwargs.get("_reuse_shared_dense_prefix") else None
         )
+        source_state = self._shared_prefill_source_state(req_id, kv_group, kwargs)
+        source_prefix = 0
+        if deferred_layerwise_get and kwargs.get("_reuse_shared_dense_prefix"):
+            kwargs.pop("_shared_prefill_reuse_count", None)
         debug_stats = kwargs.get(_PREFILL_REUSE_DEBUG_KEY)
 
         try:
@@ -5832,6 +6206,23 @@ class LMCacheEngine:
                         page_view_started = (
                             serving_perf_now() if perf_enabled else 0.0
                         )
+                        if kwargs.get("_reuse_shared_dense_prefix"):
+                            kwargs["_shared_prefill_reuse_count"] = 0
+                        if source_state is not None:
+                            source_prefix = self._shared_prefill_cached_prefix(
+                                req_id, kv_group,
+                                zip(starts, ends, keys_layer_major[0], strict=False),
+                                kwargs,
+                            )
+                            source_prefix = source_state.matching_prefix(
+                                starts, ends, keys_layer_major[0], source_prefix
+                            )
+                            # Full-envelope bounds validation happens below,
+                            # before any borrowed views are submitted to DMA.
+                            source_prefix = source_state.wire_prefix(
+                                compact_batch, source_prefix
+                            )
+                            kwargs["_shared_prefill_reuse_count"] = source_prefix
                         view_error: Exception | None = None
                         try:
                             passive_page_tuple = self._make_passive_layer_page_views(
@@ -5867,13 +6258,16 @@ class LMCacheEngine:
                                 "materialization failed"
                             ) from view_error
                         passive_pages.extend(passive_page_tuple)
-                        for page in passive_pages:
-                            if id(page) not in retained_view_ids:
+                        reused_pages = min(source_prefix, len(passive_pages))
+                        for page in passive_pages[reused_pages:]:
+                            if retained_lease is None or not retained_lease.owns(page):
                                 to_release.append(page)
                                 if debug_stats is not None:
                                     debug_stats["page_new"] += 1
                             elif debug_stats is not None:
                                 debug_stats["page_reuse"] += 1
+                        if debug_stats is not None:
+                            debug_stats["page_reuse"] += reused_pages
                         if page_view_started:
                             view_build_s += serving_perf_now() - page_view_started
                 elif (
@@ -5900,7 +6294,15 @@ class LMCacheEngine:
                 )
                 view_started = serving_perf_now() if perf_enabled else 0.0
                 page_chunks = len(passive_pages)
-                for chunk_index in range(page_chunks, expected_handle_count):
+                if source_prefix > page_chunks:
+                    mem_objs_layer.extend(
+                        kwargs["cached_memory_objs"][layer_id][page_chunks:source_prefix]
+                    )
+                    if debug_stats is not None:
+                        debug_stats["tail_reuse"] += source_prefix - page_chunks
+                for chunk_index in range(
+                    max(page_chunks, source_prefix), expected_handle_count
+                ):
                     handle = layer_handles[chunk_index]
                     expected_shape, expected_dtype, expected_fmt = (
                         self._expected_shared_cpu_chunk_metadata(
@@ -5976,7 +6378,7 @@ class LMCacheEngine:
                             "RemoteFill passive shared view materialization failed"
                         ) from exc
                     mem_objs_layer.append(mem_obj)
-                    if id(mem_obj) not in retained_view_ids:
+                    if retained_lease is None or not retained_lease.owns(mem_obj):
                         to_release.append(mem_obj)
                         if debug_stats is not None:
                             debug_stats["tail_new"] += 1
@@ -6089,6 +6491,10 @@ class LMCacheEngine:
                 )
                 if adopted:
                     to_release.clear()
+                    self._remember_shared_prefill_sources(
+                        req_id, kv_group, starts, ends, keys_layer_major,
+                        compact_batch, kwargs,
+                    )
                 elif kwargs.get("_retain_shared_dense_cache"):
                     raise RuntimeError("Dense shared source retention failed")
 
@@ -6698,7 +7104,16 @@ class LMCacheEngine:
         req_id = self._get_req_id(kwargs)
         store_result.request_id = req_id
 
-        if mask is not None:
+        prefill_skip = (
+            kwargs.get("_prefill_skip_tokens")
+            if deferred_layerwise_put and kwargs.get("_prefill_metadata_cache")
+            is not None else None
+        )
+        if prefill_skip is not None:
+            if not 0 <= prefill_skip <= len(tokens):
+                raise ValueError("Invalid P-prefill store mask boundary")
+            num_to_store_tokens = len(tokens) - prefill_skip
+        elif mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
         else:
             num_to_store_tokens = len(tokens)
@@ -6754,15 +7169,30 @@ class LMCacheEngine:
         allocation_ms = 0.0
         scanned_chunks = 0
         existing_chunks = 0
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask, request_configs=request_configs,
-            kv_group=kv_group,
-        ):
+        store_plan = None
+        metadata_cache = kwargs.get("_prefill_metadata_cache")
+        if metadata_cache is not None and deferred_layerwise_put:
+            store_plan = metadata_cache.prepare(
+                self.token_database, tokens, request_configs=request_configs,
+                kv_group=kv_group, num_layers=num_layers,
+                skip_tokens=len(tokens) - int(num_to_store_tokens),
+            )
+        store_candidates = (
+            store_plan.candidates if store_plan is not None else
+            self.token_database.process_tokens(
+                tokens=tokens, mask=mask, request_configs=request_configs,
+                kv_group=kv_group,
+            )
+        )
+        for candidate_index, (start, end, key) in enumerate(store_candidates):
             assert isinstance(key, CacheEngineKey)
             requested_end = end
 
             lookup_started = time.perf_counter() if prefill_plan_started else 0.0
-            keys_multi_layer = key.split_layers(num_layers)
+            keys_multi_layer = (
+                store_plan.keys_chunk_major[candidate_index]
+                if store_plan is not None else key.split_layers(num_layers)
+            )
             fully_stored = self._layerwise_chunk_fully_stored(
                 keys_multi_layer,
                 req_id=req_id,
@@ -7152,6 +7582,16 @@ class LMCacheEngine:
                 )
         return ret_mask
 
+    def track_prefill_retrieve_keys(
+        self, req_id: str, keys: Iterable[CacheEngineKey]
+    ) -> None:
+        """Track dependencies of cached P-prefill keys without rehashing them.
+
+        Async persistence engines override this to retain their existing
+        request-to-put dependencies when a prepared plan bypasses tokenization.
+        The base engine has no additional persistence dependency to register.
+        """
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def retrieve_layer(
@@ -7213,7 +7653,16 @@ class LMCacheEngine:
         )
         mask_setup_started = time.perf_counter() if prefill_timing else 0.0
         prefix_tokens = len(tokens)
-        if mask is not None:
+        prefill_skip = (
+            kwargs.get("_prefill_skip_tokens")
+            if deferred_layerwise_get and kwargs.get("_prefill_metadata_cache")
+            is not None else None
+        )
+        if prefill_skip is not None:
+            if not 0 <= prefill_skip <= prefix_tokens:
+                raise ValueError("Invalid P-prefill retrieve mask boundary")
+            num_required_tokens = prefix_tokens - prefill_skip
+        elif mask is not None:
             num_required_tokens = torch.sum(mask).item()
         else:
             num_required_tokens = prefix_tokens
@@ -7244,45 +7693,61 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
-        if shared_layerwise_retrieve and self._is_passive():
-            debug_rank = getattr(self.metadata, "worker_id", -1)
-            debug_stats: Optional[dict[str, Any]] = None
-            if deferred_layerwise_get and prefill_reuse_debug_enabled(debug_rank):
-                debug_stats = {
-                    "hash_source": "-",
-                    "keys_new": 0,
-                    "page_reuse": 0,
-                    "page_new": 0,
-                    "tail_reuse": 0,
-                    "tail_new": 0,
-                    "ptr_keep": 0,
-                    "ptr_add": 0,
-                    "compact": 0,
-                    "wait_ms": 0.0,
-                }
-                kwargs[_PREFILL_REUSE_DEBUG_KEY] = debug_stats
-            token_plan_started = (
-                time.perf_counter()
-                if prefill_timing or debug_stats is not None
-                else 0.0
+        debug_rank = getattr(self.metadata, "worker_id", -1)
+        debug_stats: Optional[dict[str, Any]] = None
+        if (
+            shared_layerwise_retrieve and deferred_layerwise_get
+            and prefill_reuse_debug_enabled(debug_rank)
+        ):
+            debug_stats = {
+                "hash_source": "-", "keys_new": 0,
+                "page_reuse": 0, "page_new": 0,
+                "tail_reuse": 0, "tail_new": 0,
+                "ptr_keep": 0, "ptr_add": 0,
+                "compact": 0, "wait_ms": 0.0,
+            }
+            kwargs[_PREFILL_REUSE_DEBUG_KEY] = debug_stats
+        token_plan_started = (
+            time.perf_counter() if prefill_timing or debug_stats is not None else 0.0
+        )
+        metadata_plan = None
+        metadata_cache = kwargs.get("_prefill_metadata_cache")
+        if (
+            metadata_cache is not None and shared_layerwise_retrieve
+            and deferred_layerwise_get and kwargs.get("_reuse_shared_dense_prefix")
+        ):
+            metadata_plan = metadata_cache.prepare(
+                self.token_database, tokens, request_configs=request_configs,
+                kv_group=kv_group, num_layers=num_layers,
+                skip_tokens=prefix_tokens - int(num_required_tokens),
             )
-            for start, end, key in self._dense_retrieve_token_results(
-                tokens,
-                mask,
-                request_configs,
-                kv_group,
-                kwargs,
-            ):
-                assert isinstance(key, CacheEngineKey)
-                starts.append(start)
-                ends.append(end)
-                keys.append(key.split_layers(num_layers))
-                if debug_stats is not None:
-                    debug_stats["keys_new"] += len(keys[-1])
+            self.track_prefill_retrieve_keys(req_id, metadata_plan.base_keys)
+            kwargs["_prefill_layer_keys"] = metadata_plan.keys_layer_major
+            if debug_stats is not None:
+                debug_stats["hash_source"] = (
+                    "inc" if metadata_plan.hashes_new else "hit"
+                )
+                debug_stats["keys_new"] = metadata_plan.keys_new
 
-            keys_layer_major = (
-                [list(row) for row in zip(*keys, strict=False)] if keys else []
-            )
+        if shared_layerwise_retrieve and self._is_passive():
+            if metadata_plan is not None:
+                starts, ends = metadata_plan.starts, metadata_plan.ends
+                keys_layer_major = (
+                    metadata_plan.keys_layer_major if starts else []
+                )
+            else:
+                for start, end, key in self._dense_retrieve_token_results(
+                    tokens, mask, request_configs, kv_group, kwargs,
+                ):
+                    assert isinstance(key, CacheEngineKey)
+                    starts.append(start)
+                    ends.append(end)
+                    keys.append(key.split_layers(num_layers))
+                    if debug_stats is not None:
+                        debug_stats["keys_new"] += len(keys[-1])
+                keys_layer_major = (
+                    [list(row) for row in zip(*keys, strict=False)] if keys else []
+                )
             if debug_stats is not None:
                 debug_stats["plan_ms"] = (
                     time.perf_counter() - token_plan_started
@@ -7319,28 +7784,9 @@ class LMCacheEngine:
                     result = next(passive_retriever)
                     if debug_stats is not None:
                         prepare_ms = (time.perf_counter() - prepare_started) * 1000
-                        prefill_reuse_debug_log(
-                            debug_rank,
-                            "plan",
-                            req_id=req_id,
-                            p=prefix_tokens,
-                            g=kv_group,
-                            h=debug_stats["hash_source"],
-                            k=debug_stats["keys_new"],
-                            ms=round(debug_stats["plan_ms"], 1),
-                        )
-                        prefill_reuse_debug_log(
-                            debug_rank,
-                            "src",
-                            req_id=req_id,
-                            p=prefix_tokens,
-                            g=kv_group,
-                            v=f"{debug_stats['page_reuse']}/{debug_stats['page_new']}",
-                            t=f"{debug_stats['tail_reuse']}/{debug_stats['tail_new']}",
-                            x=f"{debug_stats['ptr_keep']}/{debug_stats['ptr_add']}",
-                            c=debug_stats["compact"],
-                            w=debug_stats["wait_ms"],
-                            ms=round(prepare_ms, 1),
+                        _log_prefill_reuse_preparation(
+                            debug_rank, req_id, prefix_tokens, kv_group,
+                            debug_stats, prepare_ms,
                         )
                         kwargs.pop(_PREFILL_REUSE_DEBUG_KEY, None)
                     if prefill_timing:
@@ -7405,10 +7851,13 @@ class LMCacheEngine:
             missing_shared_chunks: list[dict[str, Any]] = []
             phase = kwargs.get("shared_cpu_phase", "dense_prefix")
             request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
-            token_results = self._dense_retrieve_token_results(
-                tokens, mask, request_configs, kv_group, kwargs
+            candidates = (
+                metadata_plan.candidates if metadata_plan is not None else list(
+                    self._dense_retrieve_token_results(
+                        tokens, mask, request_configs, kv_group, kwargs
+                    )
+                )
             )
-            candidates = list(token_results)
             try:
                 remote_fill_plan = self._remote_fill_retrieve_plan(
                     req_id,
@@ -7449,6 +7898,46 @@ class LMCacheEngine:
                     yielded_steps=0,
                 )
                 return
+            location_cache = None
+            retained_chunks = 0
+            if metadata_plan is not None and remote_fill_plan is None:
+                lease = self.get_shared_cpu_request_lease(req_id)
+                if lease is not None:
+                    location_cache = lease.prefill_locations.get(kv_group)
+                if (
+                    not isinstance(location_cache, PrefillLocationPlan)
+                    or location_cache.num_layers != num_layers
+                ):
+                    location_cache = PrefillLocationPlan(num_layers)
+                else:
+                    retained_chunks = min(
+                        self._shared_prefill_cached_prefix(
+                            req_id, kv_group, candidates, kwargs
+                        ),
+                        len(location_cache.starts),
+                        location_cache.valid_chunks,
+                    )
+                    if retained_chunks:
+                        index = retained_chunks - 1
+                        start, end, key = candidates[index]
+                        if (
+                            location_cache.starts[index] != start
+                            or location_cache.ends[index] != end
+                            or not same_chunk_key(location_cache.keys[index][0], key)
+                        ):
+                            retained_chunks -= 1
+                    if mooncake_layer_pages_enabled(self.config):
+                        # A former legacy tail may now be a merged page. Keep
+                        # the proven page prefix and resolve that tail afresh.
+                        retained_chunks = min(
+                            retained_chunks, location_cache.page_chunks
+                        )
+                location_cache.truncate(retained_chunks)
+                starts, ends = location_cache.starts, location_cache.ends
+                keys = location_cache.keys
+                chunk_locations = location_cache.locations
+                if retained_chunks:
+                    ret_mask[starts[0]:ends[-1]] = True
             batch_plan = None
             tail_plan: Optional[list[str]] = None
             layer_pages = False
@@ -7457,15 +7946,32 @@ class LMCacheEngine:
                 layer_pages = mooncake_layer_pages_enabled(self.config)
                 # Exact-size merged pages include the valid partial tail.
                 page_candidates = candidates
-                if page_candidates:
-                    batch_plan = self._shared_page_first_location_plan(
+                if len(page_candidates) > retained_chunks:
+                    suffix_plan = self._shared_page_first_location_plan(
                         [
                             item[2]
                             if layer_pages
-                            else item[2].split_layers(num_layers)
-                            for item in page_candidates
+                            else (
+                                list(metadata_plan.keys_chunk_major[index])
+                                if metadata_plan is not None
+                                else item[2].split_layers(num_layers)
+                            )
+                            for index, item in enumerate(
+                                page_candidates[retained_chunks:], retained_chunks
+                            )
                         ]
                     )
+                    if retained_chunks:
+                        batch_plan = [
+                            chunk_locations[index][0]
+                            for index in range(retained_chunks)
+                        ] + (suffix_plan or [])
+                    else:
+                        batch_plan = suffix_plan
+                elif retained_chunks:
+                    batch_plan = [
+                        chunk_locations[index][0] for index in range(retained_chunks)
+                    ]
                 if (
                     batch_plan is not None
                     and len(page_candidates) < len(candidates)
@@ -7490,7 +7996,9 @@ class LMCacheEngine:
                             tail_locations.append(tail_location)
                         else:
                             tail_plan = tail_locations
-            for candidate_index, (start, end, key) in enumerate(candidates):
+            for candidate_index, (start, end, key) in enumerate(
+                candidates[retained_chunks:], retained_chunks
+            ):
                 missing_layer = False
                 remote_fill_chunk = (
                     remote_fill_plan[candidate_index]
@@ -7509,6 +8017,8 @@ class LMCacheEngine:
                     [key] * num_layers
                     if remote_fill_page_planned
                     or (ordinary_page_planned and layer_pages)
+                    else metadata_plan.keys_chunk_major[candidate_index]
+                    if metadata_plan is not None
                     else key.split_layers(num_layers)
                 )
                 planned_location = (
@@ -7550,34 +8060,40 @@ class LMCacheEngine:
                 if missing_layer:
                     break
 
-                starts.append(start)
-                ends.append(end)
-                keys.append(keys_multi_layer)
-                chunk_locations.append(locations_multi_layer)
+                if location_cache is not None:
+                    location_cache.append(
+                        start, end, keys_multi_layer, locations_multi_layer,
+                        page=ordinary_page_planned and layer_pages,
+                    )
+                else:
+                    starts.append(start)
+                    ends.append(end)
+                    keys.append(keys_multi_layer)
+                    chunk_locations.append(locations_multi_layer)
                 ret_mask[start:end] = True
 
-            keys_layer_major = (
-                [list(row) for row in zip(*keys, strict=False)]
-                if keys
-                else []
-            )
-            chunk_locations_layer_major = (
-                [list(row) for row in zip(*chunk_locations, strict=False)]
-                if chunk_locations
-                else []
-            )
-            unique_locations = {
-                location
-                for locations_multi_layer in chunk_locations
-                for location in locations_multi_layer
-            }
-            location = (
-                next(iter(unique_locations))
-                if len(unique_locations) == 1
-                else "mixed"
-                if unique_locations
-                else None
-            )
+            if location_cache is not None:
+                keys_layer_major = location_cache.key_rows() if keys else []
+                chunk_locations_layer_major = (
+                    location_cache.location_rows() if keys else []
+                )
+                location = location_cache.location
+                starts, ends = PrefillSequenceView(starts), PrefillSequenceView(ends)
+            else:
+                keys_layer_major = (
+                    [list(row) for row in zip(*keys, strict=False)] if keys else []
+                )
+                chunk_locations_layer_major = (
+                    [list(row) for row in zip(*chunk_locations, strict=False)]
+                    if chunk_locations else []
+                )
+                unique_locations = {
+                    name for locations in chunk_locations for name in locations
+                }
+                location = (
+                    next(iter(unique_locations)) if len(unique_locations) == 1
+                    else "mixed" if unique_locations else None
+                )
             planned_page_chunks = (
                 sum(page for _, page in remote_fill_plan)
                 if remote_fill_plan is not None
@@ -7680,7 +8196,19 @@ class LMCacheEngine:
                     remote_fill_plan=remote_fill_plan,
                 )
                 try:
+                    if debug_stats is not None:
+                        debug_stats["plan_ms"] = (
+                            time.perf_counter() - token_plan_started
+                        ) * 1000
+                        prepare_started = time.perf_counter()
                     result = next(rank0_retriever)
+                    if debug_stats is not None:
+                        _log_prefill_reuse_preparation(
+                            debug_rank, req_id, prefix_tokens, kv_group,
+                            debug_stats,
+                            (time.perf_counter() - prepare_started) * 1000,
+                        )
+                        kwargs.pop(_PREFILL_REUSE_DEBUG_KEY, None)
                     while True:
                         yielded_steps += 1
                         try:
@@ -7694,7 +8222,10 @@ class LMCacheEngine:
                             # per-layer slot_mapping overrides and yield count.
                             result = rank0_retriever.send(layer_request)
                 except StopIteration:
-                    pass
+                    if location_cache is not None:
+                        lease = self.get_shared_cpu_request_lease(req_id)
+                        if lease is not None:
+                            lease.prefill_locations[kv_group] = location_cache
                 finally:
                     rank0_retriever.close()
             except _RemoteFillMaterializationError as exc:

@@ -60,6 +60,11 @@ class SharedCPURequestLease:
     is_rank0: bool
     active: bool = False
     groups: dict[int, list[list[MemoryObj]]] = field(default_factory=dict)
+    prefill_sources: dict[int, Any] = field(default_factory=dict, repr=False)
+    prefill_locations: dict[int, Any] = field(default_factory=dict, repr=False)
+    source_groups: dict[int, list[list[MemoryObj]]] = field(
+        default_factory=dict, repr=False
+    )
     _owned_objects: dict[int, MemoryObj] = field(
         default_factory=dict, init=False, repr=False
     )
@@ -181,6 +186,7 @@ class SharedCPURequestLease:
             )
         new_owned.update(retired)
         self.groups = replacement
+        self.source_groups.update(groups)
         self._retired_objects = retired
         self._owned_objects = new_owned
         self._release(
@@ -188,6 +194,79 @@ class SharedCPURequestLease:
             for identity, memory_obj in old_objects.items()
             if identity not in new_owned
         )
+
+    def replace_suffix_groups(
+        self,
+        groups: dict[int, list[list[MemoryObj]]],
+        unchanged_chunks: dict[int, int],
+        *,
+        retain: bool,
+    ) -> None:
+        """Replace verified suffixes, retaining retired DMA sources until close.
+
+        The caller proves that preceding ranges and objects are unchanged.
+        Only new suffix objects acquire ownership. Failed retention leaves the
+        lease untouched; removed sources remain owned for queued DMA readers.
+        """
+        updates = []
+        additions: dict[int, MemoryObj] = {}
+        retired: dict[int, MemoryObj] = {}
+        for group, layers in groups.items():
+            prefix = unchanged_chunks[group]
+            current = self.groups.get(group)
+            if (
+                prefix < 0
+                or (current is None and prefix)
+                or (
+                    current is not None
+                    and (
+                        len(current) != len(layers)
+                        or any(len(row) < prefix for row in current)
+                    )
+                )
+                or any(len(row) < prefix for row in layers)
+            ):
+                raise ValueError("Shared CPU source suffix is not prefix-aligned")
+            suffix = [list(row[prefix:]) for row in layers]
+            updates.append((group, current, prefix, suffix))
+            for row in suffix:
+                for obj in row:
+                    if id(obj) not in self._owned_objects:
+                        additions[id(obj)] = obj
+            if current is not None:
+                for row in current:
+                    retired.update((id(obj), obj) for obj in row[prefix:])
+        acquired = []
+        if retain:
+            try:
+                for obj in additions.values():
+                    obj.ref_count_up()
+                    try:
+                        if not self._is_valid(obj):
+                            raise RuntimeError("Cannot retain an invalid shared source")
+                        if self.is_rank0 and obj.pin() is False:
+                            raise RuntimeError("MemoryObj.pin() returned False")
+                    except Exception:
+                        if self._is_valid(obj):
+                            obj.ref_count_down()
+                        raise
+                    acquired.append(obj)
+            except Exception:
+                self._release(reversed(acquired))
+                raise
+        for group, current, prefix, suffix in updates:
+            if current is None:
+                self.groups[group] = suffix
+            else:
+                for row, new in zip(current, suffix, strict=True):
+                    row[prefix:] = new
+        self._retired_objects.update(retired)
+        self._owned_objects.update(additions)
+        self.source_groups.update(groups)
+
+    def owns(self, obj: MemoryObj) -> bool:
+        """Check ownership without enumerating historical objects."""
+        return self._owned_objects.get(id(obj)) is obj
 
     def append_groups(
         self,
@@ -236,6 +315,7 @@ class SharedCPURequestLease:
             self._owned_objects.update(
                 (id(obj), obj) for layer in suffix for obj in layer
             )
+        self.source_groups.update(groups)
 
     def object_ids(self, kv_group: Optional[int] = None) -> set[int]:
         if kv_group is None:
@@ -257,6 +337,9 @@ class SharedCPURequestLease:
         self._owned_objects = {}
         self._retired_objects.clear()
         self.groups.clear()
+        self.source_groups.clear()
+        self.prefill_sources.clear()
+        self.prefill_locations.clear()
         self.active = False
         self._release(objects.values())
 

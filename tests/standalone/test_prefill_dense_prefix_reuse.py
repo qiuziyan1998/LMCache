@@ -29,6 +29,8 @@ def adapter_types() -> tuple[type, type]:
     )
     methods = {
         "_prepare_dense_prefix_retrieve_state",
+        "_prefill_metadata_cache_enabled",
+        "_prefill_metadata_scope_changed",
         "_dense_retrieve_slot_mapping",
         "_materialize_dense_prefix_for_sparse",
         "_worker_retrieve_state_for_request",
