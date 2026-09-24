@@ -187,3 +187,26 @@ def test_mixed_mooncake_layer_and_page_metadata(metadata):
         mooncake_payload_layout(config, mixed)[0]
         != mooncake_payload_layout(config, other)[0]
     )
+
+
+def test_worker_hbm_permutation_does_not_change_persistent_identity(metadata):
+    policy = IndexerC8Layout(c8_layers=(False, True, False))
+    base = replace(
+        metadata,
+        runtime_kv_group_layer_counts=(3, 3),
+        runtime_kv_group_layer_names=(
+            ("a", "b", "c"),
+            ("a.indexer", "b.indexer", "c.indexer"),
+        ),
+        indexer_c8_layout=policy,
+    )
+    cfg = LMCacheEngineConfig.from_defaults(
+        dsa_two_groups=True,
+        remote_fill_model_artifact_id="weights",
+        remote_fill_cache_namespace="ns",
+    )
+    remapped = replace(base, indexer_hbm_block_map=tuple(range(36)))
+    assert mooncake_payload_layout(cfg, base) == mooncake_payload_layout(cfg, remapped)
+    assert base.get_shapes(7) == remapped.get_shapes(7)
+    assert base.get_dtypes() == remapped.get_dtypes()
+    assert "indexer_hbm_block_map" not in repr(remapped)

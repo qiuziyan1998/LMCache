@@ -56,6 +56,7 @@ class VllmServiceFactory(BaseServiceFactory):
         runtime_kv_group_layer_counts: Optional[tuple[int, ...]] = None,
         runtime_kv_group_layer_names: Optional[tuple[tuple[str, ...], ...]] = None,
         indexer_c8_layout: Optional[IndexerC8Layout] = None,
+        indexer_hbm_block_map: Optional[tuple[int, ...]] = None,
     ) -> None:
         self.lmcache_config = lmcache_config
         self.vllm_config = vllm_config
@@ -63,6 +64,7 @@ class VllmServiceFactory(BaseServiceFactory):
         self.runtime_kv_group_layer_counts = runtime_kv_group_layer_counts
         self.runtime_kv_group_layer_names = runtime_kv_group_layer_names
         self.indexer_c8_layout = indexer_c8_layout
+        self.indexer_hbm_block_map = indexer_hbm_block_map
         self.metadata: Optional[LMCacheMetadata] = None
         self.lmcache_engine: Optional[LMCacheEngine] = None
 
@@ -168,6 +170,7 @@ class VllmServiceFactory(BaseServiceFactory):
             runtime_kv_group_layer_counts=self.runtime_kv_group_layer_counts,
             runtime_kv_group_layer_names=self.runtime_kv_group_layer_names,
             indexer_c8_layout=self.indexer_c8_layout,
+            indexer_hbm_block_map=self.indexer_hbm_block_map,
         )
         return self.metadata
 

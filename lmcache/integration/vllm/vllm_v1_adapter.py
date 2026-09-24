@@ -1919,12 +1919,23 @@ class LMCacheConnectorV1Impl:
                 )
                 indexer_c8_layout = IndexerC8Layout(indexer_spec.sparse_head_dim[-1], mask)
 
+        indexer_hbm_block_map = None
+        if role == KVConnectorRole.WORKER and getattr(
+            kv_cache_config, "dsa_paired_bank_slots", 0
+        ):
+            from vllm.v1.core.dsa_shared_pool import paired_bank_indexer_block_map
+
+            indexer_hbm_block_map = paired_bank_indexer_block_map(
+                kv_cache_config.dsa_paired_bank_slots
+            )
+
         service_factory = VllmServiceFactory(
             config,
             vllm_config,
             role.name.lower(),
             runtime_kv_group_layer_counts=runtime_group_layer_counts,
             indexer_c8_layout=indexer_c8_layout,
+            indexer_hbm_block_map=indexer_hbm_block_map,
             runtime_kv_group_layer_names=(
                 tuple(
                     tuple(group.layer_names)

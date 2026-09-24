@@ -71,6 +71,8 @@ class LMCacheMetadata:
     runtime_kv_group_layer_counts: Optional[tuple[int, ...]] = None
     runtime_kv_group_layer_names: Optional[tuple[tuple[str, ...], ...]] = None
     indexer_c8_layout: Optional[IndexerC8Layout] = None
+    # Worker-local HBM addressing, deliberately excluded from payload identity.
+    indexer_hbm_block_map: Optional[tuple[int, ...]] = field(default=None, repr=False)
 
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""
