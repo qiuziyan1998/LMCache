@@ -66,6 +66,7 @@ def test_consecutive_chunks_reuse_views_and_release_only_at_request_end(
     monkeypatch.setattr(engine_module, "assert_layerwise_gpu_connector", lambda _: None)
     consumer = HostDMAConsumer()
     allocator = PassiveSharedViewAllocator(
+        reuse_prefill=True,
         slab_tensor=torch.zeros(1024, dtype=torch.uint8),
         shm_name="/prefill-test",
         generation=7,

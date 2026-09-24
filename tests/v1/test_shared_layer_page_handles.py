@@ -23,12 +23,13 @@ from lmcache.v1.shared_cpu_cache import (
 )
 
 
+@pytest.mark.parametrize("reuse_prefill", [False, True])
 @pytest.mark.parametrize(
     "layers,tokens,width,group",
     [(79, 1024, 128, 1), (3, 7, 128, 1), (3, 7, 576, 0), (1, 7, 128, 1)],
 )
 def test_layer_page_individual_handles_preserve_layer_bytes(
-    layers: int, tokens: int, width: int, group: int
+    layers: int, tokens: int, width: int, group: int, reuse_prefill: bool
 ) -> None:
     dtype = torch.bfloat16
     fmt = MemoryFormat.KV_DSA_INDEX_FMT if group else MemoryFormat.KV_MLA_LATENT_FMT
@@ -45,7 +46,7 @@ def test_layer_page_individual_handles_preserve_layer_bytes(
     for layer in range(layers):
         page.layer_tensor(layer).fill_(layer + 1)
     passive = PassiveSharedViewAllocator(
-        slab_tensor=slab, shm_name="test", generation=9
+        slab_tensor=slab, shm_name="test", generation=9, reuse_prefill=reuse_prefill
     )
     engine = object.__new__(LMCacheEngine)
     engine.shared_cpu_cache_name = "test"

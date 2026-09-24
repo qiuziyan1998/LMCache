@@ -96,6 +96,7 @@ class SharedEngine(LMCacheEngine):
         self.shared_cpu_cache_generation = 7
         self.shared_cpu_cache_name = "/source-work"
         self.allocator = PassiveSharedViewAllocator(
+            reuse_prefill=True,
             slab_tensor=torch.zeros(16384, dtype=torch.uint8),
             shm_name=self.shared_cpu_cache_name,
             generation=7,
@@ -388,6 +389,7 @@ def test_source_proof_invalidates_on_key_epoch_or_request_change(
         for engine in (rank0, passive):
             engine.shared_cpu_cache_generation += 1
         passive.shared_cpu_cache_passive_allocator = PassiveSharedViewAllocator(
+            reuse_prefill=True,
             slab_tensor=torch.zeros(16384, dtype=torch.uint8),
             shm_name=passive.shared_cpu_cache_name,
             generation=8,

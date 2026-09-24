@@ -101,6 +101,7 @@ class PassiveEngine(LMCacheEngine):
         self.token_database = TokenPlan()
         self.shared_cpu_cache_generation = 7
         self.shared_cpu_cache_passive_allocator = PassiveSharedViewAllocator(
+            reuse_prefill=True,
             slab_tensor=torch.zeros(4096, dtype=torch.uint8),
             shm_name="/reuse-debug",
             generation=7,

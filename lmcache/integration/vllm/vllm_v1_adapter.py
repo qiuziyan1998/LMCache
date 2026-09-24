@@ -4817,7 +4817,8 @@ class LMCacheConnectorV1Impl:
             )
             initial_cached_tokens = tracker.num_lmcache_cached_tokens
             cold_full_hit = (
-                initial_cached_tokens > 0
+                getattr(self, "_layerwise_prefill_p_node", False)
+                and initial_cached_tokens > 0
                 and initial_cached_tokens == tracker.prompt_len
                 and getattr(tracker, "sparse_remap_frontier", None) is not None
             )
@@ -5140,7 +5141,10 @@ class LMCacheConnectorV1Impl:
             release_prefill_pages = getattr(
                 self.lmcache_engine, "release_layerwise_prefill_pages", None
             )
-            if release_prefill_pages is not None:
+            if (
+                getattr(self, "_layerwise_prefill_p_node", False)
+                and release_prefill_pages is not None
+            ):
                 release_prefill_pages(req_id)
         # get_finished calls this even with no new finishes. Poll here once,
         # inside its measured finalization scope, not on every load submission.
@@ -5233,7 +5237,10 @@ class LMCacheConnectorV1Impl:
         )
         for kv_group in (0, 1):
             cache = state.cache_kwargs(kv_group, dsa_two_groups=True)
-            if callable(release_pointer_cache):
+            if (
+                state.dense_prefix_generation is not None
+                and callable(release_pointer_cache)
+            ):
                 release_pointer_cache(cache["cached_chunk_ptrs_npu"])
             for name in (
                 "cached_memory_objs",
@@ -6519,12 +6526,9 @@ class LMCacheConnectorV1Impl:
                 return True
             for layer_id, selected in enumerate(selected_ptrs_by_layer):
                 existing = dst_chunk_ptrs_npu[layer_id]
-                if existing is not None:
-                    raise RuntimeError(
-                        "Layerwise pointer merge requires a request-owned "
-                        "incremental table"
-                    )
-                dst_chunk_ptrs_npu[layer_id] = selected
+                dst_chunk_ptrs_npu[layer_id] = (
+                    selected if existing is None else torch.cat((existing, selected))
+                )
             return True
 
         if not append_layer_ptr_tensors():
@@ -6577,8 +6581,11 @@ class LMCacheConnectorV1Impl:
             src_chunk_ptrs_npu=result.chunk_ptrs,
             src_shared_handles=[],
             require_pointer_cache=require_pointer_cache,
-            pointer_table=destination.pointer_tables.setdefault(
-                result.kv_group, LayerwisePointerTable()
+            pointer_table=(
+                destination.pointer_tables.setdefault(
+                    result.kv_group, LayerwisePointerTable()
+                )
+                if getattr(self, "_layerwise_prefill_p_node", False) else None
             ),
             append_from=append_from,
         )
@@ -6847,13 +6854,19 @@ class LMCacheConnectorV1Impl:
             cached_ends = cache["cached_ends"]
             chunk_token_counts = None
             if cached_starts and len(cached_starts) == len(cached_ends):
-                if not self._cached_ranges_cover_prefix(
-                    cached_starts,
-                    cached_ends,
-                    token_count,
+                if not getattr(self, "_layerwise_prefill_p_node", False):
+                    if self._cached_prefix_covered_token_count(
+                        cached_starts, cached_ends
+                    ) != token_count:
+                        continue
+                elif not self._cached_ranges_cover_prefix(
+                    cached_starts, cached_ends, token_count
                 ):
                     continue
-                if int(cached_ends[-1]) > token_count:
+                if (
+                    getattr(self, "_layerwise_prefill_p_node", False)
+                    and int(cached_ends[-1]) > token_count
+                ):
                     # Chunked prefill stores publish each KV group separately.
                     # Indexer may already cover the next chunk while latent
                     # still defines the previous request frontier. Retain all
@@ -9797,8 +9810,9 @@ class LMCacheConnectorV1Impl:
                 selected_tokens/target_slot_mapping/selected_token_counts were
                 built. LMCache waits on this before row-selecting those tensors.
         """
-        wait_group = self._layerwise_wait_group(layer_name)
+        wait_group = None
         if self.supports_layerwise_prefill_transfer_window:
+            wait_group = self._layerwise_wait_group(layer_name)
             # This fence is required even on a cache miss. Layer N and N-2 use
             # the same two-bank slot; N must not overwrite it while save(N-2)
             # is still reading from that bank.
@@ -9882,6 +9896,9 @@ class LMCacheConnectorV1Impl:
                 and len(selected_tokens.shape) > 0
                 else len(selected_tokens)
             )
+
+        if wait_group is None:
+            wait_group = self._layerwise_wait_group(layer_name)
 
         parsed_layer_id = None
         parsed_layer_id_loaded = False
@@ -10240,7 +10257,8 @@ class LMCacheConnectorV1Impl:
             num_layers = len(getattr(self, "kv_caches", {}) or {})
         # Deferred P-node storers expose two suspension points per layer:
         # pre-HCOM submission and post-HCOM completion/publication.
-        return max(2 * num_layers + 2, 2)
+        steps_per_layer = 2 if getattr(self, "_layerwise_prefill_p_node", False) else 1
+        return max(steps_per_layer * num_layers + 2, 2)
 
     def _drain_layerwise_storer_fully(
         self,

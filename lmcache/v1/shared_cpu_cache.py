@@ -569,6 +569,17 @@ class SharedChunkHandle:
                 f"kv_group={kv_group}, chunk_index={chunk_index}"
             )
         meta = memory_obj.metadata
+        offset, physical_size = int(meta.address), int(meta.phy_size)
+        logical_size = int(memory_obj.get_size())
+        shape = torch.Size(memory_obj.get_shape())
+        shapes, dtypes = meta.shapes, meta.dtypes
+        if isinstance(memory_obj, LayerPageMemoryObj):
+            if not 0 <= layer_id < memory_obj.num_layers:
+                raise SharedCPUCacheValidationError("Invalid layer-page handle row")
+            # Individual handles expose one row, not the whole all-layer page.
+            offset += memory_obj.group_prefix_sum[layer_id]
+            physical_size = logical_size = memory_obj.layer_size
+            shapes, dtypes = [shape], [dtype]
         return cls(
             request_id=request_id,
             phase=phase,
@@ -577,18 +588,19 @@ class SharedChunkHandle:
             kv_group=kv_group,
             chunk_index=chunk_index,
             shm_name=shm_name,
-            offset=int(meta.address),
-            physical_size=int(meta.phy_size),
-            logical_size=int(memory_obj.get_size()),
-            shape=torch.Size(memory_obj.get_shape()),
+            offset=offset,
+            physical_size=physical_size,
+            logical_size=logical_size,
+            shape=shape,
             dtype=dtype,
             fmt=memory_obj.get_memory_format(),
             generation=int(generation),
             producer_rank=int(producer_rank),
-            shapes=[torch.Size(s) for s in meta.shapes] if meta.shapes else None,
-            dtypes=list(meta.dtypes) if meta.dtypes else None,
+            shapes=[torch.Size(s) for s in shapes] if shapes else None,
+            dtypes=list(dtypes) if dtypes else None,
             cached_positions=_positions_to_list(meta.cached_positions),
         )
+
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1060,15 +1072,17 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         slab_tensor: torch.Tensor,
         shm_name: str,
         generation: int,
+        reuse_prefill: bool = False,
     ) -> None:
+        self.reuse_prefill = reuse_prefill
         self.slab_tensor = slab_tensor.view(torch.uint8).flatten()
         self.buffer = self.slab_tensor
         self.shm_name = shm_name
         self.generation = int(generation)
         # Descriptor identities do not own the views. Request leases retain
         # the actual allocator references; dropping a lease removes dead keys.
-        self._view_descriptors: WeakKeyDictionary[MemoryObj, tuple] = (
-            WeakKeyDictionary()
+        self._view_descriptors: Optional[WeakKeyDictionary[MemoryObj, tuple]] = (
+            WeakKeyDictionary() if reuse_prefill else None
         )
 
     @property
@@ -1098,6 +1112,20 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         acquires another reference nor rebuilds its cached-position tensor.
         All normal handle validation still runs before reuse.
         """
+        if not self.reuse_prefill:
+            return self._create_view_ordinary(
+                handle,
+                expected_request_id=expected_request_id,
+                expected_phase=expected_phase,
+                expected_layer_id=expected_layer_id,
+                expected_kv_group=expected_kv_group,
+                expected_chunk_index=expected_chunk_index, expected_key=expected_key,
+                expected_shape=expected_shape, expected_dtype=expected_dtype,
+                expected_fmt=expected_fmt,
+                expected_cached_positions=expected_cached_positions,
+                expected_producer_rank=expected_producer_rank
+            )
+        assert self._view_descriptors is not None
         validate_shared_handle(
             handle,
             expected_request_id=expected_request_id,
@@ -1189,6 +1217,12 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         The caller validates the batch envelope and expected chunk metadata.
         A reused ``previous`` carries no additional allocator reference.
         """
+        if not self.reuse_prefill:
+            return self._create_batch_view_ordinary(
+                batch, layer_id=layer_id, chunk_index=chunk_index, shape=shape,
+                dtype=dtype, fmt=fmt, cached_positions=cached_positions
+            )
+        assert self._view_descriptors is not None
         page_count = len(batch.page_offsets)
         if not page_count <= chunk_index < batch.num_chunks:
             raise SharedCPUCacheValidationError("Page chunks require create_page_view")
@@ -1289,6 +1323,12 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         The caller validates the batch envelope and expected chunk metadata.
         Reuse preserves the existing request-owned reference and page identity.
         """
+        if not self.reuse_prefill:
+            return self._create_page_view_ordinary(
+                batch, chunk_index=chunk_index, shape=shape, dtype=dtype,
+                fmt=fmt, cached_positions=cached_positions
+            )
+        assert self._view_descriptors is not None
         if not 0 <= chunk_index < len(batch.page_offsets):
             raise SharedCPUCacheValidationError("Invalid compact page chunk index")
         if batch.shm_name != self.shm_name:
@@ -1390,6 +1430,7 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
             previous is not None
             and previous.is_valid()
             and previous.parent_allocator is self
+            and self._view_descriptors is not None
             and self._view_descriptors.get(previous) == descriptor
             and previous.get_shape() == shape
             and previous.get_dtype() == dtype
@@ -1444,6 +1485,158 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
     ) -> None:
         for memory_obj in memory_objs:
             self.free(memory_obj, allocator_type)
+
+    def _create_view_ordinary(
+        self,
+        handle: SharedChunkHandle,
+        *,
+        expected_request_id: str,
+        expected_phase: str,
+        expected_layer_id: int,
+        expected_kv_group: int,
+        expected_chunk_index: Optional[int] = None,
+        expected_key: Optional[CacheEngineKey] = None,
+        expected_shape: Optional[torch.Size] = None,
+        expected_dtype: Optional[torch.dtype] = None,
+        expected_fmt: Optional[MemoryFormat] = None,
+        expected_cached_positions: Optional[Iterable[int]] = None,
+        expected_producer_rank: Optional[int] = None,
+    ) -> TensorMemoryObj:
+        validate_shared_handle(
+            handle,
+            expected_request_id=expected_request_id,
+            expected_phase=expected_phase,
+            expected_layer_id=expected_layer_id,
+            expected_kv_group=expected_kv_group,
+            expected_shm_name=self.shm_name,
+            expected_generation=self.generation,
+            expected_chunk_index=expected_chunk_index,
+            expected_key=expected_key,
+            expected_shape=expected_shape,
+            expected_dtype=expected_dtype,
+            expected_fmt=expected_fmt,
+            expected_cached_positions=expected_cached_positions,
+            expected_producer_rank=expected_producer_rank,
+            slab_size=self.slab_size,
+        )
+        raw_data = self.slab_tensor[
+            handle.offset : handle.offset + handle.logical_size
+        ]
+        cached_positions = (
+            torch.tensor(handle.cached_positions, dtype=torch.int64)
+            if handle.cached_positions is not None
+            else None
+        )
+        metadata = MemoryObjMetadata(
+            shape=handle.shape,
+            dtype=handle.dtype,
+            address=handle.offset,
+            phy_size=handle.physical_size,
+            ref_count=1,
+            pin_count=0,
+            fmt=handle.fmt,
+            cached_positions=cached_positions,
+            shapes=handle.shapes,
+            dtypes=handle.dtypes,
+        )
+        return TensorMemoryObj(
+            raw_data=raw_data,
+            metadata=metadata,
+            parent_allocator=self,
+        )
+
+    def _create_batch_view_ordinary(
+        self,
+        batch: SharedHandleBatch,
+        *,
+        layer_id: int,
+        chunk_index: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+        cached_positions: Iterable[int],
+    ) -> TensorMemoryObj:
+        page_count = len(batch.page_offsets)
+        if chunk_index < page_count:
+            raise SharedCPUCacheValidationError("Page chunks require create_page_view")
+        tail_chunks = batch.num_chunks - page_count
+        tail_index = chunk_index - page_count
+        offset = batch.offsets[layer_id * tail_chunks + tail_index]
+        physical_size = batch.physical_sizes[chunk_index]
+        logical_size = shape.numel() * dtype.itemsize
+        if logical_size <= 0 or logical_size > physical_size:
+            raise SharedCPUCacheValidationError(
+                "Invalid compact shared view logical size: "
+                f"logical_size={logical_size}, physical_size={physical_size}"
+            )
+        positions = torch.tensor(list(cached_positions), dtype=torch.int64)
+        return TensorMemoryObj(
+            raw_data=self.slab_tensor[offset : offset + logical_size],
+            metadata=MemoryObjMetadata(
+                shape=shape,
+                dtype=dtype,
+                address=offset,
+                phy_size=physical_size,
+                ref_count=1,
+                pin_count=0,
+                fmt=fmt,
+                cached_positions=positions,
+                shapes=[shape],
+                dtypes=[dtype],
+            ),
+            parent_allocator=self,
+        )
+
+    def _create_page_view_ordinary(
+        self,
+        batch: SharedHandleBatch,
+        *,
+        chunk_index: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+        cached_positions: Iterable[int],
+    ) -> LayerPageMemoryObj:
+        """Create one passive all-layer view from a compact page descriptor."""
+        if not 0 <= chunk_index < len(batch.page_offsets):
+            raise SharedCPUCacheValidationError("Invalid compact page chunk index")
+        offset = batch.page_offsets[chunk_index]
+        physical_size = batch.page_physical_sizes[chunk_index]
+        layer_size = shape.numel() * dtype.itemsize
+        logical_size = layer_size * batch.num_layers
+        if (
+            layer_size != batch.physical_sizes[chunk_index]
+            or logical_size <= 0
+            or logical_size > physical_size
+        ):
+            raise SharedCPUCacheValidationError(
+                "Invalid compact page logical size: "
+                f"logical_size={logical_size}, physical_size={physical_size}"
+            )
+        positions = tuple(cached_positions)
+        if not positions:
+            raise SharedCPUCacheValidationError(
+                "Compact layer page must contain at least one token"
+            )
+        return LayerPageMemoryObj(
+            raw_data=None,
+            metadata=MemoryObjMetadata(
+                shape=shape,
+                dtype=dtype,
+                address=offset,
+                phy_size=physical_size,
+                ref_count=1,
+                pin_count=0,
+                fmt=fmt,
+                cached_positions=torch.tensor(positions, dtype=torch.int64),
+                shapes=[shape] * batch.num_layers,
+                dtypes=[dtype] * batch.num_layers,
+            ),
+            parent_allocator=self,
+            num_layers=batch.num_layers,
+            raw_view_size=logical_size,
+            valid_tokens=len(positions),
+        )
 
 
 class SharedSlabMapping:
@@ -1572,11 +1765,14 @@ class SharedSlabMapping:
             owner=True,
         )
 
-    def passive_allocator(self) -> PassiveSharedViewAllocator:
+    def passive_allocator(
+        self, *, reuse_prefill: bool = False
+    ) -> PassiveSharedViewAllocator:
         return PassiveSharedViewAllocator(
             slab_tensor=self.tensor,
             shm_name=self.shm_name,
             generation=self.generation,
+            reuse_prefill=reuse_prefill,
         )
 
     def preflight_device_ptr(self) -> int:

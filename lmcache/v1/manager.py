@@ -8,6 +8,7 @@ decoupling the vLLM adapter from internal LMCache implementation details.
 
 # Standard
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+import os
 import threading
 import time
 import traceback
@@ -260,7 +261,9 @@ class LMCacheManager:
 
     def _shared_cpu_startup_required(self) -> bool:
         return bool(
-            self._config.get_extra_config_value(
+            os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+            .strip().lower() == "true"
+            and self._config.get_extra_config_value(
                 "enable_shared_cpu_cache",
                 getattr(self._config, "enable_shared_cpu_cache", False),
             )

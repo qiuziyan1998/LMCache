@@ -35,6 +35,7 @@ def make_key(chunk_hash: int = 101) -> CacheEngineKey:
 
 def make_allocator() -> PassiveSharedViewAllocator:
     return PassiveSharedViewAllocator(
+        reuse_prefill=True,
         slab_tensor=torch.zeros(4096, dtype=torch.uint8),
         shm_name="/prefill-test",
         generation=9,
