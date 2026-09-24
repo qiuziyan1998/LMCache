@@ -222,12 +222,17 @@ def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
     )
 
     lookup_client.lookup_cache.return_value = 8193
-    new_block = SimpleNamespace(request_id="cold-new-block", num_tokens=8193)
-    assert impl.get_num_new_matched_tokens(new_block, 0) == 8192
-    assert not impl.should_load_kv_async(new_block.request_id)
-    assert not hasattr(
-        impl.load_specs[new_block.request_id], "dsa_cold_compact_load"
+    new_block = SimpleNamespace(
+        request_id="cold-new-block",
+        num_tokens=8193,
+        prompt_token_ids=[1] * 8193,
+        num_preemptions=0,
     )
+    assert impl.get_num_new_matched_tokens(new_block, 0) == 8192
+    assert impl.should_load_kv_async(new_block.request_id)
+    assert impl.load_specs[new_block.request_id].dsa_cold_compact_load
+    assert impl.load_specs[new_block.request_id].lmcache_cached_tokens == 8193
+    assert impl.load_specs[new_block.request_id].dsa_remap_frontier == 8192
 
     lookup_client.lookup_cache.return_value = 4096
     partial = SimpleNamespace(request_id="cold-partial-hit", num_tokens=8192)

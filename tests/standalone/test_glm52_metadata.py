@@ -149,6 +149,7 @@ def test_reregistration_cannot_advertise_old_row_order_for_new_buffers():
     obj.num_layers = 4
     obj.lmcache_engine = NS(
         metadata=NS(
+            indexer_c8_layout=None,
             kv_layer_groups_manager=manager,
             runtime_kv_group_layer_counts=(4, 2),
             runtime_kv_group_layer_names=names,

@@ -10539,8 +10539,20 @@ class LMCacheConnectorV1Impl:
             and num_computed_tokens == 0
             and (full_request_hit or full_resumed_query_hit)
             and need_to_allocate > 0
-            and cdiv(num_external_hit_tokens, self._block_size)
-            == cdiv(need_to_allocate, self._block_size)
+            and (
+                cdiv(num_external_hit_tokens, self._block_size)
+                == cdiv(need_to_allocate, self._block_size)
+                or (
+                    # Fresh N=block*k+1 hits reserve the final load slot via
+                    # scheduler lookahead without advancing computed tokens.
+                    not resumed
+                    and getattr(request, "num_preemptions", 0) == 0
+                    and query_scope == "all_tokens"
+                    and full_request_hit
+                    and request.num_tokens == request_prompt_tokens
+                    and num_external_hit_tokens % self._block_size == 1
+                )
+            )
             # The compact load materializes the prefix in indexer blocks that
             # only the SFA compact-scratch remap can read. That machinery
             # requires a frontier of zero or >= scratch_capacity; a smaller
