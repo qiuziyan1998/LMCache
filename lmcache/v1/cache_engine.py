@@ -9681,24 +9681,25 @@ class LMCacheEngineBuilder:
         """
         logger.info(f"Creating LMCacheEngine instance {instance_id}")
         if instance_id not in cls._instances:
-            numa_mapping = NUMADetector.get_numa_mapping(config)
+            with startup_phase("engine_numa", rank=metadata.worker_id):
+                numa_mapping = NUMADetector.get_numa_mapping(config)
             logger.info(f"NUMA mapping for instance {instance_id}: {numa_mapping}")
-            token_database = cls._Create_token_database(config, metadata)
-            stat_logger = LMCacheStatsLogger(
-                metadata,
-                log_interval=10,
-                config=config,
-            )
-
-            engine = LMCacheEngine(
-                config,
-                metadata,
-                token_database,
-                gpu_connector,
-                broadcast_fn,
-                broadcast_object_fn,
-                collective_all_true_fn,
-            )
+            with startup_phase("engine_create", rank=metadata.worker_id):
+                token_database = cls._Create_token_database(config, metadata)
+                stat_logger = LMCacheStatsLogger(
+                    metadata,
+                    log_interval=10,
+                    config=config,
+                )
+                engine = LMCacheEngine(
+                    config,
+                    metadata,
+                    token_database,
+                    gpu_connector,
+                    broadcast_fn,
+                    broadcast_object_fn,
+                    collective_all_true_fn,
+                )
 
             cls._instances[instance_id] = engine
             cls._cfgs[instance_id] = config

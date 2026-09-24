@@ -58,6 +58,7 @@ from lmcache.v1.remote_fill.native import (
     NativeExternalPageTransferUnknownError,
     PreparedDirectPushSource,
 )
+from lmcache.v1.startup_trace import startup_phase
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.system_detection import NUMADetector
@@ -277,7 +278,8 @@ class MooncakestoreConnector(RemoteConnector):
 
         store_setup_started = False
         try:
-            self.store = MooncakeDistributedStore()
+            with startup_phase("mooncake_create", rank=engine_metadata.worker_id):
+                self.store = MooncakeDistributedStore()
             config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
             if config_file_path is not None:
                 self.config = MooncakeStoreConfig.from_file(config_file_path)
@@ -325,14 +327,15 @@ class MooncakestoreConnector(RemoteConnector):
                     raise ValueError(
                         "mooncake_reuse_vllm_transfer_engine requires protocol=ascend"
                     )
-                (
-                    self._shared_global_te,
-                    local_segment,
-                    native_engine,
-                    self._shared_transfer_engine,
-                ) = (
-                    _shared_vllm_mooncake_transport()
-                )
+                with startup_phase(
+                    "mooncake_shared_engine", rank=engine_metadata.worker_id
+                ):
+                    (
+                        self._shared_global_te,
+                        local_segment,
+                        native_engine,
+                        self._shared_transfer_engine,
+                    ) = _shared_vllm_mooncake_transport()
                 self._shared_local_segment = local_segment
 
             # Check if storage_root_dir exists and set environment variable
@@ -410,9 +413,10 @@ class MooncakestoreConnector(RemoteConnector):
                 setup_args.append(native_engine)
                 logger.info("Reusing vLLM-Ascend's process-wide Mooncake engine")
             store_setup_started = True
-            status = self.store.setup(*setup_args)
-            if status not in (None, 0):
-                raise RuntimeError(f"Mooncake setup failed: status={status}")
+            with startup_phase("mooncake_setup", rank=engine_metadata.worker_id):
+                status = self.store.setup(*setup_args)
+                if status not in (None, 0):
+                    raise RuntimeError(f"Mooncake setup failed: status={status}")
 
             logger.info("Mooncake store setup completed successfully")
 
@@ -494,7 +498,10 @@ class MooncakestoreConnector(RemoteConnector):
 
             # Passive readers own no LocalCPU allocator or slab.
             if not self._external_page_only:
-                self._register_cpu_buffer()
+                with startup_phase(
+                    "mooncake_register_cpu", rank=engine_metadata.worker_id
+                ):
+                    self._register_cpu_buffer()
 
             logger.info("MooncakeConnector initialized successfully.")
         except BaseException as exc:
