@@ -78,6 +78,7 @@ from lmcache.v1.gpu_connector.sparse import (
     PreparedSparseSource,
     build_prepared_sparse_source,
 )
+from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.kv_layer_groups import validate_two_group_layer_counts
 from lmcache.v1.manager import LMCacheManager
 
@@ -512,6 +513,7 @@ def _dsa_debug_minmax_count(value: Any) -> Any:
         return (min(seq), max(seq), len(seq))
     except Exception as exc:
         return f"{type(value).__name__}:minmax_failed:{exc}"
+
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
@@ -1864,6 +1866,7 @@ class PreemptionConnectorMetadata(LMCacheConnectorMetadata):
 
 class LMCacheConnectorV1Impl:
     supports_preemption_checkpoint = False
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -1905,11 +1908,23 @@ class LMCacheConnectorV1Impl:
         self._checkpoint_snapshots: list[tuple] = []
         self._checkpoint_cancels: list[tuple[str, int]] = []
 
+        indexer_c8_layout = None
+        if runtime_group_layer_counts is not None:
+            indexer_spec = kv_cache_config.kv_cache_groups[1].kv_cache_spec
+            if getattr(indexer_spec, "cache_sparse_c8", False):
+                selected = getattr(indexer_spec, "indexer_c8_layer_names", None)
+                mask = (
+                    tuple(name in selected for name in kv_cache_config.kv_cache_groups[1].layer_names)
+                    if selected is not None else ()
+                )
+                indexer_c8_layout = IndexerC8Layout(indexer_spec.sparse_head_dim[-1], mask)
+
         service_factory = VllmServiceFactory(
             config,
             vllm_config,
             role.name.lower(),
             runtime_kv_group_layer_counts=runtime_group_layer_counts,
+            indexer_c8_layout=indexer_c8_layout,
             runtime_kv_group_layer_names=(
                 tuple(
                     tuple(group.layer_names)
@@ -2456,7 +2471,13 @@ class LMCacheConnectorV1Impl:
             kv_layer_groups_manager = (
                 self.lmcache_engine.metadata.kv_layer_groups_manager
             )
-            kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
+            indexer_layout = self.lmcache_engine.metadata.indexer_c8_layout
+            if indexer_layout is not None and indexer_layout.mixed:
+                kv_layer_groups_manager.build_kv_layer_groups(
+                    self.kv_caches, indexer_c8_layout=indexer_layout
+                )
+            else:
+                kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
             self._normalize_dsa_kv_layer_groups()
             if self._is_dsa_two_groups():
                 engine = self.lmcache_engine
@@ -10734,8 +10755,20 @@ class LMCacheConnectorV1Impl:
             and num_computed_tokens == 0
             and (full_request_hit or full_resumed_query_hit)
             and need_to_allocate > 0
-            and cdiv(num_external_hit_tokens, self._block_size)
-            == cdiv(need_to_allocate, self._block_size)
+            and (
+                cdiv(num_external_hit_tokens, self._block_size)
+                == cdiv(need_to_allocate, self._block_size)
+                or (
+                    # Fresh N=block*k+1 hits reserve the final load slot via
+                    # scheduler lookahead without advancing computed tokens.
+                    not resumed
+                    and getattr(request, "num_preemptions", 0) == 0
+                    and query_scope == "all_tokens"
+                    and full_request_hit
+                    and request.num_tokens == request_prompt_tokens
+                    and num_external_hit_tokens % self._block_size == 1
+                )
+            )
             # The compact load materializes the prefix in indexer blocks that
             # only the SFA compact-scratch remap can read. That machinery
             # requires a frontier of zero or >= scratch_capacity; a smaller

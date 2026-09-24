@@ -213,3 +213,63 @@ def test_page_handle_rejects_invalid_layer_without_materializing_storage(
         assert "raw_data" not in page.__dict__
     finally:
         page.ref_count_down()
+
+
+def test_mixed_page_compact_view_preserves_variable_offsets():
+    from lmcache.v1.shared_cpu_cache import SharedHandleBatch
+
+    tokens = 7
+    shapes = [torch.Size([tokens * width]) for width in (256, 130, 256)]
+    slab = torch.empty(16384, dtype=torch.uint8)
+    owner = TensorMemoryAllocator(slab)
+    pages = owner.batched_allocate_layer_pages(
+        shapes,
+        [torch.uint8] * 3,
+        1,
+        3,
+        MemoryFormat.KV_DSA_INDEX_FMT,
+        valid_tokens=tokens,
+        full_tokens=tokens,
+    )
+    page = pages[0]
+    for layer in range(3):
+        page.layer_tensor(layer).fill_(layer + 1)
+    engine = object.__new__(LMCacheEngine)
+    engine.shared_cpu_cache_name = "test"
+    engine.metadata = SimpleNamespace(worker_id=0)
+    engine.num_layers_for_group = lambda group: 3
+    key = CacheEngineKey("model", 1, 0, 7, torch.uint8, kv_group=1)
+    batch = engine._make_shared_handle_batch(
+        [[page]] * 3, [[key] for key in key.split_layers(3)], kv_group=1
+    )
+    assert batch is not None
+    passive = PassiveSharedViewAllocator(
+        slab_tensor=slab, shm_name="test", generation=9
+    )
+    view = passive.create_page_view(
+        SharedHandleBatch.from_dict(batch.to_dict()),
+        chunk_index=0,
+        shape=shapes[0],
+        dtype=torch.uint8,
+        fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+        cached_positions=range(tokens),
+        layer_shapes=shapes,
+    )
+    try:
+        for layer in range(3):
+            assert view.layer_data_ptr(layer) == page.layer_data_ptr(layer)
+            assert torch.equal(view.layer_tensor(layer), page.layer_tensor(layer))
+        with pytest.raises(SharedCPUCacheValidationError):
+            passive.create_page_view(
+                batch,
+                chunk_index=0,
+                shape=shapes[0],
+                dtype=torch.uint8,
+                fmt=MemoryFormat.KV_DSA_INDEX_FMT,
+                cached_positions=range(tokens),
+                layer_shapes=shapes[:2],
+            )
+    finally:
+        view.ref_count_down()
+        page.ref_count_down()
+    assert owner.total_allocated_size == 0

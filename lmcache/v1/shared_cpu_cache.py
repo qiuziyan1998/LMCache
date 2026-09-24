@@ -468,7 +468,8 @@ class SharedChunkHandle:
                 raise SharedCPUCacheValidationError("Invalid layer-page handle row")
             # Individual handles expose one row, not the whole all-layer page.
             offset += memory_obj.group_prefix_sum[layer_id]
-            physical_size = logical_size = memory_obj.layer_size
+            physical_size = logical_size = memory_obj.layer_size_bytes(layer_id)
+            shape = torch.Size(memory_obj.get_shapes()[layer_id])
             shapes, dtypes = [shape], [dtype]
         return cls(
             request_id=request_id,
@@ -1081,6 +1082,7 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         dtype: torch.dtype,
         fmt: MemoryFormat,
         cached_positions: Iterable[int],
+        layer_shapes: Optional[list[torch.Size]] = None,
     ) -> LayerPageMemoryObj:
         """Create one passive all-layer view from a compact page descriptor."""
         if not 0 <= chunk_index < len(batch.page_offsets):
@@ -1088,7 +1090,17 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         offset = batch.page_offsets[chunk_index]
         physical_size = batch.page_physical_sizes[chunk_index]
         layer_size = shape.numel() * dtype.itemsize
+        shapes = [shape] * batch.num_layers if layer_shapes is None else layer_shapes
         logical_size = layer_size * batch.num_layers
+        if layer_shapes is not None:
+            if (
+                len(shapes) != batch.num_layers
+                or not shapes
+                or shapes[0] != shape
+                or any(s.numel() <= 0 for s in shapes)
+            ):
+                raise SharedCPUCacheValidationError("Invalid compact page layer shapes")
+            logical_size = sum(s.numel() * dtype.itemsize for s in shapes)
         if (
             layer_size != batch.physical_sizes[chunk_index]
             or logical_size <= 0
@@ -1114,7 +1126,7 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
                 pin_count=0,
                 fmt=fmt,
                 cached_positions=torch.tensor(positions, dtype=torch.int64),
-                shapes=[shape] * batch.num_layers,
+                shapes=shapes,
                 dtypes=[dtype] * batch.num_layers,
             ),
             parent_allocator=self,

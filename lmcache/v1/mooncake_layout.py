@@ -98,6 +98,9 @@ def _infer_dsa_raw_token_dims(
             if len(shape) >= 1:
                 inferred[kv_group] = int(shape[-1])
 
+    indexer = getattr(metadata, "indexer_c8_layout", None)
+    if indexer is not None and indexer.mixed:
+        inferred[1] = indexer.head_dim
     model_config, source = _load_model_config_for_dsa_dims(metadata)
     if not model_config:
         return inferred, source if inferred else "no inferable local metadata"
@@ -156,12 +159,20 @@ def resolve_mooncake_dsa_raw_token_dims(
 
     override = (config.extra_config or {}).get("mooncake_dsa_raw_token_dims")
     if override is not None:
-        return (
-            _parse_dsa_raw_token_dims(override),
-            "extra_config.mooncake_dsa_raw_token_dims",
-        )
-
-    inferred, source = _infer_dsa_raw_token_dims(config, metadata)
+        inferred = _parse_dsa_raw_token_dims(override)
+        source = "extra_config.mooncake_dsa_raw_token_dims"
+    else:
+        inferred, source = _infer_dsa_raw_token_dims(config, metadata)
+    c8 = getattr(metadata, "indexer_c8_layout", None)
+    if c8 is not None:
+        width = max(c8.token_bytes_for(i) for i in range(len(c8.c8_layers))) if c8.mixed else c8.token_bytes
+        if inferred.get(1, c8.head_dim) not in (c8.head_dim, width):
+            raise ValueError(
+                "Indexer C8 raw width conflicts with the runtime key/scale layout"
+            )
+        inferred[1] = width
+    if override is not None:
+        return inferred, source
     if inferred.get(0, 0) > 0 and inferred.get(1, 0) > 0:
         return inferred, f"model config inference: {source}"
 
@@ -352,11 +363,17 @@ def mooncake_payload_layout(
             extra_config.get("mooncake_layer_merged_page_objects", False)
         ),
     }
+    c8 = getattr(metadata, "indexer_c8_layout", None)
+    if c8 is not None:
+        # Index selection changes downstream latent KV too: isolate BOTH groups.
+        descriptor["indexer_execution"] = c8.descriptor()
     counts = getattr(metadata, "runtime_kv_group_layer_counts", None)
-    if counts is not None and len(set(counts)) > 1:
+    if c8 is not None or (counts is not None and len(set(counts)) > 1):
         names = getattr(metadata, "runtime_kv_group_layer_names", None)
-        if names is None or tuple(map(len, names)) != tuple(counts):
-            raise ValueError("Unequal KV groups require ordered runtime layer names")
+        if counts is None or names is None or tuple(map(len, names)) != tuple(counts):
+            raise ValueError(
+                "C8 or unequal KV groups require ordered runtime layer names"
+            )
         descriptor["runtime_kv_groups"] = tuple(zip(counts, names, strict=True))
     encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
     return hashlib.blake2b(encoded.encode(), digest_size=8).hexdigest(), descriptor

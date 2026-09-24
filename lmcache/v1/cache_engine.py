@@ -779,6 +779,12 @@ class LMCacheEngine:
         kv_group: int,
         num_tokens: int,
     ) -> int:
+        policy = getattr(self.metadata, "indexer_c8_layout", None)
+        if kv_group == 1 and policy is not None and policy.mixed:
+            return max(
+                policy.layer_bytes(num_tokens, i)
+                for i in range(self.num_layers_for_group(kv_group))
+            )
         shape: Optional[torch.Size] = None
         if kv_group != 0:
             shape = self._metadata_shape_for_kv_group(kv_group, num_tokens)
@@ -818,7 +824,15 @@ class LMCacheEngine:
         *,
         kv_group: int,
         num_tokens: int,
+        layer_id: int = 0,
     ) -> tuple[torch.Size, torch.dtype, MemoryFormat]:
+        policy = getattr(self.metadata, "indexer_c8_layout", None)
+        if kv_group == 1 and policy is not None and policy.mixed:
+            return (
+                torch.Size([policy.layer_bytes(num_tokens, layer_id)]),
+                torch.uint8,
+                self._memory_format_for_kv_group(kv_group),
+            )
         shape: Optional[torch.Size] = None
         if kv_group != 0:
             shape = self._metadata_shape_for_kv_group(kv_group, num_tokens)
@@ -1590,8 +1604,10 @@ class LMCacheEngine:
             page = memory_objs[0][chunk]
             if not isinstance(page, LayerPageMemoryObj):
                 break
-            if page.num_layers != num_layers or any(
-                layer[chunk] is not page for layer in memory_objs
+            if (
+                not page.layer_layout_is_valid()
+                or page.num_layers != num_layers
+                or any(layer[chunk] is not page for layer in memory_objs)
             ):
                 return None
             page_chunks += 1
@@ -1600,7 +1616,7 @@ class LMCacheEngine:
             return None
         physical_sizes = [
             (
-                memory_objs[0][chunk].layer_size
+                memory_objs[0][chunk].layer_size_bytes(0)
                 if chunk < page_chunks
                 else int(memory_objs[0][chunk].meta.phy_size)
             )
@@ -1691,8 +1707,18 @@ class LMCacheEngine:
                         shape=shape,
                         dtype=dtype,
                         fmt=fmt,
-                        cached_positions=range(
-                            starts[chunk_index], ends[chunk_index]
+                        cached_positions=range(starts[chunk_index], ends[chunk_index]),
+                        **(
+                            {
+                                "layer_shapes": self.metadata.indexer_layer_shapes(
+                                    int(ends[chunk_index] - starts[chunk_index])
+                                )
+                            }
+                            if kv_group == 1
+                            and getattr(self.metadata, "indexer_c8_layout", None)
+                            is not None
+                            and self.metadata.indexer_c8_layout.mixed
+                            else {}
                         ),
                     )
                 )
@@ -3075,6 +3101,12 @@ class LMCacheEngine:
         logical_bytes = self._estimate_shared_cpu_bytes_per_layer(
             kv_group, int(num_tokens or self.config.chunk_size)
         ) * self.num_layers_for_group(kv_group)
+        policy = getattr(self.metadata, "indexer_c8_layout", None)
+        if kv_group == 1 and policy is not None and policy.mixed:
+            logical_bytes = sum(
+                policy.layer_bytes(int(num_tokens or self.config.chunk_size), i)
+                for i in range(self.num_layers_for_group(kv_group))
+            )
         try:
             allocator = getattr(
                 self._shared_local_cpu_backend(), "memory_allocator", None
@@ -5461,6 +5493,7 @@ class LMCacheEngine:
                     expected_shape, expected_dtype, expected_fmt = (
                         self._expected_shared_cpu_chunk_metadata(
                             kv_group=kv_group,
+                            layer_id=layer_id,
                             num_tokens=int(
                                 ends_all[chunk_index] - starts_all[chunk_index]
                             ),

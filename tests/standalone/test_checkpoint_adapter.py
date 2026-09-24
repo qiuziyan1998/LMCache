@@ -492,3 +492,113 @@ def test_warm_update_keeps_nonresident_frontier():
         tracker, [16], ([], []), preempted=False
     )
     assert tracker.dsa_nonresident_frontier == tracker.sparse_remap_frontier == 12
+
+
+@pytest.mark.parametrize("length", [81664, 81665, 81666])
+@pytest.mark.parametrize("chunk_size", [1024, 1000])
+def test_fresh_full_hit_keeps_full_load_and_recompute_frontier(length, chunk_size):
+    req = NS(
+        request_id="fresh",
+        num_tokens=length,
+        prompt_token_ids=[1] * length,
+        all_token_ids=[1] * length,
+        num_preemptions=0,
+        status="waiting",
+    )
+    adapter = NS(
+        kv_role="kv_both",
+        lookup_client=NS(lookup_cache=lambda **kw: length),
+        _cold_perf_lookup_started={},
+        _lmcache_chunk_size=chunk_size,
+        _block_size=128,
+        _dsa_scratch_capacity=4096,
+        _dsa_kv_policy_threshold=0,
+        config=NS(min_retrieve_tokens=0, dsa_group1_load_mode="p2p_preferred"),
+        enable_sparse_attention=True,
+        supports_dsa_cold_compact_load=lambda: True,
+        load_specs={},
+        _requests_priority={},
+    )
+    matched = method(
+        "get_num_new_matched_tokens", cdiv=lambda a, b: (a + b - 1) // b, LoadSpec=NS
+    )(adapter, req, 0)
+    spec = adapter.load_specs["fresh"]
+    assert matched == length - 1
+    assert spec.lmcache_cached_tokens == length
+    assert spec.dsa_cold_compact_load
+    assert spec.dsa_remap_frontier == length - 1
+    assert spec.dsa_committed_end == length
+    assert spec.dsa_release_frontier == (length - 1) // chunk_size * chunk_size
+
+
+@pytest.mark.parametrize(
+    "condition",
+    ["previously_preempted", "short_policy", "disabled", "partial", "local"],
+)
+def test_boundary_exception_does_not_relax_other_eligibility(condition):
+    length = 81665
+    hit = length - 1 if condition == "partial" else length
+    req = NS(
+        request_id="r",
+        num_tokens=length,
+        prompt_token_ids=[1] * length,
+        num_preemptions=int(condition == "previously_preempted"),
+        status="waiting",
+    )
+    adapter = NS(
+        kv_role="kv_both",
+        lookup_client=NS(lookup_cache=lambda **kw: hit),
+        _cold_perf_lookup_started={},
+        _lmcache_chunk_size=1024,
+        _block_size=128,
+        _dsa_scratch_capacity=4096,
+        _dsa_kv_policy_threshold=length if condition == "short_policy" else 0,
+        config=NS(min_retrieve_tokens=0, dsa_group1_load_mode="p2p_preferred"),
+        enable_sparse_attention=True,
+        supports_dsa_cold_compact_load=lambda: condition != "disabled",
+        load_specs={},
+        _requests_priority={},
+    )
+    method(
+        "get_num_new_matched_tokens", cdiv=lambda a, b: (a + b - 1) // b, LoadSpec=NS
+    )(adapter, req, 128 if condition == "local" else 0)
+    assert not getattr(adapter.load_specs["r"], "dsa_cold_compact_load", False)
+
+
+@pytest.mark.parametrize("blocks,valid", [(638, False), (639, True), (648, True)])
+def test_boundary_worker_metadata_requires_full_restore_capacity(blocks, valid):
+    import torch
+
+    cdiv = lambda a, b: (a + b - 1) // b
+    mapping = method("_build_slot_mapping", torch=torch, utils=NS(cdiv=cdiv))
+    build = method(
+        "_build_dsa_cold_compact_meta",
+        cdiv=cdiv,
+        ReqMeta=NS,
+        _split_kv_group_block_ids=lambda groups: groups,
+        _build_slot_mapping=mapping,
+        _live_split_source_dp_rank=lambda *args: None,
+    )
+    length = 81665
+    req = NS(request_id="r", all_token_ids=list(range(length)), sampling_params=None)
+    spec = NS(
+        lmcache_cached_tokens=length,
+        dsa_remap_frontier=length - 1,
+        dsa_committed_end=length,
+    )
+    adapter = NS(
+        _block_size=128,
+        _vllm_config=NS(parallel_config=NS(tensor_parallel_size=4)),
+        _group1_p2p_preferred=lambda: False,
+    )
+    ids = list(range(1, blocks + 1))
+    if not valid:
+        with pytest.raises(ValueError, match="smaller than the cache hit"):
+            build(adapter, req, ([], ids), spec)
+        return
+    meta = build(adapter, req, ([], ids), spec)
+    assert meta.token_ids == req.all_token_ids
+    slots = meta.indexer_slot_mapping[0]
+    assert len(slots) == length and slots[-1].item() == 639 * 128
+    assert set((slots // 128).tolist()).issubset(ids)
+    assert meta.dsa_nonresident_frontier == length - 1

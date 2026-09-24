@@ -969,7 +969,7 @@ class TensorMemoryObj(MemoryObj):
 
 
 class LayerPageMemoryObj(TensorMemoryObj):
-    """One allocator-owned chunk containing the same layout for every layer."""
+    """One allocator-owned chunk with an exact byte range for every layer."""
 
     def __init__(
         self,
@@ -997,10 +997,9 @@ class LayerPageMemoryObj(TensorMemoryObj):
                 self.group_prefix_sum, self.group_prefix_sum[1:], strict=False
             )
         }
-        if len(sizes) != 1:
-            raise ValueError("Layer page requires a homogeneous layer layout")
         self.num_layers = num_layers
-        self.layer_size = sizes.pop()
+        # Preserve the homogeneous fast path; mixed pages must use a layer ID.
+        self.layer_size = sizes.pop() if len(sizes) == 1 else None
         if valid_tokens is None:
             token_dim = metadata.fmt.token_dim()
             if token_dim >= len(metadata.shape) and len(metadata.shape) == 1:
@@ -1047,6 +1046,29 @@ class LayerPageMemoryObj(TensorMemoryObj):
         if not 0 <= layer_id < self.num_layers:
             raise IndexError(f"Invalid layer page index: {layer_id}")
         return self._base_data_ptr + self.group_prefix_sum[layer_id]
+
+    def layer_size_bytes(self, layer_id: int) -> int:
+        """Return this layer's logical bytes, excluding allocator padding."""
+        if not self.valid:
+            raise RuntimeError("Layer page storage is no longer valid")
+        if not 0 <= layer_id < self.num_layers:
+            raise IndexError(f"Invalid layer page index: {layer_id}")
+        return self.group_prefix_sum[layer_id + 1] - self.group_prefix_sum[layer_id]
+
+    def layer_layout_is_valid(self) -> bool:
+        """Check logical layer extents without materializing tensor views."""
+        if self.layer_size is not None:
+            return self.get_size() == self.layer_size * self.num_layers
+        shapes, dtypes = self.meta.shapes or (), self.meta.dtypes or ()
+        return (
+            len(shapes) == len(dtypes) == self.num_layers
+            and len(self.group_prefix_sum) == self.num_layers + 1
+            and self.group_prefix_sum[0] == 0
+            and all(
+                shape.numel() * dtype.itemsize == self.layer_size_bytes(layer)
+                for layer, (shape, dtype) in enumerate(zip(shapes, dtypes, strict=True))
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1789,8 +1811,10 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         if num_layers < 1:
             raise ValueError("num_layers must be positive")
         shapes, dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
-        if len(shapes) != 1 or len(dtypes) != 1:
+        if len(shapes) not in (1, num_layers) or len(dtypes) != len(shapes):
             return None
+        if len(set(dtypes)) != 1:
+            raise ValueError("Layer pages require one storage dtype")
         token_dim = fmt.token_dim()
         if full_tokens is None:
             if token_dim >= len(shapes[0]) and len(shapes[0]) == 1:
@@ -1800,9 +1824,10 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                 if token_dim < len(shapes[0])
                 else shapes[0][0]
             )
-        full_shape = _layer_page_shape(
-            shapes[0], fmt, full_tokens, full_tokens=full_tokens
-        )
+        full_shapes = [
+            _layer_page_shape(shape, fmt, full_tokens, full_tokens=full_tokens)
+            for shape in shapes
+        ]
         token_counts = (
             [full_tokens] * batch_size
             if valid_tokens is None
@@ -1824,7 +1849,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             allocated_pages: list[LayerPageMemoryObj] = []
             for count, positions in positions_by_count.items():
                 allocated = self.batched_allocate_layer_pages(
-                    [full_shape],
+                    full_shapes,
                     dtypes,
                     len(positions),
                     num_layers,
@@ -1849,10 +1874,14 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             _layer_page_shape(
                 full_shape, fmt, count, full_tokens=full_tokens
             )
+            for full_shape in full_shapes
         ]
+        if len(shapes) == 1:
+            shapes = shapes * num_layers
+            dtypes = dtypes * num_layers
         return self._batched_allocate(
-            shapes * num_layers,
-            dtypes * num_layers,
+            shapes,
+            dtypes,
             batch_size,
             fmt,
             materialize_views=False,

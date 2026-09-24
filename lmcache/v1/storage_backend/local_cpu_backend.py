@@ -749,6 +749,18 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 if self.metadata is not None
                 else page.num_layers
             )
+            counts = getattr(self.metadata, "runtime_kv_group_layer_counts", None)
+            if counts is not None:
+                if not 0 <= key.kv_group < len(counts):
+                    return False
+                expected_layers = counts[key.kv_group]
+            layout = getattr(self.metadata, "indexer_c8_layout", None)
+            if key.kv_group == 1 and layout is not None and layout.mixed:
+                if page.num_layers != expected_layers or any(
+                    page.layer_size_bytes(i) != layout.layer_bytes(page.valid_tokens, i)
+                    for i in range(expected_layers)
+                ):
+                    return False
             expected_format = (
                 MemoryFormat.KV_MLA_LATENT_FMT
                 if key.kv_group == 0
@@ -756,7 +768,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             )
             return bool(
                 page.num_layers == expected_layers
-                and page.get_size() == page.layer_size * page.num_layers
+                and page.layer_layout_is_valid()
                 and len(dtypes) == page.num_layers
                 and all(dtype == key.dtype for dtype in dtypes)
                 and (

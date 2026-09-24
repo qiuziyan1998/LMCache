@@ -27,6 +27,7 @@ from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.health_monitor.base import HealthMonitor
+from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.internal_api_server.api_server import InternalAPIServer
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
@@ -54,12 +55,14 @@ class VllmServiceFactory(BaseServiceFactory):
         *,
         runtime_kv_group_layer_counts: Optional[tuple[int, ...]] = None,
         runtime_kv_group_layer_names: Optional[tuple[tuple[str, ...], ...]] = None,
+        indexer_c8_layout: Optional[IndexerC8Layout] = None,
     ) -> None:
         self.lmcache_config = lmcache_config
         self.vllm_config = vllm_config
         self.role = role
         self.runtime_kv_group_layer_counts = runtime_kv_group_layer_counts
         self.runtime_kv_group_layer_names = runtime_kv_group_layer_names
+        self.indexer_c8_layout = indexer_c8_layout
         self.metadata: Optional[LMCacheMetadata] = None
         self.lmcache_engine: Optional[LMCacheEngine] = None
 
@@ -164,6 +167,7 @@ class VllmServiceFactory(BaseServiceFactory):
             max_model_len=getattr(model_config, "max_model_len", None),
             runtime_kv_group_layer_counts=self.runtime_kv_group_layer_counts,
             runtime_kv_group_layer_names=self.runtime_kv_group_layer_names,
+            indexer_c8_layout=self.indexer_c8_layout,
         )
         return self.metadata
 
