@@ -2544,6 +2544,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.load_spec.can_load is False
         assert req_meta.load_spec.lmcache_cached_tokens == 0
         assert req_meta.load_spec.dsa_committed_end == 0
+        assert req_meta.load_spec.dsa_full_resident is True
         assert req_meta.save_spec is not None
         assert not req_meta.save_spec.can_save
         assert not impl._dsa_kv_policy_is_sparse_managed(tracker)

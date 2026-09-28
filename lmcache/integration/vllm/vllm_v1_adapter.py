@@ -773,6 +773,10 @@ class LoadSpec:
     dsa_current_released_frontier: int = 0
     # Load Group 1 directly from persistent storage into its final HBM blocks.
     dsa_group1_direct_hbm: bool = False
+    # The request uses the sparse metadata/SFA route while its full latent
+    # prefix remains resident in vLLM. This is deliberately distinct from
+    # ``can_load``: the route must not create a zero-length sparse slot table.
+    dsa_full_resident: bool = False
 
 
 @dataclass
@@ -1717,7 +1721,8 @@ class ReqMeta:
                 skip_save = True
 
         requires_indexer_slots = dsa_two_groups and (
-            (load_spec is not None and load_spec.can_load)
+            is_sparse_decode
+            or (load_spec is not None and load_spec.can_load)
             or not skip_save
             or live_source_requested
         )
@@ -1801,7 +1806,17 @@ class ReqMeta:
         )
 
         # Calculate the token ids and slot mappings for load and save
-        if is_sparse_decode and load_spec is not None and skip_save:
+        full_resident_route = bool(
+            is_sparse_decode
+            and load_spec is not None
+            and load_spec.dsa_full_resident
+        )
+        if (
+            is_sparse_decode
+            and load_spec is not None
+            and skip_save
+            and not full_resident_route
+        ):
             sparse_token_count = int(load_spec.lmcache_cached_tokens)
             if (
                 load_spec.can_load
@@ -1921,7 +1936,11 @@ class ReqMeta:
         needs_full_slots = bool(
             (load_spec is not None and load_spec.can_load) or save_entire_prefix
         )
-        if is_sparse_decode and load_spec is not None:
+        if (
+            is_sparse_decode
+            and load_spec is not None
+            and not full_resident_route
+        ):
             num_slots = _sparse_slot_mapping_len(load_spec.lmcache_cached_tokens)
             current_slots = (
                 int(tracker.sparse_slot_mapping[0].numel())
@@ -1976,7 +1995,7 @@ class ReqMeta:
                         )
                     )
                 indexer_slot_mapping = tracker.sparse_indexer_slot_mapping
-            elif not is_sparse_decode:
+            elif not is_sparse_decode or full_resident_route:
                 if use_windowed_save_mapping and not needs_full_slots:
                     indexer_slot_mapping = save_indexer_slot_mapping
                 else:
@@ -2016,7 +2035,7 @@ class ReqMeta:
 
         decode_token_mask: Optional[torch.Tensor] = None
         decode_ret_mask: Optional[torch.Tensor] = None
-        if is_sparse_decode and load_spec is not None:
+        if is_sparse_decode and load_spec is not None and not full_resident_route:
             num_retrieve_tokens = len(token_ids)
             if load_spec.vllm_cached_tokens > 0:
                 if (
@@ -13295,6 +13314,9 @@ class LMCacheConnectorV1Impl:
                         else None
                     ),
                     dsa_current_released_frontier=request_tracker.dsa_current_released_frontier,
+                    dsa_full_resident=(
+                        not self._dsa_kv_policy_is_sparse_managed(request_tracker)
+                    ),
                 )
 
             req_meta = self._build_request_meta(
