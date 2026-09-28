@@ -315,6 +315,7 @@ class RemoteFillStateCore:
         terminal_record_ttl_sec: float = 300.0,
         clock: Callable[[], float] = monotonic,
         token_factory: Callable[[], str] = _new_token,
+        tp_independent: bool = False,
     ) -> None:
         """Create a state core.
 
@@ -335,6 +336,8 @@ class RemoteFillStateCore:
                 outcomes. Fatal records are retained until process restart.
             clock: Monotonic clock, injectable for deterministic tests.
             token_factory: Unique ID source for sessions, attempts, and pages.
+            tp_independent: Integration-qualified replicated payload. Allows only
+                TP-size differences; all other negotiated fields remain exact.
 
         Raises:
             ValueError: If a safety-critical configuration value is invalid.
@@ -372,6 +375,7 @@ class RemoteFillStateCore:
         ):
             raise ValueError("RemoteFill group layer counts disagree with negotiation")
         self._group_layer_counts = tuple(counts)
+        self._tp_independent = tp_independent
         self._lifecycle = page_lifecycle
         self._reservation_ttl_sec = reservation_ttl_sec
         self._descriptor_ttl_sec = min(descriptor_ttl, reservation_ttl_sec)
@@ -823,12 +827,14 @@ class RemoteFillStateCore:
                 item.name
                 for item in fields(NegotiationSpec)
                 if getattr(supplied, item.name) != getattr(self._negotiation, item.name)
+                and not (self._tp_independent and item.name == "tp_size")
             )
-            return self._response(
-                request,
-                ResultCode.RESERVATION_REJECTED,
-                f"remote-fill layout negotiation failed: fields={mismatches}",
-            )
+            if mismatches:
+                return self._response(
+                    request,
+                    ResultCode.RESERVATION_REJECTED,
+                    f"remote-fill layout negotiation failed: fields={mismatches}",
+                )
         return self._response(request, ResultCode.OK)
 
     def _open_locked(self, request: OpenRequest) -> RemoteFillResponse:

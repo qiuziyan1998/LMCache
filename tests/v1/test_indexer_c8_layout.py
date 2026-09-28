@@ -210,3 +210,37 @@ def test_worker_hbm_permutation_does_not_change_persistent_identity(metadata):
     assert base.get_shapes(7) == remapped.get_shapes(7)
     assert base.get_dtypes() == remapped.get_dtypes()
     assert "indexer_hbm_block_map" not in repr(remapped)
+
+
+@pytest.mark.parametrize("policy", [(), (True,) * 16 + (False,) * 6])
+def test_asymmetric_tp_preserves_c8_payload_identity_and_tail_keys(metadata, policy):
+    names = (tuple(f"latent.{i}" for i in range(79)),
+             tuple(f"indexer.{i}" for i in range(22)))
+    source = replace(metadata, world_size=8, local_world_size=8,
+                     kv_shape=(79, 1, 1024, 1, 576),
+                     runtime_kv_group_layer_counts=(79, 22),
+                     runtime_kv_group_layer_names=names,
+                     indexer_c8_layout=IndexerC8Layout(c8_layers=policy),
+                     mla_cache_tp_replicated=True)
+    destination = replace(source, world_size=4, local_world_size=4,
+                          indexer_hbm_block_map=tuple(range(36)))
+    config = LMCacheEngineConfig.from_defaults(
+        dsa_two_groups=True, remote_fill_model_artifact_id="same-weights",
+        remote_fill_cache_namespace="test", chunk_size=1024, save_unfull_chunk=True,
+        extra_config={"save_only_first_rank": True,
+                      "mooncake_page_first_multi_buffer": True,
+                      "mooncake_layer_merged_page_objects": True},
+    )
+    source_identity = mooncake_payload_layout(config, source)
+    assert source_identity == mooncake_payload_layout(config, destination)
+    databases = [ChunkedTokenDatabase(config, meta) for meta in (source, destination)]
+    for group in (0, 1):
+        keys = [list(db.process_tokens(tokens=list(range(1027)), kv_group=group))
+                for db in databases]
+        assert keys[0] == keys[1]
+        assert len(keys[0]) == 2  # Full chunk and partial tail.
+    changed = replace(
+        destination,
+        indexer_c8_layout=IndexerC8Layout(c8_layers=(False,) + (True,) * 21),
+    )
+    assert source_identity != mooncake_payload_layout(config, changed)

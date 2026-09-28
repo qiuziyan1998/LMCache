@@ -73,6 +73,9 @@ class LMCacheMetadata:
     indexer_c8_layout: Optional[IndexerC8Layout] = None
     # Worker-local HBM addressing, deliberately excluded from payload identity.
     indexer_hbm_block_map: Optional[tuple[int, ...]] = field(default=None, repr=False)
+    # Derived from native serving topology, never from a deployment override.
+    # Payload format/ownership must still be qualified by the cache integration.
+    mla_cache_tp_replicated: bool = False
 
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""
