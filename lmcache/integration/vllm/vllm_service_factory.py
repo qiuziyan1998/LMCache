@@ -164,6 +164,20 @@ class VllmServiceFactory(BaseServiceFactory):
             max_model_len=getattr(model_config, "max_model_len", None),
             runtime_kv_group_layer_counts=self.runtime_kv_group_layer_counts,
             runtime_kv_group_layer_names=self.runtime_kv_group_layer_names,
+            mla_cache_tp_replicated=(
+                use_mla
+                and num_kv_head == 1
+                and parallel_config.world_size == parallel_config.tensor_parallel_size
+                and all(
+                    getattr(parallel_config, name, 1) == 1
+                    for name in (
+                        "pipeline_parallel_size",
+                        "prefill_context_parallel_size",
+                        "decode_context_parallel_size",
+                    )
+                )
+                and not getattr(parallel_config, "enable_elastic_ep", False)
+            ),
         )
         return self.metadata
 

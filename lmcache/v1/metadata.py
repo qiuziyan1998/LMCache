@@ -69,6 +69,9 @@ class LMCacheMetadata:
     """Immutable per-group layer counts resolved by the serving engine."""
     runtime_kv_group_layer_counts: Optional[tuple[int, ...]] = None
     runtime_kv_group_layer_names: Optional[tuple[tuple[str, ...], ...]] = None
+    # Derived from native serving topology, never from a deployment override.
+    # Payload format/ownership must still be qualified by the cache integration.
+    mla_cache_tp_replicated: bool = False
 
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""
