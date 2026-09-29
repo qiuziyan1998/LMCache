@@ -109,6 +109,20 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         if callable(configure):
             configure(enabled)
 
+    @property
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        return self._lmcache_engine.supports_layerwise_prefill_transfer_window
+
+    @property
+    def supports_dsa_index_lmcache(self) -> bool:
+        return self._lmcache_engine.supports_dsa_index_lmcache
+
+    @property
+    def supports_layerwise_prefill_dsa_index_transfer_window(self) -> bool:
+        return (
+            self._lmcache_engine.supports_layerwise_prefill_dsa_index_transfer_window
+        )
+
     # ==============================
     # Worker-side methods
     # ==============================
@@ -192,6 +206,23 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
             payload_event=payload_event,
             selected_token_counts=selected_token_counts,
         )
+
+    def submit_layerwise_prefill_load(self, layer_name: str | int) -> None:
+        """Submit N+2; virtual N=-1 submits L1 at first-layer entry."""
+        self._lmcache_engine.submit_layerwise_prefill_load(layer_name)
+
+    def record_layerwise_prefill_bank_use(self, layer_name: str, event: Any) -> None:
+        """Hand off the event recorded after a P layer's final KV access.
+
+        Args:
+            layer_name: Registered latent or indexer layer name.
+            event: Device event marking the layer's final bank access.
+        """
+        self._lmcache_engine.record_layerwise_prefill_bank_use(layer_name, event)
+
+    def finish_layerwise_prefill_save(self, layer_name: str) -> None:
+        """Run storage publication after the layer's HCOM is submitted."""
+        self._lmcache_engine.finish_layerwise_prefill_save(layer_name)
 
     def save_kv_layer(
         self,
