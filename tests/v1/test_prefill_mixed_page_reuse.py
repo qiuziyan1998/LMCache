@@ -57,6 +57,7 @@ def test_mixed_page_offsets_and_reuse(reuse: bool, tokens: int) -> None:
         for layer, shape in enumerate(shapes):
             tensor = page.layer_tensor(layer)
             assert tensor.shape == shape
+            assert page.layer_size_bytes(layer) == tensor.numel() * tensor.element_size()
             assert tensor.data_ptr() == slab.data_ptr() + cursor
             tensor.fill_(layer + 1)
             cursor += shape.numel()

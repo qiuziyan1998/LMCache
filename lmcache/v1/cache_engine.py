@@ -5673,8 +5673,27 @@ class LMCacheEngine:
         )
         mem_obj_consumer = None
         if not prepare_c8_packets:
-            mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
-            next(mem_obj_consumer)
+            try:
+                mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                    starts, ends, **kwargs
+                )
+                next(mem_obj_consumer)
+            except Exception as exc:
+                message = "Shared CPU cache rank0 consumer preparation failed."
+                self._broadcast_shared_envelope(
+                    self._shared_layerwise_error_envelope(
+                        req_id=req_id,
+                        phase=phase,
+                        request_ordinal=request_ordinal,
+                        layer_id=0,
+                        kv_group=kv_group,
+                        message=message,
+                        details={"error": str(exc), "location": location},
+                    )
+                )
+                if remote_fill_plan is not None:
+                    raise _RemoteFillMaterializationError(message) from exc
+                raise
 
         to_release: list[MemoryObj] = []
         resolved_layers: list[list[MemoryObj]] = []
@@ -5891,6 +5910,14 @@ class LMCacheEngine:
                 resolved_layers.append(mem_objs_layer)
 
                 try:
+                    if deferred_layerwise_get and envelope_required and layer_id == 0:
+                        wait_publication = getattr(
+                            self.gpu_connector,
+                            "wait_for_layerwise_prefill_source_publication",
+                            None,
+                        )
+                        if callable(wait_publication):
+                            wait_publication(kv_group)
                     handles = (
                         [None] * len(mem_objs_layer)
                         if compact_batch is not None
@@ -5905,7 +5932,7 @@ class LMCacheEngine:
                         )
                     )
                 except Exception as exc:
-                    if remote_fill_plan is None or not envelope_required:
+                    if not envelope_required:
                         raise
                     message = (
                         "Shared CPU cache rank0 handle materialization failed "
@@ -5925,6 +5952,8 @@ class LMCacheEngine:
                             },
                         )
                     )
+                    if remote_fill_plan is None:
+                        raise
                     raise _RemoteFillMaterializationError(message) from exc
                 handles_by_layer.append(handles)
                 if envelope_required:
