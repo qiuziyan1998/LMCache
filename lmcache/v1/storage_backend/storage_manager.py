@@ -40,6 +40,7 @@ from lmcache.v1.memory_management import (
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import mooncake_valid_tokens
+from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
 from lmcache.v1.storage_backend import CreateStorageBackends, is_cuda_worker
 from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
@@ -485,8 +486,21 @@ class StorageManager:
         pages: List[LayerPageMemoryObj],
         location: Optional[str] = None,
         req_id: str = "",
+        *,
+        publish_local_early: bool = False,
+        producer_events: Any = None,
     ) -> list[Future]:
-        """Store each physical page once locally and remotely."""
+        """Store each physical page once locally and remotely.
+
+        publish_local_early is for banked P-node continuation-prefill only:
+        the caller owns a sticky-error remote completion queue. Local hits
+        then mean CPU-ready, NOT remotely persisted. ``producer_events``
+        carries the D2H completion events when publication is intentionally
+        submitted before those copies finish; the external-page backend
+        waits on them before reading the page. The caller MUST fence returned
+        futures before PD handoff or teardown. Other callers retain the
+        original remote-before-local publication.
+        """
         if (
             len(keys) != len(pages)
             or len(set(keys)) != len(keys)
@@ -528,6 +542,8 @@ class StorageManager:
             None,
         )
         required_futures: list[Future] = []
+        if publish_local_early and remote is not None:
+            local.batched_submit_layer_pages(keys, pages)
         if remote is None:
             local.batched_submit_layer_pages(keys, pages)
         else:
@@ -546,12 +562,19 @@ class StorageManager:
                     ],
                     [[page.layer_size] * layer_count for page in pages],
                     tuple(owner_by_storage.values()),
-                    None,
+                    producer_events,
                     req_id,
                 )
-            except Exception:
-                for page in pages:
-                    page.ref_count_down()
+            except Exception as error:
+                if publish_local_early and isinstance(
+                    error, NativeExternalPageTransferUnknownError
+                ):
+                    error.layerwise_source_pages = (
+                        getattr(error, "layerwise_source_pages", ()) + tuple(pages)
+                    )
+                else:
+                    for page in pages:
+                        page.ref_count_down()
                 raise
 
             completion: Future = Future()
@@ -564,13 +587,23 @@ class StorageManager:
                 error = None
                 try:
                     completed_remote.result()
-                    # A local page hit must also represent a durable remote page.
-                    local.batched_submit_layer_pages(page_keys, list(held))
+                    # Default callers publish only remotely durable pages.
+                    if not publish_local_early:
+                        local.batched_submit_layer_pages(page_keys, list(held))
                 except Exception as caught:
                     error = caught
                 finally:
-                    for page in held:
-                        page.ref_count_down()
+                    if publish_local_early and isinstance(
+                        error, NativeExternalPageTransferUnknownError
+                    ):
+                        # The P-node's sticky queue will refuse handoff/close.
+                        # Do not return possibly DMA-owned pages to the pool.
+                        error.layerwise_source_pages = (
+                            getattr(error, "layerwise_source_pages", ()) + held
+                        )
+                    else:
+                        for page in held:
+                            page.ref_count_down()
                 if not completion.done():
                     if error is None:
                         completion.set_result(None)

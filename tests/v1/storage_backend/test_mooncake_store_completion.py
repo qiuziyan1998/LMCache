@@ -7,6 +7,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 import asyncio
+import io
 import json
 import sys
 import threading
@@ -17,6 +18,7 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
+from lmcache.v1 import startup_trace
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, TensorMemoryAllocator
@@ -75,6 +77,7 @@ def _make_mooncake_connector(
     remote_fill_enabled: bool = False,
     external_page_only: bool = False,
     store_cls: type | None = None,
+    cpu_buffer: torch.Tensor | None = None,
 ) -> tuple[MooncakestoreConnector, asyncio.AbstractEventLoop]:
     class _Store:
         def setup(self, *args):
@@ -155,6 +158,8 @@ def _make_mooncake_connector(
         metadata=metadata,
         memory_allocator=SimpleNamespace(),
     )
+    if cpu_buffer is not None:
+        local_cpu.memory_allocator.pin_allocator = SimpleNamespace(buffer=cpu_buffer)
     loop = asyncio.new_event_loop()
     try:
         connector = MooncakestoreConnector(
@@ -171,6 +176,97 @@ def _make_mooncake_connector(
         loop.close()
         raise
     return connector, loop
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    [
+        None,
+        "mooncake_create",
+        "mooncake_shared_engine",
+        "mooncake_setup",
+        "mooncake_register_cpu",
+    ],
+)
+def test_mooncake_startup_marks_native_calls_and_preserves_failure(
+    monkeypatch: pytest.MonkeyPatch, failure_stage: str | None
+) -> None:
+    output = io.StringIO()
+    monkeypatch.setattr(startup_trace, "sys", SimpleNamespace(stderr=output))
+    monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
+    original = RuntimeError("native failure at secret-endpoint")
+    stages = []
+    calls = []
+
+    def entering(stage: str) -> None:
+        lines = [
+            line for line in output.getvalue().splitlines()
+            if line.startswith("[LMCACHE_INIT]")
+        ]
+        assert f"stage={stage} state=begin" in lines[-1]
+        assert "rank=0" in lines[-1]
+        stages.append(stage)
+        if failure_stage == stage:
+            raise original
+
+    class Store:
+        def __init__(self) -> None:
+            entering("mooncake_create")
+
+        def setup(self, *args: object) -> int:
+            entering("mooncake_setup")
+            return 0
+
+        def register_buffer(self, ptr: int, size: int) -> int:
+            entering("mooncake_register_cpu")
+            calls.append((ptr, size))
+            return 0
+
+        def close(self) -> None:
+            calls.append("close")
+
+    def shared_transport() -> tuple:
+        entering("mooncake_shared_engine")
+        shared = SimpleNamespace(
+            adopt_registered_buffer=lambda ptr, size, register: register() == 0
+        )
+        return shared, "shared-host", object(), object()
+
+    monkeypatch.setattr(
+        mooncake_connector, "_shared_vllm_mooncake_transport", shared_transport
+    )
+    buffer = torch.empty(16, dtype=torch.uint8)
+
+    def construct() -> tuple:
+        return _make_mooncake_connector(
+            monkeypatch,
+            {"mooncake_reuse_vllm_transfer_engine": True},
+            calls,
+            store_cls=Store,
+            cpu_buffer=buffer,
+        )
+
+    if failure_stage is None:
+        connector, loop = construct()
+        try:
+            assert connector.registered_buffer_size == buffer.numel()
+            assert calls == [(buffer.data_ptr(), buffer.numel())]
+        finally:
+            loop.close()
+    else:
+        with pytest.raises(RuntimeError) as caught:
+            construct()
+        assert caught.value is original
+    lines = [
+        line for line in output.getvalue().splitlines()
+        if line.startswith("[LMCACHE_INIT]")
+    ]
+    for stage in stages:
+        matching = [line for line in lines if f"stage={stage} " in line]
+        assert len(matching) == 2
+        final_state = "error" if stage == failure_stage else "end"
+        assert f"state={final_state}" in matching[-1]
+    assert all("secret-endpoint" not in line for line in lines)
 
 
 def test_external_page_only_mooncake_has_no_local_cpu_slab(monkeypatch) -> None:

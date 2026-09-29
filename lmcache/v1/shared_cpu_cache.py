@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, Union
+from weakref import WeakKeyDictionary
 
 import torch
 
@@ -59,7 +60,15 @@ class SharedCPURequestLease:
     is_rank0: bool
     active: bool = False
     groups: dict[int, list[list[MemoryObj]]] = field(default_factory=dict)
+    prefill_sources: dict[int, Any] = field(default_factory=dict, repr=False)
+    prefill_locations: dict[int, Any] = field(default_factory=dict, repr=False)
+    source_groups: dict[int, list[list[MemoryObj]]] = field(
+        default_factory=dict, repr=False
+    )
     _owned_objects: dict[int, MemoryObj] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _retired_objects: dict[int, MemoryObj] = field(
         default_factory=dict, init=False, repr=False
     )
 
@@ -116,8 +125,21 @@ class SharedCPURequestLease:
         groups: dict[int, list[list[MemoryObj]]],
         *,
         retain: bool,
+        preserve_replaced: bool = False,
     ) -> None:
-        """Replace selected groups, retaining borrowed objects when requested."""
+        """Replace selected groups while preserving the request's references.
+
+        Args:
+            groups: Complete per-layer source lists for each replaced group.
+            retain: Acquire one reference/pin for each newly borrowed source;
+                otherwise adopt the caller's already-owned reference.
+            preserve_replaced: Keep removed sources alive until ``close``.
+                They remain retained through subsequent store-seed promotions,
+                even if those replacements do not set this flag again.
+
+        Raises:
+            RuntimeError: If a newly borrowed source cannot be retained/pinned.
+        """
 
         replacement = dict(self.groups)
         for kv_group, layers in groups.items():
@@ -155,13 +177,96 @@ class SharedCPURequestLease:
                 self._release(reversed(retained))
                 raise
 
+        retired = dict(self._retired_objects)
+        if preserve_replaced:
+            retired.update(
+                (identity, obj)
+                for identity, obj in old_objects.items()
+                if identity not in new_owned
+            )
+        new_owned.update(retired)
         self.groups = replacement
+        self.source_groups.update(groups)
+        self._retired_objects = retired
         self._owned_objects = new_owned
         self._release(
             memory_obj
             for identity, memory_obj in old_objects.items()
             if identity not in new_owned
         )
+
+    def replace_suffix_groups(
+        self,
+        groups: dict[int, list[list[MemoryObj]]],
+        unchanged_chunks: dict[int, int],
+        *,
+        retain: bool,
+    ) -> None:
+        """Replace verified suffixes, retaining retired DMA sources until close.
+
+        The caller proves that preceding ranges and objects are unchanged.
+        Only new suffix objects acquire ownership. Failed retention leaves the
+        lease untouched; removed sources remain owned for queued DMA readers.
+        """
+        updates = []
+        additions: dict[int, MemoryObj] = {}
+        retired: dict[int, MemoryObj] = {}
+        for group, layers in groups.items():
+            prefix = unchanged_chunks[group]
+            current = self.groups.get(group)
+            if (
+                prefix < 0
+                or (current is None and prefix)
+                or (
+                    current is not None
+                    and (
+                        len(current) != len(layers)
+                        or any(len(row) < prefix for row in current)
+                    )
+                )
+                or any(len(row) < prefix for row in layers)
+            ):
+                raise ValueError("Shared CPU source suffix is not prefix-aligned")
+            suffix = [list(row[prefix:]) for row in layers]
+            updates.append((group, current, prefix, suffix))
+            for row in suffix:
+                for obj in row:
+                    if id(obj) not in self._owned_objects:
+                        additions[id(obj)] = obj
+            if current is not None:
+                for row in current:
+                    retired.update((id(obj), obj) for obj in row[prefix:])
+        acquired = []
+        if retain:
+            try:
+                for obj in additions.values():
+                    obj.ref_count_up()
+                    try:
+                        if not self._is_valid(obj):
+                            raise RuntimeError("Cannot retain an invalid shared source")
+                        if self.is_rank0 and obj.pin() is False:
+                            raise RuntimeError("MemoryObj.pin() returned False")
+                    except Exception:
+                        if self._is_valid(obj):
+                            obj.ref_count_down()
+                        raise
+                    acquired.append(obj)
+            except Exception:
+                self._release(reversed(acquired))
+                raise
+        for group, current, prefix, suffix in updates:
+            if current is None:
+                self.groups[group] = suffix
+            else:
+                for row, new in zip(current, suffix, strict=True):
+                    row[prefix:] = new
+        self._retired_objects.update(retired)
+        self._owned_objects.update(additions)
+        self.source_groups.update(groups)
+
+    def owns(self, obj: MemoryObj) -> bool:
+        """Check ownership without enumerating historical objects."""
+        return self._owned_objects.get(id(obj)) is obj
 
     def append_groups(
         self,
@@ -210,6 +315,7 @@ class SharedCPURequestLease:
             self._owned_objects.update(
                 (id(obj), obj) for layer in suffix for obj in layer
             )
+        self.source_groups.update(groups)
 
     def object_ids(self, kv_group: Optional[int] = None) -> set[int]:
         if kv_group is None:
@@ -229,7 +335,11 @@ class SharedCPURequestLease:
     def close(self) -> None:
         objects = self._owned_objects
         self._owned_objects = {}
+        self._retired_objects.clear()
         self.groups.clear()
+        self.source_groups.clear()
+        self.prefill_sources.clear()
+        self.prefill_locations.clear()
         self.active = False
         self._release(objects.values())
 
@@ -490,6 +600,7 @@ class SharedChunkHandle:
             dtypes=list(dtypes) if dtypes else None,
             cached_positions=_positions_to_list(meta.cached_positions),
         )
+
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -961,17 +1072,421 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         slab_tensor: torch.Tensor,
         shm_name: str,
         generation: int,
+        reuse_prefill: bool = False,
     ) -> None:
+        self.reuse_prefill = reuse_prefill
         self.slab_tensor = slab_tensor.view(torch.uint8).flatten()
         self.buffer = self.slab_tensor
         self.shm_name = shm_name
         self.generation = int(generation)
+        # Descriptor identities do not own the views. Request leases retain
+        # the actual allocator references; dropping a lease removes dead keys.
+        self._view_descriptors: Optional[WeakKeyDictionary[MemoryObj, tuple]] = (
+            WeakKeyDictionary() if reuse_prefill else None
+        )
 
     @property
     def slab_size(self) -> int:
         return int(self.slab_tensor.numel())
 
     def create_view(
+        self,
+        handle: SharedChunkHandle,
+        *,
+        expected_request_id: str,
+        expected_phase: str,
+        expected_layer_id: int,
+        expected_kv_group: int,
+        expected_chunk_index: Optional[int] = None,
+        expected_key: Optional[CacheEngineKey] = None,
+        expected_shape: Optional[torch.Size] = None,
+        expected_dtype: Optional[torch.dtype] = None,
+        expected_fmt: Optional[MemoryFormat] = None,
+        expected_cached_positions: Optional[Iterable[int]] = None,
+        expected_producer_rank: Optional[int] = None,
+        previous: Optional[TensorMemoryObj] = None,
+    ) -> TensorMemoryObj:
+        """Validate a handle and create its view, or borrow an exact prior view.
+
+        ``previous`` remains owned by its request lease: reusing it neither
+        acquires another reference nor rebuilds its cached-position tensor.
+        All normal handle validation still runs before reuse.
+        """
+        if not self.reuse_prefill:
+            return self._create_view_ordinary(
+                handle,
+                expected_request_id=expected_request_id,
+                expected_phase=expected_phase,
+                expected_layer_id=expected_layer_id,
+                expected_kv_group=expected_kv_group,
+                expected_chunk_index=expected_chunk_index, expected_key=expected_key,
+                expected_shape=expected_shape, expected_dtype=expected_dtype,
+                expected_fmt=expected_fmt,
+                expected_cached_positions=expected_cached_positions,
+                expected_producer_rank=expected_producer_rank
+            )
+        assert self._view_descriptors is not None
+        validate_shared_handle(
+            handle,
+            expected_request_id=expected_request_id,
+            expected_phase=expected_phase,
+            expected_layer_id=expected_layer_id,
+            expected_kv_group=expected_kv_group,
+            expected_shm_name=self.shm_name,
+            expected_generation=self.generation,
+            expected_chunk_index=expected_chunk_index,
+            expected_key=expected_key,
+            expected_shape=expected_shape,
+            expected_dtype=expected_dtype,
+            expected_fmt=expected_fmt,
+            expected_cached_positions=expected_cached_positions,
+            expected_producer_rank=expected_producer_rank,
+            slab_size=self.slab_size,
+        )
+        descriptor = (
+            self.shm_name,
+            self.generation,
+            handle.producer_rank,
+            handle.layer_id,
+            handle.kv_group,
+            handle.key,
+            handle.offset,
+            handle.physical_size,
+            handle.shape,
+            handle.dtype,
+            handle.fmt,
+            tuple(handle.shapes) if handle.shapes is not None else None,
+            tuple(handle.dtypes) if handle.dtypes is not None else None,
+            tuple(handle.cached_positions)
+            if handle.cached_positions is not None
+            else None,
+        )
+        if self._matches_view(
+            previous,
+            descriptor,
+            handle.shape,
+            handle.dtype,
+            handle.fmt,
+            handle.offset,
+            handle.physical_size,
+        ):
+            assert previous is not None
+            return previous
+        raw_data = self.slab_tensor[
+            handle.offset : handle.offset + handle.logical_size
+        ]
+        cached_positions = (
+            torch.tensor(handle.cached_positions, dtype=torch.int64)
+            if handle.cached_positions is not None
+            else None
+        )
+        metadata = MemoryObjMetadata(
+            shape=handle.shape,
+            dtype=handle.dtype,
+            address=handle.offset,
+            phy_size=handle.physical_size,
+            ref_count=1,
+            pin_count=0,
+            fmt=handle.fmt,
+            cached_positions=cached_positions,
+            shapes=handle.shapes,
+            dtypes=handle.dtypes,
+        )
+        view = TensorMemoryObj(
+            raw_data=raw_data,
+            metadata=metadata,
+            parent_allocator=self,
+        )
+        self._view_descriptors[view] = descriptor
+        return view
+
+    def create_batch_view(
+        self,
+        batch: SharedHandleBatch,
+        *,
+        layer_id: int,
+        chunk_index: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+        cached_positions: Iterable[int],
+        previous: Optional[TensorMemoryObj] = None,
+    ) -> TensorMemoryObj:
+        """Create a validated compact tail view, borrowing an exact prior view.
+
+        The caller validates the batch envelope and expected chunk metadata.
+        A reused ``previous`` carries no additional allocator reference.
+        """
+        if not self.reuse_prefill:
+            return self._create_batch_view_ordinary(
+                batch, layer_id=layer_id, chunk_index=chunk_index, shape=shape,
+                dtype=dtype, fmt=fmt, cached_positions=cached_positions
+            )
+        assert self._view_descriptors is not None
+        page_count = len(batch.page_offsets)
+        if not page_count <= chunk_index < batch.num_chunks:
+            raise SharedCPUCacheValidationError("Page chunks require create_page_view")
+        if batch.shm_name != self.shm_name or not 0 <= layer_id < batch.num_layers:
+            raise SharedCPUCacheValidationError(
+                "Invalid compact shared view slab or layer"
+            )
+        tail_chunks = batch.num_chunks - page_count
+        tail_index = chunk_index - page_count
+        offset = batch.offsets[layer_id * tail_chunks + tail_index]
+        physical_size = batch.physical_sizes[chunk_index]
+        logical_size = shape.numel() * dtype.itemsize
+        if (
+            logical_size <= 0
+            or logical_size > physical_size
+            or offset < 0
+            or offset + physical_size > self.slab_size
+        ):
+            raise SharedCPUCacheValidationError(
+                "Invalid compact shared view logical size: "
+                f"logical_size={logical_size}, physical_size={physical_size}"
+            )
+        cached_positions = (
+            cached_positions
+            if isinstance(cached_positions, range)
+            else tuple(cached_positions)
+        )
+        position_identity = (
+            (
+                "range",
+                cached_positions.start,
+                cached_positions.stop,
+                cached_positions.step,
+            )
+            if isinstance(cached_positions, range)
+            else ("positions", cached_positions)
+        )
+        descriptor = (
+            self.shm_name,
+            self.generation,
+            batch.producer_rank,
+            batch.chunk_hashes[chunk_index],
+            layer_id,
+            offset,
+            physical_size,
+            shape,
+            dtype,
+            fmt,
+            position_identity,
+        )
+        if self._matches_view(
+            previous, descriptor, shape, dtype, fmt, offset, physical_size
+        ):
+            assert previous is not None
+            return previous
+        positions = (
+            torch.arange(
+                cached_positions.start,
+                cached_positions.stop,
+                cached_positions.step,
+                dtype=torch.int64,
+            )
+            if isinstance(cached_positions, range)
+            else torch.tensor(cached_positions, dtype=torch.int64)
+        )
+        view = TensorMemoryObj(
+            raw_data=self.slab_tensor[offset : offset + logical_size],
+            metadata=MemoryObjMetadata(
+                shape=shape,
+                dtype=dtype,
+                address=offset,
+                phy_size=physical_size,
+                ref_count=1,
+                pin_count=0,
+                fmt=fmt,
+                cached_positions=positions,
+                shapes=[shape],
+                dtypes=[dtype],
+            ),
+            parent_allocator=self,
+        )
+        self._view_descriptors[view] = descriptor
+        return view
+
+    def create_page_view(
+        self,
+        batch: SharedHandleBatch,
+        *,
+        chunk_index: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+        cached_positions: Iterable[int],
+        previous: Optional[LayerPageMemoryObj] = None,
+    ) -> LayerPageMemoryObj:
+        """Create a compact all-layer view, borrowing an exact prior view.
+
+        The caller validates the batch envelope and expected chunk metadata.
+        Reuse preserves the existing request-owned reference and page identity.
+        """
+        if not self.reuse_prefill:
+            return self._create_page_view_ordinary(
+                batch, chunk_index=chunk_index, shape=shape, dtype=dtype,
+                fmt=fmt, cached_positions=cached_positions
+            )
+        assert self._view_descriptors is not None
+        if not 0 <= chunk_index < len(batch.page_offsets):
+            raise SharedCPUCacheValidationError("Invalid compact page chunk index")
+        if batch.shm_name != self.shm_name:
+            raise SharedCPUCacheValidationError("Invalid compact page slab")
+        offset = batch.page_offsets[chunk_index]
+        physical_size = batch.page_physical_sizes[chunk_index]
+        layer_size = shape.numel() * dtype.itemsize
+        logical_size = layer_size * batch.num_layers
+        if (
+            layer_size != batch.physical_sizes[chunk_index]
+            or logical_size <= 0
+            or logical_size > physical_size
+            or offset < 0
+            or offset + physical_size > self.slab_size
+        ):
+            raise SharedCPUCacheValidationError(
+                "Invalid compact page logical size: "
+                f"logical_size={logical_size}, physical_size={physical_size}"
+            )
+        cached_positions = (
+            cached_positions
+            if isinstance(cached_positions, range)
+            else tuple(cached_positions)
+        )
+        position_identity = (
+            (
+                "range",
+                cached_positions.start,
+                cached_positions.stop,
+                cached_positions.step,
+            )
+            if isinstance(cached_positions, range)
+            else ("positions", cached_positions)
+        )
+        descriptor = (
+            self.shm_name,
+            self.generation,
+            batch.producer_rank,
+            batch.chunk_hashes[chunk_index],
+            batch.num_layers,
+            offset,
+            physical_size,
+            shape,
+            dtype,
+            fmt,
+            position_identity,
+        )
+        if self._matches_view(
+            previous, descriptor, shape, dtype, fmt, offset, physical_size
+        ):
+            assert previous is not None
+            return previous
+        if not cached_positions:
+            raise SharedCPUCacheValidationError(
+                "Compact layer page must contain at least one token"
+            )
+        view = LayerPageMemoryObj(
+            raw_data=None,
+            metadata=MemoryObjMetadata(
+                shape=shape,
+                dtype=dtype,
+                address=offset,
+                phy_size=physical_size,
+                ref_count=1,
+                pin_count=0,
+                fmt=fmt,
+                cached_positions=(
+                    torch.arange(
+                        cached_positions.start,
+                        cached_positions.stop,
+                        cached_positions.step,
+                        dtype=torch.int64,
+                    )
+                    if isinstance(cached_positions, range)
+                    else torch.tensor(cached_positions, dtype=torch.int64)
+                ),
+                shapes=[shape] * batch.num_layers,
+                dtypes=[dtype] * batch.num_layers,
+            ),
+            parent_allocator=self,
+            num_layers=batch.num_layers,
+            raw_view_size=logical_size,
+            valid_tokens=len(cached_positions),
+        )
+        self._view_descriptors[view] = descriptor
+        return view
+
+    def _matches_view(
+        self,
+        previous: Optional[TensorMemoryObj],
+        descriptor: tuple,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+        offset: int,
+        physical_size: int,
+    ) -> bool:
+        return bool(
+            previous is not None
+            and previous.is_valid()
+            and previous.parent_allocator is self
+            and self._view_descriptors is not None
+            and self._view_descriptors.get(previous) == descriptor
+            and previous.get_shape() == shape
+            and previous.get_dtype() == dtype
+            and previous.get_memory_format() == fmt
+            and previous.metadata.address == offset
+            and previous.metadata.phy_size == physical_size
+        )
+
+    def allocate(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        fmt: MemoryFormat = MemoryFormat.UNDEFINED,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[MemoryObj]:
+        raise SharedCPUCacheError("PassiveSharedViewAllocator cannot allocate")
+
+    def batched_allocate(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.UNDEFINED,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[list[MemoryObj]]:
+        raise SharedCPUCacheError(
+            "PassiveSharedViewAllocator cannot allocate batches"
+        )
+
+    def free(
+        self,
+        memory_obj: MemoryObj,
+        allocator_type: Optional[str] = None,
+    ) -> None:
+        if not memory_obj.is_valid():
+            logger.warning(
+                "Double-free of passive shared CPU view ignored: "
+                "shm_name=%s address=%s size=%s generation=%s",
+                self.shm_name,
+                memory_obj.metadata.address,
+                memory_obj.metadata.phy_size,
+                self.generation,
+            )
+            return
+        memory_obj.invalidate()
+
+    def batched_free(
+        self,
+        memory_objs: list[MemoryObj],
+        allocator_type: Optional[str] = None,
+        update_stats: bool = True,
+    ) -> None:
+        for memory_obj in memory_objs:
+            self.free(memory_obj, allocator_type)
+
+    def _create_view_ordinary(
         self,
         handle: SharedChunkHandle,
         *,
@@ -1030,7 +1545,7 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
             parent_allocator=self,
         )
 
-    def create_batch_view(
+    def _create_batch_view_ordinary(
         self,
         batch: SharedHandleBatch,
         *,
@@ -1072,7 +1587,7 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
             parent_allocator=self,
         )
 
-    def create_page_view(
+    def _create_page_view_ordinary(
         self,
         batch: SharedHandleBatch,
         *,
@@ -1122,53 +1637,6 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
             raw_view_size=logical_size,
             valid_tokens=len(positions),
         )
-
-    def allocate(
-        self,
-        shapes: Union[torch.Size, list[torch.Size]],
-        dtypes: Union[torch.dtype, list[torch.dtype]],
-        fmt: MemoryFormat = MemoryFormat.UNDEFINED,
-        allocator_type: Optional[str] = None,
-    ) -> Optional[MemoryObj]:
-        raise SharedCPUCacheError("PassiveSharedViewAllocator cannot allocate")
-
-    def batched_allocate(
-        self,
-        shapes: Union[torch.Size, list[torch.Size]],
-        dtypes: Union[torch.dtype, list[torch.dtype]],
-        batch_size: int,
-        fmt: MemoryFormat = MemoryFormat.UNDEFINED,
-        allocator_type: Optional[str] = None,
-    ) -> Optional[list[MemoryObj]]:
-        raise SharedCPUCacheError(
-            "PassiveSharedViewAllocator cannot allocate batches"
-        )
-
-    def free(
-        self,
-        memory_obj: MemoryObj,
-        allocator_type: Optional[str] = None,
-    ) -> None:
-        if not memory_obj.is_valid():
-            logger.warning(
-                "Double-free of passive shared CPU view ignored: "
-                "shm_name=%s address=%s size=%s generation=%s",
-                self.shm_name,
-                memory_obj.metadata.address,
-                memory_obj.metadata.phy_size,
-                self.generation,
-            )
-            return
-        memory_obj.invalidate()
-
-    def batched_free(
-        self,
-        memory_objs: list[MemoryObj],
-        allocator_type: Optional[str] = None,
-        update_stats: bool = True,
-    ) -> None:
-        for memory_obj in memory_objs:
-            self.free(memory_obj, allocator_type)
 
 
 class SharedSlabMapping:
@@ -1297,11 +1765,14 @@ class SharedSlabMapping:
             owner=True,
         )
 
-    def passive_allocator(self) -> PassiveSharedViewAllocator:
+    def passive_allocator(
+        self, *, reuse_prefill: bool = False
+    ) -> PassiveSharedViewAllocator:
         return PassiveSharedViewAllocator(
             slab_tensor=self.tensor,
             shm_name=self.shm_name,
             generation=self.generation,
+            reuse_prefill=reuse_prefill,
         )
 
     def preflight_device_ptr(self) -> int:
