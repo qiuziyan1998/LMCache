@@ -27,6 +27,17 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 
 
+@pytest.fixture(autouse=True)
+def capture_engine_logs(caplog):
+    # LMCache deliberately disables propagation to pytest's root handler.
+    logger = logging.getLogger("lmcache.v1.cache_engine")
+    logger.addHandler(caplog.handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(caplog.handler)
+
+
 class _TokenDatabase:
     def process_tokens(
         self,

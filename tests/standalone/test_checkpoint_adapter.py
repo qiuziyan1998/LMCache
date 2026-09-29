@@ -25,6 +25,15 @@ def method(name, **extra):
         n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name
     )
     node.decorator_list = []
+    # Execute production's new bank metadata helpers alongside the extracted
+    # update method; do not replace their behavior with fixture-only lambdas.
+    helpers = [
+        candidate
+        for candidate in tree.body
+        if isinstance(candidate, ast.FunctionDef)
+        and candidate.name
+        in {"_copy_block_ids_by_bank", "_block_allocation_mode_value"}
+    ]
     ns = dict(vars(control))
     ns.update(
         RequestStatus=NS(PREEMPTED="preempted"),
@@ -39,7 +48,9 @@ def method(name, **extra):
     )
     exec(
         compile(
-            ast.fix_missing_locations(ast.Module(body=[prefix, node], type_ignores=[])),
+            ast.fix_missing_locations(
+                ast.Module(body=[prefix, *helpers, node], type_ignores=[])
+            ),
             str(SOURCE),
             "exec",
         ),
@@ -303,6 +314,7 @@ def test_completed_resume_still_checks_shared_cache_generation():
         token_count=11,
         shared_request_active=True,
         shared_generation=1,
+        dense_prefix_generation=None,
         prepared_sparse_sources={0: NS(total_tokens=11)},
     )
     adapter = NS(
