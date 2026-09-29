@@ -2,7 +2,9 @@
 """Mixed packets keep exact layer offsets when passive P views are reused."""
 
 # Standard
+import ast
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 # Third Party
@@ -57,7 +59,9 @@ def test_mixed_page_offsets_and_reuse(reuse: bool, tokens: int) -> None:
         for layer, shape in enumerate(shapes):
             tensor = page.layer_tensor(layer)
             assert tensor.shape == shape
-            assert page.layer_size_bytes(layer) == tensor.numel() * tensor.element_size()
+            assert (
+                page.layer_size_bytes(layer) == tensor.numel() * tensor.element_size()
+            )
             assert tensor.data_ptr() == slab.data_ptr() + cursor
             tensor.fill_(layer + 1)
             cursor += shape.numel()
@@ -171,7 +175,7 @@ def test_passive_c8_prepares_all_sources_before_first_yield(monkeypatch) -> None
             return super().prepare_layerwise_prefill_source_pointers(*args, **kwargs)
 
         def batched_to_gpu(self, *args, **kwargs):
-            assert order == ["sources"]
+            assert not order
             rows = kwargs["prefill_c8_memory_objs"]
             assert len(rows) == 2 and all(len(row) == 1 for row in rows)
             assert [rows[i][0].layer_tensor(i).numel() for i in range(2)] == [390, 768]
@@ -242,13 +246,124 @@ def test_passive_c8_prepares_all_sources_before_first_yield(monkeypatch) -> None
     )
     try:
         assert next(generator).item() == 3
-        assert order == ["sources", "consumer"]
+        assert order == ["consumer", "sources"]
         assert not engine.gpu_connector.submissions
         result = list(generator)
         assert len(engine.gpu_connector.submissions) == 2
         assert bool(result[-1].all())
     finally:
         generator.close()
+
+
+@pytest.mark.parametrize("role", ["rank0", "passive"])
+@pytest.mark.parametrize("warm", [False, True])
+def test_c8_layout_is_initialized_before_shared_pointer_preparation(role, warm):
+    """Execute both preparation sequences with Ascend's real cardinality guard."""
+    root = Path(__file__).resolve().parents[3]
+    connector_path = (
+        root / "LMCache-Ascend/lmcache_ascend/v1/npu_connector/npu_connectors.py"
+    )
+    connector_tree = ast.parse(connector_path.read_text(encoding="utf-8"))
+    cls = next(
+        node
+        for node in connector_tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "VLLMPagedMemLayerwiseNPUConnector"
+    )
+    module = ast.parse("from __future__ import annotations")
+    module.body.extend(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"get_num_layers", "_expected_group_layers"}
+    )
+    namespace = {}
+    exec(
+        compile(ast.fix_missing_locations(module), str(connector_path), "exec"),
+        namespace,
+    )
+    order = []
+
+    class Consumer:
+        dsa_two_groups = True
+        num_layers = 79
+        get_num_layers = namespace["get_num_layers"]
+        _expected_group_layers = namespace["_expected_group_layers"]
+
+        def __init__(self):
+            self._group_layouts = {0: SimpleNamespace(num_layers=79)}
+            if warm:
+                self._group_layouts[1] = SimpleNamespace(num_layers=22)
+
+        def batched_to_gpu(self, *args, **kwargs):
+            # Model the first yield's device-layout initialization; no KV is read.
+            assert kwargs["prefill_c8_memory_objs"] is sources
+            self._group_layouts[1] = SimpleNamespace(num_layers=len(kwargs["kvcaches"]))
+            order.append("layout")
+            yield
+
+    consumer = Consumer()
+    sources = [[object()] for _ in range(22)]
+
+    def prepare(rows, group, kwargs):
+        assert len(rows) == consumer._expected_group_layers(group) == 22
+        order.append("pointers")
+
+    engine_path = Path(__file__).parents[2] / "lmcache/v1/cache_engine.py"
+    tree = ast.parse(engine_path.read_text(encoding="utf-8"))
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == f"_retrieve_layer_shared_{role}"
+    )
+
+    def is_prepare(node):
+        return (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "_prepare_shared_prefill_sources"
+        )
+
+    body = next(
+        node.body
+        for node in ast.walk(method)
+        if isinstance(node, ast.If) and any(is_prepare(item) for item in node.body)
+    )
+    preparation = [
+        node
+        for node in body
+        if is_prepare(node)
+        or (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "prepare_c8_packets"
+        )
+    ]
+    scope = dict(
+        self=SimpleNamespace(
+            gpu_connector=consumer, _prepare_shared_prefill_sources=prepare
+        ),
+        prepared_sources=sources,
+        resolved_layers=sources,
+        kv_group=1,
+        prepare_c8_packets=True,
+        starts=[0],
+        ends=[1024],
+        kwargs={"kvcaches": [object() for _ in range(22)]},
+    )
+    try:
+        exec(
+            compile(
+                ast.Module(body=preparation, type_ignores=[]), str(engine_path), "exec"
+            ),
+            scope,
+        )
+        assert order == ["layout", "pointers"]
+    finally:
+        if scope.get("mem_obj_consumer") is not None:
+            scope["mem_obj_consumer"].close()
 
 
 def test_promoted_mixed_flat_sources_use_each_layer_shape() -> None:

@@ -6035,14 +6035,16 @@ class LMCacheEngine:
                     consumer_send_s += serving_perf_now() - send_started
 
             if deferred_layerwise_get:
-                self._prepare_shared_prefill_sources(
-                    prepared_sources, kv_group, kwargs
-                )
                 if prepare_c8_packets:
+                    # Priming initializes the group's layout/cardinality before
+                    # shared pointer preparation validates its source rows.
                     mem_obj_consumer = self.gpu_connector.batched_to_gpu(
                         starts, ends, prefill_c8_memory_objs=resolved_layers, **kwargs
                     )
                     next(mem_obj_consumer)
+                self._prepare_shared_prefill_sources(
+                    prepared_sources, kv_group, kwargs
+                )
                 sources_safe_to_release = False
                 if perf_enabled:
                     consume_started = serving_perf_now()
@@ -6562,15 +6564,15 @@ class LMCacheEngine:
                     # ordinary P prefix loads prepare every layer here.
                     if all(source is not None for source in prepared_sources):
                         pointer_started = time.perf_counter() if prefill_timing else 0.0
-                        self._prepare_shared_prefill_sources(
-                            prepared_sources, kv_group, kwargs
-                        )
                         if prepare_c8_packets:
                             mem_obj_consumer = self.gpu_connector.batched_to_gpu(
                                 starts, ends,
                                 prefill_c8_memory_objs=resolved_layers, **kwargs
                             )
                             next(mem_obj_consumer)
+                        self._prepare_shared_prefill_sources(
+                            prepared_sources, kv_group, kwargs
+                        )
                         if pointer_started:
                             prefill_start_timing_log(
                                 logger,
