@@ -3282,6 +3282,33 @@ class LMCacheConnectorV1Impl:
                 f"window: layer={layer_name}, kv_group={kv_group}"
             ) from None
 
+    def record_layerwise_prefill_bank_use(self, layer_name: str, event: Any) -> None:
+        """Fence this layer's banks after their final compute access.
+
+        Args:
+            layer_name: Registered latent or indexer layer name.
+            event: Device event recorded by attention after its final KV access.
+
+        Include every scheduled request, even cache misses and passive TP ranks
+        that do not save. Enqueue device waits only; do not wait on the host.
+        """
+        if not self._layerwise_prefill_p_node:
+            return
+        metadata = self._parent._get_connector_metadata()
+        offsets = tuple({
+            int(getattr(request, "layerwise_prefill_bank_offset", 0)) & 1
+            for request in metadata.requests
+        })
+        if not offsets:
+            return
+        kv_group = self._layerwise_wait_group(layer_name)
+        self.lmcache_engine.gpu_connector.record_layerwise_prefill_bank_use(
+            self._layerwise_prefill_transfer_layer_id(layer_name, kv_group),
+            kv_group,
+            offsets,
+            event,
+        )
+
     def _wait_for_layerwise_prefill_bank(
         self,
         layer_name: str,

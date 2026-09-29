@@ -211,6 +211,15 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         """Submit N+2; virtual N=-1 submits L1 at first-layer entry."""
         self._lmcache_engine.submit_layerwise_prefill_load(layer_name)
 
+    def record_layerwise_prefill_bank_use(self, layer_name: str, event: Any) -> None:
+        """Hand off the event recorded after a P layer's final KV access.
+
+        Args:
+            layer_name: Registered latent or indexer layer name.
+            event: Device event marking the layer's final bank access.
+        """
+        self._lmcache_engine.record_layerwise_prefill_bank_use(layer_name, event)
+
     def finish_layerwise_prefill_save(self, layer_name: str) -> None:
         """Run storage publication after the layer's HCOM is submitted."""
         self._lmcache_engine.finish_layerwise_prefill_save(layer_name)
