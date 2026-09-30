@@ -946,10 +946,14 @@ class LMCacheEngine:
             "kv_layer_groups",
             (),
         )
-        if getattr(self, "_layerwise_prefill_p_node", False) and registered_groups:
-            # Startup precedes the connector's lazy layout initialization.
+        if registered_groups and (
+            self.dsa_two_groups or getattr(self, "_layerwise_prefill_p_node", False)
+        ):
+            # P and D startup precede the connector's lazy layout initialization.
             # Its generic get_shape() fallback has a K/V factor of two even
             # for MLA. Registered metadata already describes the real layout.
+            if self.dsa_two_groups:
+                self.num_layers_for_group(0)  # Validate both registered counts.
             shapes = self.metadata.get_shapes(chunk_size)
             bytes_per_chunk_all_layers = sum(
                 math.prod(shapes[kv_group])

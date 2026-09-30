@@ -2140,7 +2140,9 @@ def _make_engine_for_sparse_capacity(
         world_size=8,
         is_first_rank=lambda: True,
         max_model_len=1024,
+        worker_id=0,
         kv_dtype=torch.float16,
+        runtime_kv_group_layer_counts=(4, 4),
         get_dtypes=lambda: [torch.float16],
         get_shapes=lambda num_tokens: [torch.Size([num_tokens, 1024])],
     )
