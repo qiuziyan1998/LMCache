@@ -158,6 +158,155 @@ def test_cold_promotion_is_one_shot_and_preserves_exact_frontier():
     assert not take(adapter, "r", load)
 
 
+@pytest.mark.parametrize("resumed", [False, True])
+@pytest.mark.parametrize("already_published", [False, True])
+def test_pending_cold_load_cannot_publish_or_rearm_release(
+    resumed: bool, already_published: bool
+) -> None:
+    mark = method("_mark_initial_sparse_release_ready")
+    drain = method("get_completed_decode_window_saves")
+    load = NS(
+        dsa_cold_compact_load=True,
+        dsa_release_frontier=7168,
+        dsa_current_released_frontier=0,
+    )
+    pending = NS(
+        req_id="r",
+        is_sparse_decode=True,
+        load_spec=load,
+        resumed_from_preemption=resumed,
+        dsa_current_released_frontier=0,
+    )
+    worker = NS(_completed_decode_window_saves={})
+    if already_published:
+        worker._initial_sparse_release_published = {"r"}
+    # Repeated polls, including a failed/unpromoted restore, must not signal
+    # that a sparse step ran or consume/rearm its one-shot release marker.
+    for _ in range(3):
+        mark(worker, pending)
+        assert drain(worker) == {}
+    assert not hasattr(pending, "_initial_sparse_release_rearmed")
+    assert getattr(worker, "_initial_sparse_release_published", None) == (
+        {"r"} if already_published else None
+    )
+    # Continuing requests in the same batch still release normally.
+    active = NS(
+        **{
+            **vars(pending),
+            "req_id": "active",
+            "load_spec": NS(dsa_release_frontier=6144, dsa_current_released_frontier=0),
+        }
+    )
+    mark(worker, active)
+    assert drain(worker) == {"active": 6144}
+    # Actual promotion clears the load-only flag and permits one release.
+    assert method("_take_completed_cold_load")(
+        NS(_dsa_cold_loaded_req_ids={"r"}), "r", load
+    )
+    pending.resumed_from_preemption = True
+    mark(worker, pending)
+    assert drain(worker) == {"r": 7168}
+    mark(worker, pending)
+    assert drain(worker) == {}
+
+
+def test_checkpoint_release_waits_for_resumed_tracker_history() -> None:
+    from runpy import run_path
+    from types import MethodType
+
+    tracker = NS(
+        req_id="r",
+        prompt_len=7166,
+        num_lmcache_cached_tokens=7166,
+        token_ids=list(range(7166)),
+        sparse_token_ids=[],
+        sparse_slot_mapping=[],
+        sparse_indexer_slot_mapping=[],
+        decode_window_save_pending_commits={},
+        allocated_block_ids=[1],
+        allocated_block_ids_indexer=[2],
+    )
+    scheduler = NS(
+        _request_trackers={"r": tracker},
+        _lmcache_chunk_size=1024,
+        _decode_window_save_window_size=0,
+    )
+    commit = run_path(str(SOURCE.with_name("decode_window_commit.py")))
+    consume = method(
+        "update_connector_output",
+        _mtp_dw_event=lambda *a, **kw: None,
+        publish_delayed_decode_window_commit=commit[
+            "publish_delayed_decode_window_commit"
+        ],
+    )
+    # Keep the safety check: an early notification must still be rejected.
+    with pytest.raises(RuntimeError, match="committed_end=7168.*frontier=7166"):
+        consume(scheduler, NS(completed_decode_window_saves={"r": 7168}))
+    load = NS(
+        dsa_cold_compact_load=True,
+        dsa_release_frontier=7168,
+        dsa_current_released_frontier=0,
+        lmcache_cached_tokens=7168,
+        vllm_cached_tokens=0,
+        dsa_remap_frontier=7168,
+    )
+    pending = NS(
+        req_id="r",
+        is_sparse_decode=True,
+        load_spec=load,
+        resumed_from_preemption=False,
+        dsa_current_released_frontier=0,
+    )
+    worker = NS(_completed_decode_window_saves={})
+    mark = method("_mark_initial_sparse_release_ready")
+    mark(worker, pending)
+    consume(
+        scheduler,
+        NS(completed_decode_window_saves=worker._completed_decode_window_saves),
+    )
+    assert len(tracker.token_ids) == 7166
+
+    tracker.update = MethodType(
+        method(
+            "update", _split_kv_group_block_ids=lambda blocks: tuple(map(list, blocks))
+        ),
+        tracker,
+    )
+    tracker.seed_sparse_decode_tokens = lambda tokens, count: None
+    scheduler._add_decode_window_save_metas = lambda *args: None
+    scheduler._build_request_meta = lambda tr, spec, **kw: NS(
+        req_id=tr.req_id,
+        load_spec=spec,
+        is_sparse_decode=True,
+        dsa_current_released_frontier=tr.dsa_current_released_frontier,
+    )
+    scheduler._dsa_cold_loaded_req_ids = {"r"}
+    assert method("_take_completed_cold_load")(scheduler, "r", load)
+    outputs = []
+    method("_add_completed_cold_resume")(
+        scheduler,
+        NS(add_request=outputs.append),
+        tracker,
+        NS(all_token_ids=list(range(7169))),
+        [7168],
+        ([3], [4]),
+        load,
+    )
+    assert len(tracker.token_ids) == 7169
+    mark(worker, outputs[0])
+    assert worker._completed_decode_window_saves == {"r": 7168}
+    scheduler._dsa_scratch_capacity = 4096
+    scheduler._eligible_dsa_release_frontier = MethodType(
+        method("_eligible_dsa_release_frontier"), scheduler
+    )
+    consume(
+        scheduler,
+        NS(completed_decode_window_saves=worker._completed_decode_window_saves),
+    )
+    assert tracker.dsa_current_released_frontier == 7168
+    assert worker._completed_decode_window_saves == {"r": 7168}
+
+
 def test_preemption_cannot_reuse_other_generation_prepared_state():
     check = method("completed_cold_resume_state")
     req = NS(

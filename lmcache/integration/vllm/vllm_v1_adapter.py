@@ -4773,6 +4773,10 @@ class LMCacheConnectorV1Impl:
         """Publish the cache-hit frontier after the first sparse step completes."""
         if not request.is_sparse_decode or request.load_spec is None:
             return
+        # Load-only metadata precedes resumed tracker reconstruction and has
+        # not executed a sparse step; leave its release marker untouched.
+        if getattr(request.load_spec, "dsa_cold_compact_load", False):
+            return
         committed_end = request.load_spec.dsa_release_frontier
         if committed_end is None or committed_end <= 0:
             return
