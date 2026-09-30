@@ -66,8 +66,46 @@ def no_cyclic_gc():
             gc.enable()
 
 
+@pytest.mark.parametrize("aborted", [False, True])
+def test_prepared_pointer_publication_waits_for_final_device_event(
+    aborted, no_cyclic_gc
+):
+    from lmcache.integration.vllm.cold_load import ColdLoadCoordinator
+
+    actions = []
+    ready = [False]
+    state = NS(dense_load_readiness=NS(query=lambda: ready[0]))
+
+    class Owner:
+        def publish(self, req_id, entry, result, was_aborted, perf):
+            assert ready[0] and result is state
+            actions.append("retire" if was_aborted else "publish")
+
+        def fail(self, *args):
+            pytest.fail("Unexpected cold-load failure")
+
+        def requires_restart(self):
+            return False
+
+    owner = Owner()
+    coordinator = ColdLoadCoordinator(owner.publish, owner.fail, owner.requires_restart)
+    latent, indexer = Future(), Future()
+    latent.set_result(state)
+    indexer.set_result(None)
+    request = NS(load_spec=NS(dsa_cold_load_generation=7))
+    coordinator.futures["r"] = (7, latent, request, {12}, 0.0, indexer)
+    coordinator.aborted = {"r"} if aborted else None
+    assert coordinator.poll() is None
+    assert coordinator.futures and not actions
+    ready[0] = True
+    assert coordinator.poll() == {"r"}
+    assert actions == ["retire" if aborted else "publish"]
+    assert not coordinator.futures
+
+
 @pytest.mark.parametrize(
-    "failure", [None, "incomplete", "missing_event", "submit", "unknown_completion"]
+    "failure", [None, "incomplete", "missing_event", "submit", "unknown_completion",
+                "final_record", "final_record_unknown"]
 )
 def test_resident_worker_loads_before_publication_and_unblocks_failures(
     failure, no_cyclic_gc
@@ -77,7 +115,7 @@ def test_resident_worker_loads_before_publication_and_unblocks_failures(
     spec = NS(
         lmcache_cached_tokens=length,
         dsa_cold_resident_load=True,
-        dsa_group1_direct_hbm=True,
+        dsa_group1_direct_hbm=failure not in ("final_record", "final_record_unknown"),
     )
     slots = torch.arange(length)
     request = NS(req_id="r", load_spec=spec, slot_mapping=[slots])
@@ -114,7 +152,7 @@ def test_resident_worker_loads_before_publication_and_unblocks_failures(
     engine = NS(gpu_connector=connector, retrieve_layer=dense)
     gate = Future()
     indexer = Future()
-    indexer.set_result((None, None, 0, 0))
+    indexer.set_result((None, None if spec.dsa_group1_direct_hbm else object(), 0, 0))
     plan = dict(
         request=request,
         token_count=length,
@@ -133,15 +171,20 @@ def test_resident_worker_loads_before_publication_and_unblocks_failures(
 
     def fence():
         trace.append("fence")
-        if failure == "unknown_completion":
+        if failure in ("unknown_completion", "final_record_unknown"):
             raise RuntimeError("completion unknown")
+
+    def record(*args, **kwargs):
+        trace.append("record")
+        if failure in ("final_record", "final_record_unknown"):
+            raise RuntimeError("final fence failed after graph pointer submission")
 
     adapter = NS(
         lmcache_engine=engine,
         _num_layers_for_group=lambda group: 2 if group == 0 else 1,
         _sparse_retrieve_kwargs=lambda *a, **kw: (dict(kv_group=0), None, None),
         _synchronize_dsa_cold_dense_readiness=lambda event: trace.append("ready"),
-        _record_dsa_cold_dense_load_readiness=lambda *a, **kw: trace.append("record"),
+        _record_dsa_cold_dense_load_readiness=record,
         _refresh_prepared_sparse_sources=seal,
         _synchronize_dsa_cold_dense_load=fence,
         _release_dense_load_source_owners=lambda *a, **kw: trace.append("release"),
@@ -157,9 +200,11 @@ def test_resident_worker_loads_before_publication_and_unblocks_failures(
     if failure:
         with pytest.raises(RuntimeError) as error:
             run(adapter, plan, None, indexer)
-        assert gate.done() and gate.exception() is not None
-        assert "seal" not in trace
-        if failure == "unknown_completion":
+        assert gate.done()
+        after_seal = failure in ("final_record", "final_record_unknown")
+        assert (gate.exception() is None) == after_seal
+        assert ("seal" in trace) == after_seal
+        if failure in ("unknown_completion", "final_record_unknown"):
             assert "release" not in trace
             assert error.value._lmcache_dsa_cold_state is state
         else:
@@ -167,7 +212,7 @@ def test_resident_worker_loads_before_publication_and_unblocks_failures(
     else:
         result = run(adapter, plan, None, indexer)
         assert result is state and gate.result() is None
-        assert trace == ["load", "close", "ready", "record", "seal"]
+        assert trace == ["load", "close", "ready", "seal", "record"]
         assert state.indexer_npu_resident and state.token_count == length
 
 

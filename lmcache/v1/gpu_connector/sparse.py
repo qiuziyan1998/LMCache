@@ -36,6 +36,11 @@ class PreparedSparseSource:
     binding_token: object = field(
         default_factory=object, init=False, repr=False, compare=False
     )
+    # Optional accelerator-prepared K/PE tables, owned by this exact source.
+    # Replacing source geometry must rebuild them (dataclasses.replace resets it).
+    graph_pointer_pairs: Optional[tuple[int, torch.Tensor]] = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
 
 def build_prepared_sparse_source(

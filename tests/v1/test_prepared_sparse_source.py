@@ -189,9 +189,14 @@ def test_binding_token_does_not_retain_source_and_changes_on_replace():
 
     pointers = torch.ones(1, dtype=torch.int64)
     source = PreparedSparseSource((PreparedSparseSourceLayer((), pointers),), 1, (1,))
+    pairs = torch.ones((2, 1, 1), dtype=torch.int64)
+    pairs_ref = weakref.ref(pairs)
+    object.__setattr__(source, "graph_pointer_pairs", (1024, pairs))
     token = source.binding_token
     changed = replace(source, total_tokens=1)
     assert changed.binding_token is not token
+    assert changed.graph_pointer_pairs is None
     pointer_ref = weakref.ref(pointers)
-    del pointers, source, changed
+    del pointers, pairs, source, changed
     assert pointer_ref() is None  # A retained token owns no pointer tensor.
+    assert pairs_ref() is None

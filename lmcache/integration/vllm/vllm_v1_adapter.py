@@ -8287,24 +8287,23 @@ class LMCacheConnectorV1Impl:
                     raise RuntimeError(
                         "Direct Group-1 load returned an unexpected CPU-source fence"
                     )
-            # Group-0 pointer tables and the CPU-staged Group-1 fallback use
-            # this same load stream. One final event covers both submissions.
-            self._record_dsa_cold_dense_load_readiness(
-                state,
-                additional_owners=tuple(plan.get("indexer_source_owners", ())),
-            )
-
             seal_started = serving_perf_now() if perf_enabled else 0.0
             state.indexer_npu_resident = True
             state.location = retrieve_location
             state.metadata_warm = state.has_cache()
             state.token_count = token_count
             self._refresh_prepared_sparse_sources(state, token_count)
-            if perf_enabled:
-                latent_seal_ms = (serving_perf_now() - seal_started) * 1000
             if state.prepared_sparse_sources.get(0) is None:
                 raise RuntimeError("Cold compact latent source was not sealed")
+            # Include derived source-table preparation in the existing final
+            # fence before publishing either KV group to the foreground.
+            self._record_dsa_cold_dense_load_readiness(
+                state,
+                additional_owners=tuple(plan.get("indexer_source_owners", ())),
+            )
             completed_at = serving_perf_now() if perf_enabled else 0.0
+            if perf_enabled:
+                latent_seal_ms = (completed_at - seal_started) * 1000
             state._dsa_cold_load_completed_at = completed_at
             if perf_enabled:
                 serving_perf_log(
@@ -8362,8 +8361,6 @@ class LMCacheConnectorV1Impl:
                     self._synchronize_dsa_cold_dense_readiness(
                         state.dense_load_readiness
                     )
-                elif indexer_readiness is not None:
-                    self._synchronize_dsa_cold_dense_readiness(indexer_readiness)
                 else:
                     # The final event may have failed to record after the
                     # pointer-table copy was submitted. Fence its load stream
