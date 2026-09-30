@@ -128,6 +128,8 @@ def completed_cold_resume_state(request: Any, state: Any) -> bool:
                 == getattr(spec, "dsa_cold_load_generation", -1)
                 and state.token_count == spec.lmcache_cached_tokens
                 and state.indexer_npu_resident
+                and (not getattr(spec, "dsa_cold_resident_load", False)
+                     or state.dense_prefix_resident_tokens == spec.lmcache_cached_tokens)
                 and state.prepared_sparse_sources.get(0) is not None)
 
 
@@ -1319,6 +1321,7 @@ class WorkerRetrieveState:
     request_scope_token: Optional[str] = None
     shared_validation_signature: Optional[tuple[Any, ...]] = None
     dense_prefix_seed: bool = False
+    dense_prefix_resident_tokens: int = 0
     dense_prefix_generation: Optional[int] = None
     prefill_metadata_cache: Optional[PrefillMetadataCache] = field(
         default=None, repr=False
@@ -1367,6 +1370,8 @@ class WorkerRetrieveState:
         }
 
     def clear_group(self, kv_group: int) -> None:
+        if kv_group == 0:
+            self.dense_prefix_resident_tokens = 0
         for values in self.cache_kwargs(kv_group, dsa_two_groups=True).values():
             values.clear()
         self.prepared_sparse_sources.pop(kv_group, None)
@@ -5348,6 +5353,7 @@ class LMCacheConnectorV1Impl:
         state.shared_latent_status = "missing"
         state.shared_index_status = "missing"
         state.indexer_npu_resident = False
+        state.dense_prefix_resident_tokens = 0
         state.indexer_npu_materialization_pending = False
         state.shared_generation = 0
         state.pointer_cache_generation = 0
@@ -7455,7 +7461,8 @@ class LMCacheConnectorV1Impl:
                 "worker_load_start",
                 req_id=request.req_id,
                 tokens=token_count,
-                mode="dsa_cold_compact",
+                mode=("dsa_cold_resident" if getattr(request.load_spec,
+                      "dsa_cold_resident_load", False) else "dsa_cold_compact"),
             )
         executor = self._get_dsa_cold_load_executor()
         if perf_enabled:
@@ -7487,6 +7494,8 @@ class LMCacheConnectorV1Impl:
 
     def _try_prepare_dsa_live_split(self, request: ReqMeta) -> bool:
         """Reserve cold groups until live import succeeds or falls back."""
+        if getattr(request.load_spec, "dsa_cold_resident_load", False):
+            return False  # Live compact sources do not restore resident Group 0.
         pending = getattr(self, "_dsa_live_split_pending", None)
         coordinator = getattr(self, "_cold_load_coordinator", None)
         futures = coordinator.futures if coordinator is not None else None
@@ -8059,6 +8068,7 @@ class LMCacheConnectorV1Impl:
                 "dsa_group1_direct_hbm",
                 False,
             )
+            or getattr(entry[2].load_spec, "dsa_cold_resident_load", False)
         }
         pending_req_ids = [
             req_id
@@ -8187,16 +8197,23 @@ class LMCacheConnectorV1Impl:
                     latent_kwargs_ms = (
                         serving_perf_now() - phase_started
                     ) * 1000
-                retrieve_kwargs["materialize_only"] = True
+                resident = getattr(request.load_spec, "dsa_cold_resident_load", False)
+                if resident:
+                    readiness_out: list[Any] = []
+                    # The dense consumer validates/stages CPU slots inside the
+                    # engine's shared error-envelope guard, before publication.
+                    retrieve_kwargs["slot_mapping"] = request.slot_mapping[0]
+                    retrieve_kwargs["_retain_shared_dense_cache"] = True
+                    retrieve_kwargs["_dense_load_readiness_out"] = readiness_out
+                else:
+                    retrieve_kwargs["materialize_only"] = True
                 retrieve_kwargs["shared_cpu_phase"] = "dsa_cold_compact_latent"
                 retrieve_kwargs["_defer_sparse_pointer_copy"] = True
                 phase_started = serving_perf_now() if perf_enabled else 0.0
-                latent_retriever = (
-                    self.lmcache_engine.retrieve_layer_head_token_wise(
-                        tokens,
-                        token_mask,
-                        **retrieve_kwargs,
-                    )
+                retrieve = (self.lmcache_engine.retrieve_layer if resident else
+                            self.lmcache_engine.retrieve_layer_head_token_wise)
+                latent_retriever = retrieve(
+                    tokens, token_mask, **retrieve_kwargs,
                 )
                 if perf_enabled:
                     latent_generator_create_ms = (
@@ -8209,7 +8226,7 @@ class LMCacheConnectorV1Impl:
                         latent_first_yield_ms = (
                             serving_perf_now() - phase_started
                         ) * 1000
-                    for layer_id in range(latent_layers):
+                    for layer_id in range(latent_layers + int(resident)):
                         phase_started = (
                             serving_perf_now() if perf_enabled else 0.0
                         )
@@ -8231,6 +8248,11 @@ class LMCacheConnectorV1Impl:
                     or int(latent_result.sum().item()) != token_count
                 ):
                     raise RuntimeError("Cold compact latent retrieve was incomplete")
+                if resident:
+                    if len(readiness_out) != 1:
+                        raise RuntimeError("Resident latent load did not record readiness")
+                    self._synchronize_dsa_cold_dense_readiness(readiness_out[0])
+                    state.dense_prefix_resident_tokens = token_count
                 if perf_enabled:
                     latent_result_check_ms = (
                         serving_perf_now() - phase_started
@@ -11708,7 +11730,8 @@ class LMCacheConnectorV1Impl:
                 started=submitted_at,
                 req_id=req_id,
                 tokens=request.load_spec.lmcache_cached_tokens,
-                mode="dsa_cold_compact",
+                mode=("dsa_cold_resident" if getattr(request.load_spec,
+                      "dsa_cold_resident_load", False) else "dsa_cold_compact"),
                 background_ms=round((completed_at - submitted_at) * 1000, 3),
                 scheduler_poll_ms=round((publish_started - completed_at) * 1000, 3),
                 publish_ms=round((published_at - publish_started) * 1000, 3),
@@ -11762,7 +11785,10 @@ class LMCacheConnectorV1Impl:
             )
             raise
         retry = self._record_checkpoint_restore_miss(request, generation, exc)
-        if not retry and not request.load_spec.dsa_group1_direct_hbm:
+        if not retry and (
+            not request.load_spec.dsa_group1_direct_hbm
+            or getattr(request.load_spec, "dsa_cold_resident_load", False)
+        ):
             try:
                 self._synchronize_dsa_cold_dense_load()
             except BaseException:
@@ -12274,6 +12300,11 @@ class LMCacheConnectorV1Impl:
             and self._dsa_scratch_capacity > 0
             and num_external_hit_tokens > 0
         )
+        resident_cold_load = (
+            getattr(self, "_resident_cold_load_enabled", False)
+            and getattr(self.config, "pd_role", None) == "receiver"
+            and 1 < num_external_hit_tokens <= self._dsa_scratch_capacity
+        )
         dsa_cold_compact_load = (
             self.supports_dsa_cold_compact_load()
             and num_computed_tokens == 0
@@ -12293,20 +12324,14 @@ class LMCacheConnectorV1Impl:
                     and num_external_hit_tokens % self._block_size == 1
                 )
             )
-            # The compact load materializes the prefix in indexer blocks that
-            # only the SFA compact-scratch remap can read. That machinery
-            # requires a frontier of zero or >= scratch_capacity; a smaller
-            # frontier (e.g. a short prompt) is rejected by the staged-SFA
-            # route (frontier_too_short FATAL). Such prompts take the normal
-            # dense-prefix load path instead (short-context full-resident
-            # policy).
-            and compact_remap_frontier >= self._dsa_scratch_capacity
-            # Short-context full-resident policy (方案 A): a prompt within the
-            # threshold is served from resident main blocks, so compact KV load
-            # is pure overhead. Skip it in favor of normal dense-prefix load.
-            and num_external_hit_tokens > getattr(
+            # Short D prefixes restore both groups into resident slots and
+            # use a zero remap frontier. Long prefixes keep compact scratch.
+            and (resident_cold_load or compact_remap_frontier >= self._dsa_scratch_capacity)
+            # Preserve policy-controlled dense loading beyond the bounded
+            # resident-prefix range; do not compact those requests implicitly.
+            and (resident_cold_load or num_external_hit_tokens > getattr(
                 self, "_dsa_kv_policy_threshold", 0
-            )
+            ))
         )
         if (
             query_scope == "preemption_checkpoint"
@@ -12384,10 +12409,13 @@ class LMCacheConnectorV1Impl:
         if dsa_cold_compact_load:
             self.load_specs[req_id].dsa_cold_compact_load = True
             self.load_specs[req_id].dsa_group1_direct_hbm = group1_direct_hbm
+            if resident_cold_load:
+                self.load_specs[req_id].dsa_cold_resident_load = True
+                self.load_specs[req_id].dsa_cold_resume_computed_end = compact_remap_frontier
 
         if dsa_prefix_hit:
             remap_frontier = (
-                compact_remap_frontier
+                (0 if resident_cold_load else compact_remap_frontier)
                 if dsa_cold_compact_load
                 else num_external_hit_tokens
             )
@@ -12422,7 +12450,7 @@ class LMCacheConnectorV1Impl:
             block_ids = blocks.get_block_ids()
         else:
             block_ids = blocks
-        _, indexer_block_ids = _split_kv_group_block_ids(block_ids)
+        latent_block_ids, indexer_block_ids = _split_kv_group_block_ids(block_ids)
         if not indexer_block_ids:
             raise ValueError("Cold compact load requires allocated indexer blocks")
         required_indexer_blocks = cdiv(
@@ -12474,6 +12502,12 @@ class LMCacheConnectorV1Impl:
             load_spec=load_spec,
             request_configs=extract_request_configs(request.sampling_params),
         )
+        if getattr(load_spec, "dsa_cold_resident_load", False):
+            if len(latent_block_ids) < required_indexer_blocks:
+                raise ValueError("Resident cold load requires complete latent destinations")
+            req_meta.slot_mapping = [
+                _build_slot_mapping(latent_block_ids, self._block_size, len(token_ids))
+            ]
         params = getattr(request, "kv_transfer_params", None)
         raw_capabilities = (
             params.get("live_split_capabilities", ())
@@ -13420,6 +13454,7 @@ class LMCacheConnectorV1Impl:
                         > getattr(self, "_dsa_kv_policy_threshold", 0)
                     )
                     or request_tracker.dsa_nonresident_frontier > 0
+                    or hasattr(request_tracker, "sparse_remap_frontier")
                 )
             )
             if self._dsa_kv_policy_log:
