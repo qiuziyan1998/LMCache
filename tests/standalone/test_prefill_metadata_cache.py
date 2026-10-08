@@ -163,6 +163,11 @@ SOURCE = (
 
 def adapter_types():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    pointer_table = next(
+        node
+        for node in tree.body
+        if getattr(node, "name", "") == "LayerwisePointerTable"
+    )
     state = next(
         node for node in tree.body if getattr(node, "name", "") == "WorkerRetrieveState"
     )
@@ -194,7 +199,7 @@ def adapter_types():
         module="__future__", names=[ast.alias("annotations")], level=0
     )
     module = ast.fix_missing_locations(
-        ast.Module(body=[future, state, adapter], type_ignores=[])
+        ast.Module(body=[future, pointer_table, state, adapter], type_ignores=[])
     )
     namespace = dict(
         dataclass=dataclass,
@@ -203,7 +208,6 @@ def adapter_types():
         deepcopy=deepcopy,
         PrefillMetadataCache=PrefillMetadataCache,
         prefill_reuse_debug_enabled=lambda rank: False,
-        LayerwisePointerTable=lambda: NS(clear=lambda: None, truncate=lambda _: None),
     )
     exec(compile(module, str(SOURCE), "exec"), namespace)
     return namespace["LMCacheConnectorV1Impl"], namespace["WorkerRetrieveState"]

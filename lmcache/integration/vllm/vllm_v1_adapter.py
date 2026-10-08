@@ -1205,6 +1205,33 @@ class LayerwisePointerTable:
         self.length = 0
         self.capacity = 0
 
+    def matches_rows(
+        self,
+        rows: list[Optional[torch.Tensor]],
+        length: int,
+    ) -> bool:
+        """Whether current cache rows still view this table's live prefix.
+
+        Dense loads can replace or defer the rows independently of this
+        incremental store table. Check view metadata, including addresses,
+        without reading pointer values or synchronizing the device.
+        """
+        table = self.table
+        if table is None or self.length != length or len(rows) != table.shape[0]:
+            return False
+        base_ptr = table.data_ptr()
+        row_bytes = table.stride(0) * table.element_size()
+        return all(
+            isinstance(row, torch.Tensor)
+            and row.ndim == 1
+            and row.numel() == length
+            and row.dtype == table.dtype
+            and row.device == table.device
+            and row.stride(0) == table.stride(1)
+            and row.data_ptr() == base_ptr + layer_id * row_bytes
+            for layer_id, row in enumerate(rows)
+        )
+
     def truncate(self, length: int) -> None:
         if length < 0:
             raise ValueError("Pointer-table length cannot be negative")
@@ -6531,6 +6558,16 @@ class LMCacheConnectorV1Impl:
         can_append_ptrs = can_append_layer_ptr_tensors()
         if require_pointer_cache and not can_append_ptrs:
             return 0
+
+        if pointer_table is not None and (
+            not can_append_ptrs
+            or not pointer_table.matches_rows(dst_chunk_ptrs_npu, existing_chunks)
+        ):
+            # A dense load may have adopted a longer prefix, replaced its
+            # pointers, or deferred them for raw DMA. Invalidate the old store
+            # table before truncation; append rebuilds from the current rows
+            # when available. Keep matching tables for amortized growth.
+            pointer_table.clear()
 
         if replace_at is not None:
             del dst_starts[replace_at:]
