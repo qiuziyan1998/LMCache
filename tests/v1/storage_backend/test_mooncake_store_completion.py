@@ -2568,6 +2568,37 @@ def test_mooncake_page_grouping_serializes_each_page_once(
     assert page_key.call_count == 2
 
 
+def test_mooncake_grouping_keeps_canonical_keys_out_of_layer_groups() -> None:
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    layers = [_layer_key(1, layer) for layer in range(2)]
+    base = layers[0].without_layer()
+    groups, legacy = connector._complete_page_groups([base, *layers])
+    assert groups == [(mooncake_page_key(base, 2), [1, 2])]
+    assert legacy == [0]
+    # Generic base-key lookup uses the legacy object identity; merged pages
+    # retain their separate explicit lookup API.
+    seen = []
+    connector.store = SimpleNamespace(
+        batch_is_exist=lambda keys: seen.extend(keys) or [1] * len(keys)
+    )
+    assert connector.batched_contains([base]) == 1
+    assert seen == [base.to_string()]
+    seen.clear()
+    assert connector.batched_contains_layer_pages([base]) == 1
+    assert seen == [mooncake_page_key(base, 2)]
+    sentinel = object()
+
+    async def legacy_get(keys):
+        assert keys == [base]
+        return [sentinel]
+
+    connector.save_chunk_meta = False
+    connector._batch_get_into_legacy = legacy_get
+    assert asyncio.run(connector.batched_get([base])) == [sentinel]
+
+
 def test_mooncake_page_alias_requires_complete_batch() -> None:
     class _Store:
         @staticmethod

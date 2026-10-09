@@ -960,7 +960,9 @@ class MooncakestoreConnector(RemoteConnector):
         grouped: dict[str, list[int]] = {}
         legacy_indices: list[int] = []
         for index, page_key in enumerate(self._page_keys_for(keys)):
-            if page_key is None:
+            # Generic whole-chunk objects retain their legacy key semantics.
+            # Canonical merged pages use batched_*_layer_pages explicitly.
+            if page_key is None or not isinstance(keys[index], LayerCacheEngineKey):
                 legacy_indices.append(index)
                 continue
             grouped.setdefault(page_key, []).append(index)

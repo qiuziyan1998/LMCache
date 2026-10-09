@@ -5740,6 +5740,16 @@ class LMCacheEngine:
             kwargs["_shared_prefill_reuse_count"] = source_prefix
             source_state = self._shared_prefill_source_state(req_id, kv_group, kwargs)
             kwargs["_shared_prefill_fresh_refs"] = to_release
+        # Retained pages keep their original tier labels. Appending a local
+        # suffix can make those labels non-monotonic without changing the
+        # canonical page keys. Resolve remaining planned pages as pages, not
+        # through the legacy per-layer path; owned prefix pages stay borrowed.
+        if (
+            deferred_layerwise_get and not page_first_resolve
+            and planned_page_chunks > source_prefix
+            and mooncake_layer_pages_enabled(self.config)
+        ):
+            page_first_resolve = True
         perf_enabled = serving_perf_enabled()
         consume_started = consumer_send_s = consumer_finish_s = 0.0
         try:

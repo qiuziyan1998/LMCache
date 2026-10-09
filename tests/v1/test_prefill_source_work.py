@@ -4,6 +4,7 @@
 # Standard
 from collections import deque
 from dataclasses import replace
+import gc
 from threading import Lock
 from types import SimpleNamespace
 from typing import Any
@@ -179,7 +180,9 @@ class SharedEngine(LMCacheEngine):
             MemoryFormat.KV_MLA_LATENT_FMT,
         )
 
-    def _expected_shared_cpu_chunk_metadata(self, *, kv_group: int, num_tokens: int):
+    def _expected_shared_cpu_chunk_metadata(
+        self, *, kv_group: int, num_tokens: int, layer_id: int = 0
+    ):
         return torch.Size([num_tokens]), torch.float16, MemoryFormat.KV_MLA_LATENT_FMT
 
     def _validate_rank0_shared_mem_obj(self, obj, **kwargs: Any) -> None:
@@ -307,6 +310,109 @@ def test_public_retrieve_only_resolves_and_constructs_new_sources(
     assert not first.is_valid()
     for page in pages:
         page.ref_count_down()
+
+
+@pytest.mark.parametrize("group", [0, 1])
+@pytest.mark.parametrize("total", [11, 12])
+@pytest.mark.parametrize("fail_suffix", [False, True])
+def test_retained_remote_page_with_local_remote_suffix_keeps_page_route(
+    shared_engines, gc_disabled, group: int, total: int, fail_suffix: bool
+) -> None:
+    rank0, passive = shared_engines
+    rank0.num_layers = passive.num_layers = 3 if group == 0 else 2
+    rank0.retrieve_locations = None
+    rank0.populate(total, group)
+    all_pages = dict(rank0.backend.hot_cache)
+    keys = list(all_pages)
+    remote_pages = {key: rank0.backend.hot_cache.pop(key) for key in (keys[0], keys[2])}
+    fetched = []
+
+    def local_prefix(wanted):
+        pages = []
+        for key in wanted:
+            page = rank0.backend.hot_cache.get(key)
+            if page is None:
+                break
+            page.ref_count_up()
+            pages.append(page)
+        return pages, len(pages)
+
+    def contains(wanted):
+        return next(
+            (i for i, key in enumerate(wanted) if key not in remote_pages), len(wanted)
+        )
+
+    def retrieve(wanted):
+        fetched.append(list(wanted))
+        if fail_suffix and keys[2] in wanted:
+            raise RuntimeError("injected suffix read failure")
+        pages = [remote_pages[key] for key in wanted]
+        for key, page in zip(wanted, pages, strict=True):
+            rank0.backend.hot_cache[key] = page
+            page.ref_count_up()
+        return pages
+
+    def generic_get(*args, **kwargs):
+        raise AssertionError("Merged-page keys escaped into generic per-layer fetching")
+
+    remote = SimpleNamespace(
+        connection=SimpleNamespace(batched_contains_layer_pages=contains),
+        batched_contains_layer_pages=contains,
+        batched_get_layer_pages=retrieve,
+    )
+    rank0.backend.batched_get_layer_page_prefix = local_prefix
+    rank0.backend.contains_all_exact = lambda wanted: all(
+        k in rank0.backend.hot_cache for k in wanted
+    )
+    rank0.storage_manager.storage_backends["RemoteBackend"] = remote
+    rank0.storage_manager.get_active_storage_backends = (
+        lambda **kw: rank0.storage_manager.storage_backends.items()
+    )
+    rank0.storage_manager.batched_contains_layer_pages = lambda wanted, loc: (
+        contains(wanted), {"RemoteBackend": wanted[:contains(wanted)]}
+    )
+    rank0.storage_manager.batched_get = generic_get
+    try:
+        for length in (4, total, total):
+            if fail_suffix and length == total:
+                with pytest.raises(RuntimeError, match="injected suffix"):
+                    rank0.retrieve(length, group)
+                passive.incoming.extend(rank0.outgoing)
+                with pytest.raises(ValueError, match="rank0 error envelope"):
+                    passive.retrieve(length, group)
+                assert all_pages[keys[0]].get_ref_count() == 2
+                assert all_pages[keys[1]].get_ref_count() == 1
+                return
+            assert rank0.retrieve(length, group)[-1].all()
+            passive.incoming.extend(rank0.outgoing)
+            rank0.outgoing.clear()
+            assert passive.retrieve(length, group)[-1].all()
+        # The retained page keeps its original location; it is still owned.
+        locations = rank0.get_shared_cpu_request_lease("r").prefill_locations[group]
+        assert list(locations.location_rows()[0]) == [
+            "RemoteBackend", "LocalCPUBackend", "RemoteBackend"
+        ]
+        assert fetched == [[keys[0]], [keys[2]]]
+        assert rank0.gpu_connector.appended == [1, 2, 0]
+        assert passive.gpu_connector.appended == [1, 2, 0]
+        assert all(page.get_ref_count() == 2 for page in all_pages.values())
+    finally:
+        rank0.release_shared_cpu_sparse_request("r")
+        passive.release_shared_cpu_sparse_request("r")
+        for page in all_pages.values():
+            assert page.get_ref_count() == 1 and page.metadata.pin_count == 0
+            page.ref_count_down()
+
+
+@pytest.fixture
+def gc_disabled():
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
 
 
 def test_promoted_partial_tail_avoids_backend_borrow_and_preserves_old_source(
