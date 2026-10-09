@@ -126,6 +126,7 @@ class SharedCPURequestLease:
         *,
         retain: bool,
         preserve_replaced: bool = False,
+        prepared_owners: Optional[tuple[MemoryObj, ...]] = None,
     ) -> None:
         """Replace selected groups while preserving the request's references.
 
@@ -136,6 +137,9 @@ class SharedCPURequestLease:
             preserve_replaced: Keep removed sources alive until ``close``.
                 They remain retained through subsequent store-seed promotions,
                 even if those replacements do not set this flag again.
+            prepared_owners: Complete unique owners from a validated, exclusively
+                owned cold source. Used only for initial Group-0 adoption; other
+                operations rediscover ownership from their complete replacement.
 
         Raises:
             RuntimeError: If a newly borrowed source cannot be retained/pinned.
@@ -150,7 +154,18 @@ class SharedCPURequestLease:
                 replacement.pop(kv_group, None)
 
         old_objects = self._owned_objects
-        new_objects = self._unique_objects(replacement)
+        new_objects = (
+            prepared_owners
+            if prepared_owners is not None
+            and not retain
+            and not self.active
+            and not self.groups
+            and not old_objects
+            and not self._retired_objects
+            and len(groups) == 1
+            and 0 in groups
+            else self._unique_objects(replacement)
+        )
         new_owned = {id(memory_obj): memory_obj for memory_obj in new_objects}
 
         retained: list[MemoryObj] = []

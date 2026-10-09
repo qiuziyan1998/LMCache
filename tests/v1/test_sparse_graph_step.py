@@ -872,10 +872,22 @@ def test_cold_publication_proof_skips_only_certified_scans(stale):
         load_spec=SimpleNamespace(dsa_cold_compact_load=True, dsa_cold_load_generation=2),
     )
     adopted, cleaned = [], []
-    adapter.lmcache_engine = SimpleNamespace(
-        enable_shared_cpu_cache=True, shared_cpu_cache_generation=7,
-        register_shared_cpu_sparse_request=lambda *a, **kw: adopted.append(kw),
-    )
+    from lmcache.v1.cache_engine import LMCacheEngine
+    from lmcache.v1.shared_cpu_cache import SharedCPURequestLease
+
+    engine = object.__new__(LMCacheEngine)
+    engine.enable_shared_cpu_cache = True
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = SimpleNamespace(is_first_rank=lambda: False)
+    engine._shared_cpu_request_leases = {}
+    original_register = engine.register_shared_cpu_sparse_request
+
+    def register(*args, **kwargs):
+        adopted.append(kwargs)
+        original_register(*args, **kwargs)
+
+    engine.register_shared_cpu_sparse_request = register
+    adapter.lmcache_engine = engine
     adapter._worker_retrieve_state = {}
     adapter._set_worker_retrieve_state = lambda key, value: adapter._worker_retrieve_state.update({key: value})
     adapter._mark_worker_retrieve_registry_changed = lambda: None
@@ -915,6 +927,15 @@ def test_cold_publication_proof_skips_only_certified_scans(stale):
     else:
         publish(adapter, state, request, **kwargs)
         assert adopted[0]["owned_groups"][0] is cache["cached_memory_objs"]
+        assert adopted[0]["prepared_source"] is source
+        lease = engine.get_shared_cpu_request_lease("r")
+        assert isinstance(lease, SharedCPURequestLease)
+        assert lease.object_ids() == {id(owner) for owner in owners}
+        assert lease.source_groups[0] is cache["cached_memory_objs"]
+        engine.release_shared_cpu_sparse_request("r")
+        for owner in owners:
+            owner.ref_count_up.assert_not_called()
+            owner.ref_count_down.assert_called_once()
         assert state.cold_publication_proof is None
         assert adapter._worker_retrieve_state["r"] is state
         assert not cleaned

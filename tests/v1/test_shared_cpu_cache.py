@@ -5765,3 +5765,152 @@ def test_shared_envelope_rejects_status_handle_mismatch():
             layer_id=0,
             kv_group=0,
         )
+
+
+@pytest.mark.parametrize("rank0", [False, True])
+@pytest.mark.parametrize("chunks", [1, 98, 977])
+def test_prepared_cold_lease_adopts_unique_owners_without_rescan(rank0, chunks, monkeypatch):
+    import gc
+
+    engine = object.__new__(LMCacheEngine)
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = SimpleNamespace(is_first_rank=lambda: rank0)
+    engine._shared_cpu_request_leases = {}
+    owners = tuple(_LeaseMemoryObj(pinned=rank0) for _ in range(chunks))
+    rows = [list(owners) for _ in range(79)]
+    source = SimpleNamespace(graph_owners=owners)
+    original = SharedCPURequestLease._unique_objects
+    scanned = []
+
+    def discover(groups):
+        scanned.append(sum(len(row) for layers in groups.values() for row in layers))
+        return original(groups)
+
+    monkeypatch.setattr(SharedCPURequestLease, "_unique_objects", staticmethod(discover))
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        engine.register_shared_cpu_sparse_request("req", owned_groups={0: rows}, prepared_source=source)
+        lease = engine.get_shared_cpu_request_lease("req")
+        assert sum(scanned) == 0  # Empty-lease construction is harmless.
+        assert lease.object_ids() == {id(obj) for obj in owners}
+        assert lease.source_groups[0] is rows
+        assert all(old is not new for old, new in zip(rows, lease.groups[0]))
+        rows[0].clear()
+        assert len(lease.groups[0][0]) == chunks
+        assert all(obj.ref_count == 1 and obj.pin_count == int(rank0) for obj in owners)
+        engine.release_shared_cpu_sparse_request("req")
+        lease.close()
+        assert all(obj.ref_count == obj.pin_count == 0 and not obj.valid for obj in owners)
+    finally:
+        if enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize("operation", ["replace", "append", "suffix", "other_group"])
+def test_prepared_cold_lease_keeps_existing_mutation_paths(operation):
+    engine = object.__new__(LMCacheEngine)
+    engine.shared_cpu_cache_generation = 1
+    engine.metadata = SimpleNamespace(is_first_rank=lambda: False)
+    engine._shared_cpu_request_leases = {}
+    old, new = _LeaseMemoryObj(), _LeaseMemoryObj()
+    engine.register_shared_cpu_sparse_request(
+        "req", owned_groups={0: [[old], [old]]},
+        prepared_source=SimpleNamespace(graph_owners=(old,)),
+    )
+    kwargs = {}
+    if operation == "append":
+        groups = {0: [[old, new], [old, new]]}
+        kwargs["append_from"] = {0: 1}
+    elif operation == "suffix":
+        groups = {0: [[new], [new]]}
+        kwargs["replace_from"] = {0: 0}
+    elif operation == "other_group":
+        groups = {1: [[old, new]]}
+    else:
+        groups = {0: [[new], [new]]}
+    # An irrelevant prepared hint must never override existing group ownership.
+    engine.register_shared_cpu_sparse_request(
+        "req", owned_groups=groups,
+        prepared_source=SimpleNamespace(graph_owners=()), **kwargs,
+    )
+    lease = engine.get_shared_cpu_request_lease("req")
+    assert lease.owns(new)
+    assert old.valid == (operation != "replace")
+    if operation == "other_group":
+        assert lease.owns(old) and 0 in lease.groups and 1 in lease.groups
+    engine.release_shared_cpu_sparse_request("req")
+    assert old.ref_count == new.ref_count == 0
+
+
+@pytest.mark.parametrize("stage", ["copy", "registry"])
+@pytest.mark.parametrize("rank0", [False, True])
+def test_prepared_cold_adoption_failure_releases_exactly_once(stage, rank0):
+    engine = object.__new__(LMCacheEngine)
+    engine.shared_cpu_cache_generation = 1
+    engine.metadata = SimpleNamespace(is_first_rank=lambda: rank0)
+    owner = _LeaseMemoryObj(pinned=rank0)
+    source = SimpleNamespace(graph_owners=(owner,))
+
+    class FailingRow(list):
+        def __iter__(self):
+            raise MemoryError("copy failed")
+
+    class FailingRegistry(dict):
+        def __setitem__(self, key, value):
+            raise MemoryError("registry failed")
+
+    engine._shared_cpu_request_leases = FailingRegistry() if stage == "registry" else {}
+    rows = [[owner], FailingRow([owner])] if stage == "copy" else [[owner]]
+    with pytest.raises(MemoryError):
+        engine.register_shared_cpu_sparse_request("req", owned_groups={0: rows}, prepared_source=source)
+    assert not engine._shared_cpu_request_leases
+    assert owner.ref_count == (1 if stage == "copy" else 0)
+    engine.release_shared_cpu_unowned_objects("req", {0: [[owner]]})
+    assert owner.ref_count == owner.pin_count == 0 and not owner.valid
+
+
+@pytest.mark.parametrize("retain,multiple", [(True, False), (False, True)])
+def test_prepared_owner_hint_does_not_bypass_generic_lease_rules(retain, multiple):
+    first, second = _LeaseMemoryObj(), _LeaseMemoryObj()
+    groups = {0: [[first]]}
+    if multiple:
+        groups[1] = [[second]]
+    lease = SharedCPURequestLease("req", 1, False)
+    lease.replace_groups(groups, retain=retain, prepared_owners=())
+    assert lease.owns(first)
+    assert lease.owns(second) == multiple
+    lease.close()
+    assert first.ref_count == int(retain)
+    assert second.ref_count == (0 if multiple else 1)
+
+
+@pytest.mark.parametrize("rank0", [False, True])
+def test_prepared_cold_lease_mixed_page_and_legacy_tails(rank0):
+    engine = object.__new__(LMCacheEngine)
+    engine.shared_cpu_cache_generation = 7
+    engine.metadata = SimpleNamespace(is_first_rank=lambda: rank0)
+    engine._shared_cpu_request_leases = {}
+    page = _LeaseMemoryObj(pinned=rank0)
+    tails = tuple(_LeaseMemoryObj(pinned=rank0) for _ in range(79))
+    rows = [[page, tail] for tail in tails]
+    engine.register_shared_cpu_sparse_request(
+        "req", owned_groups={0: rows},
+        prepared_source=SimpleNamespace(graph_owners=(page, *tails)),
+    )
+    lease = engine.get_shared_cpu_request_lease("req")
+    assert lease.object_ids(0) == {id(obj) for obj in (page, *tails)}
+    rows[0].clear()
+    assert lease.groups[0][0] == [page, tails[0]]
+    # A later suffix replacement must keep earlier DMA readers' owners alive.
+    new_tail = _LeaseMemoryObj(pinned=rank0)
+    engine.register_shared_cpu_sparse_request(
+        "req", owned_groups={0: [[page, new_tail] for _ in tails]},
+        replace_from={0: 1},
+    )
+    assert all(obj.valid for obj in (page, *tails, new_tail))
+    assert lease.object_ids(0) == {id(page), id(new_tail)}
+    assert lease.object_ids() == {id(obj) for obj in (page, *tails, new_tail)}
+    engine.release_shared_cpu_sparse_request("req")
+    lease.close()
+    assert all(obj.ref_count == obj.pin_count == 0 and not obj.valid for obj in (page, *tails, new_tail))

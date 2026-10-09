@@ -20,6 +20,7 @@ from typing import (
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
     from lmcache.v1.health_monitor.base import HealthMonitor
 
 # Standard
@@ -3144,6 +3145,7 @@ class LMCacheEngine:
         append_from: Optional[dict[int, int]] = None,
         preserve_replaced: bool = False,
         replace_from: Optional[dict[int, int]] = None,
+        prepared_source: Optional["PreparedSparseSource"] = None,
     ) -> None:
         """Adopt complete groups or append-only suffixes for a live request.
 
@@ -3152,6 +3154,8 @@ class LMCacheEngine:
             owned_groups: Complete per-layer object lists to adopt.
             append_from: Existing chunk count per group for suffix adoption.
             preserve_replaced: Keep replaced DMA source references until request end.
+            prepared_source: Group-0 source certified by the cold-publication
+                handoff. Only a fresh lease may reuse its unique-owner proof.
 
         Raises:
             ValueError: If suffix adoption is not append-aligned.
@@ -3166,7 +3170,18 @@ class LMCacheEngine:
                 lease.append_groups(owned_groups, append_from)
             elif owned_groups:
                 lease.replace_groups(
-                    owned_groups, retain=False, preserve_replaced=preserve_replaced
+                    owned_groups,
+                    retain=False,
+                    preserve_replaced=preserve_replaced,
+                    prepared_owners=(
+                        prepared_source.graph_owners
+                        if created
+                        and prepared_source is not None
+                        and append_from is None
+                        and replace_from is None
+                        and not preserve_replaced
+                        else None
+                    ),
                 )
             for group in owned_groups or ():
                 cached = lease.prefill_sources.get(group)

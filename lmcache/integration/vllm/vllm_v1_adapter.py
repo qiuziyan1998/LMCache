@@ -5941,6 +5941,7 @@ class LMCacheConnectorV1Impl:
             engine.register_shared_cpu_sparse_request(
                 request.req_id,
                 owned_groups=owned_groups,
+                prepared_source=validated_latent,
             )
         else:
             engine.register_shared_cpu_sparse_request(
