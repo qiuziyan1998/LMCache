@@ -7502,6 +7502,15 @@ class LMCacheConnectorV1Impl:
                       "dsa_cold_resident_load", False) else "dsa_cold_compact"),
             )
         executor = self._get_dsa_cold_load_executor()
+        prepare_chunks = getattr(self.lmcache_engine, "prepare_cold_chunk_plan", None)
+        if (
+            callable(prepare_chunks)
+            and request.load_spec.dsa_group1_direct_hbm
+            and not getattr(request.load_spec, "dsa_cold_resident_load", False)
+        ):
+            chunks = prepare_chunks(plan["tokens"])
+            if chunks is not None:
+                plan["chunk_plan"] = chunks
         if perf_enabled:
             executor_submit_started = serving_perf_now()
         coordinator.submit_pair(
@@ -7900,6 +7909,7 @@ class LMCacheConnectorV1Impl:
                 indexer_kvcaches,
                 request.request_configs,
                 request.req_id,
+                **({"chunk_plan": plan["chunk_plan"]} if "chunk_plan" in plan else {}),
             )
             finish_stage("direct_page_load_ms", direct_started)
             if perf_breakdown is not None:
@@ -8246,6 +8256,8 @@ class LMCacheConnectorV1Impl:
                     retrieve_kwargs["materialize_only"] = True
                 retrieve_kwargs["shared_cpu_phase"] = "dsa_cold_compact_latent"
                 retrieve_kwargs["_defer_sparse_pointer_copy"] = True
+                if "chunk_plan" in plan and not resident:
+                    retrieve_kwargs["_cold_chunk_plan"] = plan["chunk_plan"]
                 phase_started = serving_perf_now() if perf_enabled else 0.0
                 retrieve = (self.lmcache_engine.retrieve_layer if resident else
                             self.lmcache_engine.retrieve_layer_head_token_wise)

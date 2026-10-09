@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 class _ColdLoadOptionalFields(TypedDict, total=False):
     indexer_perf: dict[str, float]
     indexer_source_owners: tuple[Any, ...]
+    chunk_plan: Callable[[], tuple[tuple[int, int, Any], ...]]
 
 
 class ColdLoadPlan(_ColdLoadOptionalFields):

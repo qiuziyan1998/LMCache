@@ -2716,10 +2716,12 @@ def test_runtime_capacity_details_exclude_required_hot_chunks_from_evictable():
         physical_size=64,
     )
     backend = _FakeLocalCPUBackend(
-        free_bytes=9000,
+        free_bytes=0,
         hot_cache={hot_key: hot_obj, other_key: other_obj},
     )
     engine._shared_local_cpu_backend = lambda: backend
+    missing_bytes = engine._shared_cpu_estimated_physical_chunk_bytes(0, num_tokens=1)
+    backend.memory_allocator.pin_allocator.address_manager._free_bytes = missing_bytes - 32
     engine._is_rank0_shared_mem_obj = lambda mem_obj: mem_obj in (
         hot_obj,
         other_obj,
@@ -2746,7 +2748,7 @@ def test_runtime_capacity_details_exclude_required_hot_chunks_from_evictable():
         0, num_tokens=1
     )
     assert details["required_bytes"] == expected_missing_bytes
-    assert details["available_after_eviction"] == 9064
+    assert details["available_after_eviction"] == missing_bytes + 32
     assert details["protected_hot_bytes"] == 64
     assert details["hot_chunk_count"] == 1
     assert details["non_shm_hot_chunk_count"] == 0
@@ -2946,6 +2948,7 @@ def test_runtime_capacity_uses_exact_tail_size_for_remote_fetch():
 
 def test_runtime_capacity_aligns_one_combined_layer_page():
     engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    engine.metadata.runtime_kv_group_layer_counts = (2, 2)
     engine.config.extra_config["mooncake_layer_merged_page_objects"] = True
     engine.config.extra_config["mooncake_page_first_multi_buffer"] = True
     engine.config.extra_config["save_only_first_rank"] = True
@@ -2978,6 +2981,7 @@ def test_runtime_capacity_aligns_one_combined_layer_page():
 
 def test_runtime_capacity_aligns_partial_page_once():
     engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    engine.metadata.runtime_kv_group_layer_counts = (2, 2)
     engine.config.extra_config.update(
         mooncake_layer_merged_page_objects=True,
         mooncake_page_first_multi_buffer=True,
@@ -3016,6 +3020,7 @@ def test_remote_layer_pages_skip_eviction_scan_when_free_space_suffices():
             raise AssertionError("sufficient free space scanned hot objects")
 
     engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    engine.metadata.runtime_kv_group_layer_counts = (2, 2)
     engine.config.extra_config.update(
         mooncake_layer_merged_page_objects=True,
         mooncake_page_first_multi_buffer=True,

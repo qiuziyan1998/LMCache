@@ -3469,6 +3469,7 @@ class LMCacheEngine:
                     if num_tokens != self.config.chunk_size
                 )
         else:
+            merged_chunks: dict[int, bool] = {}
             entries = (
                 (layer_id, chunk_index, key, location)
                 for layer_id, (layer_keys, layer_locations) in enumerate(
@@ -3503,14 +3504,13 @@ class LMCacheEngine:
                     continue
                 missing_chunk_count += 1
                 if location != "LocalCPUBackend":
-                    merged_page = (
-                        layer_pages
-                        and all(
+                    if layer_pages and chunk_index not in merged_chunks:
+                        merged_chunks[chunk_index] = all(
                             chunk_index < len(locations)
                             and locations[chunk_index] == location
                             for locations in chunk_locations_layer_major
                         )
-                    )
+                    merged_page = merged_chunks.get(chunk_index, False)
                     if not merged_page or layer_id == 0:
                         num_tokens = (
                             int(chunk_token_lengths[chunk_index])
@@ -3585,7 +3585,7 @@ class LMCacheEngine:
             if callable(get_free_size):
                 free_bytes = int(get_free_size())
 
-        if remote_page_fast and required_bytes <= free_bytes:
+        if required_bytes <= free_bytes:
             return {
                 "request_id": req_id,
                 "phase": phase,
@@ -3593,15 +3593,15 @@ class LMCacheEngine:
                 "token_count": int(token_count or 0),
                 "chunk_count": sum(len(layer) for layer in keys_layer_major),
                 "missing_chunk_count": missing_chunk_count,
-                "hot_chunk_count": 0,
-                "non_shm_hot_chunk_count": 0,
+                "hot_chunk_count": len(rank0_shared_hot_keys),
+                "non_shm_hot_chunk_count": len(non_shm_hot_keys),
                 "required_bytes": required_bytes,
                 "per_chunk_physical_bytes_estimate": default_chunk_bytes,
                 "available_after_eviction": free_bytes,
                 "free_bytes": free_bytes,
-                "evictable_bytes": 0,
+                "evictable_bytes": None,
                 "pinned_bytes": None,
-                "protected_hot_bytes": 0,
+                "protected_hot_bytes": None,
                 "active_sparse_requests": len(active_sparse_requests),
                 "slab_size": slab_size,
                 "capacity_scan_skipped": True,
