@@ -313,7 +313,7 @@ def test_public_retrieve_only_resolves_and_constructs_new_sources(
 
 
 @pytest.mark.parametrize("group", [0, 1])
-@pytest.mark.parametrize("total", [11, 12])
+@pytest.mark.parametrize("total", [11, 12, 19, 20])
 @pytest.mark.parametrize("fail_suffix", [False, True])
 def test_retained_remote_page_with_local_remote_suffix_keeps_page_route(
     shared_engines, gc_disabled, group: int, total: int, fail_suffix: bool
@@ -324,7 +324,10 @@ def test_retained_remote_page_with_local_remote_suffix_keeps_page_route(
     rank0.populate(total, group)
     all_pages = dict(rank0.backend.hot_cache)
     keys = list(all_pages)
-    remote_pages = {key: rank0.backend.hot_cache.pop(key) for key in (keys[0], keys[2])}
+    remote_pages = {key: rank0.backend.hot_cache.pop(key) for key in keys[::2]}
+    # The later local page also exists remotely during lookup, but is evicted
+    # before materialization. Its LocalCPU copy must still be used.
+    remote_pages.update({key: all_pages[key] for key in keys[3::2]})
     fetched = []
 
     def local_prefix(wanted):
@@ -342,6 +345,12 @@ def test_retained_remote_page_with_local_remote_suffix_keeps_page_route(
             (i for i, key in enumerate(wanted) if key not in remote_pages), len(wanted)
         )
 
+    def materialize_contains(wanted):
+        if keys[2] in wanted:
+            for key in keys[3::2]:
+                remote_pages.pop(key, None)
+        return contains(wanted)
+
     def retrieve(wanted):
         fetched.append(list(wanted))
         if fail_suffix and keys[2] in wanted:
@@ -357,7 +366,7 @@ def test_retained_remote_page_with_local_remote_suffix_keeps_page_route(
 
     remote = SimpleNamespace(
         connection=SimpleNamespace(batched_contains_layer_pages=contains),
-        batched_contains_layer_pages=contains,
+        batched_contains_layer_pages=materialize_contains,
         batched_get_layer_pages=retrieve,
     )
     rank0.backend.batched_get_layer_page_prefix = local_prefix
@@ -390,11 +399,12 @@ def test_retained_remote_page_with_local_remote_suffix_keeps_page_route(
         # The retained page keeps its original location; it is still owned.
         locations = rank0.get_shared_cpu_request_lease("r").prefill_locations[group]
         assert list(locations.location_rows()[0]) == [
-            "RemoteBackend", "LocalCPUBackend", "RemoteBackend"
+            "LocalCPUBackend" if index == 1 else "RemoteBackend"
+            for index in range(len(keys))
         ]
-        assert fetched == [[keys[0]], [keys[2]]]
-        assert rank0.gpu_connector.appended == [1, 2, 0]
-        assert passive.gpu_connector.appended == [1, 2, 0]
+        assert fetched == [[key] for key in keys[::2]]
+        assert rank0.gpu_connector.appended == [1, len(keys) - 1, 0]
+        assert passive.gpu_connector.appended == [1, len(keys) - 1, 0]
         assert all(page.get_ref_count() == 2 for page in all_pages.values())
     finally:
         rank0.release_shared_cpu_sparse_request("r")

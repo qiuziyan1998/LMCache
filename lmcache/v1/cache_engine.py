@@ -4518,23 +4518,18 @@ class LMCacheEngine:
         owned: list[MemoryObj] = list(pages)
         pinned: list[MemoryObj] = []
         try:
-            legacy_probe = (
-                page_keys[local_count].split_layers(self.num_layers_for_group(kv_group))
-                if local_count < page_chunks
-                else []
-            )
-            legacy_suffix = local_count < page_chunks and local.contains_all_exact(
-                legacy_probe
-            )
-            if legacy_suffix:
-                tail_start = local_count
-            elif local_count < page_chunks:
+            tail_start = local_count
+            while tail_start < page_chunks:
+                if local.contains_all_exact(
+                    page_keys[tail_start].split_layers(self.num_layers_for_group(kv_group))
+                ):
+                    break
                 remote = self.storage_manager.storage_backends.get("RemoteBackend")
                 contains = getattr(remote, "batched_contains_layer_pages", None)
                 retrieve = getattr(remote, "batched_get_layer_pages", None)
                 if not callable(contains) or not callable(retrieve):
                     raise RuntimeError("RemoteBackend does not support layer pages")
-                remote_page_keys = page_keys[local_count:page_chunks]
+                remote_page_keys = page_keys[tail_start:page_chunks]
                 resolver_call_id = (
                     f"{os.getpid()}:{time.monotonic_ns()}"
                     if serving_perf_enabled()
@@ -4562,18 +4557,18 @@ class LMCacheEngine:
                         )
                     pages.extend(fetched)
                     owned.extend(fetched)
-                tail_start = local_count + remote_count
+                tail_start += remote_count
                 if tail_start < page_chunks:
-                    # Local-only checkpoint pages can follow a remote prompt.
+                    # Eviction can leave arbitrarily alternating tier runs.
                     fetched, count = local.batched_get_layer_page_prefix(
                         page_keys[tail_start:page_chunks]
                     )
                     pages.extend(fetched)
                     owned.extend(fetched)
                     tail_start += count
-                legacy_suffix = tail_start < page_chunks
-            else:
-                tail_start = page_chunks
+                    if not count:
+                        # Neither tier has a merged page at this boundary.
+                        break
             legacy_page_layers = (
                 [
                     list(layer)
