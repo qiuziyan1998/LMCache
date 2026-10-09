@@ -99,7 +99,7 @@ class ColdLoadCoordinator:
         self._requires_restart = WeakMethod(requires_restart)
 
     def get_executor(self) -> ThreadPoolExecutor:
-        """Return the existing lazily created pair-worker pool."""
+        """Return the lazy pair-worker pool retained until connector shutdown."""
         if self.executor is None:
             self.executor = ThreadPoolExecutor(
                 max_workers=2, thread_name_prefix="lmcache-dsa-cold"
@@ -171,9 +171,7 @@ class ColdLoadCoordinator:
             finished.add(req_id)
         if not futures:
             self.last_latent_future = None
-            if self.executor is not None:
-                self.executor.shutdown(wait=False, cancel_futures=False)
-                self.executor = None
+            # Keep the bounded pool across bursts; connector shutdown drains it.
         return finished or None
 
     def drain_retirements(

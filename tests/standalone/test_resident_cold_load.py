@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Execute adapter admission/background methods with CPU transfer collaborators."""
 
+from collections.abc import Iterator
 from concurrent.futures import Future
 import gc
 from types import SimpleNamespace as NS
@@ -214,6 +215,235 @@ def test_resident_worker_loads_before_publication_and_unblocks_failures(
         assert result is state and gate.result() is None
         assert trace == ["load", "close", "ready", "seal", "record"]
         assert state.indexer_npu_resident and state.token_count == length
+        assert state.metadata_token_ids is plan["tokens"]
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("length", [1, 129, 84454])
+def test_cold_publication_adopts_snapshot_without_copy(
+    reuse: bool, length: int
+) -> None:
+    class Tokens(list):
+        copied = 0
+
+        def __getitem__(self, key: int | slice) -> int | list[int]:
+            value = super().__getitem__(key)
+            if isinstance(key, slice):
+                self.copied += len(value)
+            return value
+
+    history = Tokens(range(length + 1))
+    snapshot = history[:length]
+    history.copied = 0
+    state = NS(
+        token_count=length, location="LocalCPU", metadata_warm=True,
+        prepared_sparse_sources={0: NS(total_tokens=length)},
+        metadata_token_ids=snapshot if reuse else [],
+    )
+    request = NS(req_id="r", token_ids=history, sparse_warm_ref=False)
+    adapter = NS(
+        _worker_retrieve_state={},
+        _refresh_prepared_sparse_sources=lambda *a: None,
+        _record_shared_worker_retrieve_state=lambda *a: None,
+        _set_worker_retrieve_state=lambda *a: None,
+    )
+    method("_publish_worker_retrieve_state")(
+        adapter, state, request, location=None, metadata_warm=True,
+        token_count=length, reuse_prepared_sources=reuse,
+    )
+    assert history.copied == (0 if reuse else length)
+    assert (state.metadata_token_ids is snapshot) == reuse
+    history[0] = -1
+    assert state.metadata_token_ids == list(range(length))
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_compact_and_live_workers_publish_their_owned_snapshot(
+    live: bool, no_cyclic_gc: None
+) -> None:
+    length = 84454
+    history = list(range(length))
+    request = NS(
+        req_id="r", token_ids=history, sparse_warm_ref=False,
+        load_spec=NS(dsa_group1_direct_hbm=True),
+    )
+    plan = dict(
+        request=request, tokens=history[:], token_count=length,
+        token_mask=torch.ones(length, dtype=torch.bool),
+        latent_kvcaches=[], latent_shared_ready=Future(),
+    )
+    state = NS(prepared_sparse_sources={}, has_cache=lambda: True)
+    calls = []
+
+    def retrieve(
+        tokens: list[int], mask: torch.Tensor, **kwargs: object
+    ) -> Iterator[torch.Tensor | None]:
+        assert not live and tokens is plan["tokens"]
+        assert kwargs["materialize_only"]
+        calls.append("retrieve")
+        yield None
+        yield None
+        yield mask
+
+    def seal(result: NS, count: int) -> None:
+        assert result.metadata_token_ids is plan["tokens"]
+        result.prepared_sparse_sources[0] = NS(total_tokens=count)
+
+    adapter = NS(
+        lmcache_engine=NS(retrieve_layer_head_token_wise=retrieve),
+        _num_layers_for_group=lambda group: 2,
+        _sparse_retrieve_kwargs=lambda *a, **kw: ({}, None, None),
+        _refresh_prepared_sparse_sources=seal,
+        _record_dsa_cold_dense_load_readiness=lambda *a, **kw: calls.append("fence"),
+        _worker_retrieve_state={},
+        _record_shared_worker_retrieve_state=lambda *a: calls.append("adopt"),
+        _set_worker_retrieve_state=lambda *a: calls.append("publish"),
+    )
+    indexer = Future()
+    indexer.set_result((None, None, 0., 0.))
+    run = method("_run_dsa_cold_compact_load", torch=torch,
+                 WorkerRetrieveState=lambda **kw: state)
+    result = run(adapter, plan, None, indexer, live_state=state if live else None)
+    history.append(-1)
+    method("_publish_worker_retrieve_state")(
+        adapter, result, request, location=None, metadata_warm=True,
+        token_count=length, reuse_prepared_sources=True,
+    )
+    assert result.metadata_token_ids is plan["tokens"]
+    history[0] = -1
+    assert result.metadata_token_ids[0] == 0
+    assert calls == ([] if live else ["retrieve"]) + ["fence", "adopt", "publish"]
+
+
+@pytest.mark.parametrize("snapshot_length", [0, 3, 5])
+def test_cold_publication_rejects_wrong_snapshot_frontier(snapshot_length: int) -> None:
+    state = NS(
+        token_count=4, location="LocalCPU", metadata_warm=True,
+        prepared_sparse_sources={0: NS(total_tokens=4)},
+        metadata_token_ids=list(range(snapshot_length)),
+    )
+    released = []
+    adapter = NS(
+        _worker_retrieve_state={}, lmcache_engine=None,
+        _release_unadopted_shared_request_objects=lambda *a: released.append(
+            "unadopted"
+        ),
+        _release_shared_worker_retrieve_state=lambda *a, **kw: released.append("state"),
+    )
+    with pytest.raises(RuntimeError, match="token snapshot"):
+        method("_publish_worker_retrieve_state")(
+            adapter, state, NS(req_id="r"), location=None, metadata_warm=True,
+            token_count=4, reuse_prepared_sources=True,
+        )
+    assert released == ["unadopted", "state"]
+
+
+def test_cold_pool_reuses_threads_across_bursts_and_shutdown_drains(
+    no_cyclic_gc: None,
+) -> None:
+    import threading
+    from lmcache.integration.vllm.cold_load import ColdLoadCoordinator
+
+    actions = []
+
+    class Owner:
+        def publish(self, *args: object) -> None:
+            actions.append("publish")
+
+        def fail(self, *args: object) -> bool:
+            raise AssertionError(args[3])
+
+        def requires_restart(self) -> bool:
+            return False
+
+    owner = Owner()
+    coordinator = ColdLoadCoordinator(owner.publish, owner.fail, owner.requires_restart)
+    executor = coordinator.get_executor()
+    try:
+        worker = executor.submit(threading.current_thread).result(timeout=5)
+        for generation in range(2):
+            latent, indexer = Future(), Future()
+            latent.set_result(NS(dense_load_readiness=NS(query=lambda: True)))
+            indexer.set_result(None)
+            coordinator.last_latent_future = latent
+            request = NS(load_spec=NS(dsa_cold_load_generation=generation))
+            coordinator.futures["r"] = (generation, latent, request, set(), 0., indexer)
+            assert coordinator.poll() == {"r"}
+            assert coordinator.last_latent_future is None
+            assert coordinator.get_executor() is executor
+            assert executor.submit(threading.current_thread).result(timeout=5) is worker
+        adapter = NS(
+            _dsa_kv_policy_states={}, _cold_load_coordinator=coordinator,
+            _synchronize_dsa_cold_dense_load=lambda: actions.append("sync"),
+            _drain_dense_load_retirements=lambda **kw: actions.append("retire"),
+            _manager=NS(stop_services=lambda: actions.append("stop")),
+        )
+        method("shutdown", logger=NS(info=lambda *a: None))(adapter)
+        assert not worker.is_alive()
+        assert actions == ["publish", "publish", "sync", "retire", "stop"]
+    finally:
+        executor.shutdown(wait=True)
+
+
+def test_retained_pool_drops_completed_request_data_without_gc(
+    no_cyclic_gc: None,
+) -> None:
+    import threading
+    import weakref
+    from lmcache.integration.vllm.cold_load import ColdLoadCoordinator
+
+    class Payload:
+        pass
+
+    class Owner:
+        def publish(self, *args: object) -> None:
+            pass
+
+        def fail(self, *args: object) -> bool:
+            raise AssertionError(args[3])
+
+        def requires_restart(self) -> bool:
+            return False
+
+    def indexer(plan: dict, device: object) -> tuple:
+        plan["latent_shared_ready"].result(timeout=5)
+        return None, None, 0., 0.
+
+    def latent(
+        plan: dict, device: object, sibling: Future, previous: Future | None
+    ) -> NS:
+        assert previous is None
+        plan["latent_shared_ready"].set_result(None)
+        sibling.result(timeout=5)
+        return NS(dense_load_readiness=None, payload=plan["payload"])
+
+    owner = Owner()
+    coordinator = ColdLoadCoordinator(owner.publish, owner.fail, owner.requires_restart)
+    executor = coordinator.get_executor()
+
+    def burst(generation: int) -> weakref.ReferenceType:
+        payload = Payload()
+        request = NS(req_id="r", load_spec=NS(dsa_cold_load_generation=generation))
+        plan = dict(request=request, payload=payload, latent_shared_ready=Future())
+        coordinator.submit_pair(
+            plan, generation, set(), 0., None, executor, indexer, latent
+        )
+        coordinator.futures["r"][1].result(timeout=5)
+        assert coordinator.poll() == {"r"}
+        assert coordinator.executor is executor
+        return weakref.ref(payload)
+
+    try:
+        references = [burst(1), burst(2)]
+        # Occupy both workers to prove their previous work items were retired.
+        barrier = threading.Barrier(3)
+        jobs = [executor.submit(barrier.wait, 5) for _ in range(2)]
+        barrier.wait(timeout=5)
+        for job in jobs:
+            job.result(timeout=5)
+        assert all(reference() is None for reference in references)
+    finally:
+        executor.shutdown(wait=True)
 
 
 @pytest.mark.parametrize("resident_tokens", [0, 279, 280])

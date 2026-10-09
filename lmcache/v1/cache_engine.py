@@ -3349,22 +3349,6 @@ class LMCacheEngine:
             "LocalCPUBackend" in locations
             for locations in chunk_locations_layer_major
         )
-        required_local_keys = (
-            {
-                key
-                for layer_keys, layer_locations in zip(
-                    keys_layer_major,
-                    chunk_locations_layer_major,
-                    strict=False,
-                )
-                for key, location in zip(
-                    layer_keys, layer_locations, strict=False
-                )
-                if location == "LocalCPUBackend"
-            }
-            if has_local
-            else set()
-        )
         required_page_keys = {
             key.without_layer()
             for key, location in zip(
@@ -3384,30 +3368,63 @@ class LMCacheEngine:
         }
         hot_cache = getattr(local_cpu_backend, "hot_cache", {})
         cpu_lock = getattr(local_cpu_backend, "cpu_lock", None)
-        lock_cm = cpu_lock if cpu_lock is not None else None
         rank0_shared_hot_keys = set()
         non_shm_hot_keys = set()
-        if lock_cm is None:
-            required_local_items = [
-                (key, hot_cache.get(key)) for key in required_local_keys
-            ]
-            required_page_items = [
-                (key, hot_cache.get(key)) for key in required_page_keys
-            ]
-        else:
-            with lock_cm:
-                required_local_items = [
-                    (key, hot_cache.get(key)) for key in required_local_keys
-                ]
-                required_page_items = [
-                    (key, hot_cache.get(key)) for key in required_page_keys
-                ]
+        with cpu_lock if cpu_lock is not None else nullcontext():
+            required_page_items = {
+                key: hot_cache.get(key) for key in required_page_keys
+            }
         rank0_shared_hot_keys.update(
-            key
-            for key, mem_obj in required_page_items
+            key for key, mem_obj in required_page_items.items()
             if isinstance(mem_obj, LayerPageMemoryObj)
             and self._is_rank0_shared_mem_obj(mem_obj)
         )
+        # Build only unresolved layer keys, outside the cache lock.
+        required_local_keys = (
+            {
+                key
+                for layer_keys, layer_locations in zip(
+                    keys_layer_major, chunk_locations_layer_major, strict=False
+                )
+                for key, location in zip(layer_keys, layer_locations, strict=False)
+                if location == "LocalCPUBackend"
+                and not (
+                    rank0_shared_hot_keys
+                    and isinstance(key, LayerCacheEngineKey)
+                    and key.without_layer() in rank0_shared_hot_keys
+                )
+            }
+            if has_local
+            else set()
+        )
+        with cpu_lock if cpu_lock is not None else nullcontext():
+            # If a page changed during classification, take the original full
+            # snapshot rather than trusting a stale merged-page proof.
+            pages_changed = any(
+                hot_cache.get(key) is not mem_obj
+                for key, mem_obj in required_page_items.items()
+            )
+            if pages_changed:
+                required_page_items = {
+                    key: hot_cache.get(key) for key in required_page_keys
+                }
+                required_local_keys = {
+                    key
+                    for layer_keys, layer_locations in zip(
+                        keys_layer_major, chunk_locations_layer_major, strict=False
+                    )
+                    for key, location in zip(layer_keys, layer_locations, strict=False)
+                    if location == "LocalCPUBackend"
+                }
+            required_local_items = [
+                (key, hot_cache.get(key)) for key in required_local_keys
+            ]
+        if pages_changed:
+            rank0_shared_hot_keys = {
+                key for key, mem_obj in required_page_items.items()
+                if isinstance(mem_obj, LayerPageMemoryObj)
+                and self._is_rank0_shared_mem_obj(mem_obj)
+            }
         for key, mem_obj in required_local_items:
             if (
                 isinstance(key, LayerCacheEngineKey)
@@ -3611,10 +3628,10 @@ class LMCacheEngine:
         evictable_bytes = 0
         pinned_bytes = 0
         protected_hot_bytes = 0
-        if lock_cm is None:
+        if cpu_lock is None:
             cache_items = list(hot_cache.items())
         else:
-            with lock_cm:
+            with cpu_lock:
                 cache_items = list(hot_cache.items())
         for key, mem_obj in cache_items:
             is_shared_hot_obj = self._is_rank0_shared_mem_obj(mem_obj)

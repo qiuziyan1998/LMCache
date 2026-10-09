@@ -2847,6 +2847,82 @@ def test_runtime_capacity_recognizes_one_layer_page_for_all_layers(location):
     pages[0].ref_count_down()
 
 
+@pytest.mark.parametrize("shared_page", [False, True])
+@pytest.mark.parametrize("use_lock,page_change", [
+    (False, "stable"), (True, "stable"), (True, "remove"), (True, "replace"),
+])
+def test_capacity_probes_legacy_keys_only_for_unresolved_pages(
+    shared_page: bool, use_lock: bool, page_change: str
+) -> None:
+    engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    engine.config.use_layerwise = True
+    engine.config.remote_url = "mooncakestore://test"
+    engine.config.chunk_size = 4
+    engine.config.extra_config.update(mooncake_layer_merged_page_objects=True)
+    engine.metadata.runtime_kv_group_layer_counts = (79, 22)
+    allocator = TensorMemoryAllocator(torch.zeros(8192, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]), torch.float16, batch_size=1, num_layers=79,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT, valid_tokens=4, full_tokens=4,
+    )
+    assert pages is not None
+    page = pages[0]
+    keys = [_make_key(), replace(_make_key(), chunk_hash=4321)]
+    layer_keys = [key.split_layers(79) for key in keys]
+    legacy = _LeaseMemoryObj()
+    reads = []
+    locked = []
+
+    class Lock:
+        entries = 0
+
+        def __enter__(self) -> None:
+            locked.append(True)
+            self.entries += 1
+            if self.entries == 2:
+                if page_change == "remove":
+                    cache.pop(keys[0])
+                elif page_change == "replace":
+                    cache[keys[0]] = legacy
+
+        def __exit__(self, *args: object) -> None:
+            locked.pop()
+
+    class Cache(dict):
+        def get(self, key: CacheEngineKey, default: object = None) -> object:
+            assert bool(locked) == use_lock
+            reads.append(key)
+            return super().get(key, default)
+
+        def items(self) -> None:
+            raise AssertionError("sufficient free capacity must not scan hot cache")
+
+    cache = Cache({keys[0]: page})
+    # Unshared merged pages must still resolve their legacy layer objects.
+    cache.update((key, legacy) for row in layer_keys for key in row)
+    backend = _FakeLocalCPUBackend(free_bytes=2**30, hot_cache=cache)
+    backend.cpu_lock = Lock() if use_lock else None
+    engine._shared_local_cpu_backend = lambda: backend
+    engine._is_rank0_shared_mem_obj = lambda obj: (
+        obj is legacy or (shared_page and obj is page)
+    )
+    try:
+        details = engine._shared_cpu_runtime_capacity_details(
+            req_id="mixed", phase="dsa_cold_compact_latent", kv_group=0,
+            keys_layer_major=[list(row) for row in zip(*layer_keys, strict=True)],
+            chunk_locations_layer_major=[["LocalCPUBackend"] * 2 for _ in range(79)],
+            token_count=8, chunk_token_lengths=[4, 4],
+        )
+        covered = shared_page and page_change == "stable"
+        expected_legacy = layer_keys[1] + ([] if covered else layer_keys[0])
+        assert set(reads) == set(keys + expected_legacy)
+        assert sum(key not in keys for key in reads) == len(expected_legacy)
+        assert details["fits"] and details["required_bytes"] == 0
+        assert details["capacity_scan_skipped"]
+    finally:
+        page.ref_count_down()
+
+
 def test_capacity_snapshot_reads_nested_pin_allocator_free_space():
     engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
     backend = _FakeLocalCPUBackend(free_bytes=768, hot_cache={})

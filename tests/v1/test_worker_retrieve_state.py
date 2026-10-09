@@ -86,7 +86,8 @@ def test_cold_publication_reuses_only_explicitly_sealed_sources(reuse: bool) -> 
     impl = _make_impl()
     source = PreparedSparseSource(layers=(), total_tokens=4)
     state = WorkerRetrieveState(
-        req_id="request", token_count=4, prepared_sparse_sources={0: source}
+        req_id="request", token_count=4, prepared_sparse_sources={0: source},
+        metadata_token_ids=[1, 2, 3, 4] if reuse else [],
     )
     request = SimpleNamespace(
         req_id="request", token_ids=[1, 2, 3, 4], sparse_warm_ref=False
@@ -185,6 +186,7 @@ def test_cold_submit_and_publish_preserve_async_handoff(
         req_id="request",
         prepared_sparse_sources={0: source},
         dense_load_readiness=readiness,
+        metadata_token_ids=executor.submit.call_args_list[0].args[1]["tokens"],
     )
     latent.set_result(state)
     indexer.set_result(None)
