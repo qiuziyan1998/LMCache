@@ -115,6 +115,7 @@ def test_resident_worker_loads_before_publication_and_unblocks_failures(
     length = 280
     spec = NS(
         lmcache_cached_tokens=length,
+        dsa_cold_load_generation=1,
         dsa_cold_resident_load=True,
         dsa_group1_direct_hbm=failure not in ("final_record", "final_record_unknown"),
     )
@@ -167,7 +168,7 @@ def test_resident_worker_loads_before_publication_and_unblocks_failures(
 
     def seal(state, count):
         assert gate.done() and state.dense_prefix_resident_tokens == count
-        state.prepared_sparse_sources[0] = object()
+        state.prepared_sparse_sources[0] = NS(graph_owners=None)
         trace.append("seal")
 
     def fence():
@@ -244,7 +245,7 @@ def test_cold_publication_adopts_snapshot_without_copy(
     adapter = NS(
         _worker_retrieve_state={},
         _refresh_prepared_sparse_sources=lambda *a: None,
-        _record_shared_worker_retrieve_state=lambda *a: None,
+        _record_shared_worker_retrieve_state=lambda *a, **kw: None,
         _set_worker_retrieve_state=lambda *a: None,
     )
     method("_publish_worker_retrieve_state")(
@@ -258,14 +259,15 @@ def test_cold_publication_adopts_snapshot_without_copy(
 
 
 @pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize("certified", [False, True])
 def test_compact_and_live_workers_publish_their_owned_snapshot(
-    live: bool, no_cyclic_gc: None
+    live: bool, certified: bool, no_cyclic_gc: None
 ) -> None:
     length = 84454
     history = list(range(length))
     request = NS(
         req_id="r", token_ids=history, sparse_warm_ref=False,
-        load_spec=NS(dsa_group1_direct_hbm=True),
+        load_spec=NS(dsa_cold_load_generation=1, dsa_group1_direct_hbm=True),
     )
     plan = dict(
         request=request, tokens=history[:], token_count=length,
@@ -287,7 +289,9 @@ def test_compact_and_live_workers_publish_their_owned_snapshot(
 
     def seal(result: NS, count: int) -> None:
         assert result.metadata_token_ids is plan["tokens"]
-        result.prepared_sparse_sources[0] = NS(total_tokens=count)
+        result.prepared_sparse_sources[0] = NS(
+            total_tokens=count, graph_owners=(object(),) if certified else None
+        )
 
     adapter = NS(
         lmcache_engine=NS(retrieve_layer_head_token_wise=retrieve),
@@ -296,7 +300,7 @@ def test_compact_and_live_workers_publish_their_owned_snapshot(
         _refresh_prepared_sparse_sources=seal,
         _record_dsa_cold_dense_load_readiness=lambda *a, **kw: calls.append("fence"),
         _worker_retrieve_state={},
-        _record_shared_worker_retrieve_state=lambda *a: calls.append("adopt"),
+        _record_shared_worker_retrieve_state=lambda *a, **kw: calls.append("adopt"),
         _set_worker_retrieve_state=lambda *a: calls.append("publish"),
     )
     indexer = Future()
@@ -304,6 +308,12 @@ def test_compact_and_live_workers_publish_their_owned_snapshot(
     run = method("_run_dsa_cold_compact_load", torch=torch,
                  WorkerRetrieveState=lambda **kw: state)
     result = run(adapter, plan, None, indexer, live_state=state if live else None)
+    proof = getattr(result, "cold_publication_proof", None)
+    if certified and not live:
+        assert proof[:3] == ("r", 1, 0)
+        assert proof[3] is result.prepared_sparse_sources[0]
+    else:
+        assert proof is None
     history.append(-1)
     method("_publish_worker_retrieve_state")(
         adapter, result, request, location=None, metadata_warm=True,
@@ -554,7 +564,7 @@ def test_resident_slot_setup_failure_reaches_shared_error_envelope():
     request = NS(
         req_id="r",
         slot_mapping=[torch.arange(280)],
-        load_spec=NS(dsa_cold_resident_load=True, dsa_group1_direct_hbm=True),
+        load_spec=NS(dsa_cold_load_generation=1, dsa_cold_resident_load=True, dsa_group1_direct_hbm=True),
     )
     gate, indexer = Future(), Future()
     indexer.set_result((None, None, 0, 0))
@@ -593,7 +603,7 @@ def test_direct_indexer_does_not_allow_failed_resident_dma_retirement():
     state = NS(req_id="r")
     error = RuntimeError("resident DMA completion unknown")
     error._lmcache_dsa_cold_state = state
-    request = NS(load_spec=NS(dsa_group1_direct_hbm=True, dsa_cold_resident_load=True))
+    request = NS(load_spec=NS(dsa_cold_load_generation=1, dsa_group1_direct_hbm=True, dsa_cold_resident_load=True))
     entry = (1, Future(), request, {3}, 0, Future())
 
     def unproven():

@@ -10,7 +10,7 @@ from typing import Optional
 import torch
 
 # First Party
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryObj, TensorMemoryObj
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +41,10 @@ class PreparedSparseSource:
     graph_pointer_pairs: Optional[tuple[int, torch.Tensor]] = field(
         default=None, init=False, repr=False, compare=False
     )
+    # Structural proof only; consumers must acquire their own live references.
+    graph_owners: Optional[tuple[TensorMemoryObj, ...]] = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
 
 def build_prepared_sparse_source(
@@ -53,6 +57,7 @@ def build_prepared_sparse_source(
     expected_pointer_device: Optional[torch.device] = None,
     cached_memory_objs: Optional[Sequence[Sequence[MemoryObj]]] = None,
     chunk_size: Optional[int] = None,
+    prepare_graph_owners: bool = False,
 ) -> Optional[PreparedSparseSource]:
     """Seal a complete layer cache into immutable hot-path source metadata.
 
@@ -67,6 +72,7 @@ def build_prepared_sparse_source(
             owner layers can replace ``cached_tensors`` without constructing
             per-chunk typed views.
         chunk_size: Optional configured chunk size to validate once at sealing.
+        prepare_graph_owners: Cache complete allocator ownership for graph leases.
 
     Returns:
         A prepared source, or ``None`` while bootstrap data is incomplete.
@@ -231,4 +237,14 @@ def build_prepared_sparse_source(
         pointer_device=pointer_device,
     )
     object.__setattr__(source, "validated_chunk_size", chunk_size)
+    if prepare_graph_owners and all(
+        len(layer.memory_objs) == len(normalized_chunk_counts)
+        and layer.memory_objs
+        for layer in layer_tuple
+    ):
+        owners = {
+            id(owner): owner for layer in layer_tuple for owner in layer.memory_objs
+        }
+        if all(isinstance(owner, TensorMemoryObj) for owner in owners.values()):
+            object.__setattr__(source, "graph_owners", tuple(owners.values()))
     return source

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 import ast
 from copy import deepcopy
+import logging
 
 # Third Party
 import pytest
@@ -30,7 +31,9 @@ def load_prepare_method(name: str = "prepare_sparse_graph_step") -> Any:
     )
     method = next(
         node
-        for node in (tree.body if name == "_defer_sparse_graph_draft" else cls.body)
+        for node in (
+            tree.body if name == "_defer_prepared_sparse_retrieve" else cls.body
+        )
         if isinstance(node, ast.FunctionDef) and node.name == name
     )
     module = ast.Module(
@@ -50,7 +53,7 @@ def load_prepare_method(name: str = "prepare_sparse_graph_step") -> Any:
     helper = next(
         node
         for node in tree.body
-        if getattr(node, "name", "") == "_defer_sparse_graph_draft"
+        if getattr(node, "name", "") == "_defer_prepared_sparse_retrieve"
     )
     if method is not helper:
         module.body.insert(1, helper)
@@ -474,7 +477,7 @@ def test_deferred_draft_preserves_destination_binding(
 def test_deferred_draft_preserves_payloads_and_closes_consumer(
     failure: str | None,
 ) -> None:
-    defer = load_prepare_method("_defer_sparse_graph_draft")
+    defer = load_prepare_method("_defer_prepared_sparse_retrieve")
     events = []
 
     def retrieve(*args: Any, **kwargs: Any) -> Any:
@@ -507,6 +510,224 @@ def test_deferred_draft_preserves_payloads_and_closes_consumer(
                 next(deferred)
             assert events == ["setup", "first", "second", "third", "closed"]
     assert events[-1] == "closed"
+
+
+@pytest.mark.parametrize("warm,graph,enabled", [
+    (False, False, False), (True, False, False),
+    (False, False, True), (True, False, True), (True, True, True),
+])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_start_load_defers_only_prepared_warm_sources(
+    warm: bool, graph: bool, enabled: bool, cancel: bool
+) -> None:
+    adapter = FakeAdapter(warm=True)
+    request, state = adapter.request, adapter.state
+    request.token_ids = list(range(512))
+    request.sparse_warm_ref = warm
+    request.slot_mapping = [torch.arange(512)]
+    request.decode_ret_mask = None
+    request.retrieve_token_count = lambda: 512
+    request.load_spec.can_load = True
+    request.load_spec.vllm_cached_tokens = 0
+    state.slot_mapping = request.slot_mapping[0]
+    state.has_cache = lambda: True
+    state.location = "LocalCPU"
+    state.metadata_warm = True
+    metadata = SimpleNamespace(requests=[request])
+    noop = lambda *a, **kw: None
+    adapter._parent = SimpleNamespace(_get_connector_metadata=lambda: metadata)
+    adapter.kv_caches = {"registered": object()}
+    adapter._kvcaches_list = [object()] * adapter.num_layers
+    adapter._layerwise_prefill_p_node = False
+    adapter.use_layerwise = True
+    adapter._defer_prepared_sparse_setup = enabled
+    adapter._lmcache_chunk_size = 256
+    adapter.enable_blending = False
+    adapter.supports_layerwise_prefill_transfer_window = False
+    adapter._cold_perf_dense_load_completed = {}
+    adapter._is_decode_window_save_request = lambda _: False
+    adapter._prune_worker_retrieve_state = noop
+    adapter._trim_dense_prefix_seed_for_sparse = noop
+    adapter._should_invalidate_worker_retrieve_state = lambda *a: False
+    adapter._worker_retrieve_state_for_warm_ref = lambda _: state
+    adapter._worker_retrieve_state_for_request = lambda _: state
+    adapter._load_tokens_for_retrieve = lambda tokens, *a, **kw: tokens
+    adapter._load_token_mask_for_retrieve = lambda *a: None
+    adapter._full_hit_recalc_last_token = lambda *a, **kw: False
+    adapter._sparse_decode_requires_index_materialization = lambda *a: True
+    adapter._shared_sparse_decode_indexer_retrieve_mode = lambda *a: "resident"
+    adapter._trace_deep_retrieve_state = noop
+    adapter._prepare_p_node_layerwise_save_storers = noop
+    adapter._set_worker_retrieve_state = noop
+    adapter._stats_monitor = SimpleNamespace(
+        update_interval_vllm_hit_tokens=noop, update_interval_prompt_tokens=noop
+    )
+    source = adapter.source if warm else None
+    kwargs = dict(prepared_sparse_source=source, slot_mapping=state.slot_mapping)
+    adapter._sparse_retrieve_kwargs = lambda *a, **kw: (kwargs, None, source)
+    adapter._is_deferred_layerwise_prefill_load_step = load_prepare_method(
+        "_is_deferred_layerwise_prefill_load_step"
+    ).__get__(adapter)
+    adapter._drain_layerwise_retrievers()
+    adapter._close_layerwise_retriever = lambda g: g.close()
+    adapter._drain_layerwise_retrievers = load_prepare_method(
+        "_drain_layerwise_retrievers"
+    ).__get__(adapter)
+    events = []
+
+    def retrieve(tokens: list, mask: Any, **kw: Any) -> Any:
+        start = kw.get("prepared_start_layer", 0)
+        events.append(("setup", start))
+        if not warm:
+            assert tokens is request.token_ids
+        try:
+            for _ in range(adapter.num_layers - start):
+                payload = yield None
+                events.append(("payload", start, payload))
+            yield None
+        finally:
+            events.append(("close", start))
+
+    adapter.lmcache_engine.retrieve_layer_head_token_wise = retrieve
+    start = load_prepare_method("_start_load_kv")
+    start.__globals__.update(
+        LMCacheConnectorMetadata=SimpleNamespace, serving_perf_enabled=lambda: False,
+        _mtp_dw_deep_diag_enabled=lambda: False, logger=logging.getLogger(__name__),
+        INDEXER_RETRIEVE_FULL="full", INDEXER_RETRIEVE_RESIDENT_SKIP="resident",
+    )
+    start(adapter, SimpleNamespace(attn_metadata={}))
+    assert events == ([] if warm and enabled else [("setup", 0)])
+    if graph:
+        adapter.prepare_sparse_graph_step(tuple(adapter._latent_layer_names[:2]))
+        assert events == []  # Unused target retriever never entered the engine.
+    retriever = adapter.layerwise_retrievers[0][0]
+    try:
+        if not cancel:
+            retriever.send("selection")
+            assert events == [("setup", 2 if graph else 0),
+                              ("payload", 2 if graph else 0, "selection")]
+    finally:
+        retriever.close()
+    if warm and enabled and cancel:
+        assert events == []
+    else:
+        assert events[-1] == ("close", 2 if graph else 0)
+
+
+@pytest.mark.parametrize(
+    "layerwise,capable", [(False, False), (False, True), (True, False)]
+)
+def test_disabled_prefill_window_does_not_consume_requests(
+    layerwise: bool, capable: bool
+) -> None:
+    def requests() -> Any:
+        raise AssertionError("disabled capability consumed request iterable")
+        yield
+
+    adapter = SimpleNamespace(use_layerwise=layerwise,
+                              supports_layerwise_prefill_transfer_window=capable)
+    assert not load_prepare_method("_is_deferred_layerwise_prefill_load_step")(
+        adapter, requests()
+    )
+
+
+@pytest.mark.parametrize("kinds,expected", [
+    ([], False), ([False], True), ([False, False], True), ([False, True], False),
+])
+def test_enabled_prefill_window_preserves_batch_eligibility(
+    kinds: list[bool], expected: bool
+) -> None:
+    adapter = SimpleNamespace(use_layerwise=True,
+                              supports_layerwise_prefill_transfer_window=True)
+    requests = (
+        SimpleNamespace(is_sparse_decode=k, block_allocation_mode="prefill_child")
+        for k in kinds
+    )
+    assert load_prepare_method("_is_deferred_layerwise_prefill_load_step")(
+        adapter, requests
+    ) is expected
+
+
+@pytest.mark.parametrize("cold,wants_cpu,missing", [
+    (True, True, True), (False, False, True),
+    (False, True, False), (False, True, True),
+])
+@pytest.mark.parametrize("index_layers", [0, 22])
+def test_publication_checks_index_coverage_only_when_materialized(
+    cold: bool, wants_cpu: bool, missing: bool, index_layers: int
+) -> None:
+    checks, adopted = [], []
+    coverage = load_prepare_method("_missing_shared_layer_cache_coverage")
+
+    def check(layers: list, count: int, chunks: int) -> list[int]:
+        checks.append(count)
+        return coverage(layers, count, chunks)
+
+    state = SimpleNamespace(
+        token_count=1400, cached_starts=[0, 1024], cached_ends=[1024, 1400],
+        shared_index_status="missing",
+        cached_memory_objs=[[object(), object()] for _ in range(79)],
+        cached_starts_indexer=[], cached_ends_indexer=[],
+        cached_memory_objs_indexer=(
+            [] if missing else [[object(), object()] for _ in range(22)]
+        ),
+    )
+    state.cache_kwargs = lambda group, dsa_two_groups: {
+        "cached_starts": [0, 1024], "cached_ends": [1024, 1400],
+        "cached_chunk_ptrs_npu": [],
+    }
+    engine = SimpleNamespace(
+        enable_shared_cpu_cache=True, shared_cpu_cache_generation=7,
+        register_shared_cpu_sparse_request=lambda *a, **kw: adopted.append(kw),
+    )
+    adapter = SimpleNamespace(
+        lmcache_engine=engine, num_layers=79,
+        _num_layers_for_group=lambda group: 79 if group == 0 else index_layers,
+        _is_dsa_two_groups=lambda: True,
+        _sparse_decode_requires_index_materialization=lambda *a: wants_cpu,
+        _shared_required_chunk_count=load_prepare_method("_shared_required_chunk_count"),
+        _missing_shared_layer_cache_coverage=check,
+        _cached_ranges_cover_prefix=lambda *a: True,
+        _missing_shared_pointer_cache_layers=lambda *a: [],
+        _shared_request_scope_token=lambda *a: a,
+        _shared_worker_validation_signature=lambda *a, **kw: (),
+    )
+    request = SimpleNamespace(req_id="r", is_sparse_decode=True,
+                              load_spec=SimpleNamespace(dsa_cold_compact_load=cold))
+    materialize = wants_cpu and not cold
+    record = load_prepare_method("_record_shared_worker_retrieve_state")
+    if not index_layers or (materialize and missing):
+        reason = "topology" if not index_layers else "complete materialized DSA index"
+        with pytest.raises(RuntimeError, match=reason):
+            record(adapter, state, request)
+        assert not adopted
+    else:
+        record(adapter, state, request)
+        assert set(adopted[0]["owned_groups"]) == ({0, 1} if materialize else {0})
+    assert checks == ([79, 22] if materialize and index_layers else [79])
+
+
+def test_deferred_warm_retrieval_keeps_original_tokens_and_mask() -> None:
+    tokens, mask, slots = [1, 2], torch.ones(2, dtype=torch.bool), object()
+    source = object()
+    calls = []
+
+    def retrieve(actual_tokens: Any, actual_mask: Any, **kwargs: Any) -> Any:
+        assert actual_tokens is tokens and actual_mask is mask
+        assert kwargs["slot_mapping"] is slots
+        assert kwargs["prepared_sparse_source"] is source
+        calls.append("setup")
+        payload = yield None
+        assert payload == "selection"
+        yield mask
+
+    defer = load_prepare_method("_defer_prepared_sparse_retrieve")
+    kwargs = dict(slot_mapping=slots, prepared_sparse_source=source)
+    retriever = defer(SimpleNamespace(retrieve_layer_head_token_wise=retrieve),
+                      kwargs, tokens, mask)
+    assert next(retriever) is None and not calls
+    assert retriever.send("selection") is mask
+    retriever.close()
 
 
 class SourcePublisher:
@@ -624,3 +845,93 @@ def test_lane_mapping_rejects_duplicates_and_absent_requests(request_ids) -> Non
             frontiers=(512,) * len(request_ids),
         )
     assert adapter.current_layer == 0 and adapter.waits == []
+
+
+@pytest.mark.parametrize("stale", [None, "request", "attempt", "slab", "source", "frontier", "live", "topology"])
+def test_cold_publication_proof_skips_only_certified_scans(stale):
+    from unittest.mock import MagicMock
+    from lmcache.v1.memory_management import TensorMemoryObj
+
+    cache = make_source_cache(512, 3)
+    owners = [MagicMock(spec=TensorMemoryObj) for _ in range(2)]
+    cache["cached_memory_objs"] = [list(owners) for _ in range(3)]
+    state = SimpleNamespace(
+        prepared_sparse_sources={}, cache_kwargs=lambda *a, **kw: cache,
+        metadata_token_ids=[1] * 512, token_count=512, location="LocalCPU",
+        metadata_warm=True, shared_index_status="missing",
+        cached_memory_objs=cache["cached_memory_objs"], cached_memory_objs_indexer=[],
+    )
+    adapter = SourcePublisher(3)
+    adapter._prepare_cold_graph_pointers = True
+    adapter.refresh_sources(state, 512)
+    source = state.prepared_sparse_sources[0]
+    assert source.graph_owners == tuple(owners)
+    state.cold_publication_proof = ("r", 2, 7, source)
+    request = SimpleNamespace(
+        req_id="r", is_sparse_decode=True,
+        load_spec=SimpleNamespace(dsa_cold_compact_load=True, dsa_cold_load_generation=2),
+    )
+    adopted, cleaned = [], []
+    adapter.lmcache_engine = SimpleNamespace(
+        enable_shared_cpu_cache=True, shared_cpu_cache_generation=7,
+        register_shared_cpu_sparse_request=lambda *a, **kw: adopted.append(kw),
+    )
+    adapter._worker_retrieve_state = {}
+    adapter._set_worker_retrieve_state = lambda key, value: adapter._worker_retrieve_state.update({key: value})
+    adapter._mark_worker_retrieve_registry_changed = lambda: None
+    adapter._release_unadopted_shared_request_objects = lambda *a: cleaned.append("unadopted")
+    adapter._release_shared_worker_retrieve_state = lambda *a, **kw: cleaned.append("state")
+    adapter._sparse_decode_requires_index_materialization = lambda *a: False
+    adapter._shared_request_scope_token = lambda *a: a
+    adapter._shared_worker_validation_signature = lambda *a, **kw: ()
+    record = load_prepare_method("_record_shared_worker_retrieve_state")
+    adapter._record_shared_worker_retrieve_state = lambda *a, **kw: record(adapter, *a, **kw)
+    # Any repeated coverage traversal is a regression on this certified handoff.
+    adapter._shared_required_chunk_count = MagicMock(side_effect=AssertionError("chunk scan"))
+    adapter._missing_shared_layer_cache_coverage = MagicMock(side_effect=AssertionError("layer scan"))
+    adapter._missing_shared_pointer_cache_layers = MagicMock(side_effect=AssertionError("pointer scan"))
+    adapter._cached_ranges_cover_prefix = MagicMock(side_effect=AssertionError("prefix scan"))
+    if stale == "request":
+        request.req_id = "other"
+    elif stale == "attempt":
+        request.load_spec.dsa_cold_load_generation += 1
+    elif stale == "slab":
+        adapter.lmcache_engine.shared_cpu_cache_generation += 1
+    elif stale == "source":
+        from dataclasses import replace
+        state.prepared_sparse_sources[0] = replace(source)
+    elif stale == "frontier":
+        state.metadata_token_ids.append(1)
+    elif stale == "live":
+        adapter._worker_retrieve_state["r"] = state
+    elif stale == "topology":
+        adapter.layers += 1
+    publish = load_prepare_method("_publish_worker_retrieve_state")
+    kwargs = dict(location="LocalCPU", metadata_warm=True, token_count=512, reuse_prepared_sources=True)
+    if stale:
+        with pytest.raises(RuntimeError, match="Cold publication"):
+            publish(adapter, state, request, **kwargs)
+        assert not adopted and cleaned == ["unadopted", "state"]
+    else:
+        publish(adapter, state, request, **kwargs)
+        assert adopted[0]["owned_groups"][0] is cache["cached_memory_objs"]
+        assert state.cold_publication_proof is None
+        assert adapter._worker_retrieve_state["r"] is state
+        assert not cleaned
+
+
+@pytest.mark.parametrize("enabled,prefiller", [(False, False), (True, False), (True, True)])
+def test_owner_preparation_gate_and_refresh_invalidation(enabled, prefiller):
+    from unittest.mock import MagicMock
+    from lmcache.v1.memory_management import TensorMemoryObj
+
+    adapter = SourcePublisher(1)
+    adapter._prepare_cold_graph_pointers = enabled
+    adapter._layerwise_prefill_p_node = prefiller
+    cache = make_source_cache(512, 1)
+    cache["cached_memory_objs"] = [[MagicMock(spec=TensorMemoryObj) for _ in range(2)]]
+    state = SimpleNamespace(cache_kwargs=lambda *a: cache, cold_publication_proof=object())
+    adapter.refresh_sources(state, 512)
+    assert state.cold_publication_proof is None
+    assert (state.prepared_sparse_sources[0].graph_owners is not None) == (enabled and not prefiller)
+    assert state.prepared_sparse_sources[1].graph_owners is None

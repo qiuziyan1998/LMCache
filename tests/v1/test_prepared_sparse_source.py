@@ -200,3 +200,26 @@ def test_binding_token_does_not_retain_source_and_changes_on_replace():
     del pointers, pairs, source, changed
     assert pointer_ref() is None  # A retained token owns no pointer tensor.
     assert pairs_ref() is None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("kind", ["allocator", "proxy", "tensor-only"])
+def test_graph_owner_proof_is_optional_and_builder_owned(enabled, kind):
+    from lmcache.v1.memory_management import TensorMemoryObj
+
+    owner = MagicMock(spec=TensorMemoryObj if kind == "allocator" else MemoryObj)
+    source = build_prepared_sparse_source(
+        [[torch.zeros(4)]] * 3,
+        [torch.ones(1, dtype=torch.int64)] * 3,
+        num_layers=3, total_tokens=4, chunk_token_counts=(4,),
+        cached_memory_objs=None if kind == "tensor-only" else [[owner]] * 3,
+        prepare_graph_owners=enabled,
+    )
+    assert source is not None
+    if enabled and kind == "allocator":
+        assert source.graph_owners == (owner,)
+        assert replace(source).graph_owners is None
+    else:
+        assert source.graph_owners is None
+    owner.ref_count_up.assert_not_called()
+    owner.ref_count_down.assert_not_called()

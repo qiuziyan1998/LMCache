@@ -133,17 +133,22 @@ def completed_cold_resume_state(request: Any, state: Any) -> bool:
                 and state.prepared_sparse_sources.get(0) is not None)
 
 
-def _defer_sparse_graph_draft(
-    engine: Any, retrieve_kwargs: dict[str, Any]
+def _defer_prepared_sparse_retrieve(
+    engine: Any,
+    retrieve_kwargs: dict[str, Any],
+    tokens: Optional[Union[torch.Tensor, list[int]]] = None,
+    mask: Optional[torch.Tensor] = None,
 ) -> Generator[Any, Any, None]:
-    """Prime only at the first draft payload, after target graph submission.
+    """Prime a sealed warm source only when its first payload arrives.
 
     Preserve the send/next/close protocol and the source/slot objects selected
-    for this step. Closing an unused draft performs no connector setup at all.
+    for this step. Closing an unused retriever performs no connector setup.
     The actual retrieval and its stream dependencies remain unchanged.
     """
     payload = yield None
-    consumer = engine.retrieve_layer_head_token_wise([], None, **retrieve_kwargs)
+    consumer = engine.retrieve_layer_head_token_wise(
+        [] if tokens is None else tokens, mask, **retrieve_kwargs
+    )
     try:
         next(consumer)
         while True:
@@ -1368,6 +1373,10 @@ class WorkerRetrieveState:
         default_factory=dict,
         repr=False,
     )
+    # Single-use proof for an exclusively owned, unpublished cold-load state.
+    cold_publication_proof: Optional[
+        tuple[str, int, int, PreparedSparseSource]
+    ] = field(default=None, repr=False)
     dense_load_readiness: Optional[Any] = field(default=None, repr=False)
     dense_load_readiness_consumed: bool = field(default=False, repr=False)
     dense_load_source_owners: tuple[Any, ...] = field(
@@ -1401,6 +1410,7 @@ class WorkerRetrieveState:
             self.dense_prefix_resident_tokens = 0
         for values in self.cache_kwargs(kv_group, dsa_two_groups=True).values():
             values.clear()
+        self.cold_publication_proof = None
         self.prepared_sparse_sources.pop(kv_group, None)
         pointer_table = self.pointer_tables.pop(kv_group, None)
         if pointer_table is not None:
@@ -2202,6 +2212,7 @@ class PreemptionConnectorMetadata(LMCacheConnectorMetadata):
 
 class LMCacheConnectorV1Impl:
     supports_preemption_checkpoint = False
+    _defer_prepared_sparse_setup = False
 
     def __init__(
         self,
@@ -3462,11 +3473,14 @@ class LMCacheConnectorV1Impl:
         self,
         loadable_requests: Iterable[ReqMeta],
     ) -> bool:
+        if (
+            not self.use_layerwise
+            or not self.supports_layerwise_prefill_transfer_window
+        ):
+            return False
         requests = tuple(loadable_requests)
         return bool(
-            self.use_layerwise
-            and self.supports_layerwise_prefill_transfer_window
-            and requests
+            requests
             and all(
                 not request.is_sparse_decode
                 and request.block_allocation_mode == "prefill_child"
@@ -5347,6 +5361,7 @@ class LMCacheConnectorV1Impl:
         )
         state.dense_load_readiness_consumed = False
         state.dense_load_source_owners = ()
+        state.cold_publication_proof = None
         state.prepared_sparse_sources.clear()
         release_pointer_cache = getattr(
             getattr(engine, "gpu_connector", None),
@@ -5734,6 +5749,7 @@ class LMCacheConnectorV1Impl:
         state: WorkerRetrieveState,
         request: ReqMeta,
         previous_token_count: int = 0,
+        validated_latent: Optional[PreparedSparseSource] = None,
     ) -> None:
         engine = self.lmcache_engine
         if (
@@ -5765,32 +5781,34 @@ class LMCacheConnectorV1Impl:
         )
         skip_index_hot_state = self._is_dsa_two_groups() and not materialize_index
 
-        required_latent_chunks = self._shared_required_chunk_count(
-            state.cached_starts,
-            state.cached_ends,
-            state.cached_memory_objs,
-        )
-        missing_latent_layers = self._missing_shared_layer_cache_coverage(
-            state.cached_memory_objs,
-            expected_latent_layers,
-            required_latent_chunks,
-        )
-        if missing_latent_layers:
-            raise RuntimeError(
-                "Shared CPU sparse decode cannot mark request state "
-                "hot-reusable with incomplete MLA latent state: "
-                f"req_id={request.req_id}, kv_group=0, "
-                f"missing_layers={missing_latent_layers}"
+        if validated_latent is not None:
+            if (
+                state.prepared_sparse_sources.get(0) is not validated_latent
+                or len(validated_latent.layers) != expected_latent_layers
+                or validated_latent.total_tokens != state.token_count
+                or validated_latent.graph_owners is None
+            ):
+                raise RuntimeError("Cold publication source proof is no longer current")
+            required_latent_chunks = len(validated_latent.chunk_token_counts)
+        else:
+            required_latent_chunks = self._shared_required_chunk_count(
+                state.cached_starts,
+                state.cached_ends,
+                state.cached_memory_objs,
             )
+            missing_latent_layers = self._missing_shared_layer_cache_coverage(
+                state.cached_memory_objs,
+                expected_latent_layers,
+                required_latent_chunks,
+            )
+            if missing_latent_layers:
+                raise RuntimeError(
+                    "Shared CPU sparse decode cannot mark request state "
+                    "hot-reusable with incomplete MLA latent state: "
+                    f"req_id={request.req_id}, kv_group=0, "
+                    f"missing_layers={missing_latent_layers}"
+                )
 
-        required_index_chunks = max(
-            required_latent_chunks,
-            self._shared_required_chunk_count(
-                state.cached_starts_indexer,
-                state.cached_ends_indexer,
-                state.cached_memory_objs_indexer,
-            ),
-        )
         expected_index_layers = self._num_layers_for_group(1)
         if expected_index_layers <= 0:
             if self._is_dsa_two_groups():
@@ -5799,18 +5817,27 @@ class LMCacheConnectorV1Impl:
                     "the index group topology is registered"
                 )
             expected_index_layers = int(getattr(self, "num_layers", 0) or 0)
-        missing_index_layers = self._missing_shared_layer_cache_coverage(
-            state.cached_memory_objs_indexer,
-            expected_index_layers,
-            required_index_chunks,
-        )
-        if materialize_index and missing_index_layers:
-            raise RuntimeError(
-                "Shared CPU sparse decode cannot mark request state "
-                "hot-reusable without complete materialized DSA index state: "
-                f"req_id={request.req_id}, kv_group=1, "
-                f"missing_layers={missing_index_layers}"
+        if materialize_index:
+            required_index_chunks = max(
+                required_latent_chunks,
+                self._shared_required_chunk_count(
+                    state.cached_starts_indexer,
+                    state.cached_ends_indexer,
+                    state.cached_memory_objs_indexer,
+                ),
             )
+            missing_index_layers = self._missing_shared_layer_cache_coverage(
+                state.cached_memory_objs_indexer,
+                expected_index_layers,
+                required_index_chunks,
+            )
+            if missing_index_layers:
+                raise RuntimeError(
+                    "Shared CPU sparse decode cannot mark request state "
+                    "hot-reusable without complete materialized DSA index state: "
+                    f"req_id={request.req_id}, kv_group=1, "
+                    f"missing_layers={missing_index_layers}"
+                )
 
         groups = [(0, state.cached_memory_objs, required_latent_chunks)]
         if materialize_index and state.cached_memory_objs_indexer:
@@ -5820,6 +5847,9 @@ class LMCacheConnectorV1Impl:
 
         owned_groups: dict[int, list[list[Any]]] = {}
         for kv_group, layers, required_chunks in groups:
+            if kv_group == 0 and validated_latent is not None:
+                owned_groups[kv_group] = layers
+                continue
             if not has_entries(layers):
                 continue
             required_token_count = (
@@ -6015,6 +6045,7 @@ class LMCacheConnectorV1Impl:
             for layer_id, pointers in enumerate(cache["cached_chunk_ptrs_npu"]):
                 if isinstance(pointers, torch.Tensor):
                     cache["cached_chunk_ptrs_npu"][layer_id] = pointers[:keep]
+        state.cold_publication_proof = None
         state.prepared_sparse_sources.clear()
         state.token_count = token_count
         if state.metadata_token_ids:
@@ -6974,6 +7005,7 @@ class LMCacheConnectorV1Impl:
         token_count: int,
     ) -> None:
         """Seal complete per-group source caches after bootstrap or store."""
+        state.cold_publication_proof = None
         prepared: dict[int, PreparedSparseSource] = {}
         dsa_two_groups = self._is_dsa_two_groups()
         group_ids = (0, 1) if dsa_two_groups else (0,)
@@ -7022,6 +7054,11 @@ class LMCacheConnectorV1Impl:
                 expected_pointer_device=expected_pointer_device,
                 cached_memory_objs=cache["cached_memory_objs"],
                 chunk_size=getattr(self, "_lmcache_chunk_size", None),
+                prepare_graph_owners=(
+                    kv_group == 0
+                    and getattr(self, "_prepare_cold_graph_pointers", False)
+                    and not getattr(self, "_layerwise_prefill_p_node", False)
+                ),
             )
             if source is not None:
                 prepared[kv_group] = source
@@ -7089,6 +7126,7 @@ class LMCacheConnectorV1Impl:
         state.metadata_warm = metadata_warm or state.metadata_warm
         state.token_count = token_count
         try:
+            validated_latent = None
             if reuse_prepared_sources:
                 # Only the completed cold worker hands off an unchanged sealed
                 # state. Generic store/metadata publication must still rebuild.
@@ -7105,12 +7143,32 @@ class LMCacheConnectorV1Impl:
                         "Cold publication requires sealed sources and token snapshot "
                         "at the load frontier"
                     )
+                proof = getattr(state, "cold_publication_proof", None)
+                state.cold_publication_proof = None
+                if proof is not None:
+                    req_id, load_generation, shared_generation, source = proof
+                    if (
+                        req_id != request.req_id
+                        or load_generation
+                        != request.load_spec.dsa_cold_load_generation
+                        or shared_generation
+                        != int(
+                            getattr(self.lmcache_engine, "shared_cpu_cache_generation", 0)
+                            or 0
+                        )
+                        or sources.get(0) is not source
+                        or source.total_tokens != token_count
+                        or previous_state is state
+                    ):
+                        raise RuntimeError("Cold publication source proof is stale")
+                    validated_latent = source
             else:
                 self._refresh_prepared_sparse_sources(state, token_count)
             self._record_shared_worker_retrieve_state(
                 state,
                 request,
                 previous_token_count,
+                validated_latent=validated_latent,
             )
             if (
                 not reuse_prepared_sources
@@ -8199,6 +8257,10 @@ class LMCacheConnectorV1Impl:
         tokens = plan["tokens"]
         token_mask = plan["token_mask"]
         state = live_state or WorkerRetrieveState(req_id=request.req_id)
+        load_generation = request.load_spec.dsa_cold_load_generation
+        shared_generation = int(
+            getattr(self.lmcache_engine, "shared_cpu_cache_generation", 0) or 0
+        )
         perf_enabled = serving_perf_enabled()
         started = serving_perf_now() if perf_enabled else 0.0
         indexer_readiness = None
@@ -8357,6 +8419,13 @@ class LMCacheConnectorV1Impl:
             self._refresh_prepared_sparse_sources(state, token_count)
             if state.prepared_sparse_sources.get(0) is None:
                 raise RuntimeError("Cold compact latent source was not sealed")
+            source = state.prepared_sparse_sources[0]
+            if live_state is None and source.graph_owners is not None:
+                # Both loading branches have finished modifying this private
+                # state. Readiness is still enforced by the coordinator.
+                state.cold_publication_proof = (
+                    request.req_id, load_generation, shared_generation, source
+                )
             # Include derived source-table preparation in the existing final
             # fence before publishing either KV group to the foreground.
             self._record_dsa_cold_dense_load_readiness(
@@ -8902,7 +8971,15 @@ class LMCacheConnectorV1Impl:
                         )
 
                     layerwise_retriever = (
-                        self.lmcache_engine.retrieve_layer_head_token_wise(
+                        _defer_prepared_sparse_retrieve(
+                            self.lmcache_engine, retrieve_kwargs,
+                            retrieve_tokens, token_mask,
+                        )
+                        if (
+                            latent_prepared is not None
+                            and self._defer_prepared_sparse_setup
+                        )
+                        else self.lmcache_engine.retrieve_layer_head_token_wise(
                             retrieve_tokens,
                             token_mask,
                             **retrieve_kwargs,
@@ -10117,7 +10194,7 @@ class LMCacheConnectorV1Impl:
             if source is None:
                 continue
             state = self._worker_retrieve_state[request.req_id]
-            suffix = _defer_sparse_graph_draft(
+            suffix = _defer_prepared_sparse_retrieve(
                 self.lmcache_engine,
                 dict(
                     kvcaches=self._kvcaches_for_group(0),
