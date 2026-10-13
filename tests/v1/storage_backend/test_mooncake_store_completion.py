@@ -873,22 +873,7 @@ def test_layer_page_timeout_releases_late_result(monkeypatch) -> None:
         async def batched_get_layer_pages(keys):
             return [page]
 
-    class _LateFuture:
-        callback = None
-        complete = False
-
-        def result(self, timeout=None):
-            if not self.complete:
-                raise TimeoutError
-            return [page]
-
-        def add_done_callback(self, callback):
-            self.callback = callback
-
-        def cancel(self):
-            raise AssertionError("timed-out transfer must finish for safe cleanup")
-
-    late = _LateFuture()
+    late: Future = Future()
 
     def submit(coroutine, loop):
         coroutine.close()
@@ -904,9 +889,8 @@ def test_layer_page_timeout_releases_late_result(monkeypatch) -> None:
     with pytest.raises(TimeoutError):
         backend.batched_get_layer_pages([_layer_key(1, 0)])
     assert page.ref_count == 1
-    late.complete = True
-    assert late.callback is not None
-    late.callback(late)
+    assert not late.cancelled()
+    late.set_result([page])
     assert page.ref_count == 0
 
 
@@ -928,10 +912,13 @@ def test_remote_backend_returns_only_required_completion(monkeypatch) -> None:
         [_key(2)], [_MemoryObj()]
     )
 
-    assert mooncake_future == [source_futures[0]]
+    assert mooncake_future is not None and len(mooncake_future) == 1
+    assert not mooncake_future[0].done()
     assert other_future is None
     for future in source_futures:
         future.set_result(None)
+    assert mooncake_future[0].done()
+    assert mooncake_future[0].result() is None
 
 
 @pytest.mark.parametrize("requires_completion", [False, True])
@@ -2383,6 +2370,9 @@ def test_remote_direct_get_timeout_drains_before_next_registration() -> None:
     try:
         first.start()
         assert first_started.wait(timeout=1)
+        # The first read already captured its short timeout. The second read
+        # tests registration ordering, not a 10 ms thread-scheduling deadline.
+        connector.config.transfer_timeout = 1
         second.start()
         second.join(timeout=0.05)
         assert second.is_alive()

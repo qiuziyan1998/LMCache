@@ -1008,6 +1008,110 @@ def test_rank0_materialization_failure_releases_pair_pins_and_recomputes() -> No
     assert len(storage.unpinned) == 1
 
 
+@pytest.mark.parametrize("kv_group", [0, 1])
+@pytest.mark.parametrize("local_full", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("failure_stage", ["materialization", "handles"])
+def test_shared_materialization_failure_agrees_across_ranks(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    kv_group: int,
+    local_full: bool,
+    deferred: bool,
+    failure_stage: str,
+) -> None:
+    """A retained P lookup plan must not grant decoder-only recovery."""
+    import lmcache.v1.cache_engine as cache_engine_module
+
+    monkeypatch.setattr(
+        cache_engine_module, "assert_layerwise_gpu_connector", lambda _: None
+    )
+    storage = _PairStorageManager(local_pairs=1, remote_pairs=1)
+    rank0 = _engine(storage)
+    rank0.dsa_two_groups = True
+    rank0._transfer_layer_counts = (2, 1)
+    num_layers = rank0.num_layers_for_group(kv_group)
+    configs = _local_full_hint() if local_full else None
+    assert rank0.lookup(
+        list(range(8)), lookup_id="actual", pin=True, request_configs=configs
+    ) == 8
+    envelopes = []
+    rank0._broadcast_shared_envelope = envelopes.append
+    closed = []
+
+    def consumer(*_args, **_kwargs):
+        try:
+            yield None
+            raise AssertionError("A failed materialization must not submit H2D")
+        finally:
+            closed.append(True)
+
+    rank0.gpu_connector = SimpleNamespace(batched_to_gpu=consumer)
+    failure = TimeoutError()
+
+    def fail(**_kwargs):
+        raise failure
+
+    if failure_stage == "materialization":
+        rank0._resolve_shared_rank0_layer_pages = fail
+    else:
+        rank0._resolve_shared_rank0_layer_pages = lambda **_: (
+            [[] for _ in range(num_layers)], 0
+        )
+        rank0._make_shared_handle_batch = lambda *_args, **_kwargs: None
+        rank0._make_shared_handles_for_layer = fail
+
+    def retrieve(engine):
+        return list(engine.retrieve_layer(
+            list(range(8)), req_id="actual", kv_group=kv_group,
+            request_configs=configs, deferred_layerwise_get=deferred,
+        ))
+
+    gc_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        if local_full:
+            rank0_result = retrieve(rank0)
+        else:
+            with pytest.raises(_RemoteFillMaterializationError) as error:
+                retrieve(rank0)
+            assert error.value.__cause__ is failure
+            assert '"action":"RECOMPUTE"' not in caplog.text
+        assert closed == [True]
+        assert len(envelopes) == 1
+        envelope = envelopes[0]
+        assert envelope.status == "error"
+        assert envelope.kv_group == kv_group
+        assert envelope.error_details["error"] == ""
+        assert envelope.error_details["error_type"] == "TimeoutError"
+
+        passive = _engine(_PairStorageManager())
+        passive.dsa_two_groups = True
+        passive._transfer_layer_counts = (2, 1)
+        passive.metadata.worker_id = 1
+        passive.metadata.is_first_rank = lambda: False
+        passive.shared_cpu_cache_passive_allocator = object()
+        # Exercise the actual wire representation and passive validation.
+        passive._receive_shared_envelope = lambda: SharedHandleEnvelope.from_dict(
+            envelope.to_dict()
+        )
+        if local_full:
+            passive_result = retrieve(passive)
+            assert len(rank0_result) == len(passive_result) == num_layers + 2
+            assert not rank0_result[-1].any()
+            assert torch.equal(rank0_result[-1], passive_result[-1])
+            assert "actual" not in rank0.lookup_pins
+        else:
+            with pytest.raises(ValueError, match="rank0 error envelope"):
+                retrieve(passive)
+    finally:
+        if gc_enabled:
+            gc.enable()
+        if "actual" in rank0.lookup_pins:
+            rank0.lookup_unpin("actual")
+    assert len(storage.unpinned) == 2
+
+
 def test_rank0_gpu_consumer_failure_is_not_masked_as_recompute() -> None:
     storage = _PairStorageManager(local_pairs=2)
     engine = _engine(storage)

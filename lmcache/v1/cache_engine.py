@@ -5939,6 +5939,7 @@ class LMCacheEngine:
                             message=message,
                             details={
                                 "error": str(exc),
+                                "error_type": type(exc).__name__,
                                 "location": location,
                             },
                         )
@@ -5989,6 +5990,7 @@ class LMCacheEngine:
                             message=message,
                             details={
                                 "error": str(exc),
+                                "error_type": type(exc).__name__,
                                 "location": location,
                             },
                         )
@@ -8416,6 +8418,10 @@ class LMCacheEngine:
                 if (
                     remote_fill_plan is None
                     or yielded_steps >= num_layers + 2
+                    # Match passive recovery: a retained P lookup plan alone
+                    # does not authorize the decoder's LOCAL_FULL fallback.
+                    or not self._remote_fill_pair_lookup_enabled()
+                    or self._remote_fill_local_full_hint(request_configs) is None
                 ):
                     raise
                 self.lookup_unpin(req_id)
