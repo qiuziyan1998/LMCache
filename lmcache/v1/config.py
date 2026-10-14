@@ -590,6 +590,12 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": None,
         "env_converter": str,
     },
+    # CPU-only paired-page preparation on P; requires async lookup/loading.
+    "enable_prefill_cpu_prefetch": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
     "enable_async_loading": {
         "type": bool,
         "default": False,
@@ -1439,4 +1445,19 @@ def load_engine_config_with_overrides(
         config_file_env_var="LMCACHE_CONFIG_FILE",
         config_file_path=config_file_path,
         overrides=overrides,
+    )
+
+
+def prefill_cpu_prefetch_enabled(config: Any) -> bool:
+    """Enable CPU preparation only for asynchronous shared two-group senders."""
+    return bool(
+        getattr(config, "enable_prefill_cpu_prefetch", False)
+        and getattr(config, "enable_async_loading", False)
+        and getattr(config, "pd_role", None) == "sender"
+        and getattr(config, "use_layerwise", False)
+        and (getattr(config, "extra_config", None) or {}).get(
+            "enable_shared_cpu_cache", getattr(config, "enable_shared_cpu_cache", False)
+        )
+        and getattr(config, "dsa_two_groups", False)
+        and getattr(config, "enable_remote_lmcache_store", False)
     )

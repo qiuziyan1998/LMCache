@@ -13,11 +13,12 @@ import zmq
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine
-from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.config import LMCacheEngineConfig, prefill_cpu_prefetch_enabled
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.lookup_client.async_lookup_message import (
     LookupCleanupMsg,
     LookupCleanupResponseMsg,
+    LookupCompleteMsg,
     LookupRequestMsg,
     LookupResponseMsg,
 )
@@ -57,6 +58,9 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         # this helps us support timeout semantics
         self.first_lookup_time: dict[str, float] = {}
         self.config = config
+        self.prefetch_timeouts: set[str] = set()
+        self.lookup_complete_workers: dict[str, set[int]] = {}
+        self.prefill_cpu_prefetch = prefill_cpu_prefetch_enabled(config)
 
         self.ctx = get_zmq_context(use_asyncio=False)
         kv_connector_extra_config = metadata.kv_connector_extra_config or {}
@@ -170,25 +174,35 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             # lookup has arrived. The worker defers cleanup until that response.
             if lookup_id in self.aborted_lookups:
                 return None
+            prefetch = getattr(self, "prefill_cpu_prefetch", False)
             if (req_status := self.reqs_status.get(lookup_id, -1)) == -1:
+                # One preparation, including a ready result awaiting admission.
+                # Unsubmitted requests have neither allocations nor a deadline.
+                if prefetch and (self.reqs_status or self.aborted_lookups):
+                    return None
                 self.reqs_status[lookup_id] = None
                 self.first_lookup_time[lookup_id] = time.time()
             elif req_status is None:
-                time.sleep(self.lookup_backoff_time)
+                if not prefetch:
+                    time.sleep(self.lookup_backoff_time)
+                started = self.first_lookup_time.get(lookup_id)
                 if (
-                    time.time() - self.first_lookup_time[lookup_id]
-                ) * 1000 > self.config.lookup_timeout_ms:
+                    started is not None
+                    and (time.time() - started) * 1000 > self.config.lookup_timeout_ms
+                ):
                     logger.warning(
                         (
                             "Request %s is still waiting for async lookup "
-                            "after %d seconds, returning 0 lmcache cached tokens "
-                            "so vllm can recompute"
+                            "after %d seconds; requesting cleanup before recompute"
                         ),
                         lookup_id,
                         self.config.lookup_timeout_ms // 1000,
                     )
                     self.cancel_lookup(lookup_id)
                     self.first_lookup_time.pop(lookup_id, None)
+                    if prefetch:
+                        self.prefetch_timeouts.add(lookup_id)
+                        return None  # Wait for cleanup acknowledgement, not timeout.
                     return 0
 
             return req_status
@@ -200,7 +214,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         lookup_id: str,
         request_configs: Optional[dict] = None,
     ) -> Optional[int]:
-        hashes: list[int] = []
+        hashes: list[int | bytes] = []
         offsets = []
         for start, end, hash_val in self.token_database.process_tokens(
             token_ids, make_key=False
@@ -221,7 +235,8 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
 
         for i in range(self.world_size):
             self.push_sockets[i].send(msg_buf, copy=False)
-        time.sleep(self.lookup_backoff_time)
+        if not self.prefill_cpu_prefetch:
+            time.sleep(self.lookup_backoff_time)
         return None
 
     def process_responses_from_workers(self):
@@ -231,11 +246,28 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                 # Deserialize message using msgspec
                 msg = msgspec.msgpack.decode(
                     msg_buf,
-                    type=Union[LookupResponseMsg, LookupCleanupResponseMsg],
+                    type=Union[
+                        LookupResponseMsg, LookupCleanupResponseMsg, LookupCompleteMsg
+                    ],
                 )
                 lookup_id = msg.lookup_id
 
                 with self.lock:
+                    if isinstance(msg, LookupCompleteMsg):
+                        if (
+                            lookup_id not in self.aborted_lookups
+                            and lookup_id in self.first_lookup_time
+                        ):
+                            workers = self.lookup_complete_workers.setdefault(
+                                lookup_id, set()
+                            )
+                            workers.add(msg.worker_id)
+                            if len(workers) == self.world_size:
+                                # Payload preparation has its own native completion
+                                # contract; the metadata lookup deadline ends here.
+                                self.first_lookup_time.pop(lookup_id, None)
+                                self.lookup_complete_workers.pop(lookup_id, None)
+                        continue
                     if isinstance(msg, LookupCleanupResponseMsg):
                         workers = self.cleanup_res_for_each_worker.setdefault(
                             lookup_id, set()
@@ -247,6 +279,9 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                             self.reqs_status.pop(lookup_id, None)
                             self.first_lookup_time.pop(lookup_id, None)
                             self.aborted_lookups.discard(lookup_id)
+                            if lookup_id in getattr(self, "prefetch_timeouts", ()):
+                                self.prefetch_timeouts.remove(lookup_id)
+                                self.reqs_status[lookup_id] = 0
                         continue
 
                     res = msg.num_hit_tokens
@@ -290,10 +325,14 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         with self.lock:
             self.reqs_status.pop(lookup_id, None)
             self.first_lookup_time.pop(lookup_id, None)
+            getattr(self, "lookup_complete_workers", {}).pop(lookup_id, None)
 
     def cleanup_lookup(self, lookup_id: str) -> None:
         """Queue ordered worker cleanup and discard scheduler-side status."""
         with self.lock:
+            if hasattr(self, "prefetch_timeouts"):
+                self.prefetch_timeouts.discard(lookup_id)
+            getattr(self, "lookup_complete_workers", {}).pop(lookup_id, None)
             already_pending = lookup_id in self.aborted_lookups
             self.aborted_lookups.add(lookup_id)
             self.reqs_status.pop(lookup_id, None)
@@ -429,9 +468,19 @@ class LMCacheAsyncLookupServer:
             except Exception as e:
                 logger.error("Error processing request from scheduler: %s", e)
 
-    def send_response_to_scheduler(
-        self, lookup_id: str, num_hit_tokens: int
-    ) -> None:
+    def is_lookup_cancelled(self, lookup_id: str) -> bool:
+        """Check cancellation without releasing an in-flight preparation's owners."""
+        with self._cleanup_lock:
+            return self._cleanup_state.get(lookup_id) == "cleanup_requested"
+
+    def send_lookup_complete(self, lookup_id: str) -> None:
+        """End the metadata deadline without publishing admission readiness."""
+        msg = LookupCompleteMsg(lookup_id=lookup_id, worker_id=self.worker_id)
+        self.lmcache_engine.storage_manager.loop.call_soon_threadsafe(
+            self.push_socket.send, msgspec.msgpack.encode(msg)
+        )
+
+    def send_response_to_scheduler(self, lookup_id: str, num_hit_tokens: int) -> None:
         """Send responses from the storage loop that owns the PUSH socket."""
         loop = self.lmcache_engine.storage_manager.loop
         try:
@@ -447,9 +496,7 @@ class LMCacheAsyncLookupServer:
             return
         self._send_response_to_scheduler(lookup_id, num_hit_tokens)
 
-    def _send_response_to_scheduler(
-        self, lookup_id: str, num_hit_tokens: int
-    ) -> None:
+    def _send_response_to_scheduler(self, lookup_id: str, num_hit_tokens: int) -> None:
         # Create structured response message
         msg = LookupResponseMsg(
             lookup_id=lookup_id,

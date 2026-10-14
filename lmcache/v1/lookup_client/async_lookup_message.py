@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 # Third Party
 import msgspec
@@ -17,9 +17,9 @@ class LookupRequestMsg(AsyncLookupMsg):
     """Async lookup request message from scheduler to worker"""
 
     lookup_id: str
-    hashes: list[int]
+    hashes: list[int | bytes]
     offsets: list[int]
-    request_configs: Optional[Dict[str, str]] = None
+    request_configs: Optional[Dict[str, Any]] = None
 
     def describe(self) -> str:
         return (
@@ -61,3 +61,10 @@ class LookupCleanupResponseMsg(AsyncLookupMsg):
             f"Cleanup complete for lookup_id={self.lookup_id} "
             f"on worker_id={self.worker_id}"
         )
+
+
+class LookupCompleteMsg(AsyncLookupMsg):
+    """Metadata lookup finished; payload preparation is not yet admission-ready."""
+
+    lookup_id: str
+    worker_id: int

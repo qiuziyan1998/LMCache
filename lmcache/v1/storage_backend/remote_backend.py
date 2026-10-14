@@ -857,10 +857,8 @@ class RemoteBackend(StorageBackendInterface):
         )
         return decompressed_memory_objs
 
-    def batched_get_layer_pages(
-        self, keys: List[CacheEngineKey]
-    ) -> list[LayerPageMemoryObj]:
-        """Retrieve pages identified by one representative key per chunk."""
+    def submit_layer_pages_get(self, keys: List[CacheEngineKey]) -> Future:
+        """Submit a page read; the caller owns its result until native completion."""
         if self.connection is None:
             raise RuntimeError("Remote connection is unavailable")
         if self._mla_worker_id_as0_mode:
@@ -868,10 +866,17 @@ class RemoteBackend(StorageBackendInterface):
         retrieve = getattr(self.connection, "batched_get_layer_pages", None)
         if not callable(retrieve):
             raise RuntimeError("Remote connector does not support layer pages")
-        future = asyncio.run_coroutine_threadsafe(retrieve(keys), self.loop)
+        return asyncio.run_coroutine_threadsafe(retrieve(keys), self.loop)
+
+    def batched_get_layer_pages(
+        self, keys: List[CacheEngineKey]
+    ) -> list[LayerPageMemoryObj]:
+        """Retrieve pages identified by one representative key per chunk."""
+        future = self.submit_layer_pages_get(keys)
         try:
             return future.result(self.config.blocking_timeout_secs)
         except TimeoutError:
+
             def release_late_result(done: Future) -> None:
                 # The timeout caller is gone. Inspect a terminal failure without
                 # re-raising it into this callback and its Future invocation

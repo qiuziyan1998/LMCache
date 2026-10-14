@@ -4,7 +4,7 @@ from functools import cached_property
 from collections import defaultdict
 from collections.abc import Iterable
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Lock
 from typing import (
     TYPE_CHECKING,
@@ -63,7 +63,7 @@ from lmcache.v1.serving_perf import (
     serving_perf_now,
     serving_perf_scope,
 )
-from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.config import LMCacheEngineConfig, prefill_cpu_prefetch_enabled
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
@@ -8872,7 +8872,6 @@ class LMCacheEngine:
 
         yield ret_mask
 
-
     @_lmcache_nvtx_annotate
     def lookup(
         self,
@@ -9207,6 +9206,156 @@ class LMCacheEngine:
         logger.debug(f"Moving {num_tokens} token from {old_position} to {new_position}")
         return num_tokens
 
+    def _prefetch_prefill_cpu_prefix(
+        self,
+        lookup_id: str,
+        result: int,
+        *,
+        tokens: Optional[Union[torch.Tensor, list[int]]] = None,
+        hashes: Optional[List[int]] = None,
+        offsets: Optional[List[int]] = None,
+        request_configs: Optional[dict] = None,
+    ) -> int:
+        """Prepare the retained paired plan without touching HBM or TP collectives."""
+        if not result:
+            return result
+        plan = self._remote_fill_lookup_plans.get(lookup_id)
+        if (
+            not self._remote_fill_pair_lookup_enabled()
+            or plan is None
+            or any(chunk.page_by_group != (True, True) for chunk in plan.chunks)
+        ):
+            logger.info(
+                "Prefill CPU prefetch uses existing loader: req_id=%s, "
+                "reason=unsupported_source_plan",
+                lookup_id,
+            )
+            return result
+        candidates = []
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens, hashes=hashes, offsets=offsets,
+            request_configs=request_configs,
+        ):
+            if start >= result:
+                break
+            candidates.append((start, end, key))
+        if (
+            [(a, b, k.chunk_hash) for a, b, k in candidates]
+            != [(c.start, c.end, c.chunk_hash) for c in plan.chunks]
+            or not plan.chunks
+            or plan.chunks[-1].end != result
+        ):
+            raise ValueError("Prefill preparation does not match retained prefix")
+        manager = self.storage_manager
+        local = self._shared_local_cpu_backend()
+        server = manager.async_lookup_server
+        group_keys = [
+            [
+                self._lookup_key_for_kv_group(
+                    key, kv_group=group, request_configs=request_configs
+                )
+                for _, _, key in candidates
+            ]
+            for group in (0, 1)
+        ]
+        owned = []
+        new_pins = {}
+        try:
+            for group, keys in enumerate(group_keys):
+                offset = 0
+                while offset < len(keys):
+                    if server.is_lookup_cancelled(lookup_id):
+                        raise RuntimeError("Prefill CPU preparation cancelled")
+                    location = plan.chunks[offset].locations_by_group[group]
+                    end = offset + 1
+                    while (
+                        end < len(keys)
+                        and plan.chunks[end].locations_by_group[group] == location
+                    ):
+                        end += 1
+                    run_keys = keys[offset:end]
+                    if location == "LocalCPUBackend":
+                        pages, _ = local.batched_get_layer_page_prefix(run_keys)
+                    else:
+                        backend = manager.storage_backends[location]
+                        # Keep the original future until native completion. A
+                        # request cancellation cannot free active DMA buffers.
+                        future = backend.submit_layer_pages_get(run_keys)
+                        try:
+                            pages = future.result()
+                        finally:
+                            del future
+                    owned.extend(pages)
+                    if len(pages) != len(run_keys):
+                        raise ValueError("Incomplete prefill CPU page preparation")
+                    offset = end
+            count, new_pins = manager.batched_contains_two_group_layer_pages(
+                *[[key.get_first_layer() for key in keys] for keys in group_keys],
+                ["LocalCPUBackend"],
+                True,
+            )
+            if count != len(candidates):
+                raise ValueError("Prepared paired prefix is not locally retained")
+            for group, keys in enumerate(group_keys):
+                # Validate the cache winners, which can differ from fetched pages.
+                pages, count = local.batched_get_layer_page_prefix(keys)
+                owned.extend(pages)
+                if count != len(keys):
+                    raise ValueError("Prepared local prefix disappeared")
+                expected = {}
+                context = self._shared_rank0_object_context(group)
+                for index, (key, page) in enumerate(zip(keys, pages, strict=True)):
+                    valid = mooncake_valid_tokens(key, self.config.chunk_size)
+                    if valid not in expected:
+                        layout = [
+                            self._expected_shared_cpu_chunk_metadata(
+                                kv_group=group,
+                                num_tokens=valid,
+                                layer_id=layer,
+                            )
+                            for layer in range(self.num_layers_for_group(group))
+                        ]
+                        expected[valid] = (
+                            [x[0] for x in layout], [x[1] for x in layout], layout[0][2]
+                        )
+                    shapes, dtypes, fmt = expected[valid]
+                    if (
+                        not isinstance(page, LayerPageMemoryObj)
+                        or page.valid_tokens != valid
+                        or page.num_layers != len(shapes)
+                        or not page.layer_layout_is_valid()
+                        or page.meta.shapes != shapes
+                        or page.meta.dtypes != dtypes
+                        or page.meta.fmt != fmt
+                    ):
+                        raise ValueError("Invalid prepared prefill page layout")
+                    self._validate_rank0_shared_mem_obj(
+                        page,
+                        req_id=lookup_id,
+                        phase="prefill_cpu_prefetch",
+                        layer_id=0,
+                        kv_group=group,
+                        chunk_index=index,
+                        _context=context,
+                    )
+            if server.is_lookup_cancelled(lookup_id):
+                raise RuntimeError("Prefill CPU preparation cancelled")
+            # New pins precede old-pin release; never expose an evictable gap.
+            self._release_lookup_pins(lookup_id)
+            self.lookup_pins[lookup_id].update(new_pins)
+            new_pins = {}
+            self._remote_fill_lookup_plans[lookup_id] = _RemoteFillLookupPlan(
+                tuple(
+                    replace(chunk, locations_by_group=("LocalCPUBackend",) * 2)
+                    for chunk in plan.chunks
+                )
+            )
+            return result
+        finally:
+            for location, keys in new_pins.items():
+                manager.batched_unpin(keys, [location])
+            self._release_shared_retrieve_objs(owned, unpin=False)
+
     # TODO(Jiayi): Add layerwise support.
     @_lmcache_nvtx_annotate
     def async_lookup_and_prefetch(
@@ -9231,7 +9380,8 @@ class LMCacheEngine:
 
         if self.use_layerwise:
             experimental_lookup_enabled = self._sampled_scheduler_lookup_requested()
-            if experimental_lookup_enabled:
+            prefetch = prefill_cpu_prefetch_enabled(self.config)
+            if experimental_lookup_enabled or prefetch:
                 async_lookup_server = getattr(
                     self.storage_manager,
                     "async_lookup_server",
@@ -9244,19 +9394,37 @@ class LMCacheEngine:
                     )
                     return
 
-                async def run_layerwise_lookup() -> None:
-                    try:
-                        result = await asyncio.to_thread(
-                            self.lookup,
+                def prepare() -> int:
+                    if prefetch and async_lookup_server.is_lookup_cancelled(lookup_id):
+                        return 0
+                    result = self.lookup(
+                        tokens=tokens,
+                        hashes=hashes,
+                        offsets=offsets,
+                        search_range=search_range,
+                        lookup_id=lookup_id,
+                        pin=pin,
+                        request_configs=request_configs,
+                    )
+                    if prefetch:
+                        async_lookup_server.send_lookup_complete(lookup_id)
+                    if prefetch and pin:
+                        result = self._prefetch_prefill_cpu_prefix(
+                            lookup_id,
+                            result,
                             tokens=tokens,
                             hashes=hashes,
                             offsets=offsets,
-                            search_range=search_range,
-                            lookup_id=lookup_id,
-                            pin=pin,
                             request_configs=request_configs,
                         )
+                    return result
+
+                async def run_layerwise_lookup() -> None:
+                    try:
+                        result = await asyncio.to_thread(prepare)
                     except Exception:
+                        if prefetch:
+                            self._release_lookup_pins(lookup_id)
                         logger.exception(
                             "Layerwise async lookup failed: lookup_id=%s",
                             lookup_id,
