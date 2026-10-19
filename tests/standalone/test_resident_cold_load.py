@@ -384,6 +384,7 @@ def test_cold_pool_reuses_threads_across_bursts_and_shutdown_drains(
             assert executor.submit(threading.current_thread).result(timeout=5) is worker
         adapter = NS(
             _dsa_kv_policy_states={}, _cold_load_coordinator=coordinator,
+            lmcache_engine=None,
             _synchronize_dsa_cold_dense_load=lambda: actions.append("sync"),
             _drain_dense_load_retirements=lambda **kw: actions.append("retire"),
             _manager=NS(stop_services=lambda: actions.append("stop")),

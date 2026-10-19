@@ -195,7 +195,10 @@ class VllmServiceFactory(BaseServiceFactory):
         # Scheduler without bypass lookup does not need an engine
         if (
             self.role == "scheduler"
-            and not self.lmcache_config.enable_scheduler_bypass_lookup
+            and (
+                not self.lmcache_config.enable_scheduler_bypass_lookup
+                or self.lmcache_config.decoder_storage_mode == "process"
+            )
         ):
             # Create PrometheusLogger for scheduler without engine
             # First Party

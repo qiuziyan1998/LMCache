@@ -116,10 +116,12 @@ class ConnectorContext:
         config: Optional[LMCacheEngineConfig],
         metadata: Optional[LMCacheMetadata],
         external_page_only: bool = False,
+        defer_layout: bool = False,
     ):
         self.url = url
         self.loop = loop
         self.external_page_only = external_page_only
+        self.defer_layout = defer_layout
         if external_page_only:
             if config is None or metadata is None:
                 raise ValueError(
@@ -182,6 +184,7 @@ class ConnectorManager:
         config: Optional[LMCacheEngineConfig] = None,
         metadata: Optional[LMCacheMetadata] = None,
         external_page_only: bool = False,
+        defer_layout: bool = False,
     ) -> None:
         logger.info("Initializing ConnectorManager")
         self.context = ConnectorContext(
@@ -191,6 +194,7 @@ class ConnectorManager:
             config=config,
             metadata=metadata,
             external_page_only=external_page_only,
+            defer_layout=defer_layout,
         )
         self.adapters: List[ConnectorAdapter] = []
         self._remote_adapters_builtin_launcher()
@@ -314,6 +318,7 @@ def CreateConnector(
     config: Optional[LMCacheEngineConfig] = None,
     metadata: Optional[LMCacheMetadata] = None,
     external_page_only: bool = False,
+    defer_layout: bool = False,
 ) -> InstrumentedRemoteConnector:
     """
     Create a remote connector from the given URL.
@@ -375,6 +380,7 @@ def CreateConnector(
         config,
         metadata,
         external_page_only,
+        defer_layout,
     )
     connector = manager.create_connector()
 

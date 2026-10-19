@@ -151,7 +151,12 @@ async def get_freeze_status(request: Request):
                 status_code=503,  # Service Unavailable
             )
 
-        freeze_mode = lmcache_engine.is_frozen()
+        if getattr(lmcache_engine, "storage_process", None) is not None:
+            from lmcache.v1.rpc.storage_admin import get_engine_storage_admin
+
+            freeze_mode = get_engine_storage_admin(lmcache_engine).is_frozen()
+        else:
+            freeze_mode = lmcache_engine.is_frozen()
         mode_str = "enabled" if freeze_mode else "disabled"
         success_info = {
             "status": "success",

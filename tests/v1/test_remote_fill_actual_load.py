@@ -548,7 +548,7 @@ def test_sender_group1_load_reuses_and_warms_exact_cpu_pages(
     monkeypatch: pytest.MonkeyPatch, hot_pages: int, tail_tokens: int, disable_gc: bool
 ) -> None:
     """Exercise lookup, exact materialization and LocalCPU reference ownership."""
-    import lmcache.v1.cache_engine as cache_engine_module
+    import lmcache.v1.cpu_cache_operations as cache_engine_module
     import lmcache.v1.storage_backend.local_cpu_backend as local_cpu_module
 
     class Page:

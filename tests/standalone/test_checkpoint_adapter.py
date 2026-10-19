@@ -595,6 +595,7 @@ def test_failed_restore_retry_is_shorter_than_the_actual_evicted_frontier():
 def test_all_worker_completion_schedules_release_even_after_request_removal():
     calls = []
     adapter = NS(
+        config=NS(decoder_storage_mode="local"),
         _checkpoint_restore_attempts={"r": (1, 7)},
         _arm_preemption_controls=lambda: calls.append("arm"),
         _clear_request_marker=lambda *a: None,

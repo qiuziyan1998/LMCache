@@ -59,7 +59,10 @@ from lmcache.v1.remote_fill.native import (
     PreparedDirectPushSource,
 )
 from lmcache.v1.startup_trace import startup_phase
-from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
+from lmcache.v1.storage_backend.connector.base_connector import (
+    RemoteConnector,
+    resolve_save_chunk_meta,
+)
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.system_detection import NUMADetector
 
@@ -222,6 +225,7 @@ class MooncakestoreConnector(RemoteConnector):
         lmcache_config: Optional[LMCacheEngineConfig],
         lmcache_metadata: Optional[LMCacheMetadata] = None,
         external_page_only: bool = False,
+        defer_layout: bool = False,
     ):
         engine_config = lmcache_config or getattr(
             local_cpu_backend, "config", None
@@ -234,12 +238,21 @@ class MooncakestoreConnector(RemoteConnector):
                 "Mooncake connector requires LMCache config and metadata"
             )
         self._external_page_only = external_page_only
+        self._engine_config = engine_config
+        self._layout_bound = not defer_layout
         self._lmcache_metadata = engine_metadata
         indexer_layout = getattr(engine_metadata, "indexer_c8_layout", None)
         self._mixed_indexer_layout = indexer_layout if indexer_layout is not None and indexer_layout.mixed else None
 
         # initialize base class, which includes some common attributes
-        super().__init__(engine_config, engine_metadata)
+        if defer_layout:
+            # Native sessions/slab registration precede final model KV topology.
+            # No payload API may use these deliberately absent layout values.
+            self.save_chunk_meta = resolve_save_chunk_meta(engine_config)
+            self.meta_shapes = []
+            self.meta_dtypes = []
+        else:
+            super().__init__(engine_config, engine_metadata)
         self._sampled_layerwise_lookup = bool(
             getattr(
                 engine_config,
@@ -256,7 +269,7 @@ class MooncakestoreConnector(RemoteConnector):
             self._resolve_dsa_raw_token_dims(
                 engine_config,
                 engine_metadata,
-            )
+            ) if not defer_layout else ({}, "deferred")
         )
         if self._dsa_raw_token_dims:
             logger.info(
@@ -435,7 +448,7 @@ class MooncakestoreConnector(RemoteConnector):
             )
             self._page_group_layer_counts = (
                 validate_two_group_layer_counts(engine_metadata.runtime_kv_group_layer_counts)
-                if engine_config.dsa_two_groups else None
+                if engine_config.dsa_two_groups and not defer_layout else None
             )
             if getattr(self, "_page_first_multi_buffer", False):
                 if self.save_chunk_meta:
@@ -516,6 +529,50 @@ class MooncakestoreConnector(RemoteConnector):
                     )
             logger.error("Mooncake connector initialization failed: %s", exc)
             raise
+
+    def bind_layout(self, metadata: LMCacheMetadata) -> None:
+        """Bind final geometry without creating/registering any native resources."""
+        before = self._lmcache_metadata
+        identity = (
+            "model_name", "world_size", "worker_id", "use_mla", "engine_id",
+            "chunk_size", "kv_dtype",
+        )
+        if any(getattr(before, name) != getattr(metadata, name) for name in identity):
+            raise ValueError(
+                "Final Mooncake layout changed bootstrap model/topology identity"
+            )
+        counts = (
+            validate_two_group_layer_counts(metadata.runtime_kv_group_layer_counts)
+            if self._engine_config.dsa_two_groups else None
+        )
+        raw_dims, _ = self._resolve_dsa_raw_token_dims(self._engine_config, metadata)
+        layout = metadata.indexer_c8_layout
+        signature = (
+            counts, metadata.runtime_kv_group_layer_names, layout,
+            tuple(metadata.get_shapes()), tuple(metadata.get_dtypes()),
+        )
+        if self._layout_bound:
+            if signature != self._bound_layout_signature:
+                raise ValueError(
+                    "Cannot change an already-bound Mooncake storage layout"
+                )
+            return
+        RemoteConnector.__init__(self, self._engine_config, metadata)
+        self._lmcache_metadata = metadata
+        self._mixed_indexer_layout = (
+            layout if layout is not None and layout.mixed else None
+        )
+        self._dsa_raw_token_dims = raw_dims
+        self._page_group_layer_counts = counts
+        self._page_num_layers = int(metadata.kv_shape[0])
+        self._bound_layout_signature = signature
+        self._layout_bound = True
+
+    def _require_layout_bound(self) -> None:
+        if not getattr(self, "_layout_bound", True):
+            raise RuntimeError(
+                "Mooncake storage layout is not bound after native bootstrap"
+            )
 
     @staticmethod
     def _resolve_dsa_raw_token_dims(
@@ -1091,6 +1148,7 @@ class MooncakestoreConnector(RemoteConnector):
         )
 
     def batched_contains(self, keys: List[CacheEngineKey]) -> int:
+        MooncakestoreConnector._require_layout_bound(self)
         if not keys:
             return 0
 
@@ -1115,6 +1173,7 @@ class MooncakestoreConnector(RemoteConnector):
 
     def batched_contains_layer_pages(self, keys: List[CacheEngineKey]) -> int:
         """Check only layer-merged page keys, without legacy-key fallback."""
+        MooncakestoreConnector._require_layout_bound(self)
         started = serving_perf_now() if serving_perf_enabled() else None
         page_keys = self._page_keys_for(keys)
         if any(key is None for key in page_keys):
@@ -1165,6 +1224,7 @@ class MooncakestoreConnector(RemoteConnector):
         Fallback for callers that still invoke non-blocking get on Mooncake.
         Delegates to batched_get and applies prefix semantics.
         """
+        MooncakestoreConnector._require_layout_bound(self)
         if not keys:
             return []
 
@@ -1183,6 +1243,7 @@ class MooncakestoreConnector(RemoteConnector):
         return memory_objs
 
     async def exists(self, key: CacheEngineKey) -> bool:
+        MooncakestoreConnector._require_layout_bound(self)
         key_string = key.to_string()
         result = self.store.is_exist(key_string)
         trace_mooncake_keys(
@@ -1191,6 +1252,7 @@ class MooncakestoreConnector(RemoteConnector):
         return bool(result)
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
+        MooncakestoreConnector._require_layout_bound(self)
         key_string = key.to_string()
         result = self.store.is_exist(key_string)
         trace_mooncake_keys(
@@ -1205,6 +1267,7 @@ class MooncakestoreConnector(RemoteConnector):
         Batch get operation - the only supported get method.
         Uses batch_get_into (with metadata) or batch_get_buffer (without metadata).
         """
+        MooncakestoreConnector._require_layout_bound(self)
         if not keys:
             return []
 
@@ -1225,6 +1288,7 @@ class MooncakestoreConnector(RemoteConnector):
         keys: List[CacheEngineKey],
         pin: bool = False,
     ) -> int:
+        MooncakestoreConnector._require_layout_bound(self)
         if getattr(self, "_page_first_multi_buffer", False):
             return self.batched_contains(keys)
         num_hit_counts = 0
@@ -1379,6 +1443,7 @@ class MooncakestoreConnector(RemoteConnector):
         self, keys: List[CacheEngineKey]
     ) -> list[LayerPageMemoryObj]:
         """Load pages identified by canonical chunk or representative layer keys."""
+        MooncakestoreConnector._require_layout_bound(self)
         perf_enabled = serving_perf_enabled()
         perf_started = serving_perf_now() if perf_enabled else 0.0
         if not self._layer_merged_pages:
@@ -1848,6 +1913,7 @@ class MooncakestoreConnector(RemoteConnector):
         Single get method - NOT SUPPORTED.
         Use batched_get instead for all operations.
         """
+        MooncakestoreConnector._require_layout_bound(self)
         logger.error("Single get operation is not supported. Use batched_get instead.")
         raise NotImplementedError(
             "Single get is not supported. Use batched_get([key]) instead."
@@ -1895,6 +1961,7 @@ class MooncakestoreConnector(RemoteConnector):
         Uses put_from (without metadata) or
         put_parts (with metadata) to match get behavior.
         """
+        MooncakestoreConnector._require_layout_bound(self)
         key_str = key.to_string()
 
         # Check metadata handling mode to match get behavior
@@ -2182,6 +2249,7 @@ class MooncakestoreConnector(RemoteConnector):
         - save_chunk_meta False: use Mooncake's batch_put_from (zero-copy).
         - save_chunk_meta True: no batch API; fall back to sequential put_parts.
         """
+        MooncakestoreConnector._require_layout_bound(self)
         if not keys:
             return
 
@@ -2200,6 +2268,7 @@ class MooncakestoreConnector(RemoteConnector):
         req_id: str,
     ) -> None:
         """Write registered accelerator buffers with page or legacy keys."""
+        MooncakestoreConnector._require_layout_bound(self)
         native_unknown = getattr(self, "_external_native_unknown_error", None)
         if native_unknown is not None:
             raise native_unknown
@@ -2364,6 +2433,7 @@ class MooncakestoreConnector(RemoteConnector):
         req_id: str,
     ) -> None:
         """Read exact Mooncake pages directly into accelerator tensor storage."""
+        MooncakestoreConnector._require_layout_bound(self)
         started = serving_perf_now() if serving_perf_enabled() else None
         native_unknown = getattr(self, "_external_native_unknown_error", None)
         if native_unknown is not None:
@@ -2497,6 +2567,7 @@ class MooncakestoreConnector(RemoteConnector):
 
     def get_remote_fill_destination_session(self) -> str | None:
         """Return the registered GlobalTE session used for direct writes."""
+        MooncakestoreConnector._require_layout_bound(self)
         return self._shared_local_segment
 
     async def push_external_pages(
@@ -2530,6 +2601,7 @@ class MooncakestoreConnector(RemoteConnector):
             qualified activation token. It never acquires the persistent
             connector's external-put lock.
         """
+        MooncakestoreConnector._require_layout_bound(self)
         _validate_direct_push_activation(activation)
         if self._shared_global_te is None or self._shared_transfer_engine is None:
             raise RuntimeError(
@@ -2560,6 +2632,7 @@ class MooncakestoreConnector(RemoteConnector):
     ) -> PreparedDirectPushSource:
         """Fence and register source owners before decoder memory is armed."""
 
+        MooncakestoreConnector._require_layout_bound(self)
         if not source_plan.producer_events or any(
             not callable(getattr(event, "synchronize", None))
             for event in source_plan.producer_events
@@ -2610,6 +2683,7 @@ class MooncakestoreConnector(RemoteConnector):
         self, keys: List[CacheEngineKey]
     ) -> List[bool]:
         """Check arbitrary existing-format page keys in one Mooncake call."""
+        MooncakestoreConnector._require_layout_bound(self)
         page_keys = [
             mooncake_page_key(key, self._page_num_layers_for(key)) for key in keys
         ]
@@ -2872,6 +2946,7 @@ class MooncakestoreConnector(RemoteConnector):
 
     @no_type_check
     async def list(self) -> List[str]:
+        MooncakestoreConnector._require_layout_bound(self)
         pass
 
     async def close(self):

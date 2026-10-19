@@ -87,6 +87,13 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": True,
         "env_converter": _to_bool,
     },
+    "decoder_storage_mode": {
+        "type": str,
+        "default": "local",
+        "env_converter": str,
+        "description": "Decoder CPU storage ownership: local or process.",
+        "mutable": False,
+    },
     "max_local_cpu_size": {"type": float, "default": 5.0, "env_converter": float},
     "reserve_local_cpu_size": {"type": float, "default": 0.0, "env_converter": float},
     "local_disk": {
@@ -817,6 +824,12 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
 # Specialized methods that are unique to LMCacheEngineConfig
 def _validate_config(self):
     """Validate configuration"""
+
+    if self.decoder_storage_mode not in ("local", "process"):
+        raise ValueError(
+            "decoder_storage_mode must be 'local' or 'process', got "
+            f"{self.decoder_storage_mode!r}"
+        )
 
     # needed for the old async serializer implementation
     # # auto-adjust save_unfull_chunk for async loading to prevent CPU fragmentation

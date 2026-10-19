@@ -58,7 +58,13 @@ class LookupClientFactory:
 
         client: LookupClientInterface
         # Check if external_lookup_client is configured
-        if config.external_lookup_client is not None:
+        if getattr(config, "decoder_storage_mode", "local") == "process":
+            from lmcache.v1.lookup_client.storage_lookup_client import (
+                StorageLookupClient,
+            )
+
+            client = StorageLookupClient(config, metadata)
+        elif config.external_lookup_client is not None:
             if config.enable_async_loading:
                 raise ValueError(
                     "Asynchronous loading is not supported for external lookup clients."
@@ -127,6 +133,8 @@ class LookupClientFactory:
             A lookup server instance, or None if no server should be created
         """
         config = lmcache_engine.config
+        if getattr(config, "decoder_storage_mode", "local") == "process":
+            return None  # M owns lookup; worker admin recreation cannot duplicate it.
         assert isinstance(config, LMCacheEngineConfig), (
             "LMCache v1 config is expected for lookup server and client"
         )

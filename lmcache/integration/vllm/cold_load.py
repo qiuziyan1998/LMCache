@@ -170,7 +170,8 @@ class ColdLoadCoordinator:
                     self.aborted = None
             finished.add(req_id)
         if not futures:
-            self.last_latent_future = None
+            if self.last_latent_future is None or self.last_latent_future.done():
+                self.last_latent_future = None
             # Keep the bounded pool across bursts; connector shutdown drains it.
         return finished or None
 

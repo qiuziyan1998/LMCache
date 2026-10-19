@@ -52,6 +52,7 @@ from lmcache.integration.vllm.preemption_checkpoint import (
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
+    apply_vllm_config_overrides,
     calculate_draft_layers,
     extract_mm_features,
     is_false,
@@ -79,7 +80,6 @@ from lmcache.v1.serving_perf import (
 )
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.gpu_connector.sparse import (
     PreparedSparseSource,
     build_prepared_sparse_source,
@@ -805,6 +805,8 @@ class LoadSpec:
     dsa_current_released_frontier: int = 0
     # Load Group 1 directly from persistent storage into its final HBM blocks.
     dsa_group1_direct_hbm: bool = False
+    # Value-only source ticket; transferred before scheduler lookup status clears.
+    cpu_source_ticket: Any = None
 
 
 @dataclass
@@ -1417,7 +1419,7 @@ class WorkerRetrieveState:
             pointer_table.clear()
 
     def has_cache(self) -> bool:
-        return bool(self.cached_keys)
+        return bool(self.cached_keys or self.prepared_sparse_sources)
 
     def group_has_data(self, kv_group: int, dsa_two_groups: bool) -> bool:
         cache = self.cache_kwargs(kv_group, dsa_two_groups)
@@ -2326,41 +2328,7 @@ class LMCacheConnectorV1Impl:
         self, config: LMCacheEngineConfig, vllm_config: "VllmConfig"
     ) -> None:
         """Apply extra config from vLLM to LMCache config."""
-        kv_connector_extra_config = (
-            vllm_config.kv_transfer_config.kv_connector_extra_config
-        )
-        if kv_connector_extra_config:
-            for key, value in kv_connector_extra_config.items():
-                if key.startswith("lmcache."):
-                    config_key = key[8:]  # Remove "lmcache." prefix
-                    if validate_and_set_config_value(config, config_key, value):
-                        logger.info(
-                            "Updated config %s from vLLM extra config",
-                            config_key,
-                        )
-
-        if config.extra_config is None:
-            config.extra_config = {}
-
-        model_config = getattr(vllm_config, "model_config", None)
-        scheduler_config = getattr(vllm_config, "scheduler_config", None)
-        if model_config is not None:
-            max_model_len = getattr(model_config, "max_model_len", None)
-            if max_model_len is not None:
-                config.extra_config["vllm_max_model_len"] = max_model_len
-        if scheduler_config is not None:
-            max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
-            if max_num_seqs is not None:
-                config.extra_config["vllm_max_num_seqs"] = max_num_seqs
-            max_num_batched_tokens = getattr(
-                scheduler_config,
-                "max_num_batched_tokens",
-                None,
-            )
-            if max_num_batched_tokens is not None:
-                config.extra_config["vllm_max_num_batched_tokens"] = (
-                    max_num_batched_tokens
-                )
+        apply_vllm_config_overrides(config, vllm_config)
 
     @staticmethod
     def _derive_runtime_kv_group_layer_counts(
@@ -4536,6 +4504,21 @@ class LMCacheConnectorV1Impl:
     ) -> bool:
         if result.request_id != request.req_id or result.kv_group != kv_group:
             return False
+        if getattr(result, "process_store_plan", None) is not None:
+            state = self._worker_retrieve_state.get(request.req_id)
+            end = result.process_store_plan.get("promoted_end", 0)
+            required_end = getattr(request, "decode_window_end", None)
+            if required_end is None:
+                required_end = len(request.token_ids)
+            return bool(
+                state is not None and end > 0
+                and end >= int(required_end)
+                and state.token_count >= end and state.indexer_npu_resident
+                and self.lmcache_engine.compact_source_importer.is_certified_source(
+                    state.prepared_sparse_sources.get(0), request.req_id,
+                    state.process_load_generation,
+                )
+            )
         starts = result.starts
         ends = result.ends
         memory_objs = result.memory_objs
@@ -4579,6 +4562,11 @@ class LMCacheConnectorV1Impl:
         )
 
     def _drop_layerwise_save_storers(self, req_id: str) -> None:
+        promotions = getattr(self, "_process_store_promotions", None)
+        if promotions:
+            for key in tuple(promotions):
+                if key[0] == req_id:
+                    promotions.pop(key)
         prepared_storer_keys = getattr(
             self,
             "_layerwise_prefill_prepared_storer_keys",
@@ -4612,6 +4600,14 @@ class LMCacheConnectorV1Impl:
         saved_expected = dict(expected or {})
         for request in requests:
             self._drop_layerwise_save_storers(request.req_id)
+        if (
+            getattr(self, "_process_store_step_slot", None) is not None
+            and not self._layerwise_save_storers
+            and not self._deferred_latent_pending
+        ):
+            from lmcache.integration.vllm.storage_process import finish_store_step
+
+            finish_store_step(self)
         if expected is not None:
             expected.update(saved_expected)
 
@@ -4871,6 +4867,11 @@ class LMCacheConnectorV1Impl:
             getattr(connector_output, "finished_recving", None) or ()
         )
         for req_id in finished_recving:
+            if getattr(self.config, "decoder_storage_mode", "local") == "process":
+                # The worker's prepared leases outlive the independent lookup
+                # ticket. Also reconcile a request aborted after cold dispatch,
+                # whose request_finished deliberately deferred this cleanup.
+                self._release_request_lookup_pins(req_id)
             attempts = getattr(self, "_checkpoint_restore_attempts", None)
             attempt = attempts.pop(req_id, None) if attempts else None
             if attempt is not None:
@@ -5318,6 +5319,10 @@ class LMCacheConnectorV1Impl:
         return finished_sending
 
     def _complete_worker_save_step(self) -> None:
+        if getattr(self, "_process_store_step_slot", None) is not None:
+            from lmcache.integration.vllm.storage_process import finish_store_step
+
+            finish_store_step(self)
         self._wait_for_save_done = True
         pending_req_ids = getattr(self, "_finished_req_ids_waiting_for_save", None)
         if not pending_req_ids:
@@ -5361,6 +5366,10 @@ class LMCacheConnectorV1Impl:
         )
         state.dense_load_readiness_consumed = False
         state.dense_load_source_owners = ()
+        if getattr(engine, "storage_process", None) is not None:
+            from lmcache.integration.vllm.storage_process import release_sources
+
+            release_sources(state, engine)
         state.cold_publication_proof = None
         state.prepared_sparse_sources.clear()
         release_pointer_cache = getattr(
@@ -5757,6 +5766,12 @@ class LMCacheConnectorV1Impl:
             or not getattr(engine, "enable_shared_cpu_cache", False)
             or not request.is_sparse_decode
         ):
+            return
+
+        if getattr(engine, "storage_process", None) is not None:
+            from lmcache.integration.vllm.storage_process import record_state
+
+            record_state(self, state, request)
             return
 
         def has_entries(layers: list[list[Any]]) -> bool:
@@ -6880,6 +6895,11 @@ class LMCacheConnectorV1Impl:
             raise RuntimeError(
                 f"Unsupported layerwise store result group {result.kv_group}"
             )
+        if getattr(result, "process_store_plan", None) is not None:
+            from lmcache.integration.vllm.storage_process import promote_store
+
+            promote_store(self, request, result)
+            return
         if (
             request.is_sparse_decode
             or not hasattr(self, "_worker_retrieve_state")
@@ -7006,6 +7026,15 @@ class LMCacheConnectorV1Impl:
         token_count: int,
     ) -> None:
         """Seal complete per-group source caches after bootstrap or store."""
+        if getattr(self.lmcache_engine, "storage_process", None) is not None:
+            if any(
+                source.total_tokens != token_count
+                for source in state.prepared_sparse_sources.values()
+            ):
+                raise RuntimeError(
+                    "Process source growth requires a newly prepared generation"
+                )
+            return
         state.cold_publication_proof = None
         prepared: dict[int, PreparedSparseSource] = {}
         dsa_two_groups = self._is_dsa_two_groups()
@@ -7397,6 +7426,10 @@ class LMCacheConnectorV1Impl:
         with startup_phase("kv_layer_groups"):
             self._refresh_kvcaches_list()
             self._build_kv_layer_groups()
+            if self.lmcache_engine.storage_process is not None:
+                self.lmcache_engine.prepare_storage_layout({
+                    group: self._kvcaches_for_group(group) for group in (0, 1)
+                })
         with startup_phase("manager_post_init"):
             self._manager.post_init()
         preflight = getattr(
@@ -7571,9 +7604,15 @@ class LMCacheConnectorV1Impl:
                       "dsa_cold_resident_load", False) else "dsa_cold_compact"),
             )
         executor = self._get_dsa_cold_load_executor()
+        process_storage = getattr(self.lmcache_engine, "storage_process", None)
+        if process_storage is not None:
+            from lmcache.integration.vllm.storage_process import submit_prepare
+
+            submit_prepare(self, plan)
         prepare_chunks = getattr(self.lmcache_engine, "prepare_cold_chunk_plan", None)
         if (
-            callable(prepare_chunks)
+            process_storage is None
+            and callable(prepare_chunks)
             and request.load_spec.dsa_group1_direct_hbm
             and not getattr(request.load_spec, "dsa_cold_resident_load", False)
         ):
@@ -7928,6 +7967,10 @@ class LMCacheConnectorV1Impl:
         self, plan: ColdLoadPlan, npu_device_id: Optional[int]
     ) -> ColdIndexerResult:
         """Load Group 1 densely after Group 0 shared-CPU publication."""
+        if getattr(self.lmcache_engine, "storage_process", None) is not None:
+            from lmcache.integration.vllm.storage_process import run_indexer
+
+            return run_indexer(self, plan, npu_device_id)
         perf_breakdown = {} if serving_perf_enabled() else None
         thread_started = (
             time.thread_time_ns() if perf_breakdown is not None else 0
@@ -8242,6 +8285,13 @@ class LMCacheConnectorV1Impl:
         previous_latent_future: Optional[Future] = None,
         live_state: Optional[WorkerRetrieveState] = None,
     ) -> WorkerRetrieveState:
+        if getattr(self.lmcache_engine, "storage_process", None) is not None:
+            from lmcache.integration.vllm.storage_process import run_cold
+
+            return run_cold(
+                self, plan, npu_device_id, indexer_future,
+                previous_latent_future, live_state,
+            )
         if npu_device_id is not None:
             torch.npu.set_device(npu_device_id)
         request = plan["request"]
@@ -8784,6 +8834,43 @@ class LMCacheConnectorV1Impl:
                     token_count,
                     len(slot_mapping),
                 )
+
+            process_storage = getattr(self.lmcache_engine, "storage_process", None)
+            if process_storage is not None and (
+                not request.is_sparse_decode
+                or self._prepared_sparse_source(
+                    self._worker_retrieve_state.get(request.req_id), 0, token_count
+                ) is None
+            ):
+                from lmcache.integration.vllm.storage_process import ordinary_layerwise_load
+
+                indexer_slots = (
+                    request.indexer_slot_mapping[0]
+                    if request.indexer_slot_mapping else None
+                )
+                if indexer_slots is None:
+                    indexer_slots = self._indexer_retrieve_slot_mapping(
+                        attn_metadata, token_count,
+                        self._indexer_layer_names[0] if self._indexer_layer_names else None,
+                    )
+                if indexer_slots is None:
+                    raise RuntimeError("Ordinary process prefix has no Group-1 slots")
+                if token_mask is None:
+                    token_mask = torch.ones(token_count, dtype=torch.bool)
+                pair = ordinary_layerwise_load(
+                    self, request, retrieve_tokens, token_mask,
+                    slot_mapping, indexer_slots, request_ordinal=idx,
+                )
+                self.layerwise_retrievers.append(pair)
+                self._layerwise_requests.append(request)
+                self._layerwise_retriever_is_sparse.append(request.is_sparse_decode)
+                self._layerwise_sparse_shared_ordered.append(False)
+                if request.is_sparse_decode:
+                    next(pair[0])
+                    next(pair[1])
+                else:
+                    self._prime_dense_prefix_retrievers(pair[0], pair[1])
+                continue
 
             if self.use_layerwise or request.is_sparse_decode:
                 sync = load_idx == len(loadable_requests) - 1
@@ -10780,6 +10867,10 @@ class LMCacheConnectorV1Impl:
             "decode_window_size": getattr(request, "decode_window_size", None),
             "request_configs": request.request_configs,
         }
+        if getattr(self.lmcache_engine, "storage_process", None) is not None:
+            from lmcache.integration.vllm.storage_process import reserve_store_step
+
+            store_kwargs["process_collective_predecessor"] = reserve_store_step(self)
         if self._layerwise_prefill_p_node:
             store_kwargs["layerwise_prefill_bank_offset"] = (
                 int(request.layerwise_prefill_bank_offset) & 1
@@ -11994,6 +12085,9 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        native_sources = getattr(self.lmcache_engine, "native_source_lifetime", None)
+        if native_sources is not None and native_sources.retirements_pending:
+            native_sources.drain()
         perf_enabled = serving_perf_enabled()
         finished_started = serving_perf_now() if perf_enabled else 0.0
         finished_thread_started = time.thread_time_ns() if perf_enabled else 0
@@ -12090,11 +12184,23 @@ class LMCacheConnectorV1Impl:
                     entry, f"Live split connector is shutting down: {req_id}"
                 )
             live_pending.clear()
+        if getattr(self, "_process_store_step_slot", None) is not None:
+            from lmcache.integration.vllm.storage_process import finish_store_step
+
+            for storer in tuple(self._layerwise_save_storers.values()):
+                storer.close()
+            self._layerwise_save_storers.clear()
+            self._deferred_latent_pending.clear()
+            finish_store_step(self)
         executor = getattr(getattr(self, "_cold_load_coordinator", None), "executor", None)
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=False)
             self._synchronize_dsa_cold_dense_load()
         self._drain_dense_load_retirements(block=True)
+        if getattr(self.lmcache_engine, "storage_process", None) is not None:
+            from lmcache.integration.vllm.storage_process import release_shutdown_states
+
+            release_shutdown_states(self)
         self._manager.stop_services()
 
     ###################
@@ -12537,6 +12643,10 @@ class LMCacheConnectorV1Impl:
             can_load=False,
             dsa_current_released_frontier=0,
         )
+        if getattr(self.config, "decoder_storage_mode", "local") == "process":
+            self.load_specs[req_id].cpu_source_ticket = (
+                self.lookup_client.peek_ticket(req_id)
+            )
         if (
             query_scope == "preemption_checkpoint"
             and num_external_hit_tokens > request_prompt_tokens
@@ -12727,6 +12837,12 @@ class LMCacheConnectorV1Impl:
         # Clear local status in lookup client when a new request is
         # successfully scheduled.
         assert self.lookup_client is not None
+        if getattr(self.config, "decoder_storage_mode", "local") == "process":
+            spec = self.load_specs.get(request.request_id)
+            if spec is not None and spec.cpu_source_ticket is None:
+                spec.cpu_source_ticket = self.lookup_client.peek_ticket(
+                    request.request_id
+                )
         self._resume_lookup_queries.pop(request.request_id, None)
         self.lookup_client.clear_lookup_status(request.request_id)
 

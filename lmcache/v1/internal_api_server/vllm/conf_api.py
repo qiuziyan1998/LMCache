@@ -117,6 +117,33 @@ async def set_config(request: Request):
             status_code=400,
         )
 
+    if getattr(config, "decoder_storage_mode", "local") == "process":
+        manager = request.app.state.lmcache_adapter
+        get_admin = getattr(manager, "get_storage_admin", None)
+        admin = get_admin() if get_admin is not None else None
+        if admin is None:
+            return JSONResponse(
+                content={"error": "Storage process is unavailable"}, status_code=503
+            )
+        try:
+            result = admin.update_config(body)
+        except Exception as error:
+            return JSONResponse(
+                content={
+                    "error": "Failed to update storage config", "message": str(error)
+                },
+                status_code=503,
+            )
+        # M validated the same public converters and ownership constraints.
+        # Mirror only successful keys after its definitive acknowledgement.
+        for key, value in result["updated"].items():
+            validate_and_set_config_value(config, key, value)
+        errors, updated = result.get("errors", {}), result["updated"]
+        status_code = 400 if errors and not updated else 200
+        if not errors:
+            result.pop("errors", None)
+        return JSONResponse(content=result, status_code=status_code)
+
     updated: Dict[str, Any] = {}
     errors: Dict[str, str] = {}
 

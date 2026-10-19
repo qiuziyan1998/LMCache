@@ -139,22 +139,30 @@ async def load_fs_chunks(
 
     remote_backend = None
     try:
-        config = await _load_config_from_file(request_body.config_path)
-        local_cpu_backend = lmcache_engine.storage_manager.allocator_backend
+        if getattr(lmcache_engine, "storage_process", None) is not None:
+            from lmcache.v1.rpc.storage_admin import get_engine_storage_admin
 
-        remote_backend = await _initialize_remote_backend(
-            config,
-            lmcache_engine.metadata,
-            local_cpu_backend,
-            lmcache_engine.storage_manager.loop,
-        )
+            result = get_engine_storage_admin(lmcache_engine).load_fs_chunks(
+                request_body.config_path, request_body.max_chunks,
+                request_body.max_failed_keys,
+            )
+        else:
+            config = await _load_config_from_file(request_body.config_path)
+            local_cpu_backend = lmcache_engine.storage_manager.allocator_backend
 
-        result = await _load_chunks_from_fs_connector(
-            remote_backend,
-            local_cpu_backend,
-            request_body.max_chunks,
-            request_body.max_failed_keys,
-        )
+            remote_backend = await _initialize_remote_backend(
+                config,
+                lmcache_engine.metadata,
+                local_cpu_backend,
+                lmcache_engine.storage_manager.loop,
+            )
+
+            result = await _load_chunks_from_fs_connector(
+                remote_backend,
+                local_cpu_backend,
+                request_body.max_chunks,
+                request_body.max_failed_keys,
+            )
 
         success_info = {
             "status": "success",

@@ -4,13 +4,16 @@
 # Standard
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 # Third Party
 import torch
 
 # First Party
 from lmcache.v1.memory_management import MemoryObj, TensorMemoryObj
+
+if TYPE_CHECKING:
+    from lmcache.v1.shared_cpu_cache import LocalLeaseHandle
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +48,18 @@ class PreparedSparseSource:
     graph_owners: Optional[tuple[TensorMemoryObj, ...]] = field(
         default=None, init=False, repr=False, compare=False
     )
+    # Compact service sources use an explicit local hold, never fake MemoryObjs.
+    owner_lease: Optional["LocalLeaseHandle"] = field(
+        default=None, repr=False, compare=False
+    )
+    # Complete CPU packet capacities, distinct from logical consumed coverage.
+    # Only compact imports need this; legacy sources retain their existing ABI.
+    physical_chunk_token_counts: tuple[tuple[int, ...], ...] = field(
+        default_factory=tuple
+    )
+    compact_transfer_metadata: Optional[dict] = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
 
 def build_prepared_sparse_source(
@@ -58,6 +73,7 @@ def build_prepared_sparse_source(
     cached_memory_objs: Optional[Sequence[Sequence[MemoryObj]]] = None,
     chunk_size: Optional[int] = None,
     prepare_graph_owners: bool = False,
+    owner_lease: Optional["LocalLeaseHandle"] = None,
 ) -> Optional[PreparedSparseSource]:
     """Seal a complete layer cache into immutable hot-path source metadata.
 
@@ -73,6 +89,7 @@ def build_prepared_sparse_source(
             per-chunk typed views.
         chunk_size: Optional configured chunk size to validate once at sealing.
         prepare_graph_owners: Cache complete allocator ownership for graph leases.
+        owner_lease: Validated compact source's explicit local ownership hold.
 
     Returns:
         A prepared source, or ``None`` while bootstrap data is incomplete.
@@ -89,11 +106,13 @@ def build_prepared_sparse_source(
         return None
     if chunk_size is not None and chunk_size <= 0:
         raise ValueError("Prepared sparse chunk size must be positive.")
+    if owner_lease is not None and not owner_lease.is_valid():
+        raise ValueError("Prepared sparse source lease has already been released.")
     tensors_complete = len(cached_tensors) == num_layers
     owners_complete = (
         cached_memory_objs is not None and len(cached_memory_objs) == num_layers
     )
-    if not tensors_complete and not owners_complete:
+    if not tensors_complete and not owners_complete and owner_lease is None:
         return None
     if len(cached_chunk_ptrs_npu) != num_layers:
         return None
@@ -138,6 +157,8 @@ def build_prepared_sparse_source(
             raise ValueError(
                 "Prepared sparse chunk coverage exceeds the configured chunk layout."
             )
+    if owner_lease is not None and not normalized_chunk_counts:
+        raise ValueError("Compact sparse sources require exact chunk token coverage.")
 
     layers: list[PreparedSparseSourceLayer] = []
     pointer_device: Optional[torch.device] = None
@@ -155,6 +176,8 @@ def build_prepared_sparse_source(
             else ()
         )
         chunk_counts = {len(chunks) for chunks in (tensors, memory_objs) if chunks}
+        if owner_lease is not None:
+            chunk_counts.add(len(normalized_chunk_counts))
         if not chunk_counts:
             return None
         if len(chunk_counts) != 1:
@@ -235,11 +258,11 @@ def build_prepared_sparse_source(
         total_tokens=int(total_tokens),
         chunk_token_counts=normalized_chunk_counts,
         pointer_device=pointer_device,
+        owner_lease=owner_lease,
     )
     object.__setattr__(source, "validated_chunk_size", chunk_size)
     if prepare_graph_owners and all(
-        len(layer.memory_objs) == len(normalized_chunk_counts)
-        and layer.memory_objs
+        len(layer.memory_objs) == len(normalized_chunk_counts) and layer.memory_objs
         for layer in layer_tuple
     ):
         owners = {
@@ -247,4 +270,56 @@ def build_prepared_sparse_source(
         }
         if all(isinstance(owner, TensorMemoryObj) for owner in owners.values()):
             object.__setattr__(source, "graph_owners", tuple(owners.values()))
+    return source
+
+
+def build_compact_prepared_sparse_source(
+    chunk_ptrs_npu: Sequence[torch.Tensor],
+    *,
+    num_layers: int,
+    total_tokens: int,
+    chunk_token_counts: Sequence[int],
+    owner_lease: "LocalLeaseHandle",
+    chunk_size: int,
+    expected_pointer_device: Optional[torch.device] = None,
+    physical_chunk_token_counts: Optional[Sequence[Sequence[int]]] = None,
+) -> PreparedSparseSource:
+    """Seal pointer rows after compact manifest extent/identity validation.
+
+    The importer validates actual physical geometry and constructs these rows
+    from its own mapped device base. This builder validates row/device and token
+    coverage using the ordinary prepared path. It borrows the caller's explicit
+    lease hold; consumers acquire separate holds for asynchronous device access.
+    No tensor views or allocator proxies are created for individual CPU chunks.
+    """
+    source = build_prepared_sparse_source(
+        (),
+        chunk_ptrs_npu,
+        num_layers=num_layers,
+        total_tokens=total_tokens,
+        chunk_token_counts=chunk_token_counts,
+        expected_pointer_device=expected_pointer_device,
+        chunk_size=chunk_size,
+        owner_lease=owner_lease,
+    )
+    if source is None:
+        raise ValueError(
+            "Compact sparse source requires complete layers and token coverage."
+        )
+    if physical_chunk_token_counts is not None:
+        physical = tuple(tuple(row) for row in physical_chunk_token_counts)
+        if len(physical) != num_layers or any(
+            len(row) != len(source.chunk_token_counts)
+            or any(
+                type(capacity) is not int or not valid <= capacity <= chunk_size
+                for capacity, valid in zip(row, source.chunk_token_counts, strict=True)
+            )
+            for row in physical
+        ):
+            raise ValueError(
+                "Compact source physical capacities disagree with coverage."
+            )
+        object.__setattr__(source, "physical_chunk_token_counts", physical)
+        if any(row[-1] != source.chunk_token_counts[-1] for row in physical):
+            object.__setattr__(source, "compact_transfer_metadata", {})
     return source

@@ -62,6 +62,7 @@ class SourcePublisher:
     _cached_ranges_cover_prefix = load_prepare_method("_cached_ranges_cover_prefix")
 
     def __init__(self, layers: int) -> None:
+        self.lmcache_engine = SimpleNamespace(storage_process=None)
         self.layers = layers
         self.device = torch.device("cpu")
         self._lmcache_chunk_size = 256

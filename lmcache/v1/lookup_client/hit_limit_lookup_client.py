@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 # Third Party
 import torch
@@ -78,6 +78,10 @@ class HitLimitLookupClient(LookupClientInterface):
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.actual_lookup_client.clear_lookup_status(lookup_id)
+
+    def peek_ticket(self, lookup_id: str) -> Optional[Any]:
+        """Return the wrapped client's source ticket without changing its holds."""
+        return self.actual_lookup_client.peek_ticket(lookup_id)
 
     def cleanup_lookup(self, lookup_id: str) -> None:
         self.actual_lookup_client.cleanup_lookup(lookup_id)

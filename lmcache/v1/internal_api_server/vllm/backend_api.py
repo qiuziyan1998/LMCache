@@ -18,8 +18,12 @@ def _get_storage_manager(request: Request):
     Returns:
         The StorageManager instance, or None if unavailable.
     """
+    manager = request.app.state.lmcache_adapter
+    get_admin = getattr(manager, "get_storage_admin", None)
+    if get_admin is not None:
+        return get_admin()
     engine = getattr(
-        request.app.state.lmcache_adapter,
+        manager,
         "lmcache_engine",
         None,
     )

@@ -26,7 +26,8 @@ def _get_storage_manager(request: Request):
             content=error_info,
             status_code=503,
         )
-    sm = lmcache_engine.storage_manager
+    get_admin = getattr(lmcache_adapter, "get_storage_admin", None)
+    sm = get_admin() if get_admin is not None else lmcache_engine.storage_manager
     if sm is None:
         error_info = {
             "error": "Bypass API is unavailable",

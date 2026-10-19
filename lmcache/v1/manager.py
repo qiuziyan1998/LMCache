@@ -89,6 +89,7 @@ class LMCacheManager:
         self._offload_server: Optional[ZMQOffloadServer] = None
         self._runtime_plugin_launcher: Optional[RuntimePluginLauncher] = None
         self._api_server: Optional[InternalAPIServer] = None
+        self._storage_admin: Any = None
 
         # Initialize components via service factory
         try:
@@ -106,6 +107,8 @@ class LMCacheManager:
         except Exception as e:
             self._init_failed = True
             self._init_failed_reason = "".join(traceback.format_exception(e))
+            if getattr(config, "decoder_storage_mode", "local") == "process":
+                raise  # A second local owner/recompute fallback is unsafe here.
             logger.error(
                 "Failed to initialize LMCacheManager components: %s. "
                 "System will operate in degraded mode (recompute).",
@@ -161,6 +164,30 @@ class LMCacheManager:
     def config(self) -> LMCacheEngineConfig:
         """Get the LMCache engine configuration."""
         return self._config
+
+    def get_storage_admin(self) -> Any:
+        """Return the existing CPU owner or its process administration facade."""
+        from lmcache.v1.rpc.storage_admin import (
+            StorageAdminClient,
+            get_engine_storage_admin,
+        )
+
+        if self._lmcache_engine is not None:
+            return get_engine_storage_admin(self._lmcache_engine)
+        if getattr(self._config, "decoder_storage_mode", "local") != "process":
+            return None
+        if self._storage_admin is None:
+            client = self._lookup_client
+            while client is not None and hasattr(client, "actual_lookup_client"):
+                client = client.actual_lookup_client
+            if client is None or not callable(
+                getattr(client, "get_storage_client", None)
+            ):
+                return None
+            self._storage_admin = StorageAdminClient(
+                client.get_storage_client(), self._config
+            )
+        return self._storage_admin
 
     # ==================== Lifecycle Methods ====================
 
@@ -260,6 +287,8 @@ class LMCacheManager:
         )
 
     def _shared_cpu_startup_required(self) -> bool:
+        if getattr(self._config, "decoder_storage_mode", "local") == "process":
+            return True
         return bool(
             os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
             .strip().lower() == "true"
@@ -342,6 +371,13 @@ class LMCacheManager:
         # Close lookup client
         if self._lookup_client is not None:
             _safe_close("lookup_client", self._lookup_client.close, timeout=10.0)
+        if (getattr(self._config, "decoder_storage_mode", "local") == "process"
+            and getattr(self._lmcache_engine_metadata, "role", None) == "scheduler"):
+            from lmcache.v1.lookup_client.storage_lookup_client import (
+                close_scheduler_storage,
+            )
+
+            close_scheduler_storage(self._lmcache_engine_metadata.engine_id)
 
         # Destroy cache engine
         engine_instance_id = self._service_factory.get_engine_instance_id()
@@ -469,6 +505,8 @@ class LMCacheManager:
         # First Party
         from lmcache.v1.lookup_client.factory import LookupClientFactory
 
+        if getattr(self._config, "decoder_storage_mode", "local") == "process":
+            return {"error": "Decoder lookup is owned by the storage process"}
         if self._lmcache_engine is None:
             return {"error": "engine not available"}
         if self._lmcache_engine_metadata is None:
@@ -560,6 +598,12 @@ class LMCacheManager:
         """
         if self._init_failed:
             return False
+        client = self._lookup_client
+        while client is not None and hasattr(client, "actual_lookup_client"):
+            client = client.actual_lookup_client
+        if client is not None and callable(getattr(client, "is_healthy", None)):
+            if not client.is_healthy():
+                return False
         if self._lmcache_engine is not None and not self._lmcache_engine.is_healthy():
             return False
         if self._health_monitor is not None:

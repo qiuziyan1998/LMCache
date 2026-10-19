@@ -13,7 +13,15 @@ from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 
-ServiceKind = Literal["lookup", "offload", "lookup_worker", "lookup_scheduler"]
+ServiceKind = Literal[
+    "lookup",
+    "offload",
+    "lookup_worker",
+    "lookup_scheduler",
+    "storage_work",
+    "storage_lifecycle",
+    "storage_bootstrap",
+]
 
 # Default timeout constants for socket operations (in milliseconds)
 DEFAULT_SOCKET_RECV_TIMEOUT_MS = 30000
@@ -111,12 +119,13 @@ def get_zmq_rpc_path_lmcache(
     rank: int = 0,
     base_url: Optional[str] = None,
 ) -> str:
-    """Get the ZMQ RPC path for LMCache lookup and offload communication.
+    """Get the instance- and rank-scoped ZMQ RPC path for an LMCache service.
 
     Args:
         engine_id: The engine ID for the RPC path.
         service_name: The service name, one of 'lookup', 'offload',
-            'lookup_worker', 'lookup_scheduler'.
+            'lookup_worker', 'lookup_scheduler', 'storage_work',
+            'storage_lifecycle', 'storage_bootstrap'.
         rpc_port: The RPC port number.
         rank: The rank of the worker.
         base_url: Optional base URL for the socket path. If not provided,
@@ -139,10 +148,16 @@ def get_zmq_rpc_path_lmcache(
             # Ensure the directory exists for IPC socket
             os.makedirs(base_url, exist_ok=True)
 
-    if service_name not in {"lookup", "offload", "lookup_worker", "lookup_scheduler"}:
-        raise ValueError(
-            f"service_name must be 'lookup' or 'offload', got {service_name!r}"
-        )
+    if service_name not in {
+        "lookup",
+        "offload",
+        "lookup_worker",
+        "lookup_scheduler",
+        "storage_work",
+        "storage_lifecycle",
+        "storage_bootstrap",
+    }:
+        raise ValueError(f"Unsupported LMCache service_name: {service_name!r}")
 
     if isinstance(rpc_port, str):
         rpc_port = rpc_port + str(rank)
