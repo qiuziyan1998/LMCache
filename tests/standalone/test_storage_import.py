@@ -335,3 +335,27 @@ def test_lazy_diagnostic_views_preserve_actual_page_offsets_and_parent_lifetime(
     assert not importer.is_certified_source(source, "req", 2)
     source.owner_lease.release("fenced")
     assert len(client.calls) == 1
+
+
+def test_merged_source_reuses_one_immutable_capacity_row_across_layers():
+    importer, reply, client = fixture()
+    manifest = msgspec.structs.replace(
+        reply.groups[0],
+        page_offsets=pack_uints([64, 128]),
+        page_extents=pack_uints([64, 64]),
+        geometry_ids=pack_uints([0, 0], 32),
+        flat_offsets=b"",
+        flat_extents=b"",
+        flat_logical_sizes=b"",
+        flat_token_capacities=b"",
+    )
+    source = imported(importer, msgspec.structs.replace(reply, groups=(manifest,)))[0]
+    try:
+        rows = source.physical_chunk_token_counts
+        assert rows == ((4, 4), (4, 4))
+        assert rows[0] is rows[1]
+        assert source.chunk_token_counts == (4, 1)
+        assert source.compact_transfer_metadata == {}
+    finally:
+        source.owner_lease.release("fenced")
+    assert len(client.calls) == 1

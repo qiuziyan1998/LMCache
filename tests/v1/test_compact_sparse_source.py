@@ -158,3 +158,41 @@ def test_compact_source_rejects_malformed_pointer_rows(rows, match):
             owner_lease=lease, chunk_size=4,
         )
     lease.close()
+
+
+def test_compact_capacity_validation_visits_shared_row_once(monkeypatch):
+    from lmcache.v1.gpu_connector import sparse
+
+    calls = []
+
+    def checked_type(value):
+        calls.append(value)
+        return type(value)
+
+    monkeypatch.setattr(sparse, "type", checked_type, raising=False)
+    lease, _, _ = make_lease()
+    row = (4, 4)
+    try:
+        source = build_compact_prepared_sparse_source(
+            [torch.tensor([101, 102])] * 79,
+            num_layers=79,
+            total_tokens=6,
+            chunk_token_counts=(4, 2),
+            owner_lease=lease,
+            chunk_size=4,
+            physical_chunk_token_counts=(row,) * 79,
+        )
+        assert calls == [4, 4]
+        assert all(item is row for item in source.physical_chunk_token_counts)
+    finally:
+        lease.close()
+
+
+@pytest.mark.parametrize("bad", [(4, 0), (4, 5), (4, True), (4, 2.0), (4,), ()])
+def test_compact_capacity_validation_checks_distinct_later_rows(bad):
+    lease, _, _ = make_lease()
+    try:
+        with pytest.raises(ValueError, match="physical capacities"):
+            compact_source(lease, physical_chunk_token_counts=((4, 4), bad))
+    finally:
+        lease.close()

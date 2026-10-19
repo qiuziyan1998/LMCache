@@ -308,17 +308,23 @@ def build_compact_prepared_sparse_source(
         )
     if physical_chunk_token_counts is not None:
         physical = tuple(tuple(row) for row in physical_chunk_token_counts)
-        if len(physical) != num_layers or any(
-            len(row) != len(source.chunk_token_counts)
-            or any(
-                type(capacity) is not int or not valid <= capacity <= chunk_size
-                for capacity, valid in zip(row, source.chunk_token_counts, strict=True)
-            )
-            for row in physical
-        ):
+        if len(physical) != num_layers:
             raise ValueError(
                 "Compact source physical capacities disagree with coverage."
             )
+        previous = None
+        for row in physical:
+            # Only skip an identical immutable row already checked in this call.
+            if row is previous:
+                continue
+            if len(row) != len(source.chunk_token_counts) or any(
+                type(capacity) is not int or not valid <= capacity <= chunk_size
+                for capacity, valid in zip(row, source.chunk_token_counts, strict=True)
+            ):
+                raise ValueError(
+                    "Compact source physical capacities disagree with coverage."
+                )
+            previous = row
         object.__setattr__(source, "physical_chunk_token_counts", physical)
         if any(row[-1] != source.chunk_token_counts[-1] for row in physical):
             object.__setattr__(source, "compact_transfer_metadata", {})

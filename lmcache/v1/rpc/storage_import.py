@@ -112,6 +112,11 @@ def source_physical_token_counts(
 ) -> tuple[tuple[int, ...], ...]:
     """Read certified packet capacities once, in the canonical chunk order."""
     indices = np.frombuffer(manifest.geometry_ids, dtype="<u4")
+    if len(indices) == len(manifest.chunk_starts):
+        # A merged allocation has one packet capacity shared by every layer.
+        # Keep that immutable geometry compact through worker/graph import.
+        row = tuple(manifest.geometries[int(index)].token_capacity for index in indices)
+        return (row,) * layers
     capacities = [[0] * len(manifest.chunk_starts) for _ in range(layers)]
     for page, position in enumerate(manifest.page_positions()):
         capacity = manifest.geometries[int(indices[page])].token_capacity
