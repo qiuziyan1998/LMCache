@@ -533,15 +533,13 @@ class CPUCacheRuntime(CPUCacheOperations):
                     (i for i, (_, page) in enumerate(plan) if not page), len(plan)
                 )
                 mixed_order = any(page for _, page in plan[page_count:])
-                layer_keys = [
-                    [
-                        self._lookup_key_for_kv_group(
-                            key, kv_group=group, request_configs=data["request_configs"]
-                        ).split_layers(self.num_layers_for_group(group))[layer]
-                        for _, _, key in selected
-                    ]
-                    for layer in range(self.num_layers_for_group(group))
-                ]
+                layer_keys = [[] for _ in range(self.num_layers_for_group(group))]
+                for _, _, key in selected:
+                    keys = self._lookup_key_for_kv_group(
+                        key, kv_group=group, request_configs=data["request_configs"]
+                    ).split_layers(len(layer_keys))
+                    for row, layer_key in zip(layer_keys, keys, strict=True):
+                        row.append(layer_key)
                 page_positions = None
                 if mixed_order:
                     rows, acquisitions, page_positions = self._resolve_mixed_sources(

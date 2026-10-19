@@ -43,6 +43,7 @@ class _Lookup:
     ticket: StorageLookupTicket | None = None
     cleanup: StorageFuture | None = None
     cleanup_phase: str = "cancel"
+    retry_at: float = 0.0
 
 
 class StorageLookupClient(LookupClientInterface):
@@ -320,7 +321,7 @@ class StorageLookupClient(LookupClientInterface):
         self.reqs_status[lookup_id] = reply.matched_tokens
         return reply.matched_tokens
 
-    def _poll_cleanup(self, lookup_id: str) -> bool:
+    def _poll_cleanup(self, lookup_id: str, *, retry_pending: bool = False) -> bool:
         entries = self._cleaning.get(lookup_id, [])
         remaining = []
         for entry in entries:
@@ -340,6 +341,15 @@ class StorageLookupClient(LookupClientInterface):
                 remaining.append(entry)
                 continue
             if entry.cleanup_phase == "ack" and result.status == "PENDING":
+                # A claimed ticket, or one published just after CANCEL, can
+                # outlive the first ACK. Retry on the cleanup thread without
+                # cancelling the worker's independent preparation ownership.
+                if retry_pending and time.monotonic() >= entry.retry_at:
+                    entry.cleanup = self._get_client().cancel(entry.future.identity)
+                    entry.cleanup_phase = "cancel"
+                    entry.cleanup.add_done_callback(
+                        lambda _, key=lookup_id: self._continue_cleanup(key)
+                    )
                 remaining.append(entry)
                 continue
             summary = result.value if isinstance(result.value, dict) else {}
@@ -349,6 +359,7 @@ class StorageLookupClient(LookupClientInterface):
                 entry.future.identity, payload
             )
             entry.cleanup_phase = "ack"
+            entry.retry_at = time.monotonic() + 0.05
             entry.cleanup.add_done_callback(
                 lambda _, key=lookup_id: self._continue_cleanup(key)
             )
@@ -363,17 +374,27 @@ class StorageLookupClient(LookupClientInterface):
         self._cleanup_wake.set()
 
     def _cleanup_loop(self) -> None:
+        retry_timeout = None
         while True:
-            self._cleanup_wake.wait()
+            self._cleanup_wake.wait(retry_timeout)
             self._cleanup_wake.clear()
             with self._lock:
                 if self._closed:
                     return
                 for lookup_id in tuple(self._cleaning):
                     try:
-                        self._poll_cleanup(lookup_id)
+                        self._poll_cleanup(lookup_id, retry_pending=True)
                     except Exception as error:
                         self._get_client().mark_fatal(
                             f"Storage lookup cleanup failed: {error}"
                         )
                         return
+                retry_timeout = (
+                    0.05
+                    if any(
+                        entry.cleanup_phase == "ack" and entry.retry_at
+                        for entries in self._cleaning.values()
+                        for entry in entries
+                    )
+                    else None
+                )
