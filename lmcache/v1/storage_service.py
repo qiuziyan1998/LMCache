@@ -12,22 +12,23 @@ import json
 import os
 import sys
 import threading
+import time
 
 # Third Party
 import msgspec
 import zmq
 
 # First Party
-from lmcache.v1.cpu_cache import StorageBusy
+from lmcache.v1.cpu_cache import StorageBusy, validate_storage_work
 from lmcache.v1.rpc.storage_client import LIFECYCLE_METHODS
 from lmcache.v1.rpc.storage_protocol import (
     OperationIdentity,
     StorageRequest,
     StorageResult,
-    content_digest,
     decode_message,
     encode_message,
 )
+from lmcache.v1.rpc_utils import PollerWakeup
 
 
 class StorageRuntime(Protocol):
@@ -83,6 +84,7 @@ class StorageService:
         self.drain_error: BaseException | None = None
         self.send_backpressure = 0
         self._thread: threading.Thread | None = None
+        self._transport_wakeup = PollerWakeup()
 
     def start(self) -> None:
         """Start the sole socket owner and wait for endpoint binding or failure."""
@@ -103,18 +105,22 @@ class StorageService:
         """Quiesce admission and retain runtime ownership until admitted jobs drain."""
         self._quiescing.set()
         self._stop_requested.set()
+        self._transport_wakeup.notify()
         if self._thread is not None:
             self._thread.join(timeout)
             if self._thread.is_alive():
                 raise TimeoutError(
                     "Storage service still owns unresolved work or replies"
                 )
+        else:
+            self._transport_wakeup.close()
         if self.failure is not None:
             raise RuntimeError("Storage service failed") from self.failure
 
     def quiesce(self) -> None:
         """Reject new work on parent loss while retaining lifecycle/lease ownership."""
         self._quiescing.set()
+        self._transport_wakeup.notify()
         quiesce = getattr(self.runtime, "quiesce", None)
         if callable(quiesce):
             quiesce()
@@ -128,7 +134,7 @@ class StorageService:
             raise RuntimeError("Storage service failed") from self.failure
 
     def serve_forever(self) -> None:
-        """Run nonblocking sockets; no Future or executor queue waits in this loop."""
+        """Run nonblocking sockets; completions only signal the socket owner."""
         context = zmq.Context()
         sockets = []
         executors = {
@@ -138,14 +144,19 @@ class StorageService:
             "persist": ThreadPoolExecutor(1, thread_name_prefix="storage-persist"),
         }
         jobs: dict[tuple[bytes, tuple, int], tuple[Future, StorageRequest, str]] = {}
-        # Per-channel outboxes are bounded by admitted work plus each session's
-        # lifecycle credits. A blocked route does not block another route's sends.
         outboxes: tuple[OrderedDict, OrderedDict] = (OrderedDict(), OrderedDict())
         routes: dict[tuple[str, int], bytes] = {}
         fatal_notified: set[str] = set()
         terminal_notices: dict[tuple, StorageResult] = {}
+        # ROUTER POLLOUT is not route-specific. Retry blocked destinations at the
+        # previous polling cadence, while other destinations remain runnable.
+        route_retry: dict[tuple[int, bytes], float] = {}
+        retry_interval = 0.005
+        notifier = getattr(self.runtime, "set_transport_notifier", None)
+        notifier_complete = False
         try:
             poller = zmq.Poller()
+            poller.register(self._transport_wakeup.fileno(), zmq.POLLIN)
             for endpoint in self._endpoints:
                 socket = context.socket(zmq.ROUTER)
                 socket.setsockopt(zmq.LINGER, 0)
@@ -154,24 +165,60 @@ class StorageService:
                 socket.setsockopt(zmq.RCVHWM, self.socket_hwm)
                 socket.bind(endpoint)
                 sockets.append(socket)
-                poller.register(socket, zmq.POLLIN)
+            if callable(notifier):
+                notifier_complete = notifier(self._transport_wakeup.notify) is True
             self.ready.set()
+            immediate = True
             while True:
-                events = dict(poller.poll(5))
+                now = time.monotonic()
+                deadlines = []
+                if not notifier_complete:
+                    # Custom runtimes may change health without a notification.
+                    deadlines.append(now + retry_interval)
+                pending_routes = {
+                    (channel, key[0]) for channel in (1, 0) for key in outboxes[channel]
+                }
+                for route_key in tuple(route_retry):
+                    if route_key not in pending_routes:
+                        del route_retry[route_key]
+                for channel in (1, 0):
+                    limit = self.max_work * (8 * len(self.sessions) if channel else 2)
+                    mask = zmq.POLLIN if len(outboxes[channel]) < limit else 0
+                    eligible = False
+                    for key in outboxes[channel]:
+                        retry_at = route_retry.get((channel, key[0]), 0.0)
+                        if retry_at <= now:
+                            eligible = True
+                        else:
+                            deadlines.append(retry_at)
+                    if eligible:
+                        mask |= zmq.POLLOUT
+                    poller.register(sockets[channel], mask)
+                timeout = None
+                if immediate:
+                    timeout = 0
+                elif deadlines:
+                    # Round upward: an early zero timeout would spin until a
+                    # blocked route's retry deadline instead of waiting for it.
+                    timeout = max(1, int((min(deadlines) - now) * 1000 + 0.999))
+                events = dict(poller.poll(timeout))
+                if events.get(self._transport_wakeup.fileno(), 0) & zmq.POLLIN:
+                    self._transport_wakeup.drain()
+                immediate = False
                 drain_notices = getattr(
                     self.runtime, "drain_terminal_notifications", None
                 )
-                if drain_notices is not None:
+                if callable(drain_notices):
                     for notice in drain_notices():
                         terminal_notices[notice.identity.key] = notice
+                lifecycle_limit = self.max_work * 8 * len(self.sessions)
                 for key, notice in tuple(terminal_notices.items()):
                     route = routes.get((notice.identity.client_session, 1))
-                    if route is not None:
+                    if route is not None and len(outboxes[1]) < lifecycle_limit:
                         outboxes[1][(route, key, "terminal")] = encode_message(notice)
                         del terminal_notices[key]
                 for channel in (1, 0):
                     socket = sockets[channel]
-                    # Reserve response space before consuming another request.
                     limit = self.max_work * (8 * len(self.sessions) if channel else 2)
                     if (
                         events.get(socket, 0) & zmq.POLLIN
@@ -185,7 +232,7 @@ class StorageService:
                             try:
                                 request = decode_message(frames, StorageRequest)
                             except (ValueError, msgspec.DecodeError):
-                                continue  # No trustworthy identity to acknowledge.
+                                continue
                             key = (route, request.identity.key, request.correlation_id)
                             try:
                                 self._validate(request, bool(channel))
@@ -195,7 +242,7 @@ class StorageService:
                                 )
                                 routes[(session, channel)] = route
                                 if key in jobs or key in outboxes[channel]:
-                                    continue  # Existing reply/registry owns this retry.
+                                    continue
                                 if channel:
                                     result = self._handle(request)
                                     outboxes[channel][key] = encode_message(result)
@@ -245,43 +292,60 @@ class StorageService:
                                             self._reply(request, "BUSY")
                                         )
                                     else:
-                                        jobs[key] = (
-                                            executors[lane].submit(
-                                                self._handle, request
-                                            ),
-                                            request,
-                                            lane,
+                                        future = executors[lane].submit(
+                                            self._handle, request
                                         )
+                                        jobs[key] = (future, request, lane)
+                                        # A Future may already be done here. Its
+                                        # callback cannot inspect/mutate jobs or
+                                        # serialize results on an executor thread.
+                                        future.add_done_callback(self._job_completed)
                             except (ValueError, PermissionError) as error:
                                 outboxes[channel][key] = encode_message(
                                     self._reply(request, "REJECTED", error=str(error))
                                 )
                     if not channel:
+                        available = min(16, limit - len(outboxes[0]))
                         for key, (future, request, _) in tuple(jobs.items()):
+                            if available <= 0:
+                                break
                             if future.done():
-                                # _handle converts runtime failures into an unknown
-                                # completion result, never an allocator-free promise.
                                 outboxes[0][key] = encode_message(future.result())
                                 del jobs[key]
+                                available -= 1
                     for key in tuple(outboxes[channel])[:16]:
-                        route = key[0]
+                        route_key = (channel, key[0])
+                        if route_retry.get(route_key, 0.0) > time.monotonic():
+                            # Rotate even deferred routes: their queued replies
+                            # cannot starve another destination behind them.
+                            outboxes[channel].move_to_end(key)
+                            continue
                         try:
                             socket.send_multipart(
-                                [route, *outboxes[channel][key]],
+                                [key[0], *outboxes[channel][key]],
                                 zmq.NOBLOCK,
                                 copy=False,
                             )
                         except (zmq.Again, zmq.ZMQError):
                             self.send_backpressure += 1
+                            route_retry[route_key] = time.monotonic() + retry_interval
                             outboxes[channel].move_to_end(key)
                             continue
                         del outboxes[channel][key]
+                        route_retry.pop(route_key, None)
                 if not self.runtime.is_healthy():
                     self._quiescing.set()
                     for session, nonce in self.sessions.items():
                         channel = 1 if (session, 1) in routes else 0
                         route = routes.get((session, channel))
-                        if route is not None and session not in fatal_notified:
+                        limit = self.max_work * (
+                            8 * len(self.sessions) if channel else 2
+                        )
+                        if (
+                            route is not None
+                            and session not in fatal_notified
+                            and len(outboxes[channel]) < limit
+                        ):
                             identity = OperationIdentity(
                                 self.cache_instance_id,
                                 self.service_epoch,
@@ -305,13 +369,29 @@ class StorageService:
                                 encode_message(result)
                             )
                             fatal_notified.add(session)
+                now = time.monotonic()
+                immediate = (
+                    any(
+                        route_retry.get((channel, key[0]), 0.0) <= now
+                        for channel in (1, 0)
+                        for key in outboxes[channel]
+                    )
+                    or (
+                        len(outboxes[0]) < self.max_work * 2
+                        and any(future.done() for future, _, _ in jobs.values())
+                    )
+                    or (
+                        len(outboxes[1]) < lifecycle_limit
+                        and any(
+                            (notice.identity.client_session, 1) in routes
+                            for notice in terminal_notices.values()
+                        )
+                    )
+                )
                 if self._stop_requested.is_set() and not jobs and not any(outboxes):
-                    # Runtime.close owns its lease/quarantine drain contract.
                     try:
                         self.runtime.close()
                     except Exception as error:
-                        # A refused drain cannot become process exit: M must keep
-                        # its mappings alive while native access is uncertain.
                         self.drain_error = error
                         self._stop_requested.clear()
                     else:
@@ -320,11 +400,19 @@ class StorageService:
             self.failure = error
             self.ready.set()
         finally:
+            # Join every producer before detaching its signal target. A refused
+            # close above leaves this loop and its wakeup alive for later drain.
             for executor in executors.values():
                 executor.shutdown(wait=True, cancel_futures=False)
+            if callable(notifier):
+                notifier(None)
             for socket in sockets:
                 socket.close(linger=1000 if self._stop_requested.is_set() else 0)
             context.term()
+            self._transport_wakeup.close()
+
+    def _job_completed(self, future: Future) -> None:
+        self._transport_wakeup.notify()
 
     def _validate(self, request: StorageRequest, lifecycle: bool) -> None:
         identity = request.identity
@@ -341,14 +429,20 @@ class StorageService:
             raise PermissionError("Only the original session can control its operation")
         if lifecycle != (request.method.lower() in LIFECYCLE_METHODS):
             raise ValueError("Storage method sent on the wrong channel")
-        if not lifecycle and request.payload_digest != content_digest(
-            (request.method, request.payload)
-        ):
-            raise ValueError("Storage work payload digest mismatch")
 
     def _handle(self, request: StorageRequest) -> StorageResult:
+        validated = None
+        if request.method.lower() not in LIFECYCLE_METHODS:
+            try:
+                validated = validate_storage_work(request)
+            except ValueError as error:
+                return self._reply(request, "REJECTED", error=str(error))
         try:
-            result = self.runtime.handle(request)
+            handle_validated = getattr(self.runtime, "handle_validated", None)
+            if validated is not None and callable(handle_validated):
+                result = handle_validated(request, validated)
+            else:
+                result = self.runtime.handle(request)
             if (
                 not isinstance(result, StorageResult)
                 or result.identity != request.identity

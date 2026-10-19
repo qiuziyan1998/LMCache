@@ -3,6 +3,7 @@
 from typing import Literal, Optional
 import os
 import socket
+import threading
 
 # Third Party
 import zmq
@@ -26,6 +27,76 @@ ServiceKind = Literal[
 # Default timeout constants for socket operations (in milliseconds)
 DEFAULT_SOCKET_RECV_TIMEOUT_MS = 30000
 DEFAULT_SOCKET_SEND_TIMEOUT_MS = 10000
+
+
+class PollerWakeup:
+    """Nonblocking poller notification, independent of authoritative work queues.
+
+    Linux uses a CLOEXEC eventfd; other hosts use a nonblocking socket pair.
+    Notifications may coalesce. Callers must publish work before notifying and
+    drain before inspecting their queues. Close is idempotent, and late notify
+    calls are harmless rather than writing through a reused file descriptor.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._closed = False
+        self._reader: socket.socket | None = None
+        self._writer: socket.socket | None = None
+        if hasattr(os, "eventfd"):
+            self._fd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        else:
+            self._reader, self._writer = socket.socketpair()
+            self._reader.setblocking(False)
+            self._writer.setblocking(False)
+            self._reader.set_inheritable(False)
+            self._writer.set_inheritable(False)
+            self._fd = self._reader.fileno()
+
+    def fileno(self) -> int:
+        """Return the pollable descriptor, or -1 after close."""
+        with self._lock:
+            return -1 if self._closed else self._fd
+
+    def notify(self) -> None:
+        """Signal pending work without blocking; a full buffer is already ready."""
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                if self._writer is None:
+                    os.eventfd_write(self._fd, 1)
+                else:
+                    self._writer.send(b"\0")
+            except BlockingIOError:
+                pass
+
+    def drain(self) -> None:
+        """Consume pending signals before the owning loop inspects its queues."""
+        with self._lock:
+            if self._closed:
+                return
+            while True:
+                try:
+                    if self._reader is None:
+                        os.eventfd_read(self._fd)
+                    elif not self._reader.recv(4096):
+                        return
+                except BlockingIOError:
+                    return
+
+    def close(self) -> None:
+        """Close once after poller users stop; late notifications become no-ops."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._reader is None:
+                os.close(self._fd)
+            else:
+                self._reader.close()
+                assert self._writer is not None
+                self._writer.close()
 
 
 def get_zmq_context(use_asyncio: bool = True):

@@ -7,6 +7,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, Callable
 import hmac
+import math
 import threading
 import time
 
@@ -22,6 +23,7 @@ from lmcache.v1.rpc.storage_protocol import (
     decode_message,
     encode_message,
 )
+from lmcache.v1.rpc_utils import PollerWakeup
 
 LIFECYCLE_METHODS = frozenset(
     (
@@ -106,6 +108,7 @@ class StorageClient:
         self._endpoints = (work_endpoint, lifecycle_endpoint)
         self._lock = threading.RLock()
         self._wake = threading.Condition(self._lock)
+        self._poll_wakeup = PollerWakeup()
         self._records: dict[tuple[str, str, int], _Pending] = {}
         self._terminal_waiting: set[tuple[str, str, int]] = set()
         self._pending: dict[tuple[tuple[str, str, int], int], _Pending] = {}
@@ -117,6 +120,7 @@ class StorageClient:
         self._correlation = 0
         self._closing = False
         self._io_stopped = False
+        self._completion_stopped = False
         self._fatal: str | None = None
         self._failure_callback = failure_callback
         self._failure_notified = False
@@ -174,6 +178,7 @@ class StorageClient:
             self._records[identity.key] = pending
             self._pending[(identity.key, 0)] = pending
             self._outboxes[int(method.lower() in LIFECYCLE_METHODS)].append(pending)
+            self._poll_wakeup.notify()
             return pending.future
 
     def replay(self, identity: OperationIdentity) -> StorageFuture:
@@ -186,6 +191,7 @@ class StorageClient:
                 self._outboxes[
                     int(pending.request.method.lower() in LIFECYCLE_METHODS)
                 ].append(pending)
+                self._poll_wakeup.notify()
             return pending.future
 
     def operation_status(self, identity: OperationIdentity) -> StorageFuture:
@@ -287,6 +293,7 @@ class StorageClient:
                             (pending, StorageUnavailableError(reason))
                         )
                 self._wake.notify_all()
+                self._poll_wakeup.notify()
         if callback is not None:
             callback(reason)
 
@@ -299,13 +306,17 @@ class StorageClient:
         with self._lock:
             self._closing = True
             self._wake.notify_all()
+            self._poll_wakeup.notify()
         self.mark_fatal(
             "Storage client closed before terminal acknowledgement", notify=False
         )
-        self._io.join(timeout)
-        if threading.current_thread() is not self._completion:
+        if threading.current_thread() is not self._io:
+            self._io.join(timeout)
+        if threading.current_thread() not in (self._completion, self._io):
             self._completion.join(timeout)
         with self._lock:
+            if self._io_stopped and self._completion_stopped:
+                self._poll_wakeup.close()
             return not self._records and not self._io.is_alive()
 
     def _check_admission(self) -> None:
@@ -348,6 +359,7 @@ class StorageClient:
                     if not pending.received and not pending.queued:
                         pending.queued = True
                         self._outboxes[1].append(pending)
+                        self._poll_wakeup.notify()
                     return pending.future
             if len(self._pending) >= self.max_pending * 9:
                 raise BufferError("Storage lifecycle admission is full")
@@ -372,6 +384,7 @@ class StorageClient:
             )
             self._pending[(identity.key, request.correlation_id)] = pending
             self._outboxes[1].append(pending)
+            self._poll_wakeup.notify()
             return pending.future
 
     def _run(self) -> None:
@@ -379,6 +392,7 @@ class StorageClient:
         sockets = []
         try:
             poller = zmq.Poller()
+            poller.register(self._poll_wakeup.fileno(), zmq.POLLIN)
             for endpoint in self._endpoints:
                 socket = context.socket(zmq.DEALER)
                 socket.setsockopt(zmq.LINGER, 0)
@@ -388,8 +402,11 @@ class StorageClient:
                 socket.connect(endpoint)
                 sockets.append(socket)
                 poller.register(socket, zmq.POLLIN)
+            events: dict[Any, int] = {}
             while not self._closing:
-                events = dict(poller.poll(5))
+                # Drain first. A concurrent enqueue is either included below or
+                # leaves a fresh signal for the next poll.
+                self._poll_wakeup.drain()
                 for channel in (1, 0):
                     socket = sockets[channel]
                     if events.get(socket, 0) & zmq.POLLIN:
@@ -417,19 +434,42 @@ class StorageClient:
                                 break
                             self._outboxes[channel].popleft()
                             pending.queued = False
-                if self.failure_timeout_s is not None:
-                    with self._lock:
-                        expired = any(
-                            not p.received
-                            and time.monotonic() - p.admitted_at
-                            > self.failure_timeout_s
-                            for p in self._pending.values()
+                with self._lock:
+                    for channel, socket in enumerate(sockets):
+                        poller.modify(
+                            socket,
+                            zmq.POLLIN
+                            | (zmq.POLLOUT if self._outboxes[channel] else 0),
                         )
-                    if expired:
-                        self.mark_fatal(
-                            "Storage response failure deadline expired; "
-                            "completion unknown"
+                    deadline = (
+                        min(
+                            (
+                                p.admitted_at + self.failure_timeout_s
+                                for p in self._pending.values()
+                                if not p.received
+                            ),
+                            default=None,
                         )
+                        if self.failure_timeout_s is not None
+                        else None
+                    )
+                    closing = self._closing
+                    runnable = any(box and box[0].received for box in self._outboxes)
+                if closing:
+                    break
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    self.mark_fatal(
+                        "Storage response failure deadline expired; completion unknown"
+                    )
+                    continue
+                # Only unsent channels request POLLOUT. Budget leftovers remain
+                # writable, while a disconnected work peer cannot spin or stall
+                # the independently connected lifecycle channel.
+                timeout = None if remaining is None else math.ceil(remaining * 1000)
+                if runnable:
+                    timeout = 0
+                events = dict(poller.poll(timeout))
         except BaseException as error:
             self.mark_fatal(f"Storage transport failed: {error}")
         finally:
@@ -439,6 +479,8 @@ class StorageClient:
             with self._lock:
                 self._io_stopped = True
                 self._wake.notify_all()
+                if self._completion_stopped:
+                    self._poll_wakeup.close()
 
     def _receive(self, result: StorageResult) -> None:
         if result.status == "TERMINAL":
@@ -489,6 +531,15 @@ class StorageClient:
             self._wake.notify_all()
 
     def _complete(self) -> None:
+        try:
+            self._complete_pending()
+        finally:
+            with self._lock:
+                self._completion_stopped = True
+                if self._io_stopped:
+                    self._poll_wakeup.close()
+
+    def _complete_pending(self) -> None:
         while True:
             with self._wake:
                 self._wake.wait_for(lambda: self._completions or self._io_stopped)

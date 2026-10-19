@@ -5,7 +5,7 @@
 from collections import defaultdict
 from dataclasses import dataclass
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 import time
 
@@ -14,7 +14,11 @@ import msgspec
 import torch
 
 # First Party
-from lmcache.v1.cpu_cache import StorageFailedSafe, StorageOperationRegistry
+from lmcache.v1.cpu_cache import (
+    StorageFailedSafe,
+    StorageOperationRegistry,
+    ValidatedStorageWork,
+)
 from lmcache.v1.cpu_cache_operations import CPUCacheOperations
 from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
@@ -817,6 +821,20 @@ class CPUCacheRuntime(CPUCacheOperations):
             for key in tickets:
                 self.drop_lookup(key, request.identity)
         return result
+
+    def handle_validated(
+        self, request: StorageRequest, proof: ValidatedStorageWork
+    ) -> StorageResult:
+        """Dispatch service-validated WORK while retaining registry safeguards.
+
+        Direct callers should use handle(), which always validates the body.
+        The proof is in-process only and bound to this exact decoded request.
+        """
+        return self.registry.handle_validated(request, self._dispatch, proof)
+
+    def set_transport_notifier(self, notifier: Callable[[], None] | None) -> bool:
+        """Forward terminal/fatal wakeups without constructing transport state."""
+        return self.registry.set_transport_notifier(notifier)
 
     def is_healthy(self) -> bool:
         """Return cached CPU ownership/registration health without remote queries."""

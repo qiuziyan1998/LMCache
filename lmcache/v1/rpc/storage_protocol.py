@@ -2,9 +2,11 @@
 """Value-only decoder storage contracts; no engine or device imports."""
 
 # Standard
+from array import array
 from hashlib import sha256
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 import struct
+import sys
 
 # Third Party
 import msgspec
@@ -13,6 +15,7 @@ import msgspec
 PROTOCOL_VERSION = 1
 _FRAME_EXT = 76
 _FRAME_THRESHOLD = 256
+_CheckpointTokensU32 = tuple[Annotated[int, msgspec.Meta(ge=0, le=2**32 - 1)], ...]
 _DTYPE_BYTES = {
     "uint8": 1,
     "int8": 1,
@@ -38,6 +41,21 @@ def pack_uints(values: Any, bits: int = 64) -> bytes:
     values = tuple(checked_uint(value, bits) for value in values)
     code = {32: "I", 64: "Q"}[bits]
     return struct.pack(f"<{len(values)}{code}", *values)
+
+
+def pack_checkpoint_tokens_u32(values: Any) -> bytes:
+    """Freeze strictly validated token IDs as immutable little-endian uint32.
+
+    ``msgspec.ValidationError`` rejects non-integers and values outside uint32.
+    Callers supporting wider integers may retain their legacy representation.
+    """
+    tokens = msgspec.convert(values, type=_CheckpointTokensU32, strict=True)
+    packed = array("I", tokens)
+    if packed.itemsize != 4:
+        raise ValueError("Checkpoint token packing requires a 32-bit unsigned int")
+    if sys.byteorder != "little":
+        packed.byteswap()
+    return packed.tobytes()
 
 
 def unpack_uints(frame: bytes, count: int, bits: int = 64) -> tuple[int, ...]:

@@ -21,6 +21,10 @@ from lmcache.v1.rpc.storage_protocol import (
     content_digest,
 )
 
+_OPERATION_CONTROLS = frozenset(
+    {"cancel", "operation_status", "acknowledge_terminal", "retire"}
+)
+
 
 class StorageBusy(RuntimeError):
     """Admission must defer until live ownership or terminal history drains."""
@@ -32,6 +36,32 @@ class StorageFailedSafe(RuntimeError):
     def __init__(self, message: str, *, details: Any = None) -> None:
         super().__init__(message)
         self.details = details
+
+
+@dataclass(frozen=True)
+class ValidatedStorageWork:
+    """In-process proof bound to the exact service-owned decoded request.
+
+    This object is never a wire field. The service must not mutate the request
+    between validation and dispatch through the trusted runtime entry.
+    """
+
+    request: StorageRequest = field(repr=False)
+    digest: bytes
+
+
+def validate_storage_work(request: StorageRequest) -> ValidatedStorageWork:
+    """Verify an immutable work body once before entering the runtime.
+
+    Raise ValueError on mismatch. Lifecycle controls retain their original work
+    digest and must use the ordinary registry entry instead.
+    """
+    if request.method in _OPERATION_CONTROLS:
+        raise ValueError("Lifecycle controls cannot use a work validation proof")
+    digest = content_digest((request.method, request.payload))
+    if request.payload_digest != digest:
+        raise ValueError("Storage work digest disagrees with its immutable payload")
+    return ValidatedStorageWork(request, digest)
 
 
 @dataclass
@@ -70,9 +100,7 @@ class StorageOperationRegistry:
     calls cannot wait for CPU I/O; unknown native completion remains retained.
     """
 
-    _CONTROLS = frozenset(
-        {"cancel", "operation_status", "acknowledge_terminal", "retire"}
-    )
+    _CONTROLS = _OPERATION_CONTROLS
 
     def __init__(
         self,
@@ -99,6 +127,19 @@ class StorageOperationRegistry:
         self._leases: dict[str, _PhysicalLease] = {}
         self._terminal_notifications: set[tuple[str, str, int]] = set()
         self._fatal: str | None = None
+        self._transport_notifier: Callable[[], None] | None = None
+
+    def set_transport_notifier(self, notifier: Callable[[], None] | None) -> bool:
+        """Register a nonblocking transport signal for terminal/fatal transitions.
+
+        The callback may only signal a wakeup; it must not re-enter this registry.
+        Return True to advertise complete asynchronous health notification.
+        """
+        with self._lock:
+            self._transport_notifier = notifier
+            if self._fatal is not None or self._terminal_notifications:
+                self._notify_transport()
+        return True
 
     def _authenticate(self, request: StorageRequest) -> None:
         request.identity.validate()
@@ -166,11 +207,39 @@ class StorageOperationRegistry:
         self, request: StorageRequest, dispatch: Callable[[StorageRequest], Any]
     ) -> StorageResult:
         """Execute original work once, or reconcile an original operation."""
+        return self._handle(request, dispatch)
+
+    def handle_validated(
+        self,
+        request: StorageRequest,
+        dispatch: Callable[[StorageRequest], Any],
+        proof: ValidatedStorageWork,
+    ) -> StorageResult:
+        """Use a service-local proof without repeating the work-body digest.
+
+        Reject proofs from another request or lifecycle controls. Authentication,
+        replay identity, ownership and normal admission checks remain mandatory.
+        """
+        if (
+            not isinstance(proof, ValidatedStorageWork)
+            or proof.request is not request
+            or proof.digest != request.payload_digest
+            or request.method in self._CONTROLS
+        ):
+            raise ValueError("Storage work validation proof does not match request")
+        return self._handle(request, dispatch, proof)
+
+    def _handle(
+        self,
+        request: StorageRequest,
+        dispatch: Callable[[StorageRequest], Any],
+        proof: ValidatedStorageWork | None = None,
+    ) -> StorageResult:
         self._authenticate(request)
         if request.method in self._CONTROLS:
             return self._control(request)
-        if request.payload_digest != content_digest((request.method, request.payload)):
-            raise ValueError("Storage work digest disagrees with its immutable payload")
+        if proof is None:
+            validate_storage_work(request)
         with self._lock:
             operation = self._find(request)
             if operation is not None:
@@ -203,6 +272,7 @@ class StorageOperationRegistry:
             with self._lock:
                 operation.quarantined = True
                 self._fatal = result.error
+                self._notify_transport()
         with self._lock:
             operation.phase = result.status
             operation.result = result
@@ -456,6 +526,7 @@ class StorageOperationRegistry:
                 lease.quarantined = True
                 self._operations[lease.operation_key].quarantined = True
                 self._fatal = f"Storage lease release failed: {exc}"
+                self._notify_transport()
             raise
         with self._lock:
             del self._leases[lease_id]
@@ -473,6 +544,17 @@ class StorageOperationRegistry:
             and not operation.notified
         ):
             self._terminal_notifications.add(operation.identity.key)
+            self._notify_transport()
+
+    def _notify_transport(self) -> None:
+        """Signal authoritative state changes without affecting ownership results."""
+        notifier = self._transport_notifier
+        if notifier is not None:
+            try:
+                notifier()
+            except Exception:
+                # Transport teardown cannot turn a safe release into an error.
+                pass
 
     def drain_terminal_notifications(self) -> list[StorageResult]:
         """Notify original owners once all physical and producer holds are safe."""
@@ -523,3 +605,4 @@ class StorageOperationRegistry:
         with self._lock:
             if self._fatal is None:
                 self._fatal = reason or "CPU storage native completion is unknown"
+                self._notify_transport()
