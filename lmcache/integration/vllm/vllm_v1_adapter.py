@@ -122,15 +122,20 @@ LayerwiseSaveKey = tuple[str, str, int, int, int]
 def completed_cold_resume_state(request: Any, state: Any) -> bool:
     """Match completed worker state to the exact load generation being promoted."""
     spec = request.load_spec
-    return bool(spec is not None and getattr(spec, "dsa_cold_compact_resume", False)
-                and state is not None
-                and getattr(state, "completed_cold_load_generation", None)
-                == getattr(spec, "dsa_cold_load_generation", -1)
-                and state.token_count == spec.lmcache_cached_tokens
-                and state.indexer_npu_resident
-                and (not getattr(spec, "dsa_cold_resident_load", False)
-                     or state.dense_prefix_resident_tokens == spec.lmcache_cached_tokens)
-                and state.prepared_sparse_sources.get(0) is not None)
+    return bool(
+        spec is not None
+        and (getattr(spec, "dsa_cold_compact_resume", False)
+             or getattr(spec, "process_ordinary_resume", False))
+        and state is not None
+        and getattr(state, "completed_cold_load_generation", None)
+        == getattr(spec, "dsa_cold_load_generation", -1)
+        and state.token_count == spec.lmcache_cached_tokens
+        and state.indexer_npu_resident
+        and (not (getattr(spec, "dsa_cold_resident_load", False)
+                  or getattr(spec, "process_ordinary_resume", False))
+             or state.dense_prefix_resident_tokens == spec.lmcache_cached_tokens)
+        and state.prepared_sparse_sources.get(0) is not None
+    )
 
 
 def _defer_prepared_sparse_retrieve(
@@ -807,6 +812,8 @@ class LoadSpec:
     dsa_group1_direct_hbm: bool = False
     # Value-only source ticket; transferred before scheduler lookup status clears.
     cpu_source_ticket: Any = None
+    # Async timing with ordinary two-group destinations; never compact scratch.
+    process_ordinary_load: bool = False
 
 
 @dataclass
@@ -4927,7 +4934,8 @@ class LMCacheConnectorV1Impl:
                 if (
                     not failed
                     and load_spec is not None
-                    and getattr(load_spec, "dsa_cold_compact_load", False)
+                    and (getattr(load_spec, "dsa_cold_compact_load", False)
+                         or getattr(load_spec, "process_ordinary_load", False))
                 ):
                     cold_loaded.add(req_id)
                 self._discard_request_set("_dsa_cold_failed_req_ids", req_id)
@@ -7608,7 +7616,31 @@ class LMCacheConnectorV1Impl:
         if process_storage is not None:
             from lmcache.integration.vllm.storage_process import submit_prepare
 
+            if getattr(request.load_spec, "process_ordinary_load", False):
+                plan["storage_mode"] = "dense"
+                plan["storage_generation"] = generation
+                plan["storage_phase"] = "storage_process_dense"
+                plan["storage_allow_safe_miss"] = True
+                plan["token_mask"] = self._load_token_mask_for_retrieve(
+                    request, token_count, self._lmcache_chunk_size
+                )
+                # Prepared dense scatter can mask exact rows within a stored
+                # chunk. Preserve the valid local prefix, including on failure.
+                prefix = min(request.load_spec.vllm_cached_tokens, token_count)
+                plan["token_mask"][:prefix] = False
             submit_prepare(self, plan)
+            if getattr(request.load_spec, "process_ordinary_load", False):
+                first = prefix // self._block_size * self._block_size
+                block_ids = _cold_indexer_block_ids(
+                    indexer_slots[first:], self._block_size
+                ) | _cold_indexer_block_ids(
+                    request.slot_mapping[0][first:], self._block_size
+                )
+                coordinator.submit_ordinary(
+                    plan, generation, block_ids, submitted_at, npu_device_id,
+                    self._run_process_ordinary_load,
+                )
+                return
         prepare_chunks = getattr(self.lmcache_engine, "prepare_cold_chunk_plan", None)
         if (
             process_storage is None
@@ -7645,6 +7677,13 @@ class LMCacheConnectorV1Impl:
                     else None
                 ),
             )
+
+    def _run_process_ordinary_load(
+        self, plan: ColdLoadPlan, device: Optional[int], previous: Optional[Future]
+    ) -> WorkerRetrieveState:
+        from lmcache.integration.vllm.storage_process import run_ordinary
+
+        return run_ordinary(self, plan, device, previous)
 
     def _try_prepare_dsa_live_split(self, request: ReqMeta) -> bool:
         """Reserve cold groups until live import succeeds or falls back."""
@@ -8598,9 +8637,8 @@ class LMCacheConnectorV1Impl:
                 request
                 for request in metadata.requests
                 if request.load_spec is not None and request.load_spec.can_load
-                and not getattr(
-                    request.load_spec, "dsa_cold_compact_load", False
-                )
+                and not (getattr(request.load_spec, "dsa_cold_compact_load", False)
+                         or getattr(request.load_spec, "process_ordinary_load", False))
             )
             raise
         finally:
@@ -8635,9 +8673,8 @@ class LMCacheConnectorV1Impl:
                 for request in metadata.requests
                 if request.load_spec is not None
                 and request.load_spec.can_load
-                and getattr(
-                    request.load_spec, "dsa_cold_compact_load", False
-                )
+                and (getattr(request.load_spec, "dsa_cold_compact_load", False)
+                     or getattr(request.load_spec, "process_ordinary_load", False))
             ]
             if cold_requests and not self.kv_caches:
                 if attn_metadata is None:
@@ -8647,7 +8684,8 @@ class LMCacheConnectorV1Impl:
                     )
                 self._init_kv_caches_from_forward_context(forward_context)
             for request in cold_requests:
-                if not self._try_prepare_dsa_live_split(request):
+                if (getattr(request.load_spec, "process_ordinary_load", False)
+                        or not self._try_prepare_dsa_live_split(request)):
                     self._submit_dsa_cold_compact_load(request)
         if attn_metadata is None:
             logger.debug("In connector.start_load_kv, but the attn_metadata is None")
@@ -8684,8 +8722,15 @@ class LMCacheConnectorV1Impl:
             load_spec = request.load_spec
             if load_spec is None:
                 continue
-            if getattr(load_spec, "dsa_cold_compact_load", False):
+            if (getattr(load_spec, "dsa_cold_compact_load", False)
+                    or getattr(load_spec, "process_ordinary_load", False)):
                 continue
+            if getattr(load_spec, "process_ordinary_resume", False):
+                if not self._completed_cold_resume(request):
+                    raise RuntimeError("Ordinary prefix resume lost its prepared generation")
+                self._consume_dsa_cold_dense_load_readiness(
+                    self._worker_retrieve_state[request.req_id]
+                )
             if not load_spec.can_load and getattr(
                 load_spec, "dsa_cold_compact_resume", False
             ):
@@ -11943,6 +11988,10 @@ class LMCacheConnectorV1Impl:
                 token_count=request.load_spec.lmcache_cached_tokens,
                 reuse_prepared_sources=True,
             )
+            if getattr(request.load_spec, "process_ordinary_load", False):
+                from lmcache.integration.vllm.storage_process import record_state
+
+                record_state(self, state, request)
             # Completion reports from different TP workers may be
             # accumulated across multiple forwards. Preserve this
             # worker's state while the scheduler is still waiting for
@@ -12304,8 +12353,18 @@ class LMCacheConnectorV1Impl:
         load_spec = self.load_specs.get(req_id)
         return bool(
             load_spec is not None
-            and getattr(load_spec, "dsa_cold_compact_load", False)
+            and (getattr(load_spec, "dsa_cold_compact_load", False)
+                 or getattr(load_spec, "process_ordinary_load", False))
         )
+
+    def is_dsa_cold_compact_load(self, req_id: str) -> bool:
+        """Return this attempt's layout policy independently of async timing."""
+        return bool(getattr(self.load_specs.get(req_id), "dsa_cold_compact_load", False))
+
+    def get_dsa_cold_load_num_tokens(self, req_id: str) -> int:
+        """Return the physical restore extent without advancing computed tokens."""
+        spec = self.load_specs.get(req_id)
+        return int(spec.lmcache_cached_tokens) if self.should_load_kv_async(req_id) else 0
 
     @_lmcache_nvtx_annotate
     def get_num_new_matched_tokens(
@@ -12647,6 +12706,13 @@ class LMCacheConnectorV1Impl:
             self.load_specs[req_id].cpu_source_ticket = (
                 self.lookup_client.peek_ticket(req_id)
             )
+            self.load_specs[req_id].process_ordinary_load = bool(
+                getattr(self.config, "enable_async_loading", False)
+                and not dsa_cold_compact_load
+                and not below_min_retrieve
+                and need_to_allocate > 0
+                and query_scope != "preemption_checkpoint"
+            )
         if (
             query_scope == "preemption_checkpoint"
             and num_external_hit_tokens > request_prompt_tokens
@@ -12691,7 +12757,13 @@ class LMCacheConnectorV1Impl:
     def _build_dsa_cold_compact_meta(
         self, request: Any, blocks: Any, load_spec: LoadSpec
     ) -> ReqMeta:
-        if hasattr(blocks, "get_unhashed_block_ids_all_groups"):
+        if getattr(load_spec, "process_ordinary_load", False) and hasattr(
+            blocks, "get_block_ids"
+        ):
+            # Ordinary slots are absolute logical positions, including the
+            # local prefix. Filtering hashed blocks would shift the suffix.
+            block_ids = blocks.get_block_ids()
+        elif hasattr(blocks, "get_unhashed_block_ids_all_groups"):
             block_ids = blocks.get_unhashed_block_ids_all_groups()
         elif hasattr(blocks, "get_block_ids"):
             block_ids = blocks.get_block_ids()
@@ -12734,6 +12806,22 @@ class LMCacheConnectorV1Impl:
             validation_blocks = {}
             self._dsa_cold_indexer_block_ids = validation_blocks
         validation_blocks[request.request_id] = set(indexer_block_ids)
+        if getattr(load_spec, "process_ordinary_load", False):
+            if len(latent_block_ids) < required_indexer_blocks:
+                raise ValueError("Ordinary cold load requires complete latent destinations")
+            validation_blocks[request.request_id].update(latent_block_ids)
+            return ReqMeta(
+                req_id=request.request_id,
+                token_ids=token_ids,
+                slot_mapping=[_build_slot_mapping(
+                    latent_block_ids, self._block_size, len(token_ids)
+                )],
+                indexer_slot_mapping=indexer_slot_mapping,
+                is_last_prefill=False,
+                is_sparse_decode=False,
+                load_spec=load_spec,
+                request_configs=extract_request_configs(request.sampling_params),
+            )
         remap_frontier = (
             load_spec.dsa_remap_frontier
             if load_spec.dsa_remap_frontier is not None
@@ -12857,11 +12945,10 @@ class LMCacheConnectorV1Impl:
             if (
                 cold_loaded_ids is not None
                 and request.request_id in cold_loaded_ids
-                and getattr(
-                    self.load_specs[request.request_id],
-                    "dsa_cold_compact_load",
-                    False,
-                )
+                and (getattr(self.load_specs[request.request_id],
+                             "dsa_cold_compact_load", False)
+                     or getattr(self.load_specs[request.request_id],
+                                "process_ordinary_load", False))
             ):
                 # Async resume has no new lookup result, but the completed cold
                 # load remains the authoritative sparse source for this step.
@@ -12897,7 +12984,8 @@ class LMCacheConnectorV1Impl:
 
         self.load_specs[request.request_id].can_load = True
         load_spec = self.load_specs[request.request_id]
-        if getattr(load_spec, "dsa_cold_compact_load", False):
+        if (getattr(load_spec, "dsa_cold_compact_load", False)
+                or getattr(load_spec, "process_ordinary_load", False)):
             try:
                 if blocks is None:
                     raise ValueError(
@@ -14003,6 +14091,11 @@ class LMCacheConnectorV1Impl:
         if load_spec is None:
             raise RuntimeError("Cold compact resume lost its LoadSpec")
         ids.remove(req_id)
+        if getattr(load_spec, "process_ordinary_load", False):
+            load_spec.process_ordinary_load = False
+            load_spec.process_ordinary_resume = True
+            load_spec.can_load = False
+            return False
         if hasattr(load_spec, "dsa_cold_compact_load"):
             delattr(load_spec, "dsa_cold_compact_load")
         load_spec.can_load = True

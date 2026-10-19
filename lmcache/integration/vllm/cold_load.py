@@ -284,3 +284,30 @@ class ColdLoadCoordinator:
             submitted_at,
             indexer_future,
         )
+
+    def submit_ordinary(
+        self,
+        plan: ColdLoadPlan,
+        generation: int,
+        block_ids: set[int],
+        submitted_at: float,
+        device: int | None,
+        job: Callable[..., Any],
+    ) -> None:
+        """Reuse the publication FIFO for one paired dense background transfer.
+
+        Both groups complete in the single job; the already-terminal sibling
+        preserves the existing completion/retirement entry contract.
+        """
+        sibling: Future[ColdIndexerResult] = Future()
+        sibling.set_result((None, None, 0.0, 0.0))
+        future = self.get_executor().submit(job, plan, device, self.last_latent_future)
+        self.last_latent_future = future
+        self.futures[plan["request"].req_id] = (
+            generation,
+            future,
+            plan["request"],
+            block_ids,
+            submitted_at,
+            sibling,
+        )

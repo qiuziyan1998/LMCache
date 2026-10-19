@@ -235,6 +235,73 @@ def _exchange_reply(adapter: Any, plan: dict[str, Any]) -> StorageResult | None:
     return decode_message(envelope.error_details["storage_result"], StorageResult)
 
 
+def import_ordinary_sources(
+    adapter: Any, plan: dict[str, Any], state: Any, *, request_ordinal: int = 0
+) -> bool:
+    """Import a paired dense prefix into private state after ordered preparation.
+
+    The caller owns publication and cleanup. Return False for a proven safe
+    preparation miss; failed imports retain their adopted leases on ``state``.
+    """
+    engine, request = adapter.lmcache_engine, plan["request"]
+    connector = engine.gpu_connector
+    result = _exchange_reply(adapter, plan)
+    if result is None or result.status != "COMPLETED":
+        if not engine._is_passive():
+            engine.storage_process.client.acknowledge_terminal(
+                plan["storage_prepare"].identity
+            )
+        return False
+    ticket = plan["storage_ticket"]
+    generation = plan["storage_generation"]
+    sources, error = {}, None
+    try:
+        reply = msgspec.convert(result.value, type=PreparedReply)
+        if (
+            result.identity.request_id != request.req_id
+            or result.identity.request_attempt != ticket.identity.request_attempt
+            or result.identity.load_generation != generation
+        ):
+            raise ValueError("Ordinary source belongs to another request lifetime")
+        with torch.npu.stream(connector.load_stream):
+            sources = engine.compact_source_importer.import_reply(
+                reply,
+                identity=result.identity,
+                payload_digest=result.payload_digest,
+                key_plan_digest=ticket.reply.key_plan_digest,
+                source_end=plan["token_count"],
+            )
+            readiness = connector.record_dense_load_readiness()
+        if set(sources) != {0, 1}:
+            raise ValueError("Ordinary prefix preparation requires both KV groups")
+    except BaseException as exc:
+        error = exc
+    state.prepared_sparse_sources = sources
+    ready = engine._ordered_checkpoint_agreement(
+        request.req_id,
+        "storage_dense_import",
+        generation,
+        request_ordinal,
+        error is None,
+    )
+    if error is not None:
+        raise error
+    if not ready:
+        raise RuntimeError("Ordinary source import failed on another TP rank")
+    state.process_load_generation = generation
+    state.process_source_plan = {
+        "starts": tuple(ticket.reply.starts),
+        "ends": tuple(ticket.reply.ends),
+        "hashes": tuple(ticket.reply.hashes),
+    }
+    state.token_count = plan["token_count"]
+    state.metadata_token_ids = list(plan["tokens"])
+    state.location, state.metadata_warm = "LocalCPU", True
+    state.dense_load_readiness = readiness
+    state.dense_prefix_seed = not request.is_sparse_decode
+    return True
+
+
 def ordinary_layerwise_load(
     adapter: Any,
     request: Any,
@@ -284,14 +351,12 @@ def ordinary_layerwise_load(
         submit_prepare(adapter, plan)
         if previous is not None:
             previous.exception()  # Ordered publication includes the whole predecessor.
-        result = _exchange_reply(adapter, plan)
-        if result is None or result.status != "COMPLETED":
+        prepared = import_ordinary_sources(
+            adapter, plan, state, request_ordinal=request_ordinal
+        )
+        if not prepared:
             # An explicit safe CPU refusal has no exported sources. Keep the
             # ordinary missing-block validation and recomputation fallback.
-            if not engine._is_passive():
-                engine.storage_process.client.acknowledge_terminal(
-                    plan["storage_prepare"].identity
-                )
 
             def missing(group: int) -> Generator[Any, Any, None]:
                 empty = torch.zeros(count, dtype=torch.bool)
@@ -305,56 +370,13 @@ def ordinary_layerwise_load(
                 yield empty
 
             return missing(0), missing(1)
-        sources, error = {}, None
-        try:
-            reply = msgspec.convert(result.value, type=PreparedReply)
-            if (
-                result.identity.request_id != request.req_id
-                or result.identity.request_attempt != ticket.identity.request_attempt
-                or result.identity.load_generation != generation
-            ):
-                raise ValueError("Ordinary source belongs to another request lifetime")
-            with torch.npu.stream(connector.load_stream):
-                sources = engine.compact_source_importer.import_reply(
-                    reply,
-                    identity=result.identity,
-                    payload_digest=result.payload_digest,
-                    key_plan_digest=ticket.reply.key_plan_digest,
-                    source_end=count,
-                )
-                readiness = connector.record_dense_load_readiness()
-            if set(sources) != {0, 1}:
-                raise ValueError("Ordinary prefix preparation requires both KV groups")
-        except BaseException as exc:
-            error = exc
-        state.prepared_sparse_sources = sources
-        ready = engine._ordered_checkpoint_agreement(
-            request.req_id,
-            "storage_dense_import",
-            generation,
-            request_ordinal,
-            error is None,
-        )
-        if error is not None:
-            raise error
-        if not ready:
-            raise RuntimeError("Ordinary source import failed on another TP rank")
-        state.process_load_generation = generation
-        state.process_source_plan = {
-            "starts": tuple(ticket.reply.starts),
-            "ends": tuple(ticket.reply.ends),
-            "hashes": tuple(ticket.reply.hashes),
-        }
-        state.token_count, state.metadata_token_ids = count, list(tokens)
-        state.location, state.metadata_warm = "LocalCPU", True
-        state.dense_load_readiness = readiness
+        sources = state.prepared_sparse_sources
+        readiness = state.dense_load_readiness
         state.slot_mapping, state.indexer_slot_mapping = slot_mapping, indexer_slots
         state.dense_prefix_seed = not request.is_sparse_decode
         completed = set()
 
-        def retrieve(
-            group: int, mapping: torch.Tensor
-        ) -> Generator[Any, Any, None]:
+        def retrieve(group: int, mapping: torch.Tensor) -> Generator[Any, Any, None]:
             # Preserve the mask without changing physical source coverage or
             # scheduler computed tokens. This is admission-time metadata only.
             if request.is_sparse_decode and group == 0:
@@ -460,6 +482,13 @@ def _dense_source(
                 if group == 0
                 else plan["indexer_slots_cpu"][start:]
             )
+            if plan.get("storage_mode") == "dense":
+                slots = slots[: plan["token_count"]].clone()
+                if slots.numel() != plan["token_count"]:
+                    raise ValueError("Ordinary prefix destination slots are incomplete")
+                slots.masked_fill_(
+                    ~plan["token_mask"].to(device=slots.device, dtype=torch.bool), -1
+                )
             slots = connector.stage_dense_load_tensor(slots, dtype=torch.long)
             retriever = engine._retrieve_prepared_sparse_layers(
                 plan["tokens"],
@@ -494,6 +523,62 @@ def _dense_source(
     finally:
         if retriever is not None:
             retriever.close()
+
+
+def run_ordinary(
+    adapter: Any,
+    plan: dict[str, Any],
+    device: int | None,
+    previous: Future | None,
+) -> Any:
+    """Load both ordinary groups off-thread and return unpublished private state.
+
+    This job participates in the same TP publication FIFO as compact loads.
+    All device waits and source preparation stay on the existing loader pool.
+    """
+    from lmcache.integration.vllm.vllm_v1_adapter import WorkerRetrieveState
+
+    if device is not None:
+        torch.npu.set_device(device)
+    engine = adapter.lmcache_engine
+    request = plan["request"]
+    state = WorkerRetrieveState(req_id=request.req_id)
+    stats = getattr(engine, "stats_monitor", None)
+    monitors = (
+        [stats.on_retrieve_request(int(plan["token_mask"].sum())) for _ in (0, 1)]
+        if stats is not None
+        else []
+    )
+    finished_groups: set[int] = set()
+    try:
+        if previous is not None:
+            previous.exception()
+        if not import_ordinary_sources(adapter, plan, state):
+            raise RuntimeError("Ordinary CPU prefix preparation missed safely")
+        for group in (0, 1):
+            _dense_source(adapter, state.prepared_sparse_sources[group], plan, group)
+            if stats is not None:
+                stats.on_retrieve_finished(monitors[group], plan["token_mask"].sum())
+                finished_groups.add(group)
+        state.slot_mapping = request.slot_mapping[0]
+        state.indexer_slot_mapping = plan["indexer_slots_cpu"]
+        state.indexer_npu_resident = True
+        state.dense_prefix_resident_tokens = plan["token_count"]
+        adapter._record_dsa_cold_dense_load_readiness(state)
+        state._dsa_cold_load_completed_at = time.perf_counter()
+        return state
+    except BaseException as error:
+        if stats is not None:
+            for group in (0, 1):
+                if group not in finished_groups:
+                    stats.on_retrieve_finished(monitors[group], 0)
+        try:
+            adapter._synchronize_dsa_cold_dense_load()
+            release_sources(state, engine)
+        except BaseException:
+            error._lmcache_dsa_cold_state = state
+            engine.__dict__.setdefault("_failed_process_source_reads", []).append(state)
+        raise
 
 
 def run_indexer(adapter: Any, plan: dict[str, Any], device: int | None) -> Any:

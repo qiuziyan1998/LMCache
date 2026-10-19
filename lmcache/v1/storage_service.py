@@ -41,9 +41,10 @@ class StorageRuntime(Protocol):
 class StorageService:
     """Serve authenticated value-only work and short lifecycle transitions.
 
-    Runtime lifecycle handlers must be nonblocking registry transitions. Bulk and
-    metadata work run in independent bounded lanes. Completed results retain their
-    admission slots while a client is backpressured, instead of being dropped.
+    Runtime lifecycle handlers must be nonblocking registry transitions. Bulk,
+    reservation and metadata work run in independent bounded lanes. Reservation
+    and bulk work share their original admission budget. Completed results retain
+    their admission slots while a client is backpressured, instead of being dropped.
     """
 
     def __init__(
@@ -132,6 +133,7 @@ class StorageService:
         sockets = []
         executors = {
             "bulk": ThreadPoolExecutor(1, thread_name_prefix="storage-prepare"),
+            "reserve": ThreadPoolExecutor(1, thread_name_prefix="storage-reserve"),
             "lookup": ThreadPoolExecutor(1, thread_name_prefix="storage-lookup"),
             "persist": ThreadPoolExecutor(1, thread_name_prefix="storage-persist"),
         }
@@ -215,23 +217,28 @@ class StorageService:
                                         self._stop_requested.set()
                                 else:
                                     method = request.method.lower()
-                                    lane = (
-                                        "lookup"
-                                        if method == "lookup"
-                                        else (
-                                            "persist"
-                                            if method
-                                            in (
-                                                "commit_write",
-                                                "commit_checkpoint",
-                                                "persist",
-                                            )
-                                            else "bulk"
-                                        )
-                                    )
+                                    if method == "lookup":
+                                        lane = "lookup"
+                                    elif method == "reserve_write":
+                                        lane = "reserve"
+                                    elif method in (
+                                        "commit_write",
+                                        "commit_checkpoint",
+                                        "persist",
+                                    ):
+                                        lane = "persist"
+                                    else:
+                                        lane = "bulk"
                                     if (
                                         self._quiescing.is_set()
-                                        or sum(job[2] == lane for job in jobs.values())
+                                        or sum(
+                                            job[2] == lane
+                                            or (
+                                                lane in ("bulk", "reserve")
+                                                and job[2] in ("bulk", "reserve")
+                                            )
+                                            for job in jobs.values()
+                                        )
                                         >= self.max_work
                                     ):
                                         outboxes[channel][key] = encode_message(
