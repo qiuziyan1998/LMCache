@@ -533,22 +533,32 @@ class CPUCacheRuntime(CPUCacheOperations):
                     (i for i, (_, page) in enumerate(plan) if not page), len(plan)
                 )
                 mixed_order = any(page for _, page in plan[page_count:])
-                layer_keys = [[] for _ in range(self.num_layers_for_group(group))]
-                for _, _, key in selected:
-                    keys = self._lookup_key_for_kv_group(
+                layers = self.num_layers_for_group(group)
+                base_keys = [
+                    self._lookup_key_for_kv_group(
                         key, kv_group=group, request_configs=data["request_configs"]
-                    ).split_layers(len(layer_keys))
-                    for row, layer_key in zip(layer_keys, keys, strict=True):
-                        row.append(layer_key)
+                    )
+                    for _, _, key in selected
+                ]
+                if page_count == len(plan):
+                    # The exact-page resolver only reads these rows' lengths
+                    # and empty tails; share the existing base-key row.
+                    layer_keys = [base_keys] * layers
+                else:
+                    layer_keys = [[] for _ in range(layers)]
+                    for key, (_, is_page) in zip(base_keys, plan, strict=True):
+                        # Only flat positions consume layer-specific keys.
+                        keys = (key,) * layers if is_page else key.split_layers(layers)
+                        for row, layer_key in zip(layer_keys, keys, strict=True):
+                            row.append(layer_key)
                 page_positions = None
                 if mixed_order:
                     rows, acquisitions, page_positions = self._resolve_mixed_sources(
                         spec.ticket_id,
                         group,
-                        selected,
+                        base_keys,
                         layer_keys,
                         plan,
-                        data["request_configs"],
                     )
                     page_count = len(page_positions)
                 elif page_count:
@@ -558,14 +568,7 @@ class CPUCacheRuntime(CPUCacheOperations):
                         kv_group=group,
                         keys_layer_major=layer_keys,
                         page_chunks=page_count,
-                        base_page_keys=[
-                            self._lookup_key_for_kv_group(
-                                key,
-                                kv_group=group,
-                                request_configs=data["request_configs"],
-                            )
-                            for _, _, key in selected
-                        ],
+                        base_page_keys=base_keys,
                         exact_chunk_locations=[location for location, _ in plan],
                     )
                 else:
@@ -670,10 +673,9 @@ class CPUCacheRuntime(CPUCacheOperations):
         self,
         ticket_id: str,
         group: int,
-        candidates: list,
+        base_keys: list,
         layer_keys: list[list],
         plan: list,
-        configs: dict,
     ) -> tuple[list[list[Any]], list[Any], tuple[int, ...]]:
         """Reuse exact resolvers for ordered page/flat runs without CPU copies."""
         rows = [[] for _ in range(self.num_layers_for_group(group))]
@@ -694,14 +696,7 @@ class CPUCacheRuntime(CPUCacheOperations):
                         kv_group=group,
                         keys_layer_major=keys,
                         page_chunks=stop - begin,
-                        base_page_keys=[
-                            self._lookup_key_for_kv_group(
-                                key,
-                                kv_group=group,
-                                request_configs=configs,
-                            )
-                            for _, _, key in candidates[begin:stop]
-                        ],
+                        base_page_keys=base_keys[begin:stop],
                         exact_chunk_locations=locations,
                     )
                     acquisitions.extend(resolved[0][:count])

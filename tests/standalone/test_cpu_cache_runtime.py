@@ -276,6 +276,47 @@ def test_lookup_prepare_keeps_unequal_group_geometry_until_every_rank_retires(se
             gc.enable()
 
 
+def test_prepare_merged_pages_does_not_expand_layer_keys(setup, monkeypatch):
+    from lmcache.utils import CacheEngineKey
+
+    owner, runtime, work, bootstrap, populate = setup
+    populate()
+    bootstrap()
+    hit, _ = lookup(work)
+    split = CacheEngineKey.split_layers
+    calls = []
+
+    def tracked(key, layers):
+        calls.append((key.kv_group, key.chunk_hash, layers))
+        return split(key, layers)
+
+    monkeypatch.setattr(CacheEngineKey, "split_layers", tracked)
+    result, original = prepare(work, runtime, hit.value)
+    assert result.status == "COMPLETED", result.error
+    try:
+        assert calls == []
+        for group in result.value.groups:
+            group.validate(
+                runtime.layout,
+                owner.allocator.buffer.numel(),
+                5,
+                key_plan_digest=hit.value.key_plan_digest,
+            )
+    finally:
+        for group in result.value.groups:
+            for participant in ("worker-0", "worker-1"):
+                control(
+                    runtime,
+                    original,
+                    "retire",
+                    {
+                        "lease_id": group.lease_id,
+                        "proof": "never_imported",
+                    },
+                    participant,
+                )
+
+
 def test_cancel_lookup_releases_only_its_unclaimed_hold(setup):
     _, runtime, work, bootstrap, populate = setup
     pages = populate()

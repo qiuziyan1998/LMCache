@@ -252,6 +252,124 @@ def test_registered_mixed_geometry_has_no_engine_or_npu_dependency(setup):
 
 
 @pytest.mark.parametrize(
+    "representations",
+    [
+        ("page", "page", "page"),
+        ("page", "layers", "page"),
+        ("layers", "page", "layers"),
+    ],
+)
+def test_ascend_prepare_expands_only_flat_keys_and_preserves_bytes(
+    setup, monkeypatch, representations
+):
+    import ctypes
+    from lmcache.utils import CacheEngineKey
+
+    owner, runtime, work = setup
+    chunks = list(runtime.token_database.process_tokens(tokens=list(range(9))))
+    expected = {}
+    for chunk_index, ((start, end, key), representation) in enumerate(
+        zip(chunks, representations, strict=True)
+    ):
+        reserved, original = work(
+            "worker-0",
+            "reserve_write",
+            {
+                "purpose": "store",
+                "groups": tuple(
+                    {
+                        "group_id": group,
+                        "representation": representation,
+                        "starts": (start,),
+                        "ends": (end,),
+                        "hashes": (wire_hash(key.chunk_hash, 64),),
+                    }
+                    for group in (0, 1)
+                ),
+            },
+        )
+        assert reserved.status == "COMPLETED", reserved.error
+        reservation = runtime._write_reservations[reserved.value["reservation_id"]]
+        for group, fragments in reservation.fragments.items():
+            for index, (_, _, obj) in enumerate(fragments):
+                values = (
+                    tuple(obj.layer_tensor(layer) for layer in range(obj.num_layers))
+                    if isinstance(obj, LayerPageMemoryObj)
+                    else (obj.tensor,)
+                )
+                for layer, value in enumerate(values):
+                    layer_id = layer if isinstance(obj, LayerPageMemoryObj) else index
+                    value.fill_(1 + group * 20 + layer_id * 3 + chunk_index)
+                    expected[group, layer_id, chunk_index] = (
+                        value.view(torch.uint8).numpy().tobytes()
+                    )
+        committed, _ = work(
+            "worker-0",
+            "commit_write",
+            {
+                "reservation_id": reserved.value["reservation_id"],
+                "proof": "fenced",
+            },
+        )
+        assert committed.status == "COMPLETED", committed.error
+        for group in reserved.value["groups"]:
+            retire(runtime, original, group["lease_id"])
+    hit, _ = work(
+        "scheduler",
+        "lookup",
+        {
+            "starts": tuple(a for a, _, _ in chunks),
+            "ends": tuple(b for _, b, _ in chunks),
+            "hashes": tuple(wire_hash(key.chunk_hash, 64) for _, _, key in chunks),
+            "request_configs": {},
+        },
+    )
+    assert hit.value.matched_tokens == 9, hit.error
+    calls, split = [], CacheEngineKey.split_layers
+
+    def tracked(key, layers):
+        calls.append((key.kv_group, layers))
+        return split(key, layers)
+
+    monkeypatch.setattr(CacheEngineKey, "split_layers", tracked)
+    prepared, original = work(
+        "worker-0",
+        "prepare",
+        PrepareSpec(
+            hit.value.ticket_id,
+            hit.value.key_plan_digest,
+            9,
+            runtime.layout.digest,
+            ("worker-0", "worker-1"),
+        ),
+    )
+    assert prepared.status == "COMPLETED", prepared.error
+    try:
+        flats = representations.count("layers")
+        assert calls == [(0, 2)] * flats + [(1, 3)] * flats
+        for manifest in prepared.value.groups:
+            manifest.validate(
+                runtime.layout,
+                owner.allocator.buffer.numel(),
+                9,
+                key_plan_digest=hit.value.key_plan_digest,
+            )
+            pointers = manifest.pointer_rows(
+                owner.allocator.buffer.data_ptr(),
+                runtime.num_layers_for_group(manifest.group_id),
+            )
+            for layer, row in enumerate(pointers):
+                for index, address in enumerate(row):
+                    wanted = expected[manifest.group_id, layer, index]
+                    assert ctypes.string_at(address, len(wanted)) == wanted
+    finally:
+        for manifest in prepared.value.groups:
+            for participant in ("worker-0", "worker-1"):
+                retire(runtime, original, manifest.lease_id, participant)
+    assert runtime.registry.snapshot()["leases"] == 0
+
+
+@pytest.mark.parametrize(
     "field,value",
     [
         ("remote_fill_cache_namespace", "stale-namespace"),
