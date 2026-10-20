@@ -1515,6 +1515,10 @@ class ReqMeta:
     )
     live_split_compact: bool = False
     live_split_latent_cpu: bool = False
+    # Optional diagnostic query span [start, end), populated by the Ascend
+    # scheduler only when P-node overlap statistics are enabled. Appended to
+    # preserve the existing positional constructor. Independent of save chunks.
+    prefill_overlap_span: Optional[tuple[int, int]] = None
 
     def retrieve_token_count(self) -> int:
         """Return the logical retrieve prefix represented by this metadata."""
@@ -3437,6 +3441,10 @@ class LMCacheConnectorV1Impl:
         )
         if bank_offset is not None:
             wait_kwargs["bank_offset"] = bank_offset
+        if getattr(self, "_prefill_overlap_step_active", False):
+            wait_kwargs["model_layer_id"] = self._layerwise_layer_id_from_name(
+                layer_name
+            )
         wait(**wait_kwargs)
 
     def _layerwise_prefill_load_position(
