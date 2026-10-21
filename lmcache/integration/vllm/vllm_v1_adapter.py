@@ -1451,7 +1451,7 @@ class ReqMeta:
     # P-node DMA consumes block IDs directly and derives one destination
     # address per DMA segment; it must not materialize a token-sized map.
     block_ids_by_bank: Optional[tuple[tuple[list[int], ...], ...]] = None
-    # Physical-bank phase for this chunk.  The P-node rotates the two banks
+    # Physical-bank phase for this chunk. The P-node rotates its configured banks
     # at every LMCache chunk boundary so the first real lightning-indexer
     # layer does not reuse the previous chunk's final bank while its D2H save
     # is still in flight.
@@ -1703,7 +1703,7 @@ class ReqMeta:
             )
             layerwise_prefill_bank_offset = (
                 local_saved_tokens // lmcache_chunk_size
-            ) % 2
+            ) % len(tracker.allocated_block_ids_by_bank or ((), ()))
         metadata_current_released_frontier = tracker.dsa_current_released_frontier
         if is_sparse_decode and load_spec is not None:
             metadata_current_released_frontier = min(
@@ -2068,9 +2068,9 @@ class ReqMeta:
 
         slot_mappings_by_bank = None
         if tracker.allocated_block_ids_by_bank is not None:
-            if len(tracker.allocated_block_ids_by_bank) != 2:
+            if not tracker.allocated_block_ids_by_bank:
                 raise RuntimeError(
-                    "Layerwise-prefill request must carry exactly two banks"
+                    "Layerwise-prefill request must carry physical banks"
                 )
             if not layerwise_prefill_dma:
                 slot_mappings_by_bank = tuple(
@@ -2231,6 +2231,12 @@ class LMCacheConnectorV1Impl:
         self.device = vllm_config.device_config.device
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self._layerwise_prefill_p_node = _layerwise_prefill_p_node_enabled()
+        self._layerwise_prefill_bank_count = 2
+        if self._layerwise_prefill_p_node:
+            # Read the same startup configuration as the physical allocator.
+            from vllm.v1.core.dsa_shared_pool import layerwise_prefill_bank_count
+
+            self._layerwise_prefill_bank_count = layerwise_prefill_bank_count()
         # The P-node marker is the feature gate shared with vLLM and
         # vllm-ascend.  Once enabled, this connector must use the raw DMA
         # two-bank path; otherwise a P node can silently fall back to the
@@ -3165,22 +3171,24 @@ class LMCacheConnectorV1Impl:
         assert mappings is not None
         bank = (
             layer_index + int(request.layerwise_prefill_bank_offset)
-        ) % 2
+        ) % getattr(self, "_layerwise_prefill_bank_count", 2)
         # Layout/allocation mode was checked when materializing this forward's
         # maps. Layer callbacks only select their group's physical bank.
         return mappings[bank][kv_group]
 
     def _layerwise_prefill_dma_block_ids(
         self, request: ReqMeta, kv_group: int
-    ) -> Optional[tuple[list[int], list[int]]]:
+    ) -> Optional[tuple[list[int], ...]]:
         if not getattr(self, "_layerwise_prefill_dma", False):
             return None
         block_ids = request.block_ids_by_bank
-        if block_ids is None or len(block_ids) != 2:
+        if block_ids is None or len(block_ids) != getattr(
+            self, "_layerwise_prefill_bank_count", 2
+        ):
             raise RuntimeError(
-                "P-node DMA needs the two original bank block-ID lists"
+                "P-node DMA bank block-ID lists disagree with the configured count"
             )
-        return block_ids[0][kv_group], block_ids[1][kv_group]
+        return tuple(bank[kv_group] for bank in block_ids)
 
     def _materialize_layerwise_prefill_slot_mappings(
         self,
@@ -3211,7 +3219,7 @@ class LMCacheConnectorV1Impl:
                 "P-node layerwise prefill request is missing banked slot mappings: "
                 f"req_id={request.req_id}"
             )
-        if len(mappings) != 2:
+        if len(mappings) != getattr(self, "_layerwise_prefill_bank_count", 2):
             raise RuntimeError(
                 "P-node layerwise prefill slot-mapping layout is invalid: "
                 f"req_id={request.req_id}, banks={len(mappings)}"
@@ -3398,7 +3406,8 @@ class LMCacheConnectorV1Impl:
             return
         metadata = self._parent._get_connector_metadata()
         offsets = tuple({
-            int(getattr(request, "layerwise_prefill_bank_offset", 0)) & 1
+            int(getattr(request, "layerwise_prefill_bank_offset", 0))
+            % getattr(self, "_layerwise_prefill_bank_count", 2)
             for request in metadata.requests
         })
         if not offsets:
@@ -3428,7 +3437,8 @@ class LMCacheConnectorV1Impl:
                 "support but has no wait_for_layerwise_prefill_load API"
             )
         offsets = {
-            int(getattr(request, "layerwise_prefill_bank_offset", 0)) & 1
+            int(getattr(request, "layerwise_prefill_bank_offset", 0))
+            % getattr(self, "_layerwise_prefill_bank_count", 2)
             for request in getattr(self, "_layerwise_requests", ())
         }
         bank_offset = offsets.pop() if len(offsets) == 1 else None
@@ -9300,10 +9310,12 @@ class LMCacheConnectorV1Impl:
                     deferred_prefill_kwargs = (
                         {
                             "deferred_layerwise_get": True,
-                            "layerwise_prefill_bank_count": 2,
+                            "layerwise_prefill_bank_count": (
+                                self._layerwise_prefill_bank_count
+                            ),
                             "layerwise_prefill_bank_offset": (
                                 int(request.layerwise_prefill_bank_offset)
-                                & 1
+                                % self._layerwise_prefill_bank_count
                             ),
                         }
                         if self._deferred_layerwise_prefill_load_active
@@ -9426,8 +9438,8 @@ class LMCacheConnectorV1Impl:
                         )
 
                     # The first two generator resumes prepare and submit L0.
-                    # L1 is submitted by the virtual N=-1 callback at the
-                    # first SFA entry, so its DMA can overlap L0 compute.
+                    # The remaining initial banks are submitted before model
+                    # execution, after every request has primed L0.
                     if prefill_request_started:
                         prefill_start_timing_log(
                             logger, "retrieve_setup_before_prime",
@@ -9510,7 +9522,7 @@ class LMCacheConnectorV1Impl:
                     recalc_last_applied=recalc_last_applied,
                 )
 
-        # Submit the second bank's initial layer before model execution.  The
+        # Fill the initial bank window before model execution. The
         # first-SFA callback remains idempotent for older callers, but it must
         # not perform a synchronous retriever advance on the latency path.
         if self._deferred_layerwise_prefill_load_active:
@@ -9923,7 +9935,7 @@ class LMCacheConnectorV1Impl:
             )
         if finish_current and layer_id != last_group_layer:
             raise RuntimeError("Only the last group row may drain its prefill load")
-        transfer_layer = layer_id + 2
+        transfer_layer = layer_id + getattr(self, "_layerwise_prefill_bank_count", 2)
         should_advance_retriever = (
             (finish_current and layer_id == last_group_layer)
             or (not finish_current and transfer_layer <= last_group_layer)
@@ -9978,7 +9990,7 @@ class LMCacheConnectorV1Impl:
         )
 
     def _submit_initial_layerwise_prefill_load(self) -> None:
-        """Submit L1 before model execution without advancing model layers."""
+        """Submit the remaining initial banks without advancing model layers."""
         if self._initial_layerwise_prefill_load_submitted:
             return
         requests = self._layerwise_requests
@@ -9986,41 +9998,48 @@ class LMCacheConnectorV1Impl:
             for request, retriever_pair in zip(
                 requests, self.layerwise_retrievers, strict=True
             ):
-                if len(self._latent_layer_names) > 1:
+                for layer_id in range(1, min(
+                    getattr(self, "_layerwise_prefill_bank_count", 2),
+                    len(self._latent_layer_names),
+                )):
                     started = (
                         time.perf_counter()
                         if prefill_start_timing_enabled() else 0.0
                     )
                     self._advance_dense_layerwise_retriever(
-                        request, retriever_pair, 0, 1
+                        request, retriever_pair, 0, layer_id
                     )
                     if started:
                         prefill_start_timing_log(
-                            logger, "second_bank_submit", started,
+                            logger, "initial_bank_submit", started,
                             req_id=request.req_id, kv_group=0,
+                            layer_id=layer_id,
                             prefix_tokens=len(request.token_ids),
                         )
-                if retriever_pair[1] is not None and len(
-                    self._indexer_layer_names
-                ) > 1:
+                for layer_id in range(1, min(
+                    getattr(self, "_layerwise_prefill_bank_count", 2),
+                    len(self._indexer_layer_names)
+                    if retriever_pair[1] is not None else 0,
+                )):
                     started = (
                         time.perf_counter()
                         if prefill_start_timing_enabled() else 0.0
                     )
                     self._advance_dense_layerwise_retriever(
-                        request, retriever_pair, 1, 1
+                        request, retriever_pair, 1, layer_id
                     )
                     if started:
                         prefill_start_timing_log(
-                            logger, "second_bank_submit", started,
+                            logger, "initial_bank_submit", started,
                             req_id=request.req_id, kv_group=1,
+                            layer_id=layer_id,
                             prefix_tokens=len(request.token_ids),
                         )
         self._initial_layerwise_prefill_load_submitted = True
 
     @_lmcache_nvtx_annotate
     def submit_layerwise_prefill_load(self, layer_name: str | int) -> None:
-        """Submit N+2; N=-1 primes L1 at first-layer SFA entry."""
+        """Submit N+bank_count; N=-1 primes the initial prefetch window."""
         if not self.layerwise_retrievers:
             return
         if not getattr(self, "_deferred_layerwise_prefill_load_active", False):
@@ -10259,9 +10278,9 @@ class LMCacheConnectorV1Impl:
         wait_group = None
         if self.supports_layerwise_prefill_transfer_window:
             wait_group = self._layerwise_wait_group(layer_name)
-            # This fence is required even on a cache miss. Layer N and N-2 use
-            # the same two-bank slot; N must not overwrite it while save(N-2)
-            # is still reading from that bank.
+            # This fence is required even on a cache miss. Layer N and N-B
+            # share a bank (B is the configured depth). Do not overwrite it
+            # while save(N-B) is still reading.
             self._wait_for_layerwise_prefill_bank(layer_name, wait_group)
 
         if self.layerwise_retrievers and logger.isEnabledFor(10):
@@ -10790,7 +10809,8 @@ class LMCacheConnectorV1Impl:
         }
         if self._layerwise_prefill_p_node:
             store_kwargs["layerwise_prefill_bank_offset"] = (
-                int(request.layerwise_prefill_bank_offset) & 1
+                int(request.layerwise_prefill_bank_offset)
+                % self._layerwise_prefill_bank_count
             )
         if self._is_dsa_two_groups() and kv_group == 1:
             store_kwargs["kv_group"] = 1
@@ -11022,7 +11042,7 @@ class LMCacheConnectorV1Impl:
             sync=sync,
             deferred_layerwise_put=True,
             layerwise_prefill_incremental=True,
-            layerwise_prefill_bank_count=2,
+            layerwise_prefill_bank_count=self._layerwise_prefill_bank_count,
             **(
                 {"prefill_dma_block_ids_by_bank":
                  self._layerwise_prefill_dma_block_ids(request, kv_group),
@@ -11393,7 +11413,8 @@ class LMCacheConnectorV1Impl:
                         self._layerwise_prefill_p_node
                     ),
                     layerwise_prefill_bank_count=(
-                        2 if self._layerwise_prefill_p_node else 1
+                        self._layerwise_prefill_bank_count
+                        if self._layerwise_prefill_p_node else 1
                     ),
                     req_id=request.req_id,
                     **store_kwargs,
