@@ -511,6 +511,16 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "description": "Capture generated decoder KV before HBM reuse and restore "
         "verified checkpoints. Requires the Ascend checkpoint worker extension.",
     },
+    "decode_checkpoint_writeback": {
+        "type": bool, "default": False, "env_converter": _to_bool,
+        "description": "Retain decoder checkpoints and spill under CPU pressure.",
+    },
+    "decode_checkpoint_retention_max_bytes": {
+        "type": int, "default": 0, "env_converter": int,
+    },
+    "decode_checkpoint_free_reserve_bytes": {
+        "type": int, "default": 0, "env_converter": int,
+    },
     "enable_npu_transfer_validation": {
         "type": bool,
         "default": True,
@@ -817,6 +827,15 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
 # Specialized methods that are unique to LMCacheEngineConfig
 def _validate_config(self):
     """Validate configuration"""
+
+    if self.decode_checkpoint_writeback and not (
+        self.decode_preemption_checkpoint
+        and self.pd_role == "receiver"
+        and self.decode_checkpoint_retention_max_bytes > 0
+        and self.decode_checkpoint_free_reserve_bytes > 0
+    ):
+        raise ValueError("decode_checkpoint_writeback requires decoder checkpointing "
+                         "and positive retention/free-reserve byte budgets")
 
     # needed for the old async serializer implementation
     # # auto-adjust save_unfull_chunk for async loading to prevent CPU fragmentation

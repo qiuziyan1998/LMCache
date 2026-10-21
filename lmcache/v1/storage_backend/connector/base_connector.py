@@ -339,9 +339,9 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         return None
 
     def batched_external_pages_exist(
-        self, keys: List[CacheEngineKey]
+        self, keys: List[CacheEngineKey], *, strict: bool = False
     ) -> List[bool]:
-        """Check arbitrary page keys in one native operation."""
+        """Check page keys; strict mode must distinguish absence from errors."""
         raise NotImplementedError
 
     def support_batched_async_contains(self) -> bool:

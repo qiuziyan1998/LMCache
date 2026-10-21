@@ -8631,6 +8631,15 @@ class LMCacheConnectorV1Impl:
                         request.req_id,
                         owned_groups={1: []},
                     )
+                    if getattr(
+                        getattr(self, "config", None),
+                        "decode_checkpoint_writeback",
+                        False,
+                    ):
+                        self.lmcache_engine.checkpoint_resume_admitted(
+                            request.req_id, request.load_spec.checkpoint_generation,
+                            request.load_spec.dsa_cold_load_generation,
+                        )
             load_spec = request.load_spec
             if load_spec is None:
                 continue
