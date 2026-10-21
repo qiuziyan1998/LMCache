@@ -805,6 +805,19 @@ class LoadSpec:
     dsa_current_released_frontier: int = 0
     # Load Group 1 directly from persistent storage into its final HBM blocks.
     dsa_group1_direct_hbm: bool = False
+    # The request uses the sparse metadata/SFA route while its full latent
+    # prefix remains resident in vLLM. This is deliberately distinct from
+    # ``can_load``: the route must not create a sparse retrieve/load plan.
+    dsa_full_resident: bool = False
+
+
+def _load_spec_requires_retrieve(load_spec: Optional[LoadSpec]) -> bool:
+    """Return whether a LoadSpec requires an LMCache retrieve operation."""
+    return bool(
+        load_spec is not None
+        and load_spec.can_load
+        and not getattr(load_spec, "dsa_full_resident", False)
+    )
 
 
 @dataclass
@@ -1681,7 +1694,7 @@ class ReqMeta:
         ):
             sparse_token_count = (
                 int(load_spec.lmcache_cached_tokens)
-                if load_spec.can_load
+                if _load_spec_requires_retrieve(load_spec)
                 else len(tracker.sparse_token_ids)
             )
             if len(tracker.sparse_token_ids) == sparse_token_count:
@@ -1788,7 +1801,8 @@ class ReqMeta:
                 skip_save = True
 
         requires_indexer_slots = dsa_two_groups and (
-            (load_spec is not None and load_spec.can_load)
+            is_sparse_decode
+            or _load_spec_requires_retrieve(load_spec)
             or not skip_save
             or live_source_requested
         )
@@ -1871,11 +1885,24 @@ class ReqMeta:
             can_save_indexer=can_save_indexer,
         )
 
-        # Calculate the token ids and slot mappings for load and save
-        if is_sparse_decode and load_spec is not None and skip_save:
+        # Calculate the token ids and slot mappings for load and save. A
+        # full-resident request still uses the sparse metadata/SFA route, but
+        # it must use its resident vLLM prefix rather than a sparse retrieve
+        # frontier or sparse scratch slot table.
+        full_resident_route = bool(
+            is_sparse_decode
+            and load_spec is not None
+            and getattr(load_spec, "dsa_full_resident", False)
+        )
+        if (
+            is_sparse_decode
+            and load_spec is not None
+            and skip_save
+            and not full_resident_route
+        ):
             sparse_token_count = int(load_spec.lmcache_cached_tokens)
             if (
-                load_spec.can_load
+                _load_spec_requires_retrieve(load_spec)
                 and sparse_token_count == tracker.sparse_meta_frontier
                 and not save_entire_prefix
             ):
@@ -1918,7 +1945,7 @@ class ReqMeta:
                 )
         else:
             retrieve_token_len = 0
-            if load_spec is not None and load_spec.can_load:
+            if _load_spec_requires_retrieve(load_spec):
                 retrieve_token_len = load_spec.lmcache_cached_tokens
             token_len = max(num_tokens_to_save, retrieve_token_len)
             token_ids = input_token_ids[:token_len]
@@ -1990,9 +2017,13 @@ class ReqMeta:
                 ]
 
         needs_full_slots = bool(
-            (load_spec is not None and load_spec.can_load) or save_entire_prefix
+            _load_spec_requires_retrieve(load_spec) or save_entire_prefix
         )
-        if is_sparse_decode and load_spec is not None:
+        if (
+            is_sparse_decode
+            and load_spec is not None
+            and not full_resident_route
+        ):
             num_slots = _sparse_slot_mapping_len(load_spec.lmcache_cached_tokens)
             current_slots = (
                 int(tracker.sparse_slot_mapping[0].numel())
@@ -2032,7 +2063,7 @@ class ReqMeta:
                     indexer_num_blocks,
                     block_size,
                 )
-            if is_sparse_decode and load_spec is not None and load_spec.can_load:
+            if is_sparse_decode and _load_spec_requires_retrieve(load_spec):
                 if (
                     not tracker.sparse_indexer_slot_mapping
                     or tracker.sparse_indexer_slot_mapping[0].numel()
@@ -2047,7 +2078,7 @@ class ReqMeta:
                         )
                     )
                 indexer_slot_mapping = tracker.sparse_indexer_slot_mapping
-            elif not is_sparse_decode:
+            elif not is_sparse_decode or full_resident_route:
                 if use_windowed_save_mapping and not needs_full_slots:
                     indexer_slot_mapping = save_indexer_slot_mapping
                 else:
@@ -2058,7 +2089,7 @@ class ReqMeta:
                             len(token_ids),
                         )
                     ]
-        if load_spec is not None and load_spec.can_load:
+        if _load_spec_requires_retrieve(load_spec):
             logger.debug(
                 "Scheduled to load %d tokens (%d cached in vLLM) for request %s",
                 load_spec.lmcache_cached_tokens,
@@ -2087,7 +2118,7 @@ class ReqMeta:
 
         decode_token_mask: Optional[torch.Tensor] = None
         decode_ret_mask: Optional[torch.Tensor] = None
-        if is_sparse_decode and load_spec is not None:
+        if is_sparse_decode and load_spec is not None and not full_resident_route:
             num_retrieve_tokens = len(token_ids)
             if load_spec.vllm_cached_tokens > 0:
                 if (
@@ -2174,8 +2205,7 @@ class ReqMeta:
         )
         if (
             is_sparse_decode
-            and load_spec is not None
-            and load_spec.can_load
+            and _load_spec_requires_retrieve(load_spec)
             and skip_save
             and not save_entire_prefix
             and len(token_ids) == load_spec.lmcache_cached_tokens
@@ -4329,8 +4359,7 @@ class LMCacheConnectorV1Impl:
         """Keep lookup pins across decode steps while sparse retrieve is active."""
         return (
             getattr(request, "is_sparse_decode", False)
-            and request.load_spec is not None
-            and request.load_spec.can_load
+            and _load_spec_requires_retrieve(request.load_spec)
         )
 
     @staticmethod
@@ -5168,10 +5197,7 @@ class LMCacheConnectorV1Impl:
             getattr(self, "_dsa_kv_policy_threshold", 0) or 0
         )
         release_gate = max(self._dsa_scratch_capacity, policy_threshold)
-        sparse_active = bool(
-            tracker.dsa_nonresident_frontier > 0
-            or len(tracker.token_ids) > policy_threshold
-        )
+        sparse_active = self._dsa_kv_policy_is_sparse_managed(tracker)
         if not sparse_active or committed_end <= release_gate:
             return 0
         return int(committed_end)
@@ -6156,7 +6182,7 @@ class LMCacheConnectorV1Impl:
         if (
             not request.is_sparse_decode
             or load_spec is None
-            or not load_spec.can_load
+            or not _load_spec_requires_retrieve(load_spec)
         ):
             raise RuntimeError(
                 f"Invalid sparse warm metadata for request {request.req_id}"
@@ -7225,7 +7251,7 @@ class LMCacheConnectorV1Impl:
         for request in metadata.requests:
             if not request.is_sparse_decode:
                 continue
-            if request.load_spec is None or not request.load_spec.can_load:
+            if not _load_spec_requires_retrieve(request.load_spec):
                 continue
             state = self._worker_retrieve_state.get(request.req_id)
             if state is None or not state.has_cache():
@@ -8570,7 +8596,7 @@ class LMCacheConnectorV1Impl:
             self._abort_layerwise_retrieve_step(
                 request
                 for request in metadata.requests
-                if request.load_spec is not None and request.load_spec.can_load
+                if _load_spec_requires_retrieve(request.load_spec)
                 and not getattr(
                     request.load_spec, "dsa_cold_compact_load", False
                 )
@@ -8607,7 +8633,7 @@ class LMCacheConnectorV1Impl:
                 request
                 for request in metadata.requests
                 if request.load_spec is not None
-                and request.load_spec.can_load
+                and _load_spec_requires_retrieve(request.load_spec)
                 and getattr(
                     request.load_spec, "dsa_cold_compact_load", False
                 )
@@ -8668,7 +8694,7 @@ class LMCacheConnectorV1Impl:
                 continue
             if getattr(load_spec, "dsa_cold_compact_load", False):
                 continue
-            if not load_spec.can_load and getattr(
+            if not _load_spec_requires_retrieve(load_spec) and getattr(
                 load_spec, "dsa_cold_compact_resume", False
             ):
                 raise RuntimeError(
@@ -8678,7 +8704,7 @@ class LMCacheConnectorV1Impl:
             has_load_spec = True
             vllm_hit_tokens += load_spec.vllm_cached_tokens
             prompt_tokens += request.retrieve_token_count()
-            if not load_spec.can_load:
+            if not _load_spec_requires_retrieve(load_spec):
                 continue
             loadable_requests.append((idx, request))
             if self.use_layerwise and not request.is_sparse_decode:
@@ -9911,7 +9937,7 @@ class LMCacheConnectorV1Impl:
             layerwise_requests = [
                 request
                 for request in metadata.requests
-                if request.load_spec is not None and request.load_spec.can_load
+                if _load_spec_requires_retrieve(request.load_spec)
             ]
 
         wait_group = self._layerwise_wait_group(layer_name)
@@ -10327,7 +10353,7 @@ class LMCacheConnectorV1Impl:
             layerwise_requests = [
                 request
                 for request in metadata.requests
-                if request.load_spec is not None and request.load_spec.can_load
+                if _load_spec_requires_retrieve(request.load_spec)
             ]
 
         rows_of_req = None
@@ -10340,8 +10366,7 @@ class LMCacheConnectorV1Impl:
                 sparse_req_ids = [
                     request.req_id
                     for request in metadata.requests
-                    if request.load_spec is not None
-                    and request.load_spec.can_load
+                    if _load_spec_requires_retrieve(request.load_spec)
                     and request.is_sparse_decode
                 ]
             row_groups_key = (tuple(request_ids), tuple(sparse_req_ids))
@@ -13015,7 +13040,7 @@ class LMCacheConnectorV1Impl:
     def _log_dsa_kv_policy(
         self,
         req_id: str,
-        is_sparse_decode: bool,
+        sparse_managed: bool,
         prompt_len: int,
         num_computed_tokens: int,
     ) -> None:
@@ -13026,7 +13051,7 @@ class LMCacheConnectorV1Impl:
         management. Both policies continue to use sparse attention. Controlled
         by ``LMCACHE_DSA_KV_POLICY_LOG=1``.
         """
-        policy = "sparse_managed" if is_sparse_decode else "full_resident"
+        policy = "sparse_managed" if sparse_managed else "full_resident"
         prev = self._dsa_kv_policy_states.get(req_id)
         if prev == policy:
             return
@@ -13040,6 +13065,39 @@ class LMCacheConnectorV1Impl:
             prompt_len,
             num_computed_tokens,
             getattr(self, "_dsa_kv_policy_threshold", 0),
+        )
+
+    def _dsa_kv_policy_is_sparse_managed(
+        self,
+        tracker: RequestTracker,
+    ) -> bool:
+        """Return whether the current request should manage KV sparsely.
+
+        This residency decision is independent from ``is_sparse_decode``.
+        DSA decode metadata remains sparse for the staged SFA route even while
+        the latent prefix stays resident in vLLM.
+        """
+        threshold = int(
+            getattr(self, "_dsa_kv_policy_threshold", 0) or 0
+        )
+        return bool(
+            tracker.dsa_nonresident_frontier > 0
+            or len(tracker.token_ids) > threshold
+        )
+
+    def _dsa_decode_route_enabled(
+        self,
+        request: Any,
+        tracker: RequestTracker,
+    ) -> bool:
+        """Return whether the request must use the DSA staged route."""
+        return bool(
+            self.enable_sparse_attention
+            and (
+                request.num_computed_tokens >= tracker.prompt_len
+                or tracker.dsa_nonresident_frontier > 0
+                or hasattr(tracker, "sparse_remap_frontier")
+            )
         )
 
     def _build_request_meta(
@@ -13627,129 +13685,143 @@ class LMCacheConnectorV1Impl:
                 new_block_allocation_mode=new_block_allocation_mode,
             )
             self._add_decode_window_save_metas(meta, request_tracker)
-            # KV policy (方案 A) follows the CURRENT context length, not the
-            # initial prompt_len. A short prompt that grows past the threshold
-            # switches from full-resident to sparse-managed loading/release;
-            # attention remains sparse under both policies.
-            is_sparse_decode = (
-                self.enable_sparse_attention
-                and (
-                    (
-                        request.num_computed_tokens
-                        >= request_tracker.prompt_len
-                        and len(request_tracker.token_ids)
-                        > getattr(self, "_dsa_kv_policy_threshold", 0)
-                    )
-                    or request_tracker.dsa_nonresident_frontier > 0
-                    or hasattr(request_tracker, "sparse_remap_frontier")
-                )
+            # Keep the KV residency policy separate from the SFA metadata
+            # route. ``is_sparse_decode`` is consumed by vLLM-Ascend's staged
+            # SFA admission and must remain true for every post-prefill DSA
+            # step, including a full-resident step whose remap frontier is 0.
+            # The threshold controls storage policy, not attention routing.
+            is_sparse_decode = self._dsa_decode_route_enabled(
+                request,
+                request_tracker,
             )
             if self._dsa_kv_policy_log:
                 self._log_dsa_kv_policy(
                     req_id,
-                    is_sparse_decode,
+                    self._dsa_kv_policy_is_sparse_managed(request_tracker),
                     request_tracker.prompt_len,
                     request.num_computed_tokens,
                 )
             if is_sparse_decode:
-                # Sparse direct decode should only retrieve the prefix whose
-                # boundary is also used by SFA scratch_remap. Keep the final
-                # partial prompt chunk in the live vLLM tail by default; the
-                # sparse direct path does not carry per-chunk sizes.
-                lmcache_cached_for_sparse = (
-                    request_tracker.prompt_len
-                    // self._lmcache_chunk_size
-                    * self._lmcache_chunk_size
+                sparse_managed = self._dsa_kv_policy_is_sparse_managed(
+                    request_tracker
                 )
-                if self._decode_window_save_window_size > 0:
-                    token_len = len(request_tracker.token_ids)
-                    save_frontier = request_tracker.decode_window_save_next_start
-                    if save_frontier is None:
-                        save_frontier = self._init_decode_window_save_start(
-                            request_tracker
-                        )
-                    save_frontier = min(int(save_frontier), token_len)
-                    lmcache_cached_for_sparse = min(
-                        request_tracker.decode_window_save_committed_end,
-                        save_frontier,
-                        token_len,
+                has_pending_retrieve = _load_spec_requires_retrieve(load_spec)
+                if not sparse_managed and not has_pending_retrieve:
+                    load_spec = LoadSpec(
+                        vllm_cached_tokens=0,
+                        lmcache_cached_tokens=0,
+                        can_load=False,
+                        dsa_committed_end=0,
+                        dsa_remap_frontier=0,
+                        dsa_scratch_capacity=self._dsa_scratch_capacity,
+                        dsa_current_released_frontier=(
+                            request_tracker.dsa_current_released_frontier
+                        ),
+                        dsa_full_resident=True,
                     )
-                lmcache_cached_for_sparse = max(
-                    lmcache_cached_for_sparse,
-                    request_tracker.dsa_nonresident_frontier,
-                )
-                committed_end = (
-                    lmcache_cached_for_sparse
-                    // self._lmcache_chunk_size
-                    * self._lmcache_chunk_size
-                )
-                dsa_release_frontier = (
-                    committed_end
-                    if committed_end
-                    > max(
-                        self._dsa_scratch_capacity,
-                        getattr(self, "_dsa_kv_policy_threshold", 0),
-                    )
-                    else 0
-                )
-                dsa_remap_frontier = getattr(
-                    request_tracker, "sparse_remap_frontier", None
-                )
-                if dsa_remap_frontier is not None:
-                    dsa_remap_frontier = max(
-                        int(dsa_remap_frontier),
-                        int(dsa_release_frontier),
-                        request_tracker.dsa_nonresident_frontier,
-                    )
-                    request_tracker.sparse_remap_frontier = dsa_remap_frontier
                 else:
-                    dsa_remap_frontier = max(
-                        dsa_release_frontier,
-                        request_tracker.dsa_nonresident_frontier,
+                    # Sparse direct decode should only retrieve the prefix
+                    # whose boundary is also used by SFA scratch_remap. Keep
+                    # the final partial prompt chunk in the live vLLM tail by
+                    # default; the sparse direct path does not carry
+                    # per-chunk sizes.
+                    lmcache_cached_for_sparse = (
+                        request_tracker.prompt_len
+                        // self._lmcache_chunk_size
+                        * self._lmcache_chunk_size
                     )
-                committed_end = max(committed_end, int(dsa_remap_frontier))
-                cold_compact_live = hasattr(
-                    request_tracker, "sparse_remap_frontier"
-                )
-                if self.kv_role == "kv_consumer" or cold_compact_live:
-                    # Include the final partial prompt chunk in worker metadata;
-                    # only the release frontier must remain chunk-aligned. A
-                    # cold compact kv_both request has already materialized its
-                    # complete prompt source, so shrinking this frontier would
-                    # discard the prepared worker state and reload both groups.
+                    if self._decode_window_save_window_size > 0:
+                        token_len = len(request_tracker.token_ids)
+                        save_frontier = request_tracker.decode_window_save_next_start
+                        if save_frontier is None:
+                            save_frontier = self._init_decode_window_save_start(
+                                request_tracker
+                            )
+                        save_frontier = min(int(save_frontier), token_len)
+                        lmcache_cached_for_sparse = min(
+                            request_tracker.decode_window_save_committed_end,
+                            save_frontier,
+                            token_len,
+                        )
                     lmcache_cached_for_sparse = max(
                         lmcache_cached_for_sparse,
-                        request_tracker.prompt_len,
-                        int(dsa_remap_frontier),
+                        request_tracker.dsa_nonresident_frontier,
                     )
-                if len(request.all_token_ids) < lmcache_cached_for_sparse:
-                    raise RuntimeError(
-                        "Sparse frontier exceeds available request tokens: "
-                        f"req_id={req_id} frontier={lmcache_cached_for_sparse} "
-                        f"tokens={len(request.all_token_ids)}"
+                    committed_end = (
+                        lmcache_cached_for_sparse
+                        // self._lmcache_chunk_size
+                        * self._lmcache_chunk_size
                     )
-                if (
-                    len(request_tracker.sparse_token_ids)
-                    < lmcache_cached_for_sparse
-                ):
-                    request_tracker.seed_sparse_decode_tokens(
-                        list(request.all_token_ids),
-                        token_count=lmcache_cached_for_sparse,
+                    dsa_release_frontier = (
+                        committed_end
+                        if committed_end
+                        > max(
+                            self._dsa_scratch_capacity,
+                            getattr(self, "_dsa_kv_policy_threshold", 0),
+                        )
+                        else 0
                     )
-                load_spec = LoadSpec(
-                    vllm_cached_tokens=0,
-                    lmcache_cached_tokens=lmcache_cached_for_sparse,
-                    can_load=lmcache_cached_for_sparse > 0,
-                    dsa_committed_end=committed_end,
-                    dsa_remap_frontier=dsa_remap_frontier,
-                    dsa_scratch_capacity=self._dsa_scratch_capacity,
-                    dsa_release_frontier=(
-                        dsa_release_frontier
-                        if dsa_release_frontier > 0
-                        else None
-                    ),
-                    dsa_current_released_frontier=request_tracker.dsa_current_released_frontier,
-                )
+                    dsa_remap_frontier = getattr(
+                        request_tracker, "sparse_remap_frontier", None
+                    )
+                    if dsa_remap_frontier is not None:
+                        dsa_remap_frontier = max(
+                            int(dsa_remap_frontier),
+                            int(dsa_release_frontier),
+                            request_tracker.dsa_nonresident_frontier,
+                        )
+                        request_tracker.sparse_remap_frontier = dsa_remap_frontier
+                    else:
+                        dsa_remap_frontier = max(
+                            dsa_release_frontier,
+                            request_tracker.dsa_nonresident_frontier,
+                        )
+                    committed_end = max(committed_end, int(dsa_remap_frontier))
+                    cold_compact_live = hasattr(
+                        request_tracker, "sparse_remap_frontier"
+                    )
+                    if self.kv_role == "kv_consumer" or cold_compact_live:
+                        # Include the final partial prompt chunk in worker metadata;
+                        # only the release frontier must remain chunk-aligned. A
+                        # cold compact kv_both request has already materialized its
+                        # complete prompt source, so shrinking this frontier would
+                        # discard the prepared worker state and reload both groups.
+                        lmcache_cached_for_sparse = max(
+                            lmcache_cached_for_sparse,
+                            request_tracker.prompt_len,
+                            int(dsa_remap_frontier),
+                        )
+                    if len(request.all_token_ids) < lmcache_cached_for_sparse:
+                        raise RuntimeError(
+                            "Sparse frontier exceeds available request tokens: "
+                            f"req_id={req_id} frontier={lmcache_cached_for_sparse} "
+                            f"tokens={len(request.all_token_ids)}"
+                        )
+                    if (
+                        len(request_tracker.sparse_token_ids)
+                        < lmcache_cached_for_sparse
+                    ):
+                        request_tracker.seed_sparse_decode_tokens(
+                            list(request.all_token_ids),
+                            token_count=lmcache_cached_for_sparse,
+                        )
+                    load_spec = LoadSpec(
+                        vllm_cached_tokens=0,
+                        lmcache_cached_tokens=lmcache_cached_for_sparse,
+                        can_load=lmcache_cached_for_sparse > 0,
+                        dsa_committed_end=committed_end,
+                        dsa_remap_frontier=dsa_remap_frontier,
+                        dsa_scratch_capacity=self._dsa_scratch_capacity,
+                        dsa_release_frontier=(
+                            dsa_release_frontier
+                            if dsa_release_frontier > 0
+                            else None
+                        ),
+                        dsa_current_released_frontier=(
+                            request_tracker.dsa_current_released_frontier
+                        ),
+                        dsa_full_resident=False,
+                    )
 
             req_meta = self._build_request_meta(
                 request_tracker,
