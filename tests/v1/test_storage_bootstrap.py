@@ -398,6 +398,8 @@ def test_early_bootstrap_uses_effective_chunk_size_and_launcher_rank(monkeypatch
 def test_local_mode_does_not_create_native_bootstrap(monkeypatch):
     from lmcache.integration.vllm import utils
 
+    # The Ascend connector still needs its config patch in local mode.
+    monkeypatch.setitem(sys.modules, "lmcache_ascend", ModuleType("lmcache_ascend"))
     monkeypatch.setattr(
         utils,
         "lmcache_get_or_create_config",

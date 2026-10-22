@@ -489,6 +489,10 @@ def early_bootstrap_decoder_storage(worker: Any) -> WorkerStorageBootstrap | Non
     transfer = worker.vllm_config.kv_transfer_config
     if transfer is None or transfer.kv_connector != "LMCacheAscendConnectorV1Dynamic":
         return None
+    # Ascend replaces the config class. Patch before creating the singleton,
+    # including local mode, or the later connector receives an old-class object.
+    import lmcache_ascend  # noqa: F401
+
     from lmcache.integration.vllm.utils import (
         apply_vllm_config_overrides,
         create_lmcache_metadata,
@@ -499,8 +503,6 @@ def early_bootstrap_decoder_storage(worker: Any) -> WorkerStorageBootstrap | Non
     apply_vllm_config_overrides(config, worker.vllm_config)
     if config.decoder_storage_mode != "process":
         return None
-    import lmcache_ascend  # noqa: F401
-
     parallel = worker.parallel_config
     if (
         config.pd_role != "receiver"
