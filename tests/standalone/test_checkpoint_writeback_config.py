@@ -12,17 +12,32 @@ from lmcache.v1.config import LMCacheEngineConfig
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_writeback_is_disabled_by_default():
-    config = LMCacheEngineConfig.from_defaults()
-    assert config.decode_checkpoint_writeback is False
-    assert config.decode_checkpoint_retention_max_bytes == 0
+@pytest.mark.parametrize("role", [None, "sender", "receiver"])
+def test_writeback_defaults_do_not_enable_checkpointing(role):
+    config = LMCacheEngineConfig.from_defaults(pd_role=role)
+    assert config.decode_preemption_checkpoint is False
+    assert config.decode_checkpoint_writeback is True
+    assert config.decode_checkpoint_retention_max_bytes == 4 << 30
+    assert config.decode_checkpoint_free_reserve_bytes == 8 << 30
     config.validate()
+
+
+@pytest.mark.parametrize("role", [None, "receiver"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_checkpoint_writeback_defaults_and_explicit_opt_out(role, enabled):
+    options = {} if enabled else {"decode_checkpoint_writeback": False}
+    config = LMCacheEngineConfig.from_defaults(
+        decode_preemption_checkpoint=True, pd_role=role, **options
+    )
+    config.validate()
+    assert config.decode_checkpoint_writeback is enabled
+    assert config.decode_checkpoint_retention_max_bytes == 4 << 30
+    assert config.decode_checkpoint_free_reserve_bytes == 8 << 30
 
 
 @pytest.mark.parametrize(
     "change",
     [
-        {"decode_preemption_checkpoint": False},
         {"pd_role": "sender"},
         {"decode_checkpoint_retention_max_bytes": 0},
         {"decode_checkpoint_free_reserve_bytes": -1},
