@@ -14031,7 +14031,7 @@ class LMCacheConnectorV1Impl:
                 pending.status = "failed"
                 cancels.append((req_id, pending.capture.generation))
                 continue
-            tokens = list(request.all_token_ids[:end])
+            tokens = request.all_token_ids[:end]
             if len(tokens) != end or any(token < 0 for token in tokens):
                 pending.status = "failed"
                 cancels.append((req_id, pending.capture.generation))
