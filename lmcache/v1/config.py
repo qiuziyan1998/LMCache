@@ -830,11 +830,12 @@ def _validate_config(self):
 
     if self.decode_checkpoint_writeback and not (
         self.decode_preemption_checkpoint
-        and self.pd_role == "receiver"
+        and self.pd_role in (None, "receiver")
         and self.decode_checkpoint_retention_max_bytes > 0
         and self.decode_checkpoint_free_reserve_bytes > 0
     ):
-        raise ValueError("decode_checkpoint_writeback requires decoder checkpointing "
+        raise ValueError("decode_checkpoint_writeback requires checkpointing, "
+                         "pd_role unset (standalone) or receiver, "
                          "and positive retention/free-reserve byte budgets")
 
     # needed for the old async serializer implementation

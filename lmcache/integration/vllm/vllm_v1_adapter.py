@@ -12448,7 +12448,14 @@ class LMCacheConnectorV1Impl:
         )
         resident_cold_load = (
             getattr(self, "_resident_cold_load_enabled", False)
-            and getattr(self.config, "pd_role", None) == "receiver"
+            and (
+                getattr(self.config, "pd_role", None) == "receiver"
+                or (
+                    getattr(self.config, "pd_role", None) is None
+                    and query_scope == "preemption_checkpoint"
+                    and getattr(self.config, "decode_preemption_checkpoint", False)
+                )
+            )
             and 1 < num_external_hit_tokens <= self._dsa_scratch_capacity
         )
         dsa_cold_compact_load = (

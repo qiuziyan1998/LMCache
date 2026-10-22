@@ -41,14 +41,48 @@ def test_writeback_rejects_missing_prerequisites(change):
         LMCacheEngineConfig.from_defaults(**values).validate()
 
 
-def test_positive_writeback_budgets_validate():
+@pytest.mark.parametrize("role", [None, "receiver"])
+def test_positive_writeback_budgets_validate(role):
     LMCacheEngineConfig.from_defaults(
         decode_checkpoint_writeback=True,
         decode_preemption_checkpoint=True,
-        pd_role="receiver",
+        pd_role=role,
         decode_checkpoint_retention_max_bytes=100,
         decode_checkpoint_free_reserve_bytes=10,
     ).validate()
+
+
+def test_standalone_page_configuration_does_not_require_pd_or_remote_fill():
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=1024,
+        local_cpu=True,
+        max_local_cpu_size=400,
+        use_layerwise=True,
+        enable_sparse_attention=True,
+        save_unfull_chunk=True,
+        dsa_two_groups=True,
+        enable_shared_cpu_cache=True,
+        shared_cpu_cache_strict=True,
+        store_async=True,
+        store_async_max_queue_size=2,
+        enable_dsa_cold_compact_load=True,
+        remote_url="mooncakestore://localhost:50088/",
+        decode_preemption_checkpoint=True,
+        decode_checkpoint_writeback=True,
+        decode_checkpoint_retention_max_bytes=4 << 30,
+        decode_checkpoint_free_reserve_bytes=8 << 30,
+        extra_config={
+            "save_only_first_rank": True,
+            "save_chunk_meta": False,
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+            "mooncake_direct_npu_prefill_store": True,
+            "use_ascend_direct": True,
+        },
+    )
+    config.validate()
+    assert config.pd_role is None and not config.enable_remote_lmcache_store
+    assert config.dsa_group1_load_mode == "p2p_preferred"
 
 
 def method(path, name, namespace):
