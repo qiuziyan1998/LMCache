@@ -22,6 +22,8 @@ ServiceKind = Literal[
     "storage_work",
     "storage_lifecycle",
     "storage_bootstrap",
+    "native_work",
+    "native_lifecycle",
 ]
 
 # Default timeout constants for socket operations (in milliseconds)
@@ -196,7 +198,8 @@ def get_zmq_rpc_path_lmcache(
         engine_id: The engine ID for the RPC path.
         service_name: The service name, one of 'lookup', 'offload',
             'lookup_worker', 'lookup_scheduler', 'storage_work',
-            'storage_lifecycle', 'storage_bootstrap'.
+            'storage_lifecycle', 'storage_bootstrap', 'native_work',
+            'native_lifecycle'.
         rpc_port: The RPC port number.
         rank: The rank of the worker.
         base_url: Optional base URL for the socket path. If not provided,
@@ -227,6 +230,8 @@ def get_zmq_rpc_path_lmcache(
         "storage_work",
         "storage_lifecycle",
         "storage_bootstrap",
+        "native_work",
+        "native_lifecycle",
     }:
         raise ValueError(f"Unsupported LMCache service_name: {service_name!r}")
 

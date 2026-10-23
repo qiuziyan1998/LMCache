@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 from weakref import ref
 import ast
 import gc
+import importlib.util
 import json
 import os
 import socket
@@ -171,6 +172,70 @@ def start(
         endpoint_factory=endpoint,
         failure_callback=(lambda reason: failed.set()) if failed else trace.append,
     )
+
+
+@pytest.mark.parametrize("ascend", [False, True])
+@pytest.mark.parametrize("native_transport", [False, True])
+def test_default_bootstrap_endpoints_reach_service_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ascend: bool,
+    native_transport: bool,
+) -> None:
+    """Exercise production naming, including Ascend, before any native setup."""
+    from lmcache.v1 import rpc_utils
+
+    if ascend:
+        # Import the actual CPU-only wrapper without NPU package initialization.
+        helper = Path(__file__).resolve().parents[3] / (
+            "LMCache-Ascend/lmcache_ascend/v1/rpc_utils.py"
+        )
+        spec = importlib.util.spec_from_file_location("ascend_rpc_probe", helper)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        monkeypatch.setattr(
+            rpc_utils,
+            "get_zmq_rpc_path_lmcache",
+            module.use_short_engine_id(rpc_utils.get_zmq_rpc_path_lmcache),
+        )
+
+    captured = {}
+
+    def stop_before_spawn(argv: list[str], **kwargs: object) -> None:
+        path = Path(argv[argv.index("--bootstrap") + 1])
+        captured.update(json.loads(path.read_text(encoding="utf-8")))
+        raise OSError("probe stops before service launch")
+
+    with pytest.raises(OSError, match="probe stops before service launch"):
+        start_worker_storage(
+            engine_id="decoder-dp0",
+            rpc_port=0,
+            tp_rank=0,
+            tp_size=4,
+            runtime_config={},
+            mapping_factory=object,
+            reader_factory=None,
+            transport_factory=object if native_transport else None,
+            base_url=str(tmp_path),
+            spawn=stop_before_spawn,
+        )
+    paths = {
+        "storage_work": captured["work_endpoint"],
+        "storage_lifecycle": captured["lifecycle_endpoint"],
+    }
+    runtime = captured["runtime_config"]
+    if native_transport:
+        paths.update(
+            native_work=runtime["transport"]["work"],
+            native_lifecycle=runtime["transport"]["lifecycle"],
+        )
+    else:
+        assert "transport" not in runtime
+    assert len(set(paths.values())) == len(paths)
+    for kind, path in paths.items():
+        assert path.startswith("ipc://")
+        assert f"_service_{kind}_lmcache_rpc_port_0" in path
 
 
 def test_owner_is_also_registered_client_and_reuses_namespace_after_drain(tmp_path):

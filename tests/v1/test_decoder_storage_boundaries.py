@@ -50,6 +50,8 @@ def test_decoder_storage_endpoints_are_distinct_and_instance_scoped(
         "storage_work",
         "storage_lifecycle",
         "storage_bootstrap",
+        "native_work",
+        "native_lifecycle",
     )
     paths = {
         get_zmq_rpc_path_lmcache("dp0", service, rpc_port, rank, "/tmp/lmcache")
