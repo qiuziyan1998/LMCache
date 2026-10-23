@@ -12,6 +12,7 @@ import msgspec
 import torch
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.rpc.storage_protocol import (
     PrepareSpec,
     PreparedReply,
@@ -23,6 +24,9 @@ from lmcache.v1.rpc.storage_protocol import (
     restore_hash,
 )
 from lmcache.integration.vllm.preemption_checkpoint import CheckpointRestoreMiss
+from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
+
+logger = init_logger(__name__)
 
 
 def cancel_unadmitted_operation(client: Any, future: Any, timeout: float) -> Any:
@@ -672,13 +676,28 @@ def run_cold(
     engine = adapter.lmcache_engine
     request = plan["request"]
     state = live_state or WorkerRetrieveState(req_id=request.req_id)
+    perf = serving_perf_enabled()
+    started = last = time.perf_counter() if perf else 0.0
+    phases = {}
+    status = "error"
+    result = None
+
+    def mark(name: str) -> None:
+        nonlocal last
+        if perf:
+            now = time.perf_counter()
+            phases[name] = round((now - last) * 1000, 3)
+            last = now
+
     try:
         if previous is not None:
             try:
                 previous.exception()
             except BaseException:
                 pass
+        mark("predecessor_wait_ms")
         result = _exchange_reply(adapter, plan)
+        mark("reply_exchange_ms")
         if result is None:
             raise RuntimeError("Cold CPU preparation cannot skip publication")
         reply = msgspec.convert(result.value, type=PreparedReply)
@@ -713,6 +732,7 @@ def run_cold(
             )
         except BaseException as exc:
             error = exc
+        mark("import_ms")
         state.prepared_sparse_sources = sources
         ready = engine._ordered_checkpoint_agreement(
             request.req_id,
@@ -721,6 +741,7 @@ def run_cold(
             0,
             error is None,
         )
+        mark("tp_agreement_ms")
         if error is not None:
             raise error
         if not ready:
@@ -730,7 +751,9 @@ def run_cold(
         if getattr(request.load_spec, "dsa_cold_resident_load", False):
             _dense_source(adapter, sources[0], plan, 0)
             state.dense_prefix_resident_tokens = plan["token_count"]
+        mark("resident_load_ms")
         indexer.result()
+        mark("indexer_remaining_wait_ms")
         state.indexer_npu_resident = True
         state.location = "LocalCPU"
         state.metadata_warm = True
@@ -751,6 +774,8 @@ def run_cold(
         )
         adapter._record_dsa_cold_dense_load_readiness(state)
         state._dsa_cold_load_completed_at = time.perf_counter()
+        mark("state_ready_ms")
+        status = "ok"
         return state
     except BaseException as error:
         gate = plan["latent_shared_ready"]
@@ -767,6 +792,34 @@ def run_cold(
             error._lmcache_dsa_cold_state = state
             engine.__dict__.setdefault("_failed_process_source_reads", []).append(state)
         raise
+    finally:
+        if perf:
+            serving_perf_log(
+                logger,
+                "storage_worker_load",
+                started=started,
+                req_id=request.req_id,
+                generation=request.load_spec.dsa_cold_load_generation,
+                rank=getattr(getattr(engine, "metadata", None), "worker_id", None),
+                prepare_operation_id=result.identity.operation_id
+                if result is not None
+                else None,
+                service_epoch=result.identity.service_epoch
+                if result is not None
+                else None,
+                client_session=result.identity.client_session
+                if result is not None
+                else None,
+                status=status,
+                tokens=plan["token_count"],
+                plan_to_worker_ms=round((started - plan["planned_at"]) * 1000, 3)
+                if "planned_at" in plan
+                else None,
+                unfinished_or_cleanup_ms=round((time.perf_counter() - last) * 1000, 3)
+                if status != "ok"
+                else 0.0,
+                **phases,
+            )
 
 
 def record_state(adapter: Any, state: Any, request: Any) -> None:

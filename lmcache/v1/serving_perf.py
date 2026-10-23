@@ -38,6 +38,48 @@ _PREFILL_REUSE_LINES = count()
 _PERF_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
     "lmcache_serving_perf_context", default=None
 )
+_PERF_TIMINGS: ContextVar[dict[str, Any] | None] = ContextVar(
+    "lmcache_serving_perf_timings", default=None
+)
+
+
+def serving_perf_context() -> dict[str, Any]:
+    """Return a snapshot for explicit diagnostic correlation across IPC."""
+    return dict(_PERF_CONTEXT.get() or {}) if serving_perf_enabled() else {}
+
+
+@contextmanager
+def serving_perf_measure(*, rollup_prefix: str = "") -> Iterator[dict[str, Any]]:
+    """Collect host timings for one operation, isolating nested operations."""
+    values: dict[str, Any] = {}
+    token = _PERF_TIMINGS.set(values)
+    try:
+        yield values
+    finally:
+        _PERF_TIMINGS.reset(token)
+        if rollup_prefix:
+            for name, value in values.items():
+                serving_perf_record(rollup_prefix + name, value)
+
+
+def serving_perf_record(name: str, value: float) -> None:
+    """Accumulate a host measurement only in an active operation summary."""
+    values = _PERF_TIMINGS.get()
+    if values is not None:
+        values[name] = round(values.get(name, 0) + value, 3)
+
+
+@contextmanager
+def serving_perf_phase(name: str) -> Iterator[None]:
+    """Measure a host phase without device events or synchronization."""
+    if _PERF_TIMINGS.get() is None:
+        yield
+        return
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        serving_perf_record(name, (time.perf_counter() - started) * 1000)
 
 
 def _clock_domain() -> tuple[str, str]:

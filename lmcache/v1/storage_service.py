@@ -19,6 +19,7 @@ import msgspec
 import zmq
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.cpu_cache import StorageBusy, validate_storage_work
 from lmcache.v1.rpc.storage_client import LIFECYCLE_METHODS
 from lmcache.v1.rpc.storage_protocol import (
@@ -29,6 +30,14 @@ from lmcache.v1.rpc.storage_protocol import (
     encode_message,
 )
 from lmcache.v1.rpc_utils import PollerWakeup
+from lmcache.v1.serving_perf import (
+    serving_perf_enabled,
+    serving_perf_log,
+    serving_perf_scope,
+    serving_perf_measure,
+)
+
+logger = init_logger(__name__)
 
 
 class StorageRuntime(Protocol):
@@ -296,7 +305,12 @@ class StorageService:
                                         )
                                     else:
                                         future = executors[lane].submit(
-                                            self._handle, request
+                                            self._handle_timed,
+                                            request,
+                                            time.perf_counter()
+                                            if serving_perf_enabled()
+                                            and method in ("prepare", "native_get")
+                                            else None,
                                         )
                                         jobs[key] = (future, request, lane)
                                         # A Future may already be done here. Its
@@ -417,6 +431,56 @@ class StorageService:
 
     def _job_completed(self, future: Future) -> None:
         self._transport_wakeup.notify()
+
+    def _handle_timed(
+        self, request: StorageRequest, queued: float | None
+    ) -> StorageResult:
+        if queued is None:
+            return self._handle(request)
+        started = time.perf_counter()
+        cpu = time.thread_time()
+        correlation = {}
+        if request.method == "prepare":
+            correlation = dict(
+                source_req_id=request.identity.request_id,
+                prepare_operation_id=request.identity.operation_id,
+            )
+        elif isinstance(request.payload, dict):
+            incoming = request.payload.get("perf_context", {})
+            if isinstance(incoming, dict):
+                correlation = {
+                    k: v
+                    for k, v in incoming.items()
+                    if k in ("source_req_id", "prepare_operation_id", "transfer_id")
+                    and type(v) in (str, int)
+                }
+        with serving_perf_scope(**correlation), serving_perf_measure() as phases:
+            result = self._handle(request)
+        finished = time.perf_counter()
+        # One preparation summary; only slow native GET batches. No lookup,
+        # per-layer, polling, PUT, or retirement logs on the steady decode path.
+        if (
+            request.method == "prepare"
+            or result.status != "COMPLETED"
+            or finished - queued >= 0.1
+        ):
+            serving_perf_log(
+                logger,
+                "storage_service_timing",
+                req_id=request.identity.request_id,
+                operation_id=request.identity.operation_id,
+                service_epoch=request.identity.service_epoch,
+                client_session=request.identity.client_session,
+                load_generation=getattr(request.identity, "load_generation", None),
+                method=request.method,
+                status=result.status,
+                **correlation,
+                **phases,
+                queue_ms=round((started - queued) * 1000, 3),
+                execute_ms=round((finished - started) * 1000, 3),
+                execute_thread_cpu_ms=round((time.thread_time() - cpu) * 1000, 3),
+            )
+        return result
 
     def _validate(self, request: StorageRequest, lifecycle: bool) -> None:
         identity = request.identity

@@ -32,6 +32,52 @@ from lmcache.v1.storage_service import StorageService
 NONCE = b"native-test"
 
 
+def test_perf_correlates_split_gets_without_per_page_summary(tmp_path, monkeypatch):
+    import time
+    from lmcache.v1 import serving_perf as perf
+    from lmcache.v1 import storage_service
+
+    monkeypatch.setattr(perf, "_MODE", "detail")
+    records = []
+
+    def record(logger, event, **fields):
+        records.append((event, {**perf.serving_perf_context(), **fields}))
+
+    monkeypatch.setattr(mooncake_transport, "serving_perf_log", record)
+    monkeypatch.setattr(storage_service, "serving_perf_log", record)
+    with transport(tmp_path) as (remote, worker, slab):
+        worker.store.values.update(a=b"1234", b=b"5678")
+        read = worker.store.batch_get_into_multi_buffers
+
+        def slow(*args):
+            time.sleep(0.11)
+            return read(*args)
+
+        monkeypatch.setattr(worker.store, "batch_get_into_multi_buffers", slow)
+        remote.max_bytes = 4  # Two sub-batches, one logical transfer summary.
+        with (
+            perf.serving_perf_measure() as parent,
+            perf.serving_perf_scope(
+                source_req_id="real-request", prepare_operation_id=7
+            ),
+        ):
+            assert remote.batch_get_into_multi_buffers(
+                ["a", "b"], [[remote.base], [remote.base + 4]], [[4], [4]]
+            ) == [4, 4]
+        assert bytes(slab.buf[:8]) == b"12345678"
+        summaries = [v for e, v in records if e == "storage_native_transfer"]
+        workers = [v for e, v in records if e == "storage_service_timing"]
+        assert len(summaries) == 1 and len(workers) == 2
+        assert summaries[0]["batches"] == 2
+        assert summaries[0]["ack_completed_batches"] == 2
+        assert parent["remote_get_batches"] == 2
+        assert parent["remote_get_reply_wait_ms"] >= 200
+        assert all(v["native_call_ms"] >= 100 for v in workers)
+        assert all(v["source_req_id"] == "real-request" for _, v in records)
+        assert all(v["prepare_operation_id"] == 7 for _, v in records)
+        assert all(v["transfer_id"] == summaries[0]["transfer_id"] for v in workers)
+
+
 def endpoint():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

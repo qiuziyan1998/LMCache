@@ -8,9 +8,20 @@ from typing import Any, Callable
 from weakref import ref
 import ctypes
 import asyncio
+import time
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.cpu_cache import StorageFailedSafe, StorageOperationRegistry
+from lmcache.v1.serving_perf import (
+    serving_perf_enabled,
+    serving_perf_log,
+    serving_perf_measure,
+    serving_perf_phase,
+    serving_perf_record,
+    serving_perf_context,
+    serving_perf_scope,
+)
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
 from lmcache.v1.rpc.storage_client import StorageClient
 from lmcache.v1.rpc.storage_protocol import (
@@ -22,6 +33,7 @@ from lmcache.v1.rpc.storage_protocol import (
 )
 
 MAX_KEYS = 256
+logger = init_logger(__name__)
 MAX_RANGES = 1024
 MAX_CONTROL_BYTES = 256 * 1024
 _READS = frozenset(("batch_get_into", "batch_get_into_multi_buffers"))
@@ -240,13 +252,15 @@ class WorkerMooncakeTransport:
             raise StorageFailedSafe(str(error)) from error
         # No native call occurred before validation. Exceptions after this point
         # are UNKNOWN: registry retains the result and refuses normal shutdown.
-        self._prepare_thread()
+        with serving_perf_phase("native_thread_setup_ms"):
+            self._prepare_thread()
         if api in _READS:
-            if api == "batch_get_into":
-                return self.store.batch_get_into(
-                    keys, [r[0] for r in ptrs], [r[0] for r in lengths]
-                )
-            return self.store.batch_get_into_multi_buffers(keys, ptrs, lengths)
+            with serving_perf_phase("native_call_ms"):
+                if api == "batch_get_into":
+                    return self.store.batch_get_into(
+                        keys, [r[0] for r in ptrs], [r[0] for r in lengths]
+                    )
+                return self.store.batch_get_into_multi_buffers(keys, ptrs, lengths)
         replica = self.replica_factory()
         replica.replica_num = 1
         if segment:
@@ -374,7 +388,29 @@ class RemoteMooncakeStore:
             obj.ref_count_up()
         unknown = False
         try:
-            return self._invoke(api, args, held)
+            if api not in _READS or not serving_perf_enabled():
+                return self._invoke(api, args, held)
+            started = time.perf_counter()
+            status = "error"
+            # One summary across every split batch; never log per-page transfers.
+            with (
+                serving_perf_measure(rollup_prefix="remote_get_") as phases,
+                serving_perf_scope(transfer_id=f"{id(self):x}:{time.monotonic_ns()}"),
+            ):
+                try:
+                    result = self._invoke(api, args, held)
+                    status = "ok"
+                    return result
+                finally:
+                    if status != "ok" or time.perf_counter() - started >= 0.1:
+                        serving_perf_log(
+                            logger,
+                            "storage_native_transfer",
+                            started=started,
+                            api=api,
+                            status=status,
+                            **phases,
+                        )
         except NativeExternalPageTransferUnknownError:
             unknown = True
             with self._lock:
@@ -418,6 +454,8 @@ class RemoteMooncakeStore:
     def _invoke(self, api: str, args: tuple, owners: tuple) -> Any:
         if not self.is_healthy() or self.registration is None:
             raise RuntimeError("Worker native transport is unavailable")
+        perf = api in _READS and serving_perf_enabled()
+        planning_started = time.perf_counter() if perf else None
         header, segment = b"", None
         scalar = api in ("put_from", "put_parts")
         exists = api == "batch_is_exist"
@@ -456,9 +494,14 @@ class RemoteMooncakeStore:
                 rows.append((offsets, spans))
             if len(rows) != len(keys):
                 raise ValueError("Native key/range cardinality mismatch")
+        if perf:
+            serving_perf_record(
+                "operand_plan_ms", (time.perf_counter() - planning_started) * 1000
+            )
         results = []
         begin = 0
         while begin < len(keys):
+            batch_started = time.perf_counter() if perf else None
             end, count, size, key_bytes = begin, 0, 0, len(header)
             while end < len(keys) and end - begin < MAX_KEYS:
                 n, b = (0, 0) if exists else (len(rows[end][0]), sum(rows[end][1]))
@@ -494,12 +537,31 @@ class RemoteMooncakeStore:
                 if api in _READS
                 else "native_put"
             )
+            if perf:
+                correlation = serving_perf_context()
+                payload["perf_context"] = {
+                    k: correlation[k]
+                    for k in ("source_req_id", "prepare_operation_id", "transfer_id")
+                    if k in correlation
+                }
+                serving_perf_record(
+                    "batch_plan_ms", (time.perf_counter() - batch_started) * 1000
+                )
+                serving_perf_record("batches", 1)
+                serving_perf_record("keys", end - begin)
+                serving_perf_record("bytes", size)
             # Only M background jobs wait here. The worker model thread never
             # services this queue. Separate lookup credit remains available.
             if method == "native_exists":
                 values = self._request(method, payload)
             else:
+                slot_started = time.perf_counter() if perf else None
                 with self._slots:
+                    if perf:
+                        serving_perf_record(
+                            "credit_wait_ms",
+                            (time.perf_counter() - slot_started) * 1000,
+                        )
                     values = self._request(method, payload)
             if scalar:
                 results.append(values)
@@ -517,6 +579,12 @@ class RemoteMooncakeStore:
         # Recheck after waiting for bulk credit and between split batches.
         if not self.is_healthy():
             raise RuntimeError("Worker native transport is unavailable")
+        started = (
+            time.perf_counter()
+            if method == "native_get" and serving_perf_enabled()
+            else None
+        )
+        submitted = replied = ack_started = ack_finished = None
         future = self.client.request(
             method,
             payload,
@@ -526,8 +594,12 @@ class RemoteMooncakeStore:
             purpose=method,
         )
         terminal = False
+        if started is not None:
+            submitted = time.perf_counter()
         try:
             result = future.result(timeout=self.timeout)
+            if started is not None:
+                replied = time.perf_counter()
             if result.status in ("BUSY", "REJECTED"):
                 cancelled = self.client.cancel(future.identity).result(
                     timeout=self.timeout
@@ -541,9 +613,13 @@ class RemoteMooncakeStore:
                 digest = content_digest((result.status, result.value, result.error))
             else:
                 raise RuntimeError(f"Native transport status {result.status}")
+            if started is not None:
+                ack_started = time.perf_counter()
             ack = self.client.acknowledge_terminal(
                 future.identity, {"terminal_result_digest": digest}
             ).result(timeout=self.timeout)
+            if started is not None:
+                ack_finished = time.perf_counter()
             if ack.status != "ACKNOWLEDGED":
                 raise RuntimeError("Native completion acknowledgement failed")
             if result.status != "COMPLETED":
@@ -558,6 +634,25 @@ class RemoteMooncakeStore:
                     "Native work completed but its control channel failed"
                 ) from error
             raise NativeExternalPageTransferUnknownError(method, future) from error
+        finally:
+            if started is not None:
+                serving_perf_record("submit_ms", (submitted - started) * 1000)
+                serving_perf_record(
+                    "reply_wait_ms",
+                    ((replied or time.perf_counter()) - submitted) * 1000,
+                )
+                if ack_started is not None:
+                    serving_perf_record(
+                        "ack_ms",
+                        ((ack_finished or time.perf_counter()) - ack_started) * 1000,
+                    )
+                if replied is not None and ack_started is not None:
+                    serving_perf_record(
+                        "terminal_processing_ms", (ack_started - replied) * 1000
+                    )
+                serving_perf_record(
+                    "ack_completed_batches", int(ack_finished is not None)
+                )
 
     def _fail(self, reason: str) -> None:
         self._fatal = reason
