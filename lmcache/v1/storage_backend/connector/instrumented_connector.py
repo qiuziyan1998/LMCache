@@ -277,9 +277,11 @@ class InstrumentedRemoteConnector(RemoteConnector):
         return self._connector.get_remote_fill_destination_session()
 
     def batched_external_pages_exist(
-        self, keys: List[CacheEngineKey]
+        self, keys: List[CacheEngineKey], *, strict: bool = False
     ) -> List[bool]:
         """Delegate arbitrary direct-page existence checks."""
+        if strict:
+            return self._connector.batched_external_pages_exist(keys, strict=True)
         return self._connector.batched_external_pages_exist(keys)
 
     def remove_sync(self, key: CacheEngineKey) -> bool:

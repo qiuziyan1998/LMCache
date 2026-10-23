@@ -2607,7 +2607,7 @@ class MooncakestoreConnector(RemoteConnector):
         return await asyncio.to_thread(prepare)
 
     def batched_external_pages_exist(
-        self, keys: List[CacheEngineKey]
+        self, keys: List[CacheEngineKey], *, strict: bool = False
     ) -> List[bool]:
         """Check arbitrary existing-format page keys in one Mooncake call."""
         page_keys = [
@@ -2622,6 +2622,8 @@ class MooncakestoreConnector(RemoteConnector):
         )
         if results is None or len(results) != len(keys):
             raise RuntimeError("Mooncake direct page lookup returned invalid results")
+        if strict and any(result not in (0, 1) for result in results):
+            raise RuntimeError("Mooncake checkpoint lookup returned an error status")
         return [result == 1 for result in results]
 
     async def _batched_put_zero_copy(

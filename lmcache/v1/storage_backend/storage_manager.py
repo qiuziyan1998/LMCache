@@ -666,15 +666,21 @@ class StorageManager:
         )
 
     def batched_external_pages_exist(
-        self, keys: Sequence[CacheEngineKey]
+        self, keys: Sequence[CacheEngineKey], *, strict: bool = False
     ) -> List[bool]:
         """Check arbitrary remote page keys without consulting LocalCPU."""
         backend = self.storage_backends.get("RemoteBackend")
         if not isinstance(backend, RemoteBackend):
+            if strict:
+                raise RuntimeError("Checkpoint lookup requires RemoteBackend")
             return [False] * len(keys)
         with self._bypass_lock:
             if "RemoteBackend" in self._bypassed_backends:
+                if strict:
+                    raise RuntimeError("Checkpoint RemoteBackend is bypassed")
                 return [False] * len(keys)
+        if strict:
+            return backend.batched_external_pages_exist(keys, strict=True)
         return backend.batched_external_pages_exist(keys)
 
     def submit_remote_fill_direct_push(

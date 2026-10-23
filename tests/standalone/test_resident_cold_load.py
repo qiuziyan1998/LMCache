@@ -12,7 +12,7 @@ from test_checkpoint_adapter import method
 
 
 @pytest.mark.parametrize("length", [2, 127, 128, 129, 280, 1025, 4095, 4096, 4097])
-@pytest.mark.parametrize("role", ["sender", "receiver"])
+@pytest.mark.parametrize("role", [None, "sender", "receiver"])
 @pytest.mark.parametrize("capable", [False, True])
 def test_short_full_hit_uses_resident_cold_admission(length, role, capable):
     request = NS(

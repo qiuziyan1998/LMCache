@@ -642,17 +642,21 @@ class RemoteBackend(StorageBackendInterface):
             raise error from timeout_error
 
     def batched_external_pages_exist(
-        self, keys: Sequence[CacheEngineKey]
+        self, keys: Sequence[CacheEngineKey], *, strict: bool = False
     ) -> List[bool]:
         """Check exact Mooncake pages without allocating LocalCPU."""
         fatal_error = getattr(self, "_external_page_fatal_error", None)
         if fatal_error is not None:
             raise fatal_error
         if self.connection is None:
+            if strict:
+                raise RuntimeError("Checkpoint remote connection is unavailable")
             return [False] * len(keys)
         normalized = list(keys)
         if self._mla_worker_id_as0_mode:
             normalized = [key.with_new_worker_id(0) for key in normalized]
+        if strict:
+            return self.connection.batched_external_pages_exist(normalized, strict=True)
         return self.connection.batched_external_pages_exist(normalized)
 
     def submit_remote_fill_direct_push(

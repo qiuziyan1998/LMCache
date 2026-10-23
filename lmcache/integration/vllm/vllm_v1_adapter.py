@@ -8654,6 +8654,15 @@ class LMCacheConnectorV1Impl:
                         request.req_id,
                         owned_groups={1: []},
                     )
+                    if getattr(
+                        getattr(self, "config", None),
+                        "decode_checkpoint_writeback",
+                        False,
+                    ):
+                        self.lmcache_engine.checkpoint_resume_admitted(
+                            request.req_id, request.load_spec.checkpoint_generation,
+                            request.load_spec.dsa_cold_load_generation,
+                        )
             load_spec = request.load_spec
             if load_spec is None:
                 continue
@@ -12473,7 +12482,14 @@ class LMCacheConnectorV1Impl:
         )
         resident_cold_load = (
             getattr(self, "_resident_cold_load_enabled", False)
-            and getattr(self.config, "pd_role", None) == "receiver"
+            and (
+                getattr(self.config, "pd_role", None) == "receiver"
+                or (
+                    getattr(self.config, "pd_role", None) is None
+                    and query_scope == "preemption_checkpoint"
+                    and getattr(self.config, "decode_preemption_checkpoint", False)
+                )
+            )
             and 1 < num_external_hit_tokens <= self._dsa_scratch_capacity
         )
         dsa_cold_compact_load = (
@@ -14056,7 +14072,7 @@ class LMCacheConnectorV1Impl:
                 pending.status = "failed"
                 cancels.append((req_id, pending.capture.generation))
                 continue
-            tokens = list(request.all_token_ids[:end])
+            tokens = request.all_token_ids[:end]
             if len(tokens) != end or any(token < 0 for token in tokens):
                 pending.status = "failed"
                 cancels.append((req_id, pending.capture.generation))
