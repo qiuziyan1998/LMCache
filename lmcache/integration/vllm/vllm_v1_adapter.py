@@ -3436,12 +3436,15 @@ class LMCacheConnectorV1Impl:
                 "GPU connector declares layerwise prefill transfer-window "
                 "support but has no wait_for_layerwise_prefill_load API"
             )
+        # Every scheduled request writes this layer's bank, including a cache
+        # miss that has no retriever. Match the final-access handoff's request
+        # set; a hit-only phase would leave the other request's save unfenced.
+        metadata = self._parent._get_connector_metadata()
         offsets = {
             int(getattr(request, "layerwise_prefill_bank_offset", 0))
             % getattr(self, "_layerwise_prefill_bank_count", 2)
-            for request in getattr(self, "_layerwise_requests", ())
+            for request in metadata.requests
         }
-        bank_offset = offsets.pop() if len(offsets) == 1 else None
         wait_kwargs = dict(
             layer_id=self._layerwise_prefill_transfer_layer_id(
                 layer_name,
@@ -3449,8 +3452,10 @@ class LMCacheConnectorV1Impl:
             ),
             kv_group=kv_group,
         )
-        if bank_offset is not None:
-            wait_kwargs["bank_offset"] = bank_offset
+        if len(offsets) == 1:
+            wait_kwargs["bank_offset"] = offsets.pop()
+        elif offsets:
+            wait_kwargs["bank_offsets"] = tuple(sorted(offsets))
         if getattr(self, "_prefill_overlap_step_active", False):
             wait_kwargs["model_layer_id"] = self._layerwise_layer_id_from_name(
                 layer_name

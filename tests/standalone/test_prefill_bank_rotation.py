@@ -27,6 +27,7 @@ def adapter() -> NS:
         "_layerwise_prefill_dma_block_ids",
         "_layerwise_prefill_slot_mapping",
         "record_layerwise_prefill_bank_use",
+        "_wait_for_layerwise_prefill_bank",
     }
     methods = [n for n in cls.body if getattr(n, "name", "") in names]
     module = ast.parse("from __future__ import annotations")
@@ -141,6 +142,44 @@ def test_eight_bank_mapping_and_mixed_phase_event_handoff() -> None:
     assert calls[0][:2] == (9, 0)
     assert set(calls[0][2]) == {0, 3, 7}
     assert calls[0][3] is event
+
+
+@pytest.mark.parametrize(
+    "banks,phases,loadable,expected_offset",
+    [
+        (4, [0, 1], [1], None),
+        (4, [0, 1], [0], None),
+        (8, [0, 3, 7], [0, 2], None),
+        (4, [2, 2], [1], 2),
+        (4, [3, 3], [], 3),
+        (4, [], [], None),
+    ],
+)
+def test_bank_wait_includes_scheduled_cache_misses(
+    banks: int,
+    phases: list[int],
+    loadable: list[int],
+    expected_offset: int | None,
+) -> None:
+    obj = adapter()
+    requests = [NS(layerwise_prefill_bank_offset=phase) for phase in phases]
+    obj._layerwise_prefill_bank_count = banks
+    obj._layerwise_requests = [requests[index] for index in loadable]
+    obj._parent = NS(_get_connector_metadata=lambda: NS(requests=requests))
+    obj._layerwise_prefill_transfer_layer_id = lambda name, group: banks
+    calls = []
+    obj.lmcache_engine = NS(
+        gpu_connector=NS(
+            wait_for_layerwise_prefill_load=lambda **kwargs: calls.append(kwargs),
+        )
+    )
+    obj._wait_for_layerwise_prefill_bank("layer", 1)
+    expected = dict(layer_id=banks, kv_group=1)
+    if expected_offset is not None:
+        expected["bank_offset"] = expected_offset
+    elif phases:
+        expected["bank_offsets"] = tuple(sorted(set(phases)))
+    assert calls == [expected]
 
 
 @pytest.mark.parametrize("chunks", [0, 1, 7, 8, 19])
