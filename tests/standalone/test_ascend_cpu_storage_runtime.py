@@ -54,6 +54,7 @@ def setup():
     factory, module = ascend_modules()
     owner = CPUStorage()
     owner.config.decode_preemption_checkpoint = True
+    owner.config.decode_checkpoint_writeback = False
     owner.config.use_layerwise = True
     owner.config.save_unfull_chunk = True
     owner.config.enable_sparse_attention = True

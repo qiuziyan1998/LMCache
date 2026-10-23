@@ -77,6 +77,15 @@ def test_pending_paired_preparation_leaves_foreground_free_and_state_private(
     owners = [Owner(adapter) for adapter in adapters]
     coordinators = [ColdLoadCoordinator(o.publish, o.fail, o.restart) for o in owners]
     plans = []
+    reductions = []
+    original_sum = torch.Tensor.sum
+
+    def count_sum(tensor, *args, **kwargs):
+        if any(tensor is plan["token_mask"] for plan in plans):
+            reductions.append(id(tensor))
+        return original_sum(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "sum", count_sum)
     try:
         for adapter, coordinator in zip(adapters, coordinators, strict=True):
             adapter.lmcache_engine.gpu_connector.synchronize_dense_load_readiness = (
@@ -102,6 +111,7 @@ def test_pending_paired_preparation_leaves_foreground_free_and_state_private(
                 storage_generation=ticket.reply.lookup_generation,
                 storage_allow_safe_miss=True,
             )
+            plans.append(plan)
             storage_process.submit_prepare(adapter, plan)
             coordinator.submit_ordinary(
                 plan,
@@ -113,7 +123,6 @@ def test_pending_paired_preparation_leaves_foreground_free_and_state_private(
                     storage_process.run_ordinary(adapter, p, device, previous)
                 ),
             )
-            plans.append(plan)
             if aborted:
                 coordinator.aborted = {"request"}
         # Simulate runnable decode callbacks while the original CPU reply is held.
@@ -147,6 +156,7 @@ def test_pending_paired_preparation_leaves_foreground_free_and_state_private(
                 )
             adapter.lmcache_engine.native_source_lifetime.drain()
         assert runtime.registry.snapshot()["leases"] == 0
+        assert sorted(reductions) == sorted(id(plan["token_mask"]) for plan in plans)
     finally:
         gate.set()
         for coordinator in coordinators:

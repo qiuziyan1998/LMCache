@@ -2371,7 +2371,13 @@ class LMCacheEngine(CPUCacheOperations):
 
     def _remote_fill_pair_lookup_enabled(self) -> bool:
         return bool(
-            getattr(self.config, "enable_remote_lmcache_store", False)
+            (
+                getattr(self.config, "enable_remote_lmcache_store", False)
+                or (
+                    getattr(self.config, "pd_role", None) is None
+                    and getattr(self.config, "decode_preemption_checkpoint", False)
+                )
+            )
             and getattr(self.config, "dsa_two_groups", False)
             and getattr(self, "use_layerwise", False)
             and mooncake_layer_pages_enabled(self.config)

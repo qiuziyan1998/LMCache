@@ -4,7 +4,7 @@
 import ast
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from queue import Queue
 from threading import Barrier
@@ -205,6 +205,85 @@ def test_prepare_is_tp0_only_and_keeps_scheduler_attempt_and_wide_hashes(definit
     passive, peer, passive_calls, _ = setup(definitions, rank=1)
     worker.submit_prepare(passive, peer)
     assert passive_calls == [] and peer["storage_prepare"] is None
+
+
+@pytest.mark.parametrize("status", ["COMPLETED", "FAILED_SAFE"])
+def test_active_reply_reuses_validated_result_and_passive_decodes_once(
+    definitions, monkeypatch, status
+):
+    queue = Queue()
+    first, plan, _, _ = setup(definitions, queue=queue)
+    second, peer, _, _ = setup(definitions, rank=1, queue=queue)
+    worker.submit_prepare(first, plan)
+    worker.submit_prepare(second, peer)
+    future = plan["storage_prepare"]
+    expected = worker.decode_message(
+        worker.encode_message(
+            msgspec.structs.replace(
+                future.result(),
+                status=status,
+                error="safe miss" if status == "FAILED_SAFE" else None,
+            )
+        ),
+        StorageResult,
+    )
+    replacement = complete(expected)
+    replacement.identity, replacement.payload_digest = (
+        future.identity,
+        future.payload_digest,
+    )
+    plan["storage_prepare"] = replacement
+    plan["storage_allow_safe_miss"] = peer["storage_allow_safe_miss"] = True
+    first.lmcache_engine.storage_process.client.operation_status = lambda *args: (
+        complete(StorageResult(expected.identity, "TERMINAL", {"leases": {}}))
+    )
+    decoded = []
+    decode = worker.decode_message
+
+    def counted(frames, record_type):
+        decoded.append(record_type)
+        return decode(frames, record_type)
+
+    monkeypatch.setattr(worker, "decode_message", counted)
+    assert worker._exchange_reply(first, plan) is expected
+    assert decoded == []
+    received = worker._exchange_reply(second, peer)
+    assert msgspec.to_builtins(received) == msgspec.to_builtins(expected)
+    assert decoded == [StorageResult]
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_reply_reuse_preserves_common_envelope_validation(definitions, rank):
+    adapter, plan, _, _ = setup(definitions, rank=rank)
+    worker.submit_prepare(adapter, plan)
+    engine = adapter.lmcache_engine
+    make_envelope = engine._shared_layerwise_error_envelope
+
+    def stale(**kwargs):
+        return replace(make_envelope(**kwargs), generation=99)
+
+    engine._shared_layerwise_error_envelope = stale
+    if rank:
+        engine._receive_matching_shared_envelope = lambda **kwargs: stale(
+            **kwargs, message="", details={}
+        )
+    with pytest.raises(ValueError, match="generation=99"):
+        worker._exchange_reply(adapter, plan)
+
+
+def test_passive_reply_still_rejects_unsupported_wire_version(definitions):
+    queue = Queue()
+    first, plan, _, _ = setup(definitions, queue=queue)
+    second, peer, _, _ = setup(definitions, rank=1, queue=queue)
+    worker.submit_prepare(first, plan)
+    worker.submit_prepare(second, peer)
+    worker._exchange_reply(first, plan)
+    envelope = queue.get_nowait()
+    result = msgspec.structs.replace(plan["storage_prepare"].result(), version=999)
+    envelope["error_details"]["storage_result"] = worker.encode_message(result)
+    queue.put(envelope)
+    with pytest.raises(ValueError, match="Unsupported decoder storage protocol"):
+        worker._exchange_reply(second, peer)
 
 
 @pytest.mark.parametrize("resident", [None, False, True])

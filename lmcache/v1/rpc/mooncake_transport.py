@@ -420,10 +420,10 @@ class RemoteMooncakeStore:
             raise RuntimeError("Worker native transport is unavailable")
         header, segment = b"", None
         scalar = api in ("put_from", "put_parts")
+        exists = api == "batch_is_exist"
         keys = [args[0]] if scalar else list(args[0])
-        if api == "batch_is_exist":
-            rows = [([], []) for _ in keys]
-        else:
+        rows = []
+        if not exists:
             if api not in _READS | _WRITES:
                 raise ValueError("Unsupported native transport API")
             if api == "put_parts":
@@ -438,7 +438,6 @@ class RemoteMooncakeStore:
                     ptrs, sizes = [[p] for p in ptrs], [[s] for s in sizes]
                 replica = args[3] if api in _WRITES else None
             segment = getattr(replica, "preferred_segment", None)
-            rows = []
             for pointers, lengths in zip(ptrs, sizes, strict=True):
                 offsets, spans = [], []
                 for ptr, size in zip(pointers, lengths, strict=True):
@@ -462,7 +461,8 @@ class RemoteMooncakeStore:
         while begin < len(keys):
             end, count, size, key_bytes = begin, 0, 0, len(header)
             while end < len(keys) and end - begin < MAX_KEYS:
-                n, b, k = len(rows[end][0]), sum(rows[end][1]), len(keys[end].encode())
+                n, b = (0, 0) if exists else (len(rows[end][0]), sum(rows[end][1]))
+                k = len(keys[end].encode())
                 if (
                     count + n > MAX_RANGES
                     or size + b > self.max_bytes
@@ -476,16 +476,20 @@ class RemoteMooncakeStore:
             payload = dict(
                 keys=keys[begin:end],
                 generation=self.generation,
-                api=api,
-                counts=[len(r[0]) for r in rows[begin:end]],
-                offsets=pack_uints(o for r in rows[begin:end] for o in r[0]),
-                sizes=pack_uints(s for r in rows[begin:end] for s in r[1]),
-                segment=segment,
-                header=header,
             )
+            if not exists:
+                batch_rows = rows[begin:end]
+                payload.update(
+                    api=api,
+                    counts=[len(r[0]) for r in batch_rows],
+                    offsets=pack_uints(o for r in batch_rows for o in r[0]),
+                    sizes=pack_uints(s for r in batch_rows for s in r[1]),
+                    segment=segment,
+                    header=header,
+                )
             method = (
                 "native_exists"
-                if api == "batch_is_exist"
+                if exists
                 else "native_get"
                 if api in _READS
                 else "native_put"

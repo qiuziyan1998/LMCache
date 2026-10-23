@@ -38,6 +38,7 @@ LIFECYCLE_METHODS = frozenset(
         "register_participant",
         "unregister_participant",
         "registration_status",
+        "checkpoint_restore_event",
     )
 )
 
@@ -70,6 +71,7 @@ class _Pending:
     acknowledged: bool = False
     terminal_digest: bytes | None = None
     terminal_ack_queued: bool = False
+    control_digest: bytes | None = None
 
 
 class StorageClient:
@@ -352,10 +354,7 @@ class StorageClient:
             ]
             control_digest = content_digest((method, payload))
             for pending in controls:
-                if (
-                    content_digest((pending.request.method, pending.request.payload))
-                    == control_digest
-                ):
+                if pending.control_digest == control_digest:
                     if not pending.received and not pending.queued:
                         pending.queued = True
                         self._outboxes[1].append(pending)
@@ -380,7 +379,11 @@ class StorageClient:
             frames = encode_message(request)
             request = decode_message(frames, StorageRequest)
             pending = _Pending(
-                request, frames, StorageFuture(request), time.monotonic()
+                request,
+                frames,
+                StorageFuture(request),
+                time.monotonic(),
+                control_digest=control_digest,
             )
             self._pending[(identity.key, request.correlation_id)] = pending
             self._outboxes[1].append(pending)

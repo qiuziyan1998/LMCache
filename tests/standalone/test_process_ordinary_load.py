@@ -218,15 +218,28 @@ def prepare_pair(adapters, ticket, count, mask):
         return list(pool.map(prepare, adapters))
 
 
-@pytest.mark.parametrize("count", [3, 5])
+@pytest.mark.parametrize("count", [1, 3, 5])
+@pytest.mark.parametrize("stats_enabled", [False, True])
 def test_paired_partial_prefix_preserves_yields_mask_physical_tail_and_final_fence(
-    harness, count
+    harness, monkeypatch, count, stats_enabled
 ):
     adapters, ticket, runtime, ready, transfers = harness
+    if not stats_enabled:
+        for adapter in adapters:
+            adapter.lmcache_engine.stats_monitor = None
     enabled = gc.isenabled()
     gc.disable()
     try:
         mask = torch.tensor([False] + [True] * (count - 1))
+        reductions = []
+        original_sum = torch.Tensor.sum
+
+        def count_sum(tensor, *args, **kwargs):
+            if tensor is mask:
+                reductions.append(1)
+            return original_sum(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "sum", count_sum)
         pairs = prepare_pair(adapters, ticket, count, mask)
         for rank, (adapter, pair) in enumerate(zip(adapters, pairs, strict=True)):
             state = adapter._worker_retrieve_state["request"]
@@ -242,11 +255,13 @@ def test_paired_partial_prefix_preserves_yields_mask_physical_tail_and_final_fen
             assert state.dense_prefix_resident_tokens == count
             assert state.process_load_generation == ticket.reply.lookup_generation
             assert state.metadata_token_ids == list(range(count))
-            assert adapter.lmcache_engine.stats_monitor.requested == [count - 1] * 2
-            assert adapter.lmcache_engine.stats_monitor.finished == [
-                (1, count - 1),
-                (2, count - 1),
-            ]
+            if stats_enabled:
+                assert adapter.lmcache_engine.stats_monitor.requested == [count - 1] * 2
+                assert adapter.lmcache_engine.stats_monitor.finished == [
+                    (1, count - 1),
+                    (2, count - 1),
+                ]
+        assert len(reductions) == (2 if stats_enabled else 0)
         assert len(transfers) == 2 * (2 + 3)
         assert all(
             slots[0] == -1 and len(slots) == count for _, _, _, slots, _ in transfers

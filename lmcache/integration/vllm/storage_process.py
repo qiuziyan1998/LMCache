@@ -108,6 +108,7 @@ def submit_prepare(adapter: Any, plan: dict[str, Any]) -> None:
 def _exchange_reply(adapter: Any, plan: dict[str, Any]) -> StorageResult | None:
     engine = adapter.lmcache_engine
     request = plan["request"]
+    result = None
     identity = dict(
         req_id=request.req_id,
         phase=plan.get("storage_phase", "storage_process_prepare"),
@@ -119,7 +120,7 @@ def _exchange_reply(adapter: Any, plan: dict[str, Any]) -> StorageResult | None:
         kv_group=0,
     )
     if not engine._is_passive():
-        result, error = None, None
+        error = None
         details = {}
         if plan.get("storage_source_plan") is not None:
             details["source_plan"] = plan["storage_source_plan"]
@@ -218,7 +219,11 @@ def _exchange_reply(adapter: Any, plan: dict[str, Any]) -> StorageResult | None:
                 details["lease_ids"],
             )
         if details.get("storage_result"):
-            failed = decode_message(details["storage_result"], StorageResult)
+            failed = (
+                result
+                if result is not None
+                else decode_message(details["storage_result"], StorageResult)
+            )
             if failed.status == "FAILED_SAFE" and plan.get("storage_allow_safe_miss"):
                 return failed
             value = failed.value
@@ -232,7 +237,13 @@ def _exchange_reply(adapter: Any, plan: dict[str, Any]) -> StorageResult | None:
         raise RuntimeError(envelope.message or "CPU source preparation failed")
     if envelope.error_details.get("storage_skip"):
         return None
-    return decode_message(envelope.error_details["storage_result"], StorageResult)
+    # The active client's Future already owns the validated response. Only
+    # passive ranks need to decode the wire copy sent through the TP envelope.
+    return (
+        result
+        if result is not None
+        else decode_message(envelope.error_details["storage_result"], StorageResult)
+    )
 
 
 def import_ordinary_sources(
@@ -341,8 +352,9 @@ def ordinary_layerwise_load(
     coordinator.last_latent_future = terminal
     state = WorkerRetrieveState(req_id=request.req_id)
     stats = getattr(engine, "stats_monitor", None)
+    retrieved_tokens = int(mask.sum().item()) if stats is not None else 0
     monitor_requests = (
-        {group: stats.on_retrieve_request(int(mask.sum().item())) for group in (0, 1)}
+        {group: stats.on_retrieve_request(retrieved_tokens) for group in (0, 1)}
         if stats is not None
         else {}
     )
@@ -434,7 +446,7 @@ def ordinary_layerwise_load(
                             record_state(adapter, state, request)
                         if request.is_sparse_decode and stats is not None:
                             stats.on_retrieve_finished(
-                                monitor_requests[group], mask.sum()
+                                monitor_requests[group], retrieved_tokens
                             )
                     payload = yield (
                         None
@@ -443,7 +455,9 @@ def ordinary_layerwise_load(
                         else value
                     )
                 if stats is not None and not request.is_sparse_decode:
-                    stats.on_retrieve_finished(monitor_requests[group], mask.sum())
+                    stats.on_retrieve_finished(
+                        monitor_requests[group], retrieved_tokens
+                    )
                 if not request.is_sparse_decode:
                     yield mask.clone()
             finally:
@@ -544,8 +558,9 @@ def run_ordinary(
     request = plan["request"]
     state = WorkerRetrieveState(req_id=request.req_id)
     stats = getattr(engine, "stats_monitor", None)
+    retrieved_tokens = int(plan["token_mask"].sum()) if stats is not None else 0
     monitors = (
-        [stats.on_retrieve_request(int(plan["token_mask"].sum())) for _ in (0, 1)]
+        [stats.on_retrieve_request(retrieved_tokens) for _ in (0, 1)]
         if stats is not None
         else []
     )
@@ -558,7 +573,7 @@ def run_ordinary(
         for group in (0, 1):
             _dense_source(adapter, state.prepared_sparse_sources[group], plan, group)
             if stats is not None:
-                stats.on_retrieve_finished(monitors[group], plan["token_mask"].sum())
+                stats.on_retrieve_finished(monitors[group], retrieved_tokens)
                 finished_groups.add(group)
         state.slot_mapping = request.slot_mapping[0]
         state.indexer_slot_mapping = plan["indexer_slots_cpu"]

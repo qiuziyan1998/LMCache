@@ -109,6 +109,54 @@ def test_capture_is_not_sealed_until_accepted_output_is_available():
     assert meta.preemption_seals == ()
 
 
+@pytest.mark.parametrize("invalid", [False, True])
+def test_seal_reuses_detached_slice_and_preserves_multimodal_isolation(invalid):
+    slices = []
+
+    class History(list):
+        def __getitem__(self, item):
+            result = super().__getitem__(item)
+            if isinstance(item, slice):
+                slices.append(result)
+            return result
+
+    req = request()
+    req.all_token_ids = History(range(12))
+    if invalid:
+        req.all_token_ids[0] = -1
+    capture = control.CaptureSpec("r", 1, 4, 14, 6, ((1,), (2,)))
+    pending = control.PendingCheckpoint(capture, "captured", captured_end=14)
+    adapter = NS(
+        _checkpoint_cancels=[],
+        _lmcache_chunk_size=4,
+        _preemption_checkpoints={"r": pending},
+        _unfinished_requests={"r": req},
+    )
+
+    def apply_mm(tokens, hashes, positions):
+        assert tokens is slices[0]  # No redundant copy of the detached snapshot.
+        tokens[0] = 999
+        return tokens
+
+    build = method(
+        "_build_preemption_controls",
+        extract_mm_features=lambda r: ([123], [0]),
+        _apply_mm_hashes=apply_mm,
+    )
+    meta = NS()
+    build(adapter, meta, NS(finished_req_ids=set()))
+    if invalid:
+        assert not meta.preemption_seals
+        assert meta.preemption_cancels == (("r", 1),)
+    else:
+        sealed = meta.preemption_seals[0].tokens
+        assert sealed == (999, *range(1, 11))
+        assert req.all_token_ids[0] == 0
+        slices[0][0] = 777
+        req.all_token_ids[1] = 888
+        assert sealed == (999, *range(1, 11))
+
+
 def test_pending_checkpoint_parks_without_querying_storage():
     pending = control.PendingCheckpoint(
         control.CaptureSpec("r", 1, 4, 14, 6, ((1,), (2,)))

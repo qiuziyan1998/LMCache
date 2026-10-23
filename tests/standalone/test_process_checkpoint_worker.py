@@ -115,6 +115,7 @@ def worker(setup, monkeypatch):
         "torch",
         NS(
             long=torch.long,
+            empty=lambda shape, **kw: torch.empty(shape, dtype=kw["dtype"]),
             tensor=lambda data, **kw: tensor(
                 data, **{k: v for k, v in kw.items() if k != "pin_memory"}
             ),
@@ -129,7 +130,7 @@ def worker(setup, monkeypatch):
         for plan in queued:
             for layer, rows in enumerate(plan[0]):
                 for row in rows:
-                    row.tensor.fill_(plan[1] * 20 + layer + 1)
+                    row.layer_tensor(layer).fill_(plan[1] * 20 + layer + 1)
         queued.clear()
 
     def prepare(rows, starts, ends, **kw):

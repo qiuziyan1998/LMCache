@@ -24,6 +24,7 @@ from lmcache.v1.rpc.mooncake_transport import (
     RemoteMooncakeStore,
     WorkerMooncakeTransport,
 )
+from lmcache.v1.rpc import mooncake_transport
 from lmcache.v1.rpc.storage_protocol import content_digest, pack_uints
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
 from lmcache.v1.storage_service import StorageService
@@ -275,6 +276,34 @@ def test_shared_payload_roundtrip_and_partial_ranges(tmp_path, child):
         if worker:
             assert worker.store.calls[0][2] == [[8], [2, 4]]  # contiguous same-key only
             assert worker.registry.snapshot()["operations"] == 0
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_exists_batches_do_not_prepare_transfer_ranges(tmp_path, monkeypatch, child):
+    with transport(tmp_path, child=child) as (remote, worker, slab):
+        slab.buf[:2] = b"ok"
+        keys = [f"key-{i}" for i in range(2 * mooncake_transport.MAX_KEYS + 3)]
+        replica = SimpleNamespace(preferred_segment="destination")
+        remote.batch_put_from_multi_buffers(
+            [keys[0], keys[-1]], [[remote.base]] * 2, [[2]] * 2, replica
+        )
+        request = remote.client.request
+        batches = []
+
+        def record_request(method, payload, **kwargs):
+            if method == "native_exists":
+                assert set(payload) == {"keys", "generation"}
+                batches.append(list(payload["keys"]))
+            return request(method, payload, **kwargs)
+
+        def unexpected_pack(*args, **kwargs):
+            raise AssertionError("EXISTS has no transfer ranges to pack")
+
+        monkeypatch.setattr(remote.client, "request", record_request)
+        monkeypatch.setattr(mooncake_transport, "pack_uints", unexpected_pack)
+        assert remote.batch_is_exist(keys) == [1, *([0] * (len(keys) - 2)), 1]
+        assert list(map(len, batches)) == [mooncake_transport.MAX_KEYS] * 2 + [3]
+        assert [key for batch in batches for key in batch] == keys
 
 
 @pytest.mark.parametrize("offset,size", [(-1, 1), (8191, 2), (8192, 1), (0, 0)])

@@ -4,6 +4,7 @@
 import zmq
 
 from lmcache.v1.cpu_cache import StorageOperationRegistry
+from lmcache.v1.rpc import storage_client
 from lmcache.v1.rpc.storage_protocol import (
     StorageRequest,
     decode_message,
@@ -49,3 +50,30 @@ def test_lost_terminal_reply_reuses_the_same_control_identity_and_credit():
         for router in routers:
             router.close(linger=0)
         context.term()
+
+
+def test_control_retries_hash_only_new_payload(monkeypatch):
+    client = _client(_endpoint(), _endpoint())
+    try:
+        future = _request(client, "prepare", {})
+        payload = {"terminal_result_digest": b"original"}
+        ack = client.acknowledge_terminal(future.identity, payload)
+        # The admitted control owns its frozen bytes, even if the caller reuses
+        # the dictionary. Its digest can be reused only for that frozen record.
+        payload["terminal_result_digest"] = b"changed"
+        digest = storage_client.content_digest
+        calls = []
+
+        def counted(value):
+            calls.append(value)
+            return digest(value)
+
+        monkeypatch.setattr(storage_client, "content_digest", counted)
+        for _ in range(10):
+            assert client.acknowledge_terminal(
+                future.identity, {"terminal_result_digest": b"original"}
+            ) is ack
+        assert len(calls) == 10
+        assert client.acknowledge_terminal(future.identity, payload) is not ack
+    finally:
+        client.close()

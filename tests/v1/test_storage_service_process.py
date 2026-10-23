@@ -344,6 +344,8 @@ def test_full_bulk_lane_preserves_lookup_and_lifecycle(tmp_path: Path) -> None:
             assert _request(client, "lookup", {"metadata": True}).result(0.5).value == {
                 "metadata": True
             }
+            event = {"generation": 1, "attempt": 2, "event": "ack"}
+            assert _request(client, "checkpoint_restore_event", event).result(0.5).value == event
             assert (
                 client.operation_status(pending.identity).result(0.5).status
                 == "PREPARING"
