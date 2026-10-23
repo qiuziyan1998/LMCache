@@ -646,6 +646,158 @@ class StorageManager:
             req_id,
         )
 
+    def batched_put_layerwise_objects(
+        self,
+        keys: Sequence[Sequence[LayerCacheEngineKey]],
+        memory_objs: Sequence[Sequence[MemoryObj]],
+        *,
+        producer_events: tuple[Any, ...],
+        location: Optional[str] = None,
+        req_id: str = "",
+    ) -> list[Future]:
+        """Publish P-prefill flat-object fallbacks with a D2H readiness fence.
+
+        Args:
+            keys: Layer-major keys, with the same ordered chunks in every row.
+            memory_objs: Allocator-owned flat CPU objects matching ``keys``.
+                A successful submission consumes their allocation references.
+            producer_events: Bank completion events. The remote writer waits
+                for these in its existing background worker before reading.
+            location: Optional backend selector, as for layer-page puts.
+            req_id: Producer request ID for remote diagnostics.
+
+        Returns:
+            Futures covering remote persistence, or an empty list for CPU-only
+            publication. Local objects retain their ordinary per-layer keys;
+            remote buffers use the same merged page keys as layer-page puts.
+
+        Raises:
+            ValueError: Sources, keys, or producer events are incomplete.
+            RuntimeError: Selected backends cannot store external layer pages.
+
+        Notes:
+            Only banked P-prefill may publish local pointers before readiness:
+            it must retain request ownership, fence every local reader and
+            wait for returned futures before PD handoff. No host wait or
+            payload copy occurs here. Unknown native completion quarantines
+            the remote ownership references on the reported exception.
+        """
+        if (
+            not keys
+            or not keys[0]
+            or len(keys) != len(memory_objs)
+            or any(
+                not isinstance(key, LayerCacheEngineKey) for row in keys for key in row
+            )
+        ):
+            raise ValueError("Layerwise object put requires nonempty source rows")
+        chunk_count = len(keys[0])
+        base_keys = [key.without_layer() for key in keys[0]]
+        objects = [obj for row in memory_objs for obj in row]
+        if (
+            not producer_events
+            or any(event is None for event in producer_events)
+            or len(set(base_keys)) != chunk_count
+            or len({id(obj) for obj in objects}) != len(objects)
+            or any(len(row) != chunk_count for row in keys)
+            or any(len(row) != chunk_count for row in memory_objs)
+            or any(
+                key.layer_id != layer or key.without_layer() != base_keys[chunk]
+                for layer, row in enumerate(keys)
+                for chunk, key in enumerate(row)
+            )
+            or any(
+                isinstance(obj, LayerPageMemoryObj)
+                or not obj.is_valid()
+                or obj.get_size() <= 0
+                for obj in objects
+            )
+        ):
+            raise ValueError("Invalid fenced layerwise object put")
+        owners = tuple(obj.raw_tensor for obj in objects)
+        if any(
+            not isinstance(owner, torch.Tensor)
+            or owner.device.type != "cpu"
+            or not owner.is_contiguous()
+            for owner in owners
+        ):
+            raise ValueError("Layerwise object put requires contiguous CPU storage")
+        selected = list(self.get_active_storage_backends(location=location))
+        if not self._supports_layer_page_backends([backend for _, backend in selected]):
+            raise RuntimeError("Selected backends do not support external layer pages")
+        local = next(
+            backend
+            for _, backend in selected
+            if isinstance(backend, LocalCPUBackend) and backend.use_hot
+        )
+        remote = next(
+            (backend for _, backend in selected if isinstance(backend, RemoteBackend)),
+            None,
+        )
+        # Pointer admission does not read the unfinished payload. P readers
+        # use the same bank/publication fences as early merged-page readers.
+        for row_keys, row_objects in zip(keys, memory_objs, strict=True):
+            local.batched_submit_put_task(row_keys, list(row_objects))
+        if remote is None:
+            for obj in objects:
+                obj.ref_count_down()
+            return []
+
+        for obj in objects:
+            obj.ref_count_up()
+        try:
+            future = self.batched_put_external_pages(
+                base_keys,
+                [
+                    [row[chunk].data_ptr for row in memory_objs]
+                    for chunk in range(chunk_count)
+                ],
+                [
+                    [row[chunk].get_size() for row in memory_objs]
+                    for chunk in range(chunk_count)
+                ],
+                owners,
+                producer_events,
+                req_id,
+            )
+        except Exception as error:
+            if isinstance(error, NativeExternalPageTransferUnknownError):
+                error.layerwise_source_pages = getattr(
+                    error, "layerwise_source_pages", ()
+                ) + tuple(objects)
+            else:
+                for obj in objects:
+                    obj.ref_count_down()
+            raise
+
+        completion: Future = Future()
+
+        def finish_objects(
+            completed_remote: Future, held: tuple[MemoryObj, ...] = tuple(objects)
+        ) -> None:
+            error = None
+            try:
+                completed_remote.result()
+            except Exception as caught:
+                error = caught
+            if isinstance(error, NativeExternalPageTransferUnknownError):
+                error.layerwise_source_pages = (
+                    getattr(error, "layerwise_source_pages", ()) + held
+                )
+            else:
+                for obj in held:
+                    obj.ref_count_down()
+            if not completion.done():
+                if error is None:
+                    completion.set_result(None)
+                else:
+                    completion.set_exception(error)
+
+        future.add_done_callback(finish_objects)
+        for obj in objects:
+            obj.ref_count_down()
+        return [completion]
+
     def batched_get_external_pages(
         self,
         keys: Sequence[CacheEngineKey],

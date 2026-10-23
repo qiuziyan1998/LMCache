@@ -222,6 +222,7 @@ def adapter_request():
         lambda *args, **kwargs: None
     )
     adapter._layerwise_prefill_p_node = adapter._layerwise_prefill_dma = True
+    adapter._layerwise_prefill_bank_count = 4
     adapter._deferred_layerwise_prefill_load_active = True
     adapter.kv_role = "kv_both"
     adapter._worker_retrieve_state = {}
