@@ -54,6 +54,11 @@ def definitions(monkeypatch):
     )
     module = ModuleType("lmcache.integration.vllm.vllm_v1_adapter")
     module.WorkerRetrieveState = state
+    module.LoadSpec = loaded(
+        root / "lmcache/integration/vllm/vllm_v1_adapter.py",
+        "LoadSpec",
+        {"dataclass": dataclass},
+    )
     monkeypatch.setitem(sys.modules, module.__name__, module)
     prepared = loaded(
         root.parent / "LMCache-Ascend/lmcache_ascend/v1/cache_engine.py",
@@ -106,6 +111,8 @@ class Connector:
 
 
 def setup(definitions, rank=0, queue=None, agreement=None):
+    from lmcache.integration.vllm.vllm_v1_adapter import LoadSpec
+
     state_cls, prepared = definitions
     importer, reply, client = fixture()
     client.client_session = f"worker-{rank}"
@@ -165,12 +172,14 @@ def setup(definitions, rank=0, queue=None, agreement=None):
         identity,
         b"lookup-digest",
     )
-    spec = NS(
+    spec = LoadSpec(
+        vllm_cached_tokens=0,
+        lmcache_cached_tokens=5,
+        can_load=True,
         cpu_source_ticket=ticket,
-        dsa_cold_load_generation=1,
-        dsa_cold_resident_load=False,
         dsa_group1_direct_hbm=True,
     )
+    spec.dsa_cold_load_generation = 1
     request = NS(
         req_id="req", load_spec=spec, request_configs={}, slot_mapping=[torch.arange(5)]
     )
@@ -196,6 +205,37 @@ def test_prepare_is_tp0_only_and_keeps_scheduler_attempt_and_wide_hashes(definit
     passive, peer, passive_calls, _ = setup(definitions, rank=1)
     worker.submit_prepare(passive, peer)
     assert passive_calls == [] and peer["storage_prepare"] is None
+
+
+@pytest.mark.parametrize("resident", [None, False, True])
+def test_cold_load_optional_resident_flag_on_active_and_passive_ranks(
+    definitions, resident: bool | None
+) -> None:
+    queue = Queue()
+    for rank in (0, 1):
+        adapter, plan, calls, _ = setup(definitions, rank=rank, queue=queue)
+        spec = plan["request"].load_spec
+        if resident is None:
+            assert not hasattr(spec, "dsa_cold_resident_load")
+        else:
+            spec.dsa_cold_resident_load = resident
+        worker.submit_prepare(adapter, plan)
+        if rank == 0:
+            assert calls[0][1].mode == ("resident" if resident else "compact")
+        else:
+            assert calls == []
+        state = worker.run_cold(adapter, plan, None, complete())
+        try:
+            assert state.indexer_npu_resident and state.metadata_warm
+            assert state.dense_prefix_resident_tokens == (5 if resident else 0)
+            assert adapter.lmcache_engine.gpu_connector.payloads == (
+                [(0, None)] * 2 if resident else []
+            )
+            assert plan["latent_shared_ready"].done()
+            assert state.prepared_sparse_sources[0].owner_lease.is_valid()
+        finally:
+            worker.release_sources(state, adapter.lmcache_engine)
+        assert adapter.lmcache_engine.compact_source_importer.sources_drained()
 
 
 def test_ready_cpu_job_does_not_publish_before_entire_predecessor(definitions):

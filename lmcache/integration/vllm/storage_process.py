@@ -712,7 +712,7 @@ def run_cold(
             raise RuntimeError("CPU source import failed on another TP rank")
         plan["storage_sources"] = sources
         plan["latent_shared_ready"].set_result(None)
-        if request.load_spec.dsa_cold_resident_load:
+        if getattr(request.load_spec, "dsa_cold_resident_load", False):
             _dense_source(adapter, sources[0], plan, 0)
             state.dense_prefix_resident_tokens = plan["token_count"]
         indexer.result()
