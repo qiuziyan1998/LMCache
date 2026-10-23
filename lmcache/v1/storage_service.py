@@ -276,6 +276,9 @@ class StorageService:
                                         lane = "persist"
                                     else:
                                         lane = "bulk"
+                                    lane = getattr(self.runtime, "work_lanes", {}).get(
+                                        method, lane
+                                    )
                                     if (
                                         self._quiescing.is_set()
                                         or sum(
@@ -333,7 +336,8 @@ class StorageService:
                             continue
                         del outboxes[channel][key]
                         route_retry.pop(route_key, None)
-                if not self.runtime.is_healthy():
+                # Successful STOP closes the runtime; its reply must remain ACK-able.
+                if self._stop_operation is None and not self.runtime.is_healthy():
                     self._quiescing.set()
                     for session, nonce in self.sessions.items():
                         channel = 1 if (session, 1) in routes else 0

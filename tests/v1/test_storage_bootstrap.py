@@ -96,6 +96,7 @@ class BootstrapProbeRuntime:
                     if self.registered == set(self.config["expected_workers"])
                     else "WAITING"
                 ),
+                "registered": tuple(self.registered),
                 "error": self.failure,
                 "layout_status": "READY"
                 if self.layouts == set(self.config["expected_workers"])
@@ -138,6 +139,7 @@ def start(
     trace=None,
     failed=None,
     reader_enabled=True,
+    transport_factory=None,
 ):
     trace = [] if trace is None else trace
 
@@ -161,6 +163,7 @@ def start(
         runtime_config={},
         mapping_factory=mapping,
         reader_factory=reader if reader_enabled else None,
+        transport_factory=transport_factory,
         timeout_s=10,
         base_url=str(tmp_path),
         launcher_pid=os.getpid(),
@@ -610,3 +613,58 @@ def test_closed_context_has_no_client_callback_cycle_with_gc_disabled(tmp_path):
     finally:
         if enabled:
             gc.enable()
+
+
+def test_worker_transport_outlives_owner_and_passive_readers(tmp_path):
+    trace = []
+    contexts = []
+
+    def factory(mapping, descriptor):
+        trace.append("native-start")
+
+        def close(timeout):
+            assert contexts[0].process.poll() == 0
+            trace.append("native-close")
+
+        return SimpleNamespace(
+            runtime=SimpleNamespace(descriptor=lambda: {"session": "native"}),
+            close=close,
+            drain_error=None,
+        )
+
+    with ThreadPoolExecutor(2) as pool:
+        first = pool.submit(
+            start, tmp_path, "native", 0, 2, trace, transport_factory=factory
+        )
+        discover_storage_service("native", base_url=str(tmp_path), timeout_s=10)
+        second = pool.submit(
+            start, tmp_path, "native", 1, 2, trace, transport_factory=factory
+        )
+        contexts[:] = [first.result(10), second.result(10)]
+        closing = pool.submit(contexts[0].close)
+        contexts[1].close()
+        closing.result(10)
+    assert trace.count("native-start") == 1
+    assert trace.index(("reader-close", 1)) < trace.index("native-close")
+    assert trace.index("native-close") < trace.index(("detach", 0))
+    assert trace.index("native-close") < trace.index(("reader-close", 0))
+
+
+def test_worker_transport_failed_drain_never_detaches_mapping():
+    trace = []
+    context = storage_bootstrap.WorkerStorageBootstrap(
+        SimpleNamespace(close=lambda: trace.append("client-close")),
+        {"transport": {}, "cache_instance_id": "probe"},
+        "worker-0",
+        1,
+        mapping=SimpleNamespace(close=lambda: trace.append("detach")),
+        reader=SimpleNamespace(close=lambda: trace.append("reader-close")),
+        transport=SimpleNamespace(close=lambda **kw: trace.append("native-close")),
+    )
+    context.call = lambda method, value: {"status": "BUSY"} if method == "stop" else {}
+    with pytest.raises(RuntimeError, match="did not drain"):
+        context.close()
+    assert trace == []
+    with pytest.raises(RuntimeError, match="mapping retained"):
+        context.close()
+    assert trace == []

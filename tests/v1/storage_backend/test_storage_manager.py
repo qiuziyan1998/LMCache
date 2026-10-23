@@ -232,7 +232,8 @@ def test_batched_put_layer_pages_preserves_caller_refs_on_remote_error(monkeypat
     assert pages[0].get_ref_count() == 0
 
 
-def test_batched_put_layer_pages_hides_async_remote_failure(monkeypatch):
+@pytest.mark.parametrize("unknown", [False, True])
+def test_batched_put_layer_pages_hides_async_remote_failure(monkeypatch, unknown):
     allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
     pages = allocator.batched_allocate_layer_pages(
         torch.Size([8]),
@@ -273,12 +274,19 @@ def test_batched_put_layer_pages_hides_async_remote_failure(monkeypatch):
     completions = manager.batched_put_layer_pages([key], pages)
     assert len(completions) == 1 and not completions[0].done()
     assert local_calls == []
-    future.set_exception(RuntimeError("remote failed"))
+    from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
+    error = (NativeExternalPageTransferUnknownError("remote failed", Future())
+             if unknown else RuntimeError("remote failed"))
+    future.set_exception(error)
 
     with pytest.raises(RuntimeError, match="remote failed"):
         completions[0].result()
     assert local_calls == []
-    assert pages[0].get_ref_count() == 0
+    assert pages[0].get_ref_count() == int(unknown)
+    if unknown:
+        assert error.layerwise_source_pages == tuple(pages)
+        # CPU test has no native DMA; explicitly retire its quarantined hold.
+        pages[0].ref_count_down()
 
 
 @pytest.mark.parametrize("local_keys", ({"a", "b"}, {"a"}))

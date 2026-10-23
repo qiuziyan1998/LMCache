@@ -78,6 +78,8 @@ def _make_mooncake_connector(
     external_page_only: bool = False,
     store_cls: type | None = None,
     cpu_buffer: torch.Tensor | None = None,
+    native_io=None,
+    native_owner_mapping=None,
 ) -> tuple[MooncakestoreConnector, asyncio.AbstractEventLoop]:
     class _Store:
         def setup(self, *args):
@@ -171,6 +173,8 @@ def _make_mooncake_connector(
             config,
             metadata,
             external_page_only=external_page_only,
+            native_io=native_io,
+            native_owner_mapping=native_owner_mapping,
         )
     except BaseException:
         loop.close()
@@ -3212,3 +3216,116 @@ def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout(
     assert fields["first_page_key"] == connector.store.page_args[0][0]
     assert fields["last_page_key"] == connector.store.page_args[0][0]
     assert fields["legacy_objects"] == 2
+
+
+def test_storage_facade_does_not_construct_native_store(monkeypatch):
+    calls = []
+
+    class NoNative:
+        def __init__(self):
+            raise AssertionError("M must not construct Mooncake/ADXL")
+
+    remote = SimpleNamespace(
+        replica_factory=SimpleNamespace,
+        get_hostname=lambda: "worker",
+        close=lambda: None,
+    )
+    connector, loop = _make_mooncake_connector(
+        monkeypatch,
+        {"use_ascend_direct": True},
+        calls,
+        store_cls=NoNative,
+        native_io=remote,
+    )
+    try:
+        assert connector.store is remote
+        assert calls == []
+        assert connector.registered_buffer_ptr is None
+    finally:
+        loop.run_until_complete(connector.close())
+        loop.close()
+
+
+def test_worker_full_store_registers_host_mapping_not_device_alias(monkeypatch):
+    calls = []
+    tensor = torch.empty(64, dtype=torch.uint8)
+    mapping = SimpleNamespace(
+        tensor=tensor,
+        ptr=tensor.data_ptr(),
+        size=64,
+        device_base=tensor.data_ptr() + 100000,
+    )
+    connector, loop = _make_mooncake_connector(
+        monkeypatch,
+        {
+            "global_segment_size": 123456,
+            "local_buffer_size": 0,
+            "use_ascend_direct": True,
+        },
+        calls,
+        native_owner_mapping=mapping,
+    )
+    try:
+        assert ("register", mapping.ptr, 64) in calls
+        assert calls[0][0] == "setup" and calls[0][1][2:4] == (123456, 0)
+    finally:
+        loop.run_until_complete(connector.close())
+        loop.close()
+
+
+def test_worker_gateway_and_group1_reader_share_engine_not_store_capacity(monkeypatch):
+    from lmcache.v1.rpc.mooncake_transport import start_worker_transport
+    from tests.v1.test_worker_mooncake_transport import endpoint
+
+    calls = []
+    shared = SimpleNamespace(
+        adopt_registered_buffer=lambda ptr, size, register: register() == 0,
+        release_adopted_buffer=lambda ptr, size, unregister: unregister(),
+    )
+    native_engine = object()
+    monkeypatch.setattr(
+        mooncake_connector,
+        "_shared_vllm_mooncake_transport",
+        lambda: (shared, "host:123", native_engine, object()),
+    )
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(current_device=lambda: 0, set_device=lambda device: None),
+        raising=False,
+    )
+    reader, loop = _make_mooncake_connector(
+        monkeypatch,
+        {
+            "mooncake_reuse_vllm_transfer_engine": True,
+            "global_segment_size": 123456,
+            "local_buffer_size": 0,
+            "save_chunk_meta": False,
+        },
+        calls,
+        external_page_only=True,
+    )
+    tensor = torch.empty(64, dtype=torch.uint8)
+    mapping = SimpleNamespace(
+        tensor=tensor, ptr=tensor.data_ptr(), size=64, generation=1, shm_name="slab"
+    )
+    descriptor = dict(
+        cache_instance_id="cache",
+        service_epoch="epoch",
+        transport=dict(work=endpoint(), lifecycle=endpoint(), nonce=b"native".hex()),
+    )
+    gateway = start_worker_transport(
+        reader._engine_config, reader._lmcache_metadata, mapping, descriptor
+    )
+    try:
+        setups = [item[1] for item in calls if item[0] == "setup"]
+        assert [args[2] for args in setups] == [0, 123456]
+        assert all(args[-1] is native_engine for args in setups)
+        assert [item for item in calls if item[0] == "register"] == [
+            ("register", mapping.ptr, 64)
+        ]
+        assert gateway.runtime.descriptor()["session"] == "host:123"
+    finally:
+        gateway.close()
+        asyncio.run(reader.close())
+        loop.close()

@@ -114,6 +114,7 @@ class WorkerStorageBootstrap:
     timeout_s: float
     mapping: Any = None
     reader: Any = None
+    transport: Any = None
     device_base: int = 0
     process: Any = None
     discovery_path: Path | None = None
@@ -186,11 +187,20 @@ class WorkerStorageBootstrap:
     def close(self) -> None:
         """Close drained worker resources, retaining readers of unknown completion."""
         if self.closing.is_set():
+            if self.failed and "transport" in self.descriptor:
+                raise RuntimeError("Worker transport shutdown failed; mapping retained")
             return
         if any(not guard() for guard in self.drain_guards):
             raise RuntimeError(
                 "Storage source leases have not drained; mapping retained"
             )
+        if "transport" in self.descriptor:
+            try:
+                self._close_worker_transport()
+            except BaseException:
+                self.failed = True
+                raise
+            return
         if self.reader is not None:
             self.reader.close()  # A failed native close must keep the mapping attached.
         if self.mapping is not None:
@@ -223,6 +233,43 @@ class WorkerStorageBootstrap:
             if _BOOTSTRAPS.get(self.descriptor["cache_instance_id"]) is self:
                 _BOOTSTRAPS.pop(self.descriptor["cache_instance_id"])
 
+    def _close_worker_transport(self) -> None:
+        """Keep W0's endpoint and mapping live until M proves it has drained."""
+        if self.transport is None and self.reader is not None:
+            self.reader.close()
+        self.closing.set()
+        self.call("unregister_participant", {"session": self.session})
+        if self.transport is not None:
+            deadline = time.monotonic() + self.timeout_s
+            while self.call("registration_status", {}).get("registered"):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Peer workers have not drained; native mapping retained"
+                    )
+                time.sleep(0.02)
+            stopped = self.call("stop", {})
+            if stopped.get("status") != "STOPPED":
+                raise RuntimeError(
+                    "Storage owner did not drain; native mapping retained"
+                )
+            if self.process is not None:
+                self.process.wait(timeout=self.timeout_s)
+            self.transport.close(timeout=self.timeout_s)
+            if self.transport.drain_error is not None:
+                raise RuntimeError(
+                    "Native transport did not drain"
+                ) from self.transport.drain_error
+            if self.reader is not None:
+                self.reader.close()
+            self.remove_discovery()
+        if self.mapping is not None:
+            self.mapping.close()
+        self.client.close()
+        if self.process is not None and self.process.stdin is not None:
+            self.process.stdin.close()
+        if _BOOTSTRAPS.get(self.descriptor["cache_instance_id"]) is self:
+            _BOOTSTRAPS.pop(self.descriptor["cache_instance_id"])
+
     def remove_discovery(self) -> None:
         """Remove only this drained epoch's descriptor, never a slab or new owner."""
         if self.discovery_path is None:
@@ -245,6 +292,7 @@ def start_worker_storage(
     runtime_config: dict[str, Any],
     mapping_factory: Callable[..., Any],
     reader_factory: Callable[[], Any] | None,
+    transport_factory: Callable[[Any, dict[str, Any]], Any] | None = None,
     timeout_s: float = 600,
     base_url: str | None = None,
     launcher_pid: int | None = None,
@@ -300,6 +348,12 @@ def start_worker_storage(
             participants=sessions,
             expected_workers=[f"worker-{rank}" for rank in range(tp_size)],
         )
+        if transport_factory is not None:
+            runtime_config["transport"] = {
+                "work": endpoint_factory("native_work", epoch),
+                "lifecycle": endpoint_factory("native_lifecycle", epoch),
+                "nonce": os.urandom(32).hex(),
+            }
         bootstrap = dict(
             runtime_factory="lmcache_ascend.v1.cpu_cache:create_storage_runtime",
             runtime_config=runtime_config,
@@ -369,6 +423,8 @@ def start_worker_storage(
                 sessions=sessions,
                 state="MEMORY_READY",
             )
+            if "transport" in runtime_config:
+                descriptor["transport"] = runtime_config["transport"]
             _write_json(path, descriptor)
         except BaseException as error:
             _write_json(
@@ -454,6 +510,11 @@ def start_worker_storage(
             native_registered=True,
             reader_ready=True,
         )
+        if tp_rank == 0 and "transport" in descriptor:
+            if transport_factory is None:
+                raise ValueError("Missing worker native transport factory")
+            context.transport = transport_factory(context.mapping, descriptor)
+            resource["native_transport"] = context.transport.runtime.descriptor()
         context.call(
             "register_participant",
             {"session": session, "tp_rank": tp_rank, "resource": resource},
@@ -517,6 +578,12 @@ def early_bootstrap_decoder_storage(worker: Any) -> WorkerStorageBootstrap | Non
     from lmcache.v1.storage_backend.remote_backend import RemoteExternalPageReader
     import vllm.envs
 
+    from copy import copy
+    from lmcache.v1.rpc.mooncake_transport import start_worker_transport
+
+    config = copy(config)
+    config.extra_config = dict(config.extra_config or {})
+    config.extra_config["mooncake_reuse_vllm_transfer_engine"] = True
     metadata, _ = create_lmcache_metadata(worker.vllm_config, role="worker")
     metadata.chunk_size = config.chunk_size
     # Match the native dynamic Ascend connector's routing before it is built.
@@ -577,6 +644,15 @@ def early_bootstrap_decoder_storage(worker: Any) -> WorkerStorageBootstrap | Non
         mapping_factory=SharedSlabMapping.attach,
         reader_factory=(
             (lambda: RemoteExternalPageReader(config, metadata, defer_layout=True))
+            if config.remote_url is not None
+            else None
+        ),
+        transport_factory=(
+            (
+                lambda mapping, descriptor: start_worker_transport(
+                    config, metadata, mapping, descriptor
+                )
+            )
             if config.remote_url is not None
             else None
         ),

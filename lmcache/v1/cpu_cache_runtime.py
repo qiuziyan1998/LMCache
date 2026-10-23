@@ -74,9 +74,11 @@ class CPUCacheRuntime(CPUCacheOperations):
         sessions: dict[str, bytes],
         slab_generation: int = 1,
         max_operations: int = 256,
+        native_io: Any = None,
     ) -> None:
         if not slab_name or slab_size <= 0 or slab_generation <= 0:
             raise ValueError("CPU storage requires a live registered slab")
+        self.native_io = native_io
         self.config, self.metadata = config, metadata
         self.token_database, self.storage_manager = token_database, storage_manager
         self.layout: LayoutSpec | None = None
@@ -174,6 +176,13 @@ class CPUCacheRuntime(CPUCacheOperations):
             error = (
                 "Worker registration does not cover the shared slab and native reader"
             )
+        if error is None and rank == 0 and self.native_io is not None:
+            try:
+                self.native_io.bind(
+                    resource.get("native_transport", {}), self.shared_cpu_cache_name
+                )
+            except (ValueError, TypeError) as exc:
+                error = str(exc)
         with self._lock:
             if error:
                 self._registration_error = f"{session}: {error}"
@@ -827,6 +836,8 @@ class CPUCacheRuntime(CPUCacheOperations):
 
     def set_transport_notifier(self, notifier: Callable[[], None] | None) -> bool:
         """Forward terminal/fatal wakeups without constructing transport state."""
+        if self.native_io is not None:
+            self.native_io.set_transport_notifier(notifier)
         return self.registry.set_transport_notifier(notifier)
 
     def is_healthy(self) -> bool:
@@ -835,6 +846,7 @@ class CPUCacheRuntime(CPUCacheOperations):
             not self._closed
             and not self._registration_error
             and self.registry.is_healthy()
+            and (self.native_io is None or self.native_io.is_healthy())
         )
 
     def drain_terminal_notifications(self) -> list[StorageResult]:
@@ -843,6 +855,8 @@ class CPUCacheRuntime(CPUCacheOperations):
 
     def check_close_ready(self) -> None:
         """Validate drain before any backend or native service is stopped."""
+        if self.native_io is not None:
+            self.native_io.close()  # Check completion before allocator teardown.
         snapshot = self.registry.snapshot()
         if (
             snapshot["leases"]
@@ -866,6 +880,8 @@ class CPUCacheRuntime(CPUCacheOperations):
         try:
             self.check_close_ready()
             self.storage_manager.close()
+            if self.native_io is not None:
+                self.native_io.shutdown()
             self._closed = True
         finally:
             with self._lock:

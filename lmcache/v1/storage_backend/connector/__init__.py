@@ -2,7 +2,7 @@
 # Standard
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 import asyncio
 import importlib
@@ -117,11 +117,13 @@ class ConnectorContext:
         metadata: Optional[LMCacheMetadata],
         external_page_only: bool = False,
         defer_layout: bool = False,
+        native_io: Any = None,
     ):
         self.url = url
         self.loop = loop
         self.external_page_only = external_page_only
         self.defer_layout = defer_layout
+        self.native_io = native_io
         if external_page_only:
             if config is None or metadata is None:
                 raise ValueError(
@@ -185,6 +187,7 @@ class ConnectorManager:
         metadata: Optional[LMCacheMetadata] = None,
         external_page_only: bool = False,
         defer_layout: bool = False,
+        native_io: Any = None,
     ) -> None:
         logger.info("Initializing ConnectorManager")
         self.context = ConnectorContext(
@@ -195,6 +198,7 @@ class ConnectorManager:
             metadata=metadata,
             external_page_only=external_page_only,
             defer_layout=defer_layout,
+            native_io=native_io,
         )
         self.adapters: List[ConnectorAdapter] = []
         self._remote_adapters_builtin_launcher()
@@ -319,6 +323,7 @@ def CreateConnector(
     metadata: Optional[LMCacheMetadata] = None,
     external_page_only: bool = False,
     defer_layout: bool = False,
+    native_io: Any = None,
 ) -> InstrumentedRemoteConnector:
     """
     Create a remote connector from the given URL.
@@ -381,6 +386,7 @@ def CreateConnector(
         metadata,
         external_page_only,
         defer_layout,
+        native_io,
     )
     connector = manager.create_connector()
 

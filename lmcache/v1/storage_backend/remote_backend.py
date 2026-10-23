@@ -61,6 +61,7 @@ class RemoteBackend(StorageBackendInterface):
         dst_device: str = "cuda",
         external_page_only: bool = False,
         defer_layout: bool = False,
+        native_io: Any = None,
     ):
         super().__init__(dst_device=dst_device)
         if external_page_only and local_cpu_backend is not None:
@@ -69,6 +70,7 @@ class RemoteBackend(StorageBackendInterface):
             )
         self.external_page_only = external_page_only
         self.defer_layout = defer_layout
+        self.native_io = native_io
         if defer_layout and not str(config.remote_url).startswith("mooncakestore://"):
             raise ValueError("Deferred layout requires the Mooncake storage backend")
         self.put_tasks: Set[CacheEngineKey] = set()
@@ -202,6 +204,8 @@ class RemoteBackend(StorageBackendInterface):
             )
             if getattr(self, "defer_layout", False):
                 connector_kwargs["defer_layout"] = True
+            if getattr(self, "native_io", None) is not None:
+                connector_kwargs["native_io"] = self.native_io
             self.connection = CreateConnector(
                 self.config.remote_url,
                 self.loop,

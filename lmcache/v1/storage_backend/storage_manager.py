@@ -606,7 +606,7 @@ class StorageManager:
                     req_id,
                 )
             except Exception as error:
-                if publish_local_early and isinstance(
+                if isinstance(
                     error, NativeExternalPageTransferUnknownError
                 ):
                     error.layerwise_source_pages = (
@@ -633,10 +633,10 @@ class StorageManager:
                 except Exception as caught:
                     error = caught
                 finally:
-                    if publish_local_early and isinstance(
+                    if isinstance(
                         error, NativeExternalPageTransferUnknownError
                     ):
-                        # The P-node's sticky queue will refuse handoff/close.
+                        # The caller's sticky failure refuses handoff/close.
                         # Do not return possibly DMA-owned pages to the pool.
                         error.layerwise_source_pages = (
                             getattr(error, "layerwise_source_pages", ()) + held

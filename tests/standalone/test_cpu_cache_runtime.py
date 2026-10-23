@@ -456,3 +456,88 @@ def test_unknown_transfer_completion_prevents_storage_teardown(setup, monkeypatc
     assert result.status == "FAILED_UNKNOWN"
     with pytest.raises(RuntimeError, match="live or quarantined"):
         runtime.close()
+
+
+def test_native_uncertainty_blocks_allocator_close(setup):
+    _, runtime, _, _, _ = setup
+    closed = []
+
+    def refuse():
+        raise RuntimeError("native completion unknown")
+
+    runtime.native_io = SimpleNamespace(close=refuse, is_healthy=lambda: False)
+    original = runtime.storage_manager.close
+    runtime.storage_manager.close = lambda: closed.append(True)
+    try:
+        with pytest.raises(RuntimeError, match="completion unknown"):
+            runtime.close()
+        assert not closed
+        assert not runtime.is_healthy()
+    finally:
+        runtime.native_io = None
+        runtime.storage_manager.close = original
+
+
+def test_native_worker_registration_is_required_before_ready(setup):
+    owner, runtime, work, _, _ = setup
+    calls = []
+
+    def bind(value, name):
+        calls.append((value, name))
+        if not value:
+            raise ValueError("missing native registration")
+
+    runtime.native_io = SimpleNamespace(bind=bind)
+    resource = dict(
+        slab_name=runtime.shared_cpu_cache_name,
+        slab_size=runtime.shared_cpu_cache_slab_size,
+        slab_generation=1,
+        native_registered=True,
+        reader_ready=True,
+        device_base=1000,
+    )
+    result, _ = work(
+        "worker-0",
+        "register_participant",
+        dict(session="worker-0", tp_rank=0, resource=resource),
+    )
+    assert result.value["status"] == "FAILED"
+    assert "missing native registration" in result.value["error"]
+    assert calls == [({}, runtime.shared_cpu_cache_name)]
+
+
+def test_actual_runtime_stop_remains_acknowledgeable(setup):
+    from threading import Event
+    from lmcache.v1.rpc.storage_bootstrap import WorkerStorageBootstrap
+    from lmcache.v1.rpc.storage_client import StorageClient
+    from lmcache.v1.storage_service import StorageService
+    from tests.v1.test_worker_mooncake_transport import endpoint
+
+    _, runtime, _, _, _ = setup
+    work, lifecycle = endpoint(), endpoint()
+    service = StorageService(
+        runtime,
+        work,
+        lifecycle,
+        cache_instance_id="cache",
+        service_epoch="epoch",
+        sessions=runtime.registry.sessions,
+    )
+    service.start()
+    fatal = Event()
+    client = StorageClient(
+        work,
+        lifecycle,
+        cache_instance_id="cache",
+        service_epoch="epoch",
+        client_session="worker-0",
+        session_nonce=b"a",
+        failure_callback=lambda reason: fatal.set(),
+    )
+    context = WorkerStorageBootstrap(client, {}, "worker-0", 2)
+    try:
+        assert context.call("stop", {}) == {"status": "STOPPED"}
+        assert not fatal.wait(0.05)
+    finally:
+        client.close()
+        service.close()
