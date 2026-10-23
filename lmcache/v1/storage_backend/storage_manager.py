@@ -40,6 +40,10 @@ from lmcache.v1.memory_management import (
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import mooncake_valid_tokens
+from lmcache.v1.prefill_store_debug import (
+    prefill_store_debug_enabled,
+    prefill_store_debug_log,
+)
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
 from lmcache.v1.storage_backend import CreateStorageBackends, is_cuda_worker
 from lmcache.v1.storage_backend.abstract_backend import (
@@ -609,6 +613,15 @@ class StorageManager:
                     else:
                         for page in held:
                             page.ref_count_down()
+                if publish_local_early and prefill_store_debug_enabled():
+                    prefill_store_debug_log(
+                        "page_done",
+                        req_id,
+                        page_keys[0].kv_group,
+                        error=error is not None,
+                        status="ok" if error is None else type(error).__name__,
+                        chunks=len(held),
+                    )
                 if not completion.done():
                     if error is None:
                         completion.set_result(None)
@@ -787,6 +800,15 @@ class StorageManager:
             else:
                 for obj in held:
                     obj.ref_count_down()
+            if prefill_store_debug_enabled():
+                prefill_store_debug_log(
+                    "flat_done",
+                    req_id,
+                    base_keys[0].kv_group,
+                    error=error is not None,
+                    status="ok" if error is None else type(error).__name__,
+                    chunks=chunk_count,
+                )
             if not completion.done():
                 if error is None:
                     completion.set_result(None)

@@ -19,6 +19,7 @@ import torch
 class Key:
     chunk: int
     layer_id: int | None = None
+    kv_group: int = 0
 
     def without_layer(self) -> "Key":
         return replace(self, layer_id=None)
@@ -71,7 +72,7 @@ class UnknownCompletion(RuntimeError):
     pass
 
 
-def manager(remote: bool = True) -> tuple[Any, Local]:
+def manager(remote: bool = True, trace: list | None = None) -> tuple[Any, Local]:
     path = (
         Path(__file__).resolve().parents[2]
         / "lmcache/v1/storage_backend/storage_manager.py"
@@ -99,6 +100,8 @@ def manager(remote: bool = True) -> tuple[Any, Local]:
         LocalCPUBackend=Local,
         RemoteBackend=Remote,
         NativeExternalPageTransferUnknownError=UnknownCompletion,
+        prefill_store_debug_enabled=lambda: trace is not None,
+        prefill_store_debug_log=lambda *args, **kwargs: trace.append((args, kwargs)),
     )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     obj, local = namespace["Manager"](), Local()
@@ -121,7 +124,8 @@ def sources(
 
 
 def test_background_writer_observes_d2h_before_reading_every_layer() -> None:
-    obj, local = manager()
+    trace = []
+    obj, local = manager(trace=trace)
     keys, objects = sources()
     flattened = [item for row in objects for item in row]
     release, waiting = threading.Event(), threading.Event()
@@ -174,6 +178,7 @@ def test_background_writer_observes_d2h_before_reading_every_layer() -> None:
             )
             assert waiting.wait(5)
             assert not future.done() and not archived
+            assert trace == [], "remote completion must not be logged on enqueue"
             assert all(item.refs == 3 for item in flattened)
             assert len(local.objects) == 6
             # Eviction and request retirement cannot free a pending writer's
@@ -190,13 +195,17 @@ def test_background_writer_observes_d2h_before_reading_every_layer() -> None:
     assert len(wait_threads) == 1 and wait_threads[0] != host_thread
     assert all(torch.all(tensor == 37) for tensor in archived)
     assert all(item.refs == 0 for item in flattened)
+    assert trace == [
+        (("flat_done", "prefill", 0), {"error": False, "status": "ok", "chunks": 2})
+    ]
 
 
 @pytest.mark.parametrize("unknown", [False, True])
 def test_remote_failure_propagates_and_unknown_completion_keeps_sources(
     unknown: bool,
 ) -> None:
-    obj, _ = manager()
+    trace = []
+    obj, _ = manager(trace=trace)
     keys, objects = sources()
     remote = Future()
     obj.batched_put_external_pages = lambda *args: remote
@@ -211,6 +220,8 @@ def test_remote_failure_propagates_and_unknown_completion_keeps_sources(
     assert all(item.refs == (3 if unknown else 2) for item in flattened)
     if unknown:
         assert error.layerwise_source_pages == flattened
+    assert trace[0][1]["error"] is True
+    assert trace[0][1]["status"] == type(error).__name__
 
 
 def test_submission_failure_does_not_consume_the_callers_allocation() -> None:
