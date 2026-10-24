@@ -87,3 +87,21 @@ def test_allocator_snapshot_uses_public_capacity_only_and_tolerates_unsupported(
         "free_mb": -1,
         "pool_mb": -1,
     }
+
+
+def test_source_tier_changes_are_not_hidden_by_first_observation(debug):
+    module, records = debug
+    for local, remote in ((4, 0), (4, 0), (0, 4), (1, 3)):
+        module.prefill_store_debug_sources(
+            "request",
+            0,
+            local_pages=local,
+            remote_pages=remote,
+            legacy_chunks=0,
+            num_layers=2,
+            first_page_bytes=16,
+        )
+    lines = [text for _, text in records]
+    assert sum("source_local " in line for line in lines) == 1
+    assert any("source_remote local=0 remote=4" in line for line in lines)
+    assert any("source_mixed local=1 remote=3" in line for line in lines)

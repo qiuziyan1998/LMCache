@@ -123,3 +123,45 @@ def prefill_store_debug_finish(req_id: str) -> None:
         for (group, stage), calls in sorted(state.stages.items()):
             _emit(state.tag, f"g{group} total {stage}={calls}")
         _emit(state.tag, "persist_done")
+
+
+def prefill_store_debug_sources(
+    req_id: str,
+    kv_group: int,
+    *,
+    local_pages: int,
+    remote_pages: int,
+    legacy_chunks: int,
+    num_layers: int,
+    first_page_bytes: int,
+) -> None:
+    """Report actual completed page reads for P-prefill history resolution.
+
+    Counts refer to this resolver call, not the whole request. Local pages
+    were acquired from the current process's CPU backend; remote pages came
+    back from a completed remote get. Reused request-owned prefixes are not
+    counted again. Legacy chunks are resolved separately and do not identify
+    a tier. Only scalar allocator metadata is supplied, never payload bytes.
+    The first local, remote, and mixed observation is logged per request/group.
+    """
+    if not _ENABLED:
+        return
+    source = (
+        "mixed"
+        if local_pages and remote_pages
+        else "remote"
+        if remote_pages
+        else "local"
+        if local_pages
+        else "legacy"
+    )
+    prefill_store_debug_log(
+        "source_" + source,
+        req_id,
+        kv_group,
+        local=local_pages,
+        remote=remote_pages,
+        legacy=legacy_chunks,
+        layers=num_layers,
+        bytes=first_page_bytes,
+    )
