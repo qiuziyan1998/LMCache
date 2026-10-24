@@ -3225,6 +3225,11 @@ class LMCacheEngine:
                     [layer.memory_objs for layer in prepared_source.layers],
                     int(self.config.chunk_size),
                 )
+            if (prepared_source is not None and kv_hash_enabled()
+                    and not getattr(self, "_force_layerwise_prefill_store", False)):
+                trace = getattr(self.gpu_connector, "trace_prepared_kv", None)
+                if callable(trace):
+                    trace(req_id, prepared_source)
         except Exception:
             if created:
                 lease.close()
@@ -3324,6 +3329,9 @@ class LMCacheEngine:
             return
         if kv_hash_enabled():
             finish_kv_hash(req_id)
+            trace = getattr(self.gpu_connector, "finish_kv_trace", None)
+            if callable(trace):
+                trace(req_id)
         lease = self._shared_cpu_request_leases.pop(req_id, None)
         if lease is not None:
             lease.close()

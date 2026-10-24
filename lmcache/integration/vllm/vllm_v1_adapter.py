@@ -87,6 +87,7 @@ from lmcache.v1.gpu_connector.sparse import (
 from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.kv_layer_groups import validate_two_group_layer_counts
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.prefill_kv_hash import kv_hash_enabled
 from lmcache.v1.prefill_metadata import PrefillMetadataCache
 
 if TYPE_CHECKING:
@@ -3461,6 +3462,38 @@ class LMCacheConnectorV1Impl:
                 layer_name
             )
         wait(**wait_kwargs)
+
+    def trace_attention_kv(self, layer_name: str, **kwargs: Any) -> None:
+        """Route attention's actual mapping to the existing debug-only tracer."""
+        if not kv_hash_enabled():
+            return
+        group = kwargs.pop("group")
+        connector = self.lmcache_engine.gpu_connector
+        trace = getattr(connector, "trace_attention_kv", None)
+        if callable(trace):
+            try:
+                metadata = self._parent._get_connector_metadata()
+            except AssertionError:
+                # Startup capture and dummy profiling have no real request.
+                return
+            try:
+                connector.configure_kv_trace(metadata.requests)
+                trace(
+                    self._layerwise_prefill_transfer_layer_id(layer_name, group),
+                    group,
+                    **kwargs,
+                )
+            except Exception as error:
+                tracer = getattr(connector, "kv_trace", None)
+                if tracer is not None:
+                    for request in metadata.requests:
+                        tracer.error(
+                            request.req_id,
+                            kwargs.get("stage", "attention"),
+                            type(error).__name__,
+                            group=group,
+                            detail=str(error)[:160],
+                        )
 
     def _layerwise_prefill_load_position(
         self, layer_name: str, kv_group: int
@@ -8602,6 +8635,22 @@ class LMCacheConnectorV1Impl:
         attn_metadata = forward_context.attn_metadata
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
+        if kv_hash_enabled():
+            configure_trace = getattr(
+                self.lmcache_engine.gpu_connector, "configure_kv_trace", None
+            )
+            if callable(configure_trace):
+                configure_trace(
+                    metadata.requests,
+                    (len(self._latent_layer_names), len(self._indexer_layer_names)),
+                    tp_size=self._vllm_config.parallel_config.tensor_parallel_size,
+                    source_ranks=(
+                        self.lmcache_engine.metadata.first_rank
+                        if self.lmcache_engine.save_only_first_rank else None,
+                        self.lmcache_engine.metadata.first_rank
+                        if self.lmcache_engine.save_indexer_only_first_rank else None,
+                    ),
+                )
         if getattr(metadata, "dsa_cold_compact_load_pending", False):
             cold_requests = [
                 request
