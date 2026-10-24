@@ -4,7 +4,8 @@
 Set LMCACHE_PREFILL_STORE_DEBUG=1 before worker startup. Each request/group
 prints the first occurrence of each stage; the terminal record counts all
 occurrences, including suppressed repeats. Errors are never suppressed.
-No payload, device state, or allocator free-list is inspected.
+This module inspects no payload, device state, or allocator free-list. The
+same switch also enables bounded CPU payload hashes in prefill_kv_hash.
 """
 
 # Standard

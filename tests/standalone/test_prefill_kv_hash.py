@@ -255,6 +255,26 @@ def test_disabled_switch_does_not_start_worker_or_touch_sources(hashing, monkeyp
     hashing.finish_kv_hash("req")
 
 
+@pytest.mark.parametrize("value, enabled", [(None, False), ("0", False), ("1", True)])
+def test_store_debug_switch_controls_metadata_and_hashes(
+    value: str | None, enabled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if value is None:
+        monkeypatch.delenv("LMCACHE_PREFILL_STORE_DEBUG", raising=False)
+    else:
+        monkeypatch.setenv("LMCACHE_PREFILL_STORE_DEBUG", value)
+    root = Path(__file__).resolve().parents[2] / "lmcache/v1"
+    for name, gate in (
+        ("prefill_store_debug", "prefill_store_debug_enabled"),
+        ("prefill_kv_hash", "kv_hash_enabled"),
+    ):
+        spec = spec_from_file_location(f"test_shared_debug_{name}", root / f"{name}.py")
+        module = module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, module)
+        spec.loader.exec_module(module)
+        assert getattr(module, gate)() is enabled
+
+
 def test_decode_hash_does_not_expand_into_generated_history(hashing):
     lines = []
     recorder = hashing.KVHashRecorder(emit=lambda tag, text: lines.append((tag, text)))

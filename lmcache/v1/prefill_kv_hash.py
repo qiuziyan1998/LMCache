@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded, opt-in CPU payload hashes for P-save/P-get/D-get diagnostics.
 
-LMCACHE_PREFILL_KV_HASH=1 selects the first and last physical owner layer in
+LMCACHE_PREFILL_STORE_DEBUG=1 selects the first and last physical owner layer in
 each group. Complete cache chunks are hashed in logical order, excluding
 allocator padding. SHA-256 is truncated to 64 bits. Each stage/group prints
 at most eight 65536-token intervals (first four and last four), two per line.
@@ -26,7 +26,7 @@ import sys
 import threading
 
 SEGMENT_TOKENS = 65536
-_ENABLED = os.environ.get("LMCACHE_PREFILL_KV_HASH", "0") == "1"
+_ENABLED = os.environ.get("LMCACHE_PREFILL_STORE_DEBUG", "0") == "1"
 _LOGGER = logging.getLogger("lmcache.prefill_kv_hash")
 _INSTANCE_LOCK = threading.Lock()
 _INSTANCE: "KVHashRecorder | None" = None
