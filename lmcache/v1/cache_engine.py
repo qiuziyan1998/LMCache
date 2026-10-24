@@ -88,6 +88,12 @@ from lmcache.v1.mooncake_layout import (
 )
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.prefill_locations import PrefillLocationPlan
+from lmcache.v1.prefill_kv_hash import (
+    drain_kv_hash,
+    finish_kv_hash,
+    kv_hash_enabled,
+    submit_kv_hash,
+)
 from lmcache.v1.prefill_metadata import PrefillSequenceView
 from lmcache.v1.prefill_sources import SharedPrefillSources, same_chunk_key
 from lmcache.v1.prefill_store_debug import (
@@ -3197,6 +3203,28 @@ class LMCacheEngine:
                     lease.prefill_sources.pop(group, None)
             lease.active = True
             self._shared_cpu_request_leases[req_id] = lease
+            if (
+                prepared_source is not None
+                and kv_hash_enabled()
+                and self.metadata.is_first_rank()
+                and not getattr(self, "_force_layerwise_prefill_store", False)
+            ):
+                counts = prepared_source.chunk_token_counts
+                ends = []
+                frontier = 0
+                for length in counts:
+                    frontier += int(length)
+                    ends.append(frontier)
+                starts = [0] + ends[:-1]
+                submit_kv_hash(
+                    "D",
+                    req_id,
+                    0,
+                    starts,
+                    ends,
+                    [layer.memory_objs for layer in prepared_source.layers],
+                    int(self.config.chunk_size),
+                )
         except Exception:
             if created:
                 lease.close()
@@ -3294,6 +3322,8 @@ class LMCacheEngine:
     def release_shared_cpu_sparse_request(self, req_id: Optional[str]) -> None:
         if not req_id:
             return
+        if kv_hash_enabled():
+            finish_kv_hash(req_id)
         lease = self._shared_cpu_request_leases.pop(req_id, None)
         if lease is not None:
             lease.close()
@@ -5996,6 +6026,16 @@ class LMCacheEngine:
                         )
                         if callable(wait_publication):
                             wait_publication(kv_group)
+                        if kv_hash_enabled() and pre_resolved_layers is not None:
+                            submit_kv_hash(
+                                "P",
+                                req_id,
+                                kv_group,
+                                starts,
+                                ends,
+                                pre_resolved_layers,
+                                int(self.config.chunk_size),
+                            )
                     handles = (
                         [None] * len(mem_objs_layer)
                         if compact_batch is not None
@@ -9758,6 +9798,8 @@ class LMCacheEngine:
     def close(self) -> None:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
+        if kv_hash_enabled() and not drain_kv_hash():
+            raise RuntimeError("KV hash worker has not drained; keep CPU slabs alive")
 
         if self.lmcache_worker is not None:
             try:
