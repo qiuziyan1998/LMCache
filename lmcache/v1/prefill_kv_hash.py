@@ -61,6 +61,10 @@ def submit_kv_hash(*args: Any, **kwargs: Any) -> "CPUHashFence | None":
     Uses ``KVHashRecorder.submit``'s arguments. Disabled by default; disabled
     calls retain nothing. Submission never waits for queue space or the NPU.
     """
+    # Ascend's all-layer byte-feature recorder owns this DEBUG observation.
+    # Do not also scan the complete CPU payload with the legacy SHA recorder.
+    if kwargs.pop("feature_mode", False):
+        return None
     if _ENABLED:
         try:
             return _recorder().submit(*args, **kwargs)

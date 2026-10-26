@@ -3224,6 +3224,9 @@ class LMCacheEngine:
                     ends,
                     [layer.memory_objs for layer in prepared_source.layers],
                     int(self.config.chunk_size),
+                    feature_mode=getattr(
+                        self.gpu_connector, "uses_token_byte_features", False
+                    ),
                 )
             if (prepared_source is not None and kv_hash_enabled()
                     and not getattr(self, "_force_layerwise_prefill_store", False)):
@@ -6043,6 +6046,9 @@ class LMCacheEngine:
                                 ends,
                                 pre_resolved_layers,
                                 int(self.config.chunk_size),
+                                feature_mode=getattr(
+                                    self.gpu_connector, "uses_token_byte_features", False
+                                ),
                             )
                     handles = (
                         [None] * len(mem_objs_layer)

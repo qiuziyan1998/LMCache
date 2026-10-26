@@ -255,6 +255,12 @@ def test_disabled_switch_does_not_start_worker_or_touch_sources(hashing, monkeyp
     hashing.finish_kv_hash("req")
 
 
+def test_feature_mode_never_starts_legacy_hash_even_with_debug_enabled(hashing, monkeypatch):
+    monkeypatch.setattr(hashing, "_ENABLED", True)
+    monkeypatch.setattr(hashing, "_recorder", lambda: pytest.fail("legacy hash must not run"))
+    assert hashing.submit_kv_hash("S", "req", 0, [], [], [object()], 4, feature_mode=True) is None
+
+
 @pytest.mark.parametrize("value, enabled", [(None, False), ("0", False), ("1", True)])
 def test_store_debug_switch_controls_metadata_and_hashes(
     value: str | None, enabled: bool, monkeypatch: pytest.MonkeyPatch
