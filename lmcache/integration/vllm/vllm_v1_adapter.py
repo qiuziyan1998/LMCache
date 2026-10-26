@@ -10285,6 +10285,8 @@ class LMCacheConnectorV1Impl:
                     sync=True,
                     prepared_sparse_source=source,
                     prepared_start_layer=target_count,
+                    req_id=request.req_id,
+                    lmcache_cached_tokens=source.total_tokens,
                     registered_destination_layout=getattr(
                         self, "_sparse_destination_binding", None
                     ),

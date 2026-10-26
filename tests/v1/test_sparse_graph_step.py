@@ -49,6 +49,7 @@ def load_prepare_method(name: str = "prepare_sparse_graph_step") -> Any:
         "torch": torch,
         "_lmcache_nvtx_annotate": lambda fn: fn,
         "build_prepared_sparse_source": build_prepared_sparse_source,
+        "kv_hash_enabled": lambda: False,
     }
     helper = next(
         node
@@ -166,6 +167,8 @@ def test_prepare_keeps_draft_suffix_and_avoids_target_loads(
         adapter.layerwise_retrievers[0][0].send("draft payload")
         assert adapter.suffix_kwargs["prepared_start_layer"] == 2
         assert adapter.suffix_kwargs["prepared_sparse_source"] is source
+        assert adapter.suffix_kwargs["req_id"] == "r1"
+        assert adapter.suffix_kwargs["lmcache_cached_tokens"] == 512
 
 
 def test_zero_frontier_requires_explicit_authorization() -> None:
@@ -257,6 +260,8 @@ def test_batch_sources_follow_model_order_and_keep_draft_suffixes(
     assert all(call["prepared_start_layer"] == 2 for call in calls)
     assert calls[0]["prepared_sparse_source"] is adapter.source
     assert calls[1]["prepared_sparse_source"] is second_source
+    assert [call["req_id"] for call in calls] == ["r1", "r2"]
+    assert [call["lmcache_cached_tokens"] for call in calls] == [512, 768]
 
 
 def test_batch_cannot_invent_missing_positive_frontier_source() -> None:
