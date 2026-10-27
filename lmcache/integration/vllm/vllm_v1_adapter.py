@@ -88,6 +88,7 @@ from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.kv_layer_groups import validate_two_group_layer_counts
 from lmcache.v1.manager import LMCacheManager
 from lmcache.v1.prefill_kv_hash import kv_hash_enabled
+from lmcache.v1.prefill_audit import audit_enabled
 from lmcache.v1.prefill_metadata import PrefillMetadataCache
 
 if TYPE_CHECKING:
@@ -8635,7 +8636,7 @@ class LMCacheConnectorV1Impl:
         attn_metadata = forward_context.attn_metadata
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
-        if kv_hash_enabled():
+        if kv_hash_enabled() or audit_enabled():
             configure_trace = getattr(
                 self.lmcache_engine.gpu_connector, "configure_kv_trace", None
             )

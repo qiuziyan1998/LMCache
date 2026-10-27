@@ -95,6 +95,7 @@ from lmcache.v1.prefill_kv_hash import (
     submit_kv_hash,
 )
 from lmcache.v1.prefill_metadata import PrefillSequenceView
+from lmcache.v1.prefill_audit import audit_enabled, audit_sources
 from lmcache.v1.prefill_sources import SharedPrefillSources, same_chunk_key
 from lmcache.v1.prefill_store_debug import (
     prefill_store_debug_enabled,
@@ -3338,6 +3339,11 @@ class LMCacheEngine:
         lease = self._shared_cpu_request_leases.pop(req_id, None)
         if lease is not None:
             lease.close()
+        if audit_enabled() and not kv_hash_enabled():
+            # Do not extend cache-object leases for diagnostic file output.
+            trace = getattr(self.gpu_connector, "finish_kv_trace", None)
+            if callable(trace):
+                trace(req_id)
 
     def _release_all_shared_cpu_request_leases(self) -> None:
         leases = list(self._shared_cpu_request_leases.values())
@@ -6050,6 +6056,11 @@ class LMCacheEngine:
                                     self.gpu_connector, "uses_token_byte_features", False
                                 ),
                             )
+                    if (
+                        audit_enabled() and layer_id == 0
+                        and pre_resolved_layers is not None
+                    ):
+                        audit_sources(req_id, keys_layer_major, pre_resolved_layers)
                     handles = (
                         [None] * len(mem_objs_layer)
                         if compact_batch is not None
