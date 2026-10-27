@@ -8761,6 +8761,14 @@ class LMCacheConnectorV1Impl:
             )
         )
         gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+        fence_debug = getattr(gpu_connector, "fence_debug", None)
+        if fence_debug is not None:
+            fence_debug.begin_step(
+                metadata.requests,
+                (len(self._latent_layer_names), len(self._indexer_layer_names)),
+                self._layerwise_prefill_bank_count,
+                self._lmcache_chunk_size,
+            )
         if staged_load_count and gpu_connector is not None and hasattr(
             gpu_connector, "set_layerwise_staging_concurrency"
         ):
