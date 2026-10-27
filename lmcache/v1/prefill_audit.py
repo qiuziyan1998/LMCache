@@ -102,29 +102,52 @@ def cpu_payload_samples(
     """
     result = []
     for ptrs, lengths in zip(pointers, sizes, strict=True):
-        if len(ptrs) != len(lengths) or any(p <= 0 for p in ptrs):
-            raise ValueError("invalid CPU sample pointers")
-        if any(n < 0 for n in lengths) or not lengths:
-            raise ValueError("invalid CPU sample lengths")
-        total = sum(lengths)
-        if total <= 0:
-            raise ValueError("empty CPU sample object")
-        width = min(8, total)
         checksum = 0
-        for offset in sorted({(total - width) * index // 7 for index in range(8)}):
-            remaining, skip = width, offset
-            for pointer, size in zip(ptrs, lengths, strict=True):
-                if skip >= size:
-                    skip -= size
-                    continue
-                take = min(remaining, size - skip)
-                checksum = zlib.crc32(ctypes.string_at(pointer + skip, take), checksum)
-                remaining -= take
-                skip = 0
-                if remaining == 0:
-                    break
-        result.append((total, f"{checksum:08x}"))
+        for pointer, size in sample_windows(ptrs, lengths):
+            checksum = zlib.crc32(ctypes.string_at(pointer, size), checksum)
+        result.append((sum(lengths), f"{checksum:08x}"))
     return result
+
+
+def sample_windows(
+    pointers: Sequence[int], sizes: Sequence[int]
+) -> list[tuple[int, int]]:
+    """Return ordered sample addresses without reading host or device memory."""
+    if len(pointers) != len(sizes) or any(p <= 0 for p in pointers):
+        raise ValueError("invalid sample pointers")
+    if any(n < 0 for n in sizes) or not sizes or sum(sizes) <= 0:
+        raise ValueError("invalid sample lengths")
+    total, result = sum(sizes), []
+    width = min(8, total)
+    for offset in sorted({(total - width) * index // 7 for index in range(8)}):
+        remaining, skip = width, offset
+        for pointer, size in zip(pointers, sizes, strict=True):
+            if skip >= size:
+                skip -= size
+                continue
+            take = min(remaining, size - skip)
+            result.append((pointer + skip, take))
+            remaining -= take
+            skip = 0
+            if remaining == 0:
+                break
+    return result
+
+
+def sampled_key_indices(keys: Sequence[str], limit: int | None = None) -> list[int]:
+    """Select the same deterministic keys for CPU samples and bounded readback."""
+    selected = [i for i, key in enumerate(keys) if zlib.crc32(key.encode()) % 8 == 0]
+    if not selected and keys:
+        selected = [0]
+    if limit is not None and limit < 1:
+        raise ValueError("sample key limit must be positive")
+    if limit == 1:
+        return selected[:1]
+    if limit is not None and len(selected) > limit:
+        selected = [
+            selected[(len(selected) - 1) * i // (limit - 1)] for i in range(limit)
+        ]
+    return selected
 
 
 def audit_payload(
@@ -141,11 +164,7 @@ def audit_payload(
     if not _ENABLED:
         return None
     try:
-        selected = [
-            i for i, key in enumerate(keys) if zlib.crc32(key.encode()) % 8 == 0
-        ]
-        if not selected and keys:
-            selected = [0]
+        selected = sampled_key_indices(keys)
         samples = cpu_payload_samples(
             [pointers[i] for i in selected], [sizes[i] for i in selected]
         )
@@ -212,11 +231,7 @@ def audit_sources(
 
         layers = len(keys)
         labels = [mooncake_page_key(key, layers) for key in keys[0]]
-        selected = [
-            i for i, key in enumerate(labels) if zlib.crc32(key.encode()) % 8 == 0
-        ]
-        if not selected and labels:
-            selected = [0]
+        selected = sampled_key_indices(labels)
         pointers, sizes = [], []
         for index in selected:
             first = sources[0][index]

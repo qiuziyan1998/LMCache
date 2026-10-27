@@ -37,6 +37,7 @@ from lmcache.v1.kv_layer_groups import (
 from lmcache.v1.mooncake_key_trace import trace_mooncake_keys
 from lmcache.v1.prefill_audit import (
     audit_cpu_put, audit_enabled, audit_payload, audit_record, cpu_backed,
+    sampled_key_indices,
 )
 from lmcache.v1.mooncake_layout import (
     mooncake_legacy_key,
@@ -2501,8 +2502,14 @@ class MooncakestoreConnector(RemoteConnector):
                     "get", page_keys, buffer_ptrs, buffer_sizes, req_id=req_id
                 )
             else:
-                audit_record("coverage", stage="get", req=req_id,
-                             detail="direct_npu_payload_not_sampled")
+                audit_record(
+                    "direct_npu", stage="get", req=req_id,
+                    groups=sorted({int(key.kv_group) for key in keys}),
+                    pages=len(page_keys),
+                    keys=[
+                        page_keys[i] for i in sampled_key_indices(page_keys, limit=3)
+                    ],
+                )
         trace_mooncake_keys(
             "get", page_keys, statuses, api="connector.direct_npu_page_get"
         )
