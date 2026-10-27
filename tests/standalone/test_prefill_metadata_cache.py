@@ -240,7 +240,6 @@ def adapter_request():
         request_configs={},
         block_allocation_mode="prefill_child",
         is_sparse_decode=False,
-        layerwise_prefill_bank_offset=0,
         resumed_from_preemption=False,
         prefill_metadata_mm_signature=(),
     )
