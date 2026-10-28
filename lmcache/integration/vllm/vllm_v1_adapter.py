@@ -9773,34 +9773,34 @@ class LMCacheConnectorV1Impl:
         wait_group: int,
         transfer_layer: int,
     ) -> Optional[torch.Tensor]:
-        """Submit one dense group while preserving its dynamic bank mapping."""
+        """Submit one dense group using the layer's fixed bank slot mapping."""
         layerwise_retriever, indexer_retriever = retriever_pair
         if wait_group == 1:
             if indexer_retriever is not None:
-                dynamic_mapping = self._layerwise_prefill_slot_mapping(
+                layer_mapping = self._layerwise_prefill_slot_mapping(
                     request,
                     1,
                     transfer_layer,
                 )
-                if dynamic_mapping is None:
+                if layer_mapping is None:
                     return next(indexer_retriever)
                 return indexer_retriever.send(
-                    {"slot_mapping": dynamic_mapping}
+                    {"slot_mapping": layer_mapping}
                 )
             raise RuntimeError(
                 "Layerwise prefill Group-1 load is missing its retriever: "
                 f"req_id={request.req_id}"
             )
 
-        dynamic_mapping = self._layerwise_prefill_slot_mapping(
+        layer_mapping = self._layerwise_prefill_slot_mapping(
             request,
             0,
             transfer_layer,
         )
-        if dynamic_mapping is None:
+        if layer_mapping is None:
             return next(layerwise_retriever)
         return layerwise_retriever.send(
-            {"slot_mapping": dynamic_mapping}
+            {"slot_mapping": layer_mapping}
         )
 
     def _complete_layerwise_retrieve_group(
@@ -11470,25 +11470,22 @@ class LMCacheConnectorV1Impl:
                             "P-node layerwise save received an unknown layer: "
                             f"layer={layer_name}, kv_group={kv_group}"
                         ) from exc
-                    # The raw-address DMA storer was prepared from the two
-                    # banks' block IDs.  It deliberately has no per-token
-                    # slot mapping to rotate here; the NPU connector selects
-                    # the physical bank from the layer ordinal.  Keep the
-                    # legacy dynamic mapping command only for the non-DMA
-                    # layerwise path.
+                    # Raw-address DMA selects the fixed bank from the layer
+                    # ordinal and its block IDs. Only the non-DMA layerwise
+                    # path needs this bank's per-token slot mapping.
                     if self._layerwise_prefill_dma:
                         layer_command = None
                     else:
-                        dynamic_slot_mapping = (
+                        layer_slot_mapping = (
                             self._layerwise_prefill_slot_mapping(
                                 request,
                                 kv_group,
                                 layer_index,
                             )
                         )
-                        assert dynamic_slot_mapping is not None
+                        assert layer_slot_mapping is not None
                         layer_command = {
-                            "slot_mapping": dynamic_slot_mapping,
+                            "slot_mapping": layer_slot_mapping,
                             "slot_mapping_base": 0,
                         }
                     yielded = self._store_result_from_yield(
