@@ -87,6 +87,8 @@ from lmcache.v1.gpu_connector.sparse import (
 from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.kv_layer_groups import validate_two_group_layer_counts
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.prefill_kv_hash import kv_hash_enabled
+from lmcache.v1.prefill_audit import audit_enabled
 from lmcache.v1.prefill_metadata import PrefillMetadataCache
 
 if TYPE_CHECKING:
@@ -1451,11 +1453,6 @@ class ReqMeta:
     # P-node DMA consumes block IDs directly and derives one destination
     # address per DMA segment; it must not materialize a token-sized map.
     block_ids_by_bank: Optional[tuple[tuple[list[int], ...], ...]] = None
-    # Physical-bank phase for this chunk. The P-node rotates its configured banks
-    # at every LMCache chunk boundary so the first real lightning-indexer
-    # layer does not reuse the previous chunk's final bank while its D2H save
-    # is still in flight.
-    layerwise_prefill_bank_offset: int = 0
     block_allocation_mode: Optional[str] = None
     # Save-only mappings for the exact sparse-layerwise write window. Chunk
     # ranges remain absolute; the worker/connector subtracts this base before
@@ -1689,21 +1686,6 @@ class ReqMeta:
             elif len(tracker.sparse_token_ids) > sparse_token_count:
                 input_token_ids = tracker.sparse_token_ids[:sparse_token_count]
         input_token_len = len(input_token_ids)
-        layerwise_prefill_bank_offset = 0
-        if layerwise_prefill_dma and lmcache_chunk_size > 0:
-            # num_lmcache_cached_tokens is the durable prefix present before
-            # this worker starts computing.  It must not advance the local
-            # bank phase: the corresponding remote DMA has no live source
-            # bank on this worker.  Only chunks computed by this P node rotate
-            # the resident banks.
-            local_saved_tokens = max(
-                0,
-                tracker.num_saved_tokens
-                - tracker.num_lmcache_cached_tokens,
-            )
-            layerwise_prefill_bank_offset = (
-                local_saved_tokens // lmcache_chunk_size
-            ) % len(tracker.allocated_block_ids_by_bank or ((), ()))
         metadata_current_released_frontier = tracker.dsa_current_released_frontier
         if is_sparse_decode and load_spec is not None:
             metadata_current_released_frontier = min(
@@ -1832,7 +1814,6 @@ class ReqMeta:
                 load_spec=None,
                 disagg_spec=tracker.disagg_spec,
                 request_configs=tracker.request_configs,
-                layerwise_prefill_bank_offset=layerwise_prefill_bank_offset,
             )
 
         # Calculate number of tokens to save based on discard_partial_chunks
@@ -2147,7 +2128,6 @@ class ReqMeta:
                 if layerwise_prefill_dma
                 else None
             ),
-            layerwise_prefill_bank_offset=layerwise_prefill_bank_offset,
             block_allocation_mode=tracker.block_allocation_mode,
             save_slot_mapping=save_slot_mapping,
             save_indexer_slot_mapping=save_indexer_slot_mapping,
@@ -3169,9 +3149,7 @@ class LMCacheConnectorV1Impl:
                 request,
             )
         assert mappings is not None
-        bank = (
-            layer_index + int(request.layerwise_prefill_bank_offset)
-        ) % getattr(self, "_layerwise_prefill_bank_count", 2)
+        bank = layer_index % getattr(self, "_layerwise_prefill_bank_count", 2)
         # Layout/allocation mode was checked when materializing this forward's
         # maps. Layer callbacks only select their group's physical bank.
         return mappings[bank][kv_group]
@@ -3196,7 +3174,7 @@ class LMCacheConnectorV1Impl:
         *,
         force: bool = False,
     ) -> Optional[tuple[tuple[torch.Tensor, ...], ...]]:
-        """Materialize the two-bank mappings once, before model forward."""
+        """Materialize the bank mappings once, before model forward."""
         if not self._layerwise_prefill_p_node:
             return None
         if not force:
@@ -3404,19 +3382,10 @@ class LMCacheConnectorV1Impl:
         """
         if not self._layerwise_prefill_p_node:
             return
-        metadata = self._parent._get_connector_metadata()
-        offsets = tuple({
-            int(getattr(request, "layerwise_prefill_bank_offset", 0))
-            % getattr(self, "_layerwise_prefill_bank_count", 2)
-            for request in metadata.requests
-        })
-        if not offsets:
-            return
         kv_group = self._layerwise_wait_group(layer_name)
         self.lmcache_engine.gpu_connector.record_layerwise_prefill_bank_use(
             self._layerwise_prefill_transfer_layer_id(layer_name, kv_group),
             kv_group,
-            offsets,
             event,
         )
 
@@ -3436,31 +3405,51 @@ class LMCacheConnectorV1Impl:
                 "GPU connector declares layerwise prefill transfer-window "
                 "support but has no wait_for_layerwise_prefill_load API"
             )
-        # Every scheduled request writes this layer's bank, including a cache
-        # miss that has no retriever. Match the final-access handoff's request
-        # set; a hit-only phase would leave the other request's save unfenced.
+        # Wait separately for every request's submitted load. All requests
+        # use the same fixed bank for this group-local layer ordinal.
         metadata = self._parent._get_connector_metadata()
-        offsets = {
-            int(getattr(request, "layerwise_prefill_bank_offset", 0))
-            % getattr(self, "_layerwise_prefill_bank_count", 2)
-            for request in metadata.requests
-        }
         wait_kwargs = dict(
-            layer_id=self._layerwise_prefill_transfer_layer_id(
-                layer_name,
-                kv_group,
-            ),
+            layer_id=self._layerwise_prefill_transfer_layer_id(layer_name, kv_group),
             kv_group=kv_group,
+            request_ids=tuple(request.req_id for request in metadata.requests),
         )
-        if len(offsets) == 1:
-            wait_kwargs["bank_offset"] = offsets.pop()
-        elif offsets:
-            wait_kwargs["bank_offsets"] = tuple(sorted(offsets))
         if getattr(self, "_prefill_overlap_step_active", False):
             wait_kwargs["model_layer_id"] = self._layerwise_layer_id_from_name(
                 layer_name
             )
         wait(**wait_kwargs)
+
+    def trace_attention_kv(self, layer_name: str, **kwargs: Any) -> None:
+        """Route attention's actual mapping to the existing debug-only tracer."""
+        if not kv_hash_enabled():
+            return
+        group = kwargs.pop("group")
+        connector = self.lmcache_engine.gpu_connector
+        trace = getattr(connector, "trace_attention_kv", None)
+        if callable(trace):
+            try:
+                metadata = self._parent._get_connector_metadata()
+            except AssertionError:
+                # Startup capture and dummy profiling have no real request.
+                return
+            try:
+                connector.configure_kv_trace(metadata.requests)
+                trace(
+                    self._layerwise_prefill_transfer_layer_id(layer_name, group),
+                    group,
+                    **kwargs,
+                )
+            except Exception as error:
+                tracer = getattr(connector, "kv_trace", None)
+                if tracer is not None:
+                    for request in metadata.requests:
+                        tracer.error(
+                            request.req_id,
+                            kwargs.get("stage", "attention"),
+                            type(error).__name__,
+                            group=group,
+                            detail=str(error)[:160],
+                        )
 
     def _layerwise_prefill_load_position(
         self, layer_name: str, kv_group: int
@@ -8602,6 +8591,22 @@ class LMCacheConnectorV1Impl:
         attn_metadata = forward_context.attn_metadata
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
+        if kv_hash_enabled() or audit_enabled():
+            configure_trace = getattr(
+                self.lmcache_engine.gpu_connector, "configure_kv_trace", None
+            )
+            if callable(configure_trace):
+                configure_trace(
+                    metadata.requests,
+                    (len(self._latent_layer_names), len(self._indexer_layer_names)),
+                    tp_size=self._vllm_config.parallel_config.tensor_parallel_size,
+                    source_ranks=(
+                        self.lmcache_engine.metadata.first_rank
+                        if self.lmcache_engine.save_only_first_rank else None,
+                        self.lmcache_engine.metadata.first_rank
+                        if self.lmcache_engine.save_indexer_only_first_rank else None,
+                    ),
+                )
         if getattr(metadata, "dsa_cold_compact_load_pending", False):
             cold_requests = [
                 request
@@ -8720,6 +8725,14 @@ class LMCacheConnectorV1Impl:
             )
         )
         gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+        fence_debug = getattr(gpu_connector, "fence_debug", None)
+        if fence_debug is not None:
+            fence_debug.begin_step(
+                metadata.requests,
+                (len(self._latent_layer_names), len(self._indexer_layer_names)),
+                self._layerwise_prefill_bank_count,
+                self._lmcache_chunk_size,
+            )
         if staged_load_count and gpu_connector is not None and hasattr(
             gpu_connector, "set_layerwise_staging_concurrency"
         ):
@@ -9327,10 +9340,6 @@ class LMCacheConnectorV1Impl:
                             "layerwise_prefill_bank_count": (
                                 self._layerwise_prefill_bank_count
                             ),
-                            "layerwise_prefill_bank_offset": (
-                                int(request.layerwise_prefill_bank_offset)
-                                % self._layerwise_prefill_bank_count
-                            ),
                         }
                         if self._deferred_layerwise_prefill_load_active
                         else {}
@@ -9773,34 +9782,34 @@ class LMCacheConnectorV1Impl:
         wait_group: int,
         transfer_layer: int,
     ) -> Optional[torch.Tensor]:
-        """Submit one dense group while preserving its dynamic bank mapping."""
+        """Submit one dense group using the layer's fixed bank slot mapping."""
         layerwise_retriever, indexer_retriever = retriever_pair
         if wait_group == 1:
             if indexer_retriever is not None:
-                dynamic_mapping = self._layerwise_prefill_slot_mapping(
+                layer_mapping = self._layerwise_prefill_slot_mapping(
                     request,
                     1,
                     transfer_layer,
                 )
-                if dynamic_mapping is None:
+                if layer_mapping is None:
                     return next(indexer_retriever)
                 return indexer_retriever.send(
-                    {"slot_mapping": dynamic_mapping}
+                    {"slot_mapping": layer_mapping}
                 )
             raise RuntimeError(
                 "Layerwise prefill Group-1 load is missing its retriever: "
                 f"req_id={request.req_id}"
             )
 
-        dynamic_mapping = self._layerwise_prefill_slot_mapping(
+        layer_mapping = self._layerwise_prefill_slot_mapping(
             request,
             0,
             transfer_layer,
         )
-        if dynamic_mapping is None:
+        if layer_mapping is None:
             return next(layerwise_retriever)
         return layerwise_retriever.send(
-            {"slot_mapping": dynamic_mapping}
+            {"slot_mapping": layer_mapping}
         )
 
     def _complete_layerwise_retrieve_group(
@@ -10245,6 +10254,8 @@ class LMCacheConnectorV1Impl:
                     sync=True,
                     prepared_sparse_source=source,
                     prepared_start_layer=target_count,
+                    req_id=request.req_id,
+                    lmcache_cached_tokens=source.total_tokens,
                     registered_destination_layout=getattr(
                         self, "_sparse_destination_binding", None
                     ),
@@ -10821,11 +10832,6 @@ class LMCacheConnectorV1Impl:
             "decode_window_size": getattr(request, "decode_window_size", None),
             "request_configs": request.request_configs,
         }
-        if self._layerwise_prefill_p_node:
-            store_kwargs["layerwise_prefill_bank_offset"] = (
-                int(request.layerwise_prefill_bank_offset)
-                % self._layerwise_prefill_bank_count
-            )
         if self._is_dsa_two_groups() and kv_group == 1:
             store_kwargs["kv_group"] = 1
         if self._prefill_metadata_cache_enabled(request, deferred=True):
@@ -11473,25 +11479,22 @@ class LMCacheConnectorV1Impl:
                             "P-node layerwise save received an unknown layer: "
                             f"layer={layer_name}, kv_group={kv_group}"
                         ) from exc
-                    # The raw-address DMA storer was prepared from the two
-                    # banks' block IDs.  It deliberately has no per-token
-                    # slot mapping to rotate here; the NPU connector selects
-                    # the physical bank from the layer ordinal.  Keep the
-                    # legacy dynamic mapping command only for the non-DMA
-                    # layerwise path.
+                    # Raw-address DMA selects the fixed bank from the layer
+                    # ordinal and its block IDs. Only the non-DMA layerwise
+                    # path needs this bank's per-token slot mapping.
                     if self._layerwise_prefill_dma:
                         layer_command = None
                     else:
-                        dynamic_slot_mapping = (
+                        layer_slot_mapping = (
                             self._layerwise_prefill_slot_mapping(
                                 request,
                                 kv_group,
                                 layer_index,
                             )
                         )
-                        assert dynamic_slot_mapping is not None
+                        assert layer_slot_mapping is not None
                         layer_command = {
-                            "slot_mapping": dynamic_slot_mapping,
+                            "slot_mapping": layer_slot_mapping,
                             "slot_mapping_base": 0,
                         }
                     yielded = self._store_result_from_yield(

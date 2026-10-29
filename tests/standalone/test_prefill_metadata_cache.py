@@ -222,6 +222,7 @@ def adapter_request():
         lambda *args, **kwargs: None
     )
     adapter._layerwise_prefill_p_node = adapter._layerwise_prefill_dma = True
+    adapter._layerwise_prefill_bank_count = 4
     adapter._deferred_layerwise_prefill_load_active = True
     adapter.kv_role = "kv_both"
     adapter._worker_retrieve_state = {}
@@ -239,7 +240,6 @@ def adapter_request():
         request_configs={},
         block_allocation_mode="prefill_child",
         is_sparse_decode=False,
-        layerwise_prefill_bank_offset=0,
         resumed_from_preemption=False,
         prefill_metadata_mm_signature=(),
     )

@@ -115,7 +115,7 @@ def test_each_finished_layer_submits_n_plus_bank_count_and_drains_once(
     assert results == ["drained"]
 
 
-def test_eight_bank_mapping_and_mixed_phase_event_handoff() -> None:
+def test_eight_bank_mapping_and_fixed_event_handoff() -> None:
     obj = adapter()
     obj._layerwise_prefill_p_node = True
     obj._layerwise_prefill_dma = True
@@ -125,11 +125,6 @@ def test_eight_bank_mapping_and_mixed_phase_event_handoff() -> None:
         [100 + b] for b in range(8)
     )
     calls = []
-    obj._parent = NS(
-        _get_connector_metadata=lambda: NS(
-            requests=[NS(layerwise_prefill_bank_offset=phase) for phase in (0, 3, 7, 7)]
-        )
-    )
     obj._layerwise_wait_group = lambda name: 0
     obj._layerwise_prefill_transfer_layer_id = lambda name, group: 9
     obj.lmcache_engine = NS(
@@ -139,30 +134,22 @@ def test_eight_bank_mapping_and_mixed_phase_event_handoff() -> None:
     )
     event = object()
     obj.record_layerwise_prefill_bank_use("layer", event)
-    assert calls[0][:2] == (9, 0)
-    assert set(calls[0][2]) == {0, 3, 7}
-    assert calls[0][3] is event
+    assert calls == [(9, 0, event)]
 
 
 @pytest.mark.parametrize(
-    "banks,phases,loadable,expected_offset",
+    "banks,count,loadable",
     [
-        (4, [0, 1], [1], None),
-        (4, [0, 1], [0], None),
-        (8, [0, 3, 7], [0, 2], None),
-        (4, [2, 2], [1], 2),
-        (4, [3, 3], [], 3),
-        (4, [], [], None),
+        (4, 2, [1]),
+        (4, 2, [0]),
+        (8, 3, [0, 2]),
+        (4, 2, []),
+        (4, 0, []),
     ],
 )
-def test_bank_wait_includes_scheduled_cache_misses(
-    banks: int,
-    phases: list[int],
-    loadable: list[int],
-    expected_offset: int | None,
-) -> None:
+def test_bank_wait_includes_scheduled_cache_misses(banks, count, loadable):
     obj = adapter()
-    requests = [NS(layerwise_prefill_bank_offset=phase) for phase in phases]
+    requests = [NS(req_id=f"r{i}") for i in range(count)]
     obj._layerwise_prefill_bank_count = banks
     obj._layerwise_requests = [requests[index] for index in loadable]
     obj._parent = NS(_get_connector_metadata=lambda: NS(requests=requests))
@@ -174,38 +161,25 @@ def test_bank_wait_includes_scheduled_cache_misses(
         )
     )
     obj._wait_for_layerwise_prefill_bank("layer", 1)
-    expected = dict(layer_id=banks, kv_group=1)
-    if expected_offset is not None:
-        expected["bank_offset"] = expected_offset
-    elif phases:
-        expected["bank_offsets"] = tuple(sorted(set(phases)))
-    assert calls == [expected]
+    assert calls == [
+        dict(layer_id=banks, kv_group=1, request_ids=tuple(r.req_id for r in requests))
+    ]
 
 
-@pytest.mark.parametrize("chunks", [0, 1, 7, 8, 19])
-def test_chunk_bank_phase_ignores_remote_prefix_and_wraps_at_eight(chunks: int) -> None:
-    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
-    phase = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.If)
-        and ast.unparse(n.test) == "layerwise_prefill_dma and lmcache_chunk_size > 0"
+@pytest.mark.parametrize("prefix", [0, 10000, 20000, 512000])
+@pytest.mark.parametrize("banks", [1, 2, 4, 8])
+def test_prefix_length_never_changes_bank_selection(prefix, banks):
+    obj = adapter()
+    obj._layerwise_prefill_p_node = True
+    obj._layerwise_prefill_dma = False
+    obj._layerwise_prefill_bank_count = banks
+    mappings = tuple((object(), object()) for _ in range(banks))
+    request = NS(
+        token_ids=range(prefix + 2000), _layerwise_prefill_device_slot_mappings=mappings
     )
-    namespace = dict(
-        layerwise_prefill_dma=True,
-        lmcache_chunk_size=1024,
-        tracker=NS(
-            num_saved_tokens=32768 + chunks * 1024,
-            num_lmcache_cached_tokens=32768,
-            allocated_block_ids_by_bank=tuple(() for _ in range(8)),
-        ),
-    )
-    exec(
-        compile(
-            ast.fix_missing_locations(ast.Module(body=[phase], type_ignores=[])),
-            str(SOURCE),
-            "exec",
-        ),
-        namespace,
-    )
-    assert namespace["layerwise_prefill_bank_offset"] == chunks % 8
+    for group in (0, 1):
+        for ordinal in range(19):
+            assert (
+                obj._layerwise_prefill_slot_mapping(request, group, ordinal)
+                is mappings[ordinal % banks][group]
+            )

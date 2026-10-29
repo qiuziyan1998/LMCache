@@ -224,6 +224,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         """Run storage publication after the layer's HCOM is submitted."""
         self._lmcache_engine.finish_layerwise_prefill_save(layer_name)
 
+    def trace_attention_kv(self, layer_name: str, **kwargs: Any) -> None:
+        """Forward opt-in model-visible KV diagnostics to the NPU connector."""
+        self._lmcache_engine.trace_attention_kv(layer_name, **kwargs)
+
     def save_kv_layer(
         self,
         layer_name: str,

@@ -88,8 +88,19 @@ from lmcache.v1.mooncake_layout import (
 )
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.prefill_locations import PrefillLocationPlan
+from lmcache.v1.prefill_kv_hash import (
+    drain_kv_hash,
+    finish_kv_hash,
+    kv_hash_enabled,
+    submit_kv_hash,
+)
 from lmcache.v1.prefill_metadata import PrefillSequenceView
+from lmcache.v1.prefill_audit import audit_enabled, audit_sources
 from lmcache.v1.prefill_sources import SharedPrefillSources, same_chunk_key
+from lmcache.v1.prefill_store_debug import (
+    prefill_store_debug_enabled,
+    prefill_store_debug_sources,
+)
 from lmcache.v1.remote_fill.security import content_digest
 from lmcache.v1.remote_fill_diagnostics import log_remote_fill_diagnostic
 from lmcache.v1.kv_layer_groups import (
@@ -3199,6 +3210,36 @@ class LMCacheEngine:
                     lease.prefill_sources.pop(group, None)
             lease.active = True
             self._shared_cpu_request_leases[req_id] = lease
+            if (
+                prepared_source is not None
+                and kv_hash_enabled()
+                and self.metadata.is_first_rank()
+                and not getattr(self, "_force_layerwise_prefill_store", False)
+            ):
+                counts = prepared_source.chunk_token_counts
+                ends = []
+                frontier = 0
+                for length in counts:
+                    frontier += int(length)
+                    ends.append(frontier)
+                starts = [0] + ends[:-1]
+                submit_kv_hash(
+                    "D",
+                    req_id,
+                    0,
+                    starts,
+                    ends,
+                    [layer.memory_objs for layer in prepared_source.layers],
+                    int(self.config.chunk_size),
+                    feature_mode=getattr(
+                        self.gpu_connector, "uses_token_byte_features", False
+                    ),
+                )
+            if (prepared_source is not None and kv_hash_enabled()
+                    and not getattr(self, "_force_layerwise_prefill_store", False)):
+                trace = getattr(self.gpu_connector, "trace_prepared_kv", None)
+                if callable(trace):
+                    trace(req_id, prepared_source)
         except Exception:
             if created:
                 lease.close()
@@ -3296,9 +3337,19 @@ class LMCacheEngine:
     def release_shared_cpu_sparse_request(self, req_id: Optional[str]) -> None:
         if not req_id:
             return
+        if kv_hash_enabled():
+            finish_kv_hash(req_id)
+            trace = getattr(self.gpu_connector, "finish_kv_trace", None)
+            if callable(trace):
+                trace(req_id)
         lease = self._shared_cpu_request_leases.pop(req_id, None)
         if lease is not None:
             lease.close()
+        if audit_enabled() and not kv_hash_enabled():
+            # Do not extend cache-object leases for diagnostic file output.
+            trace = getattr(self.gpu_connector, "finish_kv_trace", None)
+            if callable(trace):
+                trace(req_id)
 
     def _release_all_shared_cpu_request_leases(self) -> None:
         leases = list(self._shared_cpu_request_leases.values())
@@ -4426,6 +4477,7 @@ class LMCacheEngine:
             raise ValueError("RemoteFill exact layer-page plan is malformed")
 
         pages: list[MemoryObj] = []
+        local_pages = remote_pages = 0
         owned: list[MemoryObj] = []
         pinned: list[MemoryObj] = []
         try:
@@ -4450,6 +4502,7 @@ class LMCacheEngine:
                         raise ValueError(
                             "Pinned RemoteFill LocalCPU page plan became unavailable"
                         )
+                    local_pages += len(fetched)
                 else:
                     assert self.storage_manager is not None
                     backend = self.storage_manager.storage_backends.get(location)
@@ -4459,6 +4512,7 @@ class LMCacheEngine:
                             f"RemoteFill backend {location!r} cannot retrieve pages"
                         )
                     fetched = retrieve(run_keys)
+                    remote_pages += len(fetched)
                 if len(fetched) != len(run_keys):
                     owned.extend(fetched)
                     raise ValueError(
@@ -4508,6 +4562,19 @@ class LMCacheEngine:
                     kv_group=kv_group,
                     chunk_index=chunk_index,
                 )
+            if (
+                getattr(self, "_force_layerwise_prefill_store", False)
+                and prefill_store_debug_enabled()
+            ):
+                prefill_store_debug_sources(
+                    req_id,
+                    kv_group,
+                    local_pages=local_pages,
+                    remote_pages=remote_pages,
+                    legacy_chunks=chunks - page_chunks,
+                    num_layers=self.num_layers_for_group(kv_group),
+                    first_page_bytes=pages[0].get_size() if pages else 0,
+                )
             return [list(pages) + layer for layer in tail], page_chunks
         except Exception:
             for obj in reversed(pinned):
@@ -4553,6 +4620,7 @@ class LMCacheEngine:
 
         local = self._shared_local_cpu_backend()
         pages, local_count = local.batched_get_layer_page_prefix(page_keys)
+        local_pages, remote_pages = local_count, 0
         owned: list[MemoryObj] = list(pages)
         pinned: list[MemoryObj] = []
         try:
@@ -4595,6 +4663,7 @@ class LMCacheEngine:
                         )
                     pages.extend(fetched)
                     owned.extend(fetched)
+                    remote_pages += remote_count
                 tail_start += remote_count
                 if tail_start < page_chunks:
                     # Eviction can leave arbitrarily alternating tier runs.
@@ -4603,6 +4672,7 @@ class LMCacheEngine:
                     )
                     pages.extend(fetched)
                     owned.extend(fetched)
+                    local_pages += count
                     tail_start += count
                     if not count:
                         # Neither tier has a merged page at this boundary.
@@ -4671,6 +4741,19 @@ class LMCacheEngine:
                     chunk_index=chunk_index,
                 )
 
+            if (
+                getattr(self, "_force_layerwise_prefill_store", False)
+                and prefill_store_debug_enabled()
+            ):
+                prefill_store_debug_sources(
+                    req_id,
+                    kv_group,
+                    local_pages=local_pages,
+                    remote_pages=remote_pages,
+                    legacy_chunks=len(keys_layer_major[0]) - expected_pages,
+                    num_layers=self.num_layers_for_group(kv_group),
+                    first_page_bytes=pages[0].get_size() if pages else 0,
+                )
             return [list(pages) + layer for layer in tail], expected_pages
         except Exception:
             for page in reversed(pinned):
@@ -5966,6 +6049,24 @@ class LMCacheEngine:
                         )
                         if callable(wait_publication):
                             wait_publication(kv_group)
+                        if kv_hash_enabled() and pre_resolved_layers is not None:
+                            submit_kv_hash(
+                                "P",
+                                req_id,
+                                kv_group,
+                                starts,
+                                ends,
+                                pre_resolved_layers,
+                                int(self.config.chunk_size),
+                                feature_mode=getattr(
+                                    self.gpu_connector, "uses_token_byte_features", False
+                                ),
+                            )
+                    if (
+                        audit_enabled() and layer_id == 0
+                        and pre_resolved_layers is not None
+                    ):
+                        audit_sources(req_id, keys_layer_major, pre_resolved_layers)
                     handles = (
                         [None] * len(mem_objs_layer)
                         if compact_batch is not None
@@ -9728,6 +9829,8 @@ class LMCacheEngine:
     def close(self) -> None:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
+        if kv_hash_enabled() and not drain_kv_hash():
+            raise RuntimeError("KV hash worker has not drained; keep CPU slabs alive")
 
         if self.lmcache_worker is not None:
             try:

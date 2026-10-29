@@ -35,6 +35,10 @@ from lmcache.v1.kv_layer_groups import (
     validate_two_group_layer_counts,
 )
 from lmcache.v1.mooncake_key_trace import trace_mooncake_keys
+from lmcache.v1.prefill_audit import (
+    audit_cpu_put, audit_enabled, audit_payload, audit_record, cpu_backed,
+    sampled_key_indices,
+)
 from lmcache.v1.mooncake_layout import (
     mooncake_legacy_key,
     mooncake_layer_pages_enabled,
@@ -1497,6 +1501,8 @@ class MooncakestoreConnector(RemoteConnector):
                     f"Mooncake layer-page get returned {list(statuses)}, "
                     f"expected {expected}"
                 )
+            if audit_enabled() and cpu_backed(pages):
+                audit_payload("get", page_keys, ptrs, sizes)
             publish_started = serving_perf_now() if perf_enabled else 0.0
             self.local_cpu_backend.batched_submit_layer_pages(
                 base_keys, pages
@@ -2243,10 +2249,21 @@ class MooncakestoreConnector(RemoteConnector):
                 else 0.0
             )
             self._register_external_owners(owners)
+            before = None
+            audit_cpu = audit_enabled() and bool(owners) and all(
+                getattr(getattr(owner, "device", None), "type", None) == "cpu"
+                for owner in owners
+            )
+            if audit_cpu:
+                before = audit_payload("put_source", page_keys, buffer_ptrs,
+                                       buffer_sizes, req_id=req_id, emit=False)
             transfer_started = serving_perf_now() if started is not None else None
             placement = self._batch_put_multi_buffers_by_segment(
                 keys, page_keys, buffer_ptrs, buffer_sizes
             )
+            if audit_cpu:
+                audit_payload("put", page_keys, buffer_ptrs, buffer_sizes,
+                              req_id=req_id, before=before)
             transfer_ms = (
                 (serving_perf_now() - transfer_started) * 1000
                 if transfer_started is not None
@@ -2476,6 +2493,23 @@ class MooncakestoreConnector(RemoteConnector):
             )
             error.failed_pages = failed  # type: ignore[attr-defined]
             raise error
+        if audit_enabled():
+            if owners and all(
+                getattr(getattr(owner, "device", None), "type", None) == "cpu"
+                for owner in owners
+            ):
+                audit_payload(
+                    "get", page_keys, buffer_ptrs, buffer_sizes, req_id=req_id
+                )
+            else:
+                audit_record(
+                    "direct_npu", stage="get", req=req_id,
+                    groups=sorted({int(key.kv_group) for key in keys}),
+                    pages=len(page_keys),
+                    keys=[
+                        page_keys[i] for i in sampled_key_indices(page_keys, limit=3)
+                    ],
+                )
         trace_mooncake_keys(
             "get", page_keys, statuses, api="connector.direct_npu_page_get"
         )
@@ -2695,15 +2729,17 @@ class MooncakestoreConnector(RemoteConnector):
                         "preferred segment"
                     )
                 page_source_keys.append(source_key)
+            put_function = self._batch_put_multi_buffers_by_segment
+            put_args = (page_source_keys, page_keys, all_buffer_ptrs, all_buffer_sizes)
+            if audit_enabled() and cpu_backed(page_memory_objs):
+                put_function, put_args = audit_cpu_put, (
+                    put_function, put_args, page_keys,
+                    all_buffer_ptrs, all_buffer_sizes,
+                )
             placement = await self._run_blocking_put(
                 "batch_put_from_multi_buffers",
-                self._batch_put_multi_buffers_by_segment,
-                (
-                    page_source_keys,
-                    page_keys,
-                    all_buffer_ptrs,
-                    all_buffer_sizes,
-                ),
+                put_function,
+                put_args,
                 page_memory_objs,
             )
             (
@@ -2776,10 +2812,18 @@ class MooncakestoreConnector(RemoteConnector):
             buffer_ptrs.append(ptr)
             buffer_sizes.append(size)
 
+        put_function = self.store.batch_put_from
+        put_args = (key_strs, buffer_ptrs, buffer_sizes, self.replica_config)
+        if audit_enabled() and cpu_backed(memory_objs):
+            put_function, put_args = audit_cpu_put, (
+                put_function, put_args, key_strs,
+                [[pointer] for pointer in buffer_ptrs],
+                [[size] for size in buffer_sizes],
+            )
         statuses = await self._run_blocking_put(
             "batch_put_from",
-            self.store.batch_put_from,
-            (key_strs, buffer_ptrs, buffer_sizes, self.replica_config),
+            put_function,
+            put_args,
             memory_objs,
         )
         trace_mooncake_keys(

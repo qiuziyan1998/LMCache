@@ -41,10 +41,7 @@ def test_handoff_includes_cache_misses_and_passive_rank_requests(
 ) -> None:
     forward = load_method("lmcache_connector_v1.py", "LMCacheConnectorV1Dynamic")
     route = load_method("vllm_v1_adapter.py", "LMCacheConnectorV1Impl")
-    requests = [
-        SimpleNamespace(layerwise_prefill_bank_offset=i, load_spec=None)
-        for i in (0, 1, 1)
-    ]
+    requests = [SimpleNamespace(req_id=str(i), load_spec=None) for i in (0, 1, 1)]
     calls = []
     event = object()
     impl = SimpleNamespace(
@@ -67,9 +64,8 @@ def test_handoff_includes_cache_misses_and_passive_rank_requests(
     )
     forward(SimpleNamespace(_lmcache_engine=impl), "registered.layer", event)
     assert len(calls) == 1
-    layer, kv_group, offsets, handed_off = calls[0]
+    layer, kv_group, handed_off = calls[0]
     assert (layer, kv_group) == (ordinal, group)
-    assert set(offsets) == {0, 1}
     assert handed_off is event
 
 
