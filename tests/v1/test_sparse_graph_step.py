@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 import ast
 from copy import deepcopy
+from dataclasses import dataclass
 import logging
 
 # Third Party
@@ -49,6 +50,8 @@ def load_prepare_method(name: str = "prepare_sparse_graph_step") -> Any:
         "torch": torch,
         "_lmcache_nvtx_annotate": lambda fn: fn,
         "build_prepared_sparse_source": build_prepared_sparse_source,
+        "dataclass": dataclass,
+        "LMCacheConnectorMetadata": SimpleNamespace,
     }
     helper = next(
         node
@@ -57,12 +60,22 @@ def load_prepare_method(name: str = "prepare_sparse_graph_step") -> Any:
     )
     if method is not helper:
         module.body.insert(1, helper)
+    module.body.insert(
+        1,
+        next(
+            node
+            for node in tree.body
+            if getattr(node, "name", "") == "WarmSparseGraphStep"
+        ),
+    )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace[name]
 
 
 class FakeAdapter:
     prepare_sparse_graph_step = load_prepare_method()
+    _sparse_graph_suffixes = load_prepare_method("_sparse_graph_suffixes")
+    _sparse_graph_suffix = load_prepare_method("_sparse_graph_suffix")
     _sparse_decode_requires_index_materialization = load_prepare_method(
         "_sparse_decode_requires_index_materialization"
     )
@@ -740,6 +753,7 @@ class SourcePublisher:
     _cached_ranges_cover_prefix = load_prepare_method("_cached_ranges_cover_prefix")
 
     def __init__(self, layers: int) -> None:
+        self.lmcache_engine = SimpleNamespace(storage_process=None)
         self.layers = layers
         self.device = torch.device("cpu")
         self._lmcache_chunk_size = 256
@@ -956,3 +970,131 @@ def test_owner_preparation_gate_and_refresh_invalidation(enabled, prefiller):
     assert state.cold_publication_proof is None
     assert (state.prepared_sparse_sources[0].graph_owners is not None) == (enabled and not prefiller)
     assert state.prepared_sparse_sources[1].graph_owners is None
+
+
+@pytest.mark.parametrize("discard", [False, True])
+def test_warm_graph_preview_adopts_or_discards_without_bootstrap(discard):
+    import gc
+    import inspect
+
+    adapter = FakeAdapter(warm=True, draft=True)
+    adapter.layerwise_retrievers.clear()
+    adapter.current_layer = 3
+    adapter._defer_prepared_sparse_setup = adapter._wait_for_save_done = True
+    adapter._worker_retrieve_last_prune_key = (frozenset(("r1",)), 0)
+    adapter.kv_caches = [object()]
+    request = adapter.request
+    request.sparse_warm_ref = True
+    request.is_decode_window_save = False
+    request.save_spec = SimpleNamespace(can_save=False)
+    request.load_spec.can_load = True
+    request.load_spec.vllm_cached_tokens = 0
+    request.retrieve_token_count = lambda: 512
+    adapter._worker_retrieve_state_for_warm_ref = lambda r: adapter.state
+    metadata = SimpleNamespace(requests=[request])
+    preview = load_prepare_method("prepare_warm_sparse_graph_step")
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        step = preview(
+            adapter, metadata, tuple(adapter._latent_layer_names[:2]), ("r1",), (512,)
+        )
+        suffix = step.suffixes[0][1]
+        assert step.sources == (adapter.source,)
+        assert adapter.current_layer == 3 and not adapter.layerwise_retrievers
+        assert not adapter.waits and not adapter.suffix_kwargs
+        if discard:
+            step.close()
+            step.close()
+            assert inspect.getgeneratorstate(suffix) == "GEN_CLOSED"
+            assert adapter.current_layer == 3
+        else:
+            adapter._parent = SimpleNamespace(_get_connector_metadata=lambda: metadata)
+            counts = []
+            adapter._stats_monitor = SimpleNamespace(
+                update_interval_vllm_hit_tokens=counts.append,
+                update_interval_prompt_tokens=counts.append,
+            )
+            start = load_prepare_method("_start_load_kv")
+            context = SimpleNamespace(lmcache_warm_graph_step=step)
+            start(adapter, context)
+            assert step.consumed and adapter.current_layer == 2
+            assert counts == [0, 512]
+            step.close()  # Ownership now belongs to the normal adapter lifecycle.
+            assert inspect.getgeneratorstate(suffix) == "GEN_SUSPENDED"
+            with pytest.raises(RuntimeError, match="consumed"):
+                start(adapter, context)
+            suffix.send("draft payload")
+            assert adapter.suffix_kwargs["prepared_start_layer"] == 2
+            suffix.close()
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["load", "save", "checkpoint", "generation", "resident", "blending", "producer"],
+)
+def test_warm_graph_preview_keeps_nonwarm_steps_on_ordinary_path(reason):
+    adapter = FakeAdapter(warm=True, draft=True)
+    adapter.layerwise_retrievers.clear()
+    adapter._defer_prepared_sparse_setup = adapter._wait_for_save_done = True
+    adapter._worker_retrieve_last_prune_key = (frozenset(("r1",)), 0)
+    adapter.kv_caches = [object()]
+    request = adapter.request
+    request.sparse_warm_ref = True
+    request.is_decode_window_save = False
+    request.save_spec = SimpleNamespace(can_save=False)
+    request.load_spec.can_load = True
+    adapter._worker_retrieve_state_for_warm_ref = lambda r: adapter.state
+    metadata = SimpleNamespace(requests=[request])
+    if reason == "load":
+        metadata.dsa_cold_compact_load_pending = True
+    elif reason == "save":
+        request.save_spec.can_save = True
+    elif reason == "checkpoint":
+        metadata.preemption_seals = (object(),)
+    elif reason == "generation":
+        request.resumed_from_preemption = True
+    elif reason == "blending":
+        adapter.enable_blending = True
+    elif reason == "producer":
+        adapter._layerwise_prefill_p_node = True
+    else:
+        adapter.state.indexer_npu_materialization_pending = True
+    assert (
+        load_prepare_method("prepare_warm_sparse_graph_step")(
+            adapter, metadata, tuple(adapter._latent_layer_names[:2]), ("r1",), (512,)
+        )
+        is None
+    )
+    assert (
+        not adapter.waits and not adapter.suffix_kwargs and adapter.current_layer == 0
+    )
+
+
+def test_warm_step_allocation_failure_precedes_deferred_generator_creation(monkeypatch):
+    adapter = FakeAdapter(warm=True, draft=True)
+    adapter.layerwise_retrievers.clear()
+    prepare = load_prepare_method()
+    calls = []
+    original = adapter._sparse_graph_suffixes
+    adapter._sparse_graph_suffixes = lambda *args: (
+        calls.append("suffix"),
+        original(*args),
+    )[1]
+
+    def fail(*args):
+        raise MemoryError("injected step allocation failure")
+
+    monkeypatch.setitem(prepare.__globals__, "WarmSparseGraphStep", fail)
+    with pytest.raises(MemoryError, match="step allocation"):
+        prepare(
+            adapter,
+            tuple(adapter._latent_layer_names[:2]),
+            request_ids=("r1",),
+            frontiers=(512,),
+            _warm_metadata=SimpleNamespace(requests=[adapter.request]),
+        )
+    assert not calls and not adapter.waits and adapter.current_layer == 0

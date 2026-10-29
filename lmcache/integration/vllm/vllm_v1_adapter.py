@@ -2219,6 +2219,29 @@ class PreemptionConnectorMetadata(LMCacheConnectorMetadata):
     preemption_releases: tuple[tuple[str, int, int], ...] = ()
 
 
+@dataclass
+class WarmSparseGraphStep:
+    """Worker-local, unused deferred retrievers; never sent over IPC.
+
+    The existing graph binding must retain ``sources`` until adoption or discard.
+    Closing an unused step performs no native transfer and requires no GC.
+    """
+
+    metadata: LMCacheConnectorMetadata
+    sources: tuple[Optional[PreparedSparseSource], ...]
+    target_count: int
+    suffixes: list[tuple[ReqMeta, Generator[Any, Any, None]]]
+    consumed: bool = False
+
+    def close(self) -> None:
+        """Discard unsubmitted suffixes exactly once."""
+        if not self.consumed:
+            self.consumed = True
+            for _, suffix in self.suffixes:
+                suffix.close()
+            self.suffixes.clear()
+
+
 class LMCacheConnectorV1Impl:
     supports_preemption_checkpoint = False
     _defer_prepared_sparse_setup = False
@@ -8659,14 +8682,42 @@ class LMCacheConnectorV1Impl:
             The number of elements in kv_caches and layer_names should be
             the same.
         """
+        metadata = self._parent._get_connector_metadata()
+        assert isinstance(metadata, LMCacheConnectorMetadata)
+        prepared = getattr(forward_context, "lmcache_warm_graph_step", None)
+        if prepared is not None:
+            if prepared.consumed or prepared.metadata is not metadata:
+                raise RuntimeError("Stale or consumed warm graph step")
+            self._drain_layerwise_retrievers()
+            self.current_layer = prepared.target_count
+            self._wait_for_save_done = False
+            for request, suffix in prepared.suffixes:
+                self.layerwise_retrievers.append((suffix, None))
+                self._layerwise_requests.append(request)
+                self._layerwise_retriever_is_sparse.append(True)
+                self._layerwise_sparse_req_ids.append(request.req_id)
+                self._layerwise_sparse_shared_ordered.append(False)
+            prepared.consumed = True
+            prepared.suffixes.clear()
+            self._stats_monitor.update_interval_vllm_hit_tokens(
+                sum(
+                    request.load_spec.vllm_cached_tokens
+                    for request in prepared.metadata.requests
+                )
+            )
+            self._stats_monitor.update_interval_prompt_tokens(
+                sum(
+                    request.retrieve_token_count()
+                    for request in prepared.metadata.requests
+                )
+            )
+            return
         self.current_layer = 0
         self._wait_for_save_done = False
         self._deferred_layerwise_prefill_load_active = False
         self._initial_layerwise_prefill_load_submitted = False
 
         attn_metadata = forward_context.attn_metadata
-        metadata = self._parent._get_connector_metadata()
-        assert isinstance(metadata, LMCacheConnectorMetadata)
         if getattr(metadata, "dsa_cold_compact_load_pending", False):
             cold_requests = [
                 request
@@ -10174,8 +10225,11 @@ class LMCacheConnectorV1Impl:
         allow_empty: bool = False,
         request_ids: Optional[tuple[str, ...]] = None,
         frontiers: Optional[tuple[int, ...]] = None,
+        _warm_metadata: Optional[LMCacheConnectorMetadata] = None,
     ) -> Union[
-        Optional[PreparedSparseSource], tuple[Optional[PreparedSparseSource], ...]
+        Optional[PreparedSparseSource],
+        tuple[Optional[PreparedSparseSource], ...],
+        WarmSparseGraphStep,
     ]:
         """Resolve all request sources before target graph replay.
 
@@ -10202,7 +10256,11 @@ class LMCacheConnectorV1Impl:
         Shared, consumer and restored requests still require materialization.
         The caller must finish device work before releasing request ownership.
         """
-        requests = tuple(self._layerwise_requests)
+        requests = tuple(
+            self._layerwise_requests
+            if _warm_metadata is None
+            else _warm_metadata.requests
+        )
         legacy = request_ids is None
         if legacy:
             request_ids = tuple(request.req_id for request in requests)
@@ -10226,7 +10284,7 @@ class LMCacheConnectorV1Impl:
             or not self._is_dsa_two_groups()
             or not 0 < target_count <= self.num_layers
             or tuple(self._latent_layer_names[:target_count]) != target_layer_names
-            or self.current_layer != 0
+            or (_warm_metadata is None and self.current_layer != 0)
         ):
             raise RuntimeError(
                 "Full SFA graph requires unique sparse requests and an "
@@ -10277,6 +10335,18 @@ class LMCacheConnectorV1Impl:
             not source_ready(req_id, frontier)
             for req_id, frontier in zip(request_ids, frontiers, strict=True)
         ) or any(pair[1] is not None for pair in self.layerwise_retrievers)
+        if _warm_metadata is not None:
+            if needs_bootstrap:
+                return None
+            sources = tuple(
+                resolved_sources[req_id] if frontier else None
+                for req_id, frontier in zip(request_ids, frontiers, strict=True)
+            )
+            step = WarmSparseGraphStep(_warm_metadata, sources, target_count, [])
+            step.suffixes = self._sparse_graph_suffixes(
+                requests, request_lanes, sources, target_count
+            )
+            return step
         if needs_bootstrap:
             # Empty explicit payload: prepare/pin CPU sources, but never load
             # latent history before the model has computed its real top-k.
@@ -10331,33 +10401,83 @@ class LMCacheConnectorV1Impl:
         self._drain_layerwise_retrievers()
         self.current_layer = target_count
         for request in requests if target_count < self.num_layers else ():
-            lane = request_lanes[request.req_id]
-            source = sources[lane]
-            if source is None:
-                continue
-            state = self._worker_retrieve_state[request.req_id]
-            suffix = _defer_prepared_sparse_retrieve(
-                self.lmcache_engine,
-                dict(
-                    kvcaches=self._kvcaches_for_group(0),
-                    slot_mapping=state.slot_mapping,
-                    kv_group=0,
-                    sync=True,
-                    prepared_sparse_source=source,
-                    prepared_start_layer=target_count,
-                    registered_destination_layout=getattr(
-                        self, "_sparse_destination_binding", None
-                    ),
-                    ret_mask=state.decode_ret_mask,
-                ),
+            suffix = self._sparse_graph_suffix(
+                request, sources[request_lanes[request.req_id]], target_count
             )
-            next(suffix)
+            if suffix is None:
+                continue
             self.layerwise_retrievers.append((suffix, None))
             self._layerwise_requests.append(request)
             self._layerwise_retriever_is_sparse.append(True)
             self._layerwise_sparse_req_ids.append(request.req_id)
             self._layerwise_sparse_shared_ordered.append(False)
         return sources[0] if legacy else sources
+
+    def prepare_warm_sparse_graph_step(
+        self,
+        metadata: LMCacheConnectorMetadata,
+        target_layer_names: tuple[str, ...],
+        request_ids: tuple[str, ...],
+        frontiers: tuple[int, ...],
+    ) -> Optional[WarmSparseGraphStep]:
+        """Preview an unchanged warm step, or return None for ordinary preparation.
+
+        ``metadata`` is the incoming scheduler snapshot; ``target_layer_names``
+        identifies the captured layers. ``request_ids`` and ``frontiers`` give
+        the exact graph lane order and immutable prefix lengths. Existing source
+        validation errors propagate; an ineligible step returns None.
+        Never bootstrap loads, close current retrievers or change the layer cursor.
+        The caller must close an unadopted result explicitly.
+        """
+        if (
+            not self._defer_prepared_sparse_setup
+            or self.layerwise_retrievers
+            or not self._wait_for_save_done
+            or not self.kv_caches
+            or getattr(self, "enable_blending", False)
+            or getattr(self, "_layerwise_prefill_p_node", False)
+            or any(
+                getattr(metadata, name, ())
+                for name in (
+                    "preemption_captures",
+                    "preemption_seals",
+                    "preemption_cancels",
+                    "preemption_releases",
+                )
+            )
+            or getattr(metadata, "dsa_cold_compact_load_pending", False)
+            or getattr(self, "_worker_retrieve_last_prune_key", None)
+            != (
+                frozenset(request_ids),
+                getattr(self, "_worker_retrieve_registry_version", 0),
+            )
+            or len(metadata.requests) != len(request_ids)
+        ):
+            return None
+        for request in metadata.requests:
+            spec = request.load_spec
+            if (
+                not request.sparse_warm_ref
+                or request.resumed_from_preemption
+                or request.is_decode_window_save
+                or spec is None
+                or not spec.can_load
+                or (
+                    request.save_spec is not None
+                    and any(
+                        getattr(request.save_spec, name, False)
+                        for name in ("can_save", "can_save_latent", "can_save_indexer")
+                    )
+                )
+            ):
+                return None
+            self._worker_retrieve_state_for_warm_ref(request)
+        return self.prepare_sparse_graph_step(
+            target_layer_names,
+            request_ids=request_ids,
+            frontiers=frontiers,
+            _warm_metadata=metadata,
+        )
 
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(
@@ -14494,3 +14614,49 @@ class LMCacheConnectorV1Impl:
             changed = True
         if changed:
             self._refresh_prepared_sparse_sources(state, state.token_count)
+
+    def _sparse_graph_suffixes(
+        self,
+        requests: tuple,
+        request_lanes: dict,
+        sources: tuple,
+        target_count: int,
+    ) -> list:
+        """Build only deferred suffixes; close partial construction on failure."""
+        suffixes = []
+        try:
+            for request in requests if target_count < self.num_layers else ():
+                suffix = self._sparse_graph_suffix(
+                    request, sources[request_lanes[request.req_id]], target_count
+                )
+                if suffix is not None:
+                    suffixes.append((request, suffix))
+        except BaseException:
+            for _, suffix in suffixes:
+                suffix.close()
+            raise
+        return suffixes
+
+    def _sparse_graph_suffix(
+        self, request: ReqMeta, source: Any, target_count: int
+    ) -> Any:
+        if source is None:
+            return None
+        state = self._worker_retrieve_state[request.req_id]
+        suffix = _defer_prepared_sparse_retrieve(
+            self.lmcache_engine,
+            dict(
+                kvcaches=self._kvcaches_for_group(0),
+                slot_mapping=state.slot_mapping,
+                kv_group=0,
+                sync=True,
+                prepared_sparse_source=source,
+                prepared_start_layer=target_count,
+                registered_destination_layout=getattr(
+                    self, "_sparse_destination_binding", None
+                ),
+                ret_mask=state.decode_ret_mask,
+            ),
+        )
+        next(suffix)
+        return suffix
