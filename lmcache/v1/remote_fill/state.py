@@ -2,13 +2,15 @@
 """Thread-safe, hardware-independent remote-fill transaction core."""
 
 # Standard
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, fields
 from threading import RLock
 from time import monotonic
 from typing import Any, Protocol
 from uuid import uuid4
+import logging
+import math
 
 # Third Party
 import msgspec
@@ -45,6 +47,8 @@ from .security import (
     seal_descriptor,
     transaction_manifest_digest,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _new_token() -> str:
@@ -212,6 +216,8 @@ class _Transaction:
     d_local_end_open: int
     destination_dp_rank: int
     manifest_digest_seed: str
+    created_at: float
+    last_progress_at: float
     state: TransactionState = TransactionState.ACTIVE
     terminal_outcome: TerminalOutcome | None = None
     source_generation: int | None = None
@@ -256,6 +262,7 @@ class RemoteFillMetricsSnapshot:
     terminal_persistence_failed_total: int
     terminal_cancelled_total: int
     terminal_fatal_restart_total: int
+    expired_transactions_total: int = 0
 
 
 @dataclass
@@ -277,6 +284,7 @@ class _RemoteFillMetricCounters:
     terminal_persistence_failed: int = 0
     terminal_cancelled: int = 0
     terminal_fatal_restart: int = 0
+    expired_transactions: int = 0
 
 
 _TERMINAL_STATES = {
@@ -313,6 +321,7 @@ class RemoteFillStateCore:
         descriptor_ttl_sec: float | None = None,
         native_hard_timeout_sec: float = 300.0,
         terminal_record_ttl_sec: float = 300.0,
+        transaction_idle_timeout_sec: float = 1800.0,
         clock: Callable[[], float] = monotonic,
         token_factory: Callable[[], str] = _new_token,
         tp_independent: bool = False,
@@ -329,6 +338,9 @@ class RemoteFillStateCore:
             group_layer_counts: Trusted runtime physical rows; defaults to equal groups.
             limits: Protocol bounds, or defaults when omitted.
             reservation_ttl_sec: Lifetime of unarmed reservations only.
+            transaction_idle_timeout_sec: Owner progress lease, renewed by a new
+                window, ARM or native completion. STATUS and replay do not renew
+                it. Expiry cancels hidden work but never releases armed memory.
             descriptor_ttl_sec: D-local deadline for accepting ARM. Defaults
                 to the reservation lifetime and is capped by that lifetime.
             native_hard_timeout_sec: Bound after arm before restart is required.
@@ -377,6 +389,13 @@ class RemoteFillStateCore:
         self._group_layer_counts = tuple(counts)
         self._tp_independent = tp_independent
         self._lifecycle = page_lifecycle
+        if (
+            not math.isfinite(transaction_idle_timeout_sec)
+            or transaction_idle_timeout_sec <= 0
+        ):
+            raise ValueError("transaction idle timeout must be finite and positive")
+        self._transaction_idle_timeout_sec = transaction_idle_timeout_sec
+        self._next_capacity_log_at = 0.0
         self._reservation_ttl_sec = reservation_ttl_sec
         self._descriptor_ttl_sec = min(descriptor_ttl, reservation_ttl_sec)
         self._native_hard_timeout_sec = native_hard_timeout_sec
@@ -651,6 +670,7 @@ class RemoteFillStateCore:
             counters = self._metrics
             return RemoteFillMetricsSnapshot(
                 active_transactions=counters.active_transactions,
+                expired_transactions_total=counters.expired_transactions,
                 active_windows=counters.active_windows,
                 active_bytes=counters.active_bytes,
                 reserved_bytes_total=counters.reserved_bytes,
@@ -672,7 +692,7 @@ class RemoteFillStateCore:
             )
 
     def run_maintenance(self) -> tuple[str, ...]:
-        """Expire safe reservations and identify fatal armed attempts.
+        """Expire idle transactions/safe reservations and identify fatal attempts.
 
         Returns:
             Transfer IDs newly or already requiring a paired P+D restart.
@@ -881,6 +901,23 @@ class RemoteFillStateCore:
                 d_local_end_open=existing.d_local_end_open,
             )
         if self._metrics.active_transactions >= self.limits.max_active_transactions:
+            now = self._clock()
+            if now >= self._next_capacity_log_at:
+                self._next_capacity_log_at = now + 10.0
+                logger.warning(
+                    "remote_fill_active_capacity_exhausted epoch=%s generation=%s "
+                    "active_transactions=%s limit=%s active_bytes=%s owners=%s",
+                    self.destination_engine_epoch,
+                    self.shared_cache_generation,
+                    self._metrics.active_transactions,
+                    self.limits.max_active_transactions,
+                    self._metrics.active_bytes,
+                    [
+                        self._transaction_summary_locked(item, now)
+                        for item in self._transactions.values()
+                        if item.state not in _TERMINAL_STATES
+                    ],
+                )
             return self._response(
                 request,
                 ResultCode.RESOURCE_EXHAUSTED,
@@ -889,6 +926,7 @@ class RemoteFillStateCore:
         # OPEN is intentionally keyless and therefore cannot prove a local
         # prefix. Exact pages arrive in bounded RESERVE_WINDOW manifests.
         d_local_end_open = 0
+        now = self._clock()
         transaction = _Transaction(
             transfer_id=request.common.transfer_id,
             request_attempt=request.common.request_attempt,
@@ -900,6 +938,8 @@ class RemoteFillStateCore:
             d_local_end_open=d_local_end_open,
             destination_dp_rank=request.destination_dp_rank,
             manifest_digest_seed=request.manifest_digest_seed,
+            created_at=now,
+            last_progress_at=now,
         )
         self._transactions[request.common.transfer_id] = transaction
         self._metrics.active_transactions += 1
@@ -916,6 +956,13 @@ class RemoteFillStateCore:
         request: ReserveWindowRequest,
         transaction: _Transaction,
     ) -> RemoteFillResponse:
+        if transaction.state is TransactionState.ABORT_REQUESTED:
+            return self._response(
+                request,
+                ResultCode.TERMINAL,
+                "transaction cancellation is draining native work",
+                transaction_state=transaction.state,
+            )
         if transaction.publication_ineligible and request.reserve_missing:
             return self._response(
                 request,
@@ -1238,6 +1285,7 @@ class RemoteFillStateCore:
             coverage_missing=has_missing,
         )
         transaction.windows[request.window_id] = window
+        transaction.last_progress_at = self._clock()
         transaction.registered_selectors.update(requested_selectors)
         transaction.registered_keys.update(requested_keys)
         if window.state not in (WindowState.RELEASED, WindowState.COMMITTED):
@@ -1366,6 +1414,7 @@ class RemoteFillStateCore:
         self._set_window_state_locked(window, WindowState.ARMED)
         window.native_state = DestinationNativeState.ARMED
         window.armed_at = now
+        transaction.last_progress_at = now
         for reservation in window.reservations:
             if reservation.prepared.disposition is PageDisposition.ALLOCATED:
                 reservation.state = WindowState.ARMED
@@ -1428,6 +1477,7 @@ class RemoteFillStateCore:
             )
         window.native_return_code = request.native_return_code
         window.completed_bytes = request.completed_bytes
+        transaction.last_progress_at = self._clock()
         transfer_ok = (
             request.native_return_code == 0
             and request.completed_bytes == window.total_bytes
@@ -1648,19 +1698,9 @@ class RemoteFillStateCore:
         request: AbortRequest,
         transaction: _Transaction,
     ) -> RemoteFillResponse:
-        transaction.publication_ineligible = True
-        transaction.state = TransactionState.ABORT_REQUESTED
-        for window in transaction.windows.values():
-            if window.native_state is DestinationNativeState.ARMED:
-                self._set_window_state_locked(window, WindowState.ABORT_REQUESTED)
-                for reservation in window.reservations:
-                    reservation.state = WindowState.ABORT_REQUESTED
-                continue
-            if window.state not in (WindowState.COMMITTED, WindowState.RELEASED):
-                if not self._release_window_locked(transaction, window, "abort"):
-                    return self._fatal_response(request, transaction)
-                self._set_window_state_locked(window, WindowState.RELEASED)
-        self._finish_abort_if_drained_locked(transaction)
+        self._cancel_transaction_locked(transaction, "abort")
+        if transaction.state is TransactionState.FATAL_RESTART:
+            return self._fatal_response(request, transaction)
         code = (
             ResultCode.TERMINAL
             if transaction.state is TransactionState.CANCELLED
@@ -1672,6 +1712,29 @@ class RemoteFillStateCore:
             transaction_state=transaction.state,
             terminal_outcome=transaction.terminal_outcome,
         )
+
+    def _cancel_transaction_locked(
+        self, transaction: _Transaction, reason: str
+    ) -> None:
+        """Cancel safe pages while keeping armed destinations until a report."""
+
+        transaction.publication_ineligible = True
+        transaction.state = TransactionState.ABORT_REQUESTED
+        for window in transaction.windows.values():
+            if window.native_state is DestinationNativeState.ARMED:
+                self._set_window_state_locked(window, WindowState.ABORT_REQUESTED)
+                for reservation in window.reservations:
+                    reservation.state = WindowState.ABORT_REQUESTED
+                continue
+            if window.state not in (WindowState.COMMITTED, WindowState.RELEASED):
+                if not self._release_window_locked(transaction, window, reason):
+                    return
+                self._set_window_state_locked(window, WindowState.RELEASED)
+                if window.native_state is DestinationNativeState.NOT_ARMED:
+                    # A different window can still be draining native work.
+                    # Invalidate this window's replayable address capability now.
+                    window.expired_unarmed = True
+        self._finish_abort_if_drained_locked(transaction)
 
     def _status_locked(
         self,
@@ -1723,9 +1786,47 @@ class RemoteFillStateCore:
                     self._mark_fatal_locked(transaction)
             if transaction.state is TransactionState.ABORT_REQUESTED:
                 self._finish_abort_if_drained_locked(transaction)
+            elif (
+                transaction.state not in _TERMINAL_STATES
+                and now - transaction.last_progress_at
+                >= self._transaction_idle_timeout_sec
+            ):
+                logger.warning(
+                    "remote_fill_transaction_expired epoch=%s generation=%s owner=%s",
+                    self.destination_engine_epoch,
+                    self.shared_cache_generation,
+                    self._transaction_summary_locked(transaction, now),
+                )
+                self._metrics.expired_transactions += 1
+                self._cancel_transaction_locked(transaction, "transaction idle expiry")
         if now >= self._next_terminal_prune_at:
             self._next_terminal_prune_at = now + self._terminal_prune_interval_sec
             self._prune_terminal_records_locked(now)
+
+    @staticmethod
+    def _transaction_summary_locked(
+        transaction: _Transaction, now: float
+    ) -> dict[str, Any]:
+        """Summarize ownership without addresses or unbounded window lists."""
+
+        return {
+            "transfer_id": transaction.transfer_id,
+            "request_id": transaction.request_id,
+            "request_attempt": transaction.request_attempt,
+            "source_engine_id": transaction.source_engine_id,
+            "state": transaction.state.value,
+            "created_at": transaction.created_at,
+            "last_progress_at": transaction.last_progress_at,
+            "age_sec": round(now - transaction.created_at, 3),
+            "idle_sec": round(now - transaction.last_progress_at, 3),
+            "reserved_bytes": transaction.reserved_bytes,
+            "windows": dict(
+                Counter(
+                    f"{window.state.value}/{window.native_state.value}"
+                    for window in transaction.windows.values()
+                )
+            ),
+        }
 
     def _expire_unarmed_window_locked(
         self,

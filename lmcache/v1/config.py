@@ -370,6 +370,13 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": 300,
         "env_converter": int,
     },
+    # Maximum silence between new windows/ARM/completion, not total Prefill time.
+    # Decoder expiry retains native-armed memory until terminal evidence arrives.
+    "remote_fill_transaction_idle_timeout_sec": {
+        "type": int,
+        "default": 1800,
+        "env_converter": int,
+    },
     "remote_fill_native_hard_timeout_ms": {
         "type": int,
         "default": 120000,
@@ -1035,6 +1042,9 @@ def _validate_config(self):
             "remote_fill_reservation_ttl_sec": self.remote_fill_reservation_ttl_sec,
             "remote_fill_terminal_record_ttl_sec": (
                 self.remote_fill_terminal_record_ttl_sec
+            ),
+            "remote_fill_transaction_idle_timeout_sec": (
+                self.remote_fill_transaction_idle_timeout_sec
             ),
             "remote_fill_native_hard_timeout_ms": (
                 self.remote_fill_native_hard_timeout_ms
