@@ -77,6 +77,28 @@ def test_six_orphans_recover_admission_and_bytes(
     assert len(h.lifecycle.released) == (0 if mode == "open_only" else 6)
 
 
+def test_direct_abandoned_recovers_on_idle_expiry(lease_harness: Any) -> None:
+    """A reserve-time abandon is reclaimed by the decoder idle lease."""
+
+    h = lease_harness
+    assert h.client.execute(h.requests.open()).code is ResultCode.ACCEPTED
+
+    h.lifecycle.fail_prepare = True
+    response = h.client.execute(h.requests.reserve())
+    assert response.code is ResultCode.RESERVATION_REJECTED
+    snapshot = h.state.metrics_snapshot()
+    assert snapshot.active_transactions == 1
+    assert snapshot.active_bytes == snapshot.active_windows == 0
+    assert snapshot.expired_transactions_total == 0
+
+    h.clock.advance(10)
+    assert h.state.run_maintenance() == ()
+    snapshot = h.state.metrics_snapshot()
+    assert snapshot.active_transactions == 0
+    assert snapshot.expired_transactions_total == 1
+    assert not h.lifecycle.released
+
+
 def test_long_prefill_renews_only_on_new_progress(lease_harness: Any) -> None:
     """Total duration may exceed the lease many times while windows advance."""
     h = lease_harness
