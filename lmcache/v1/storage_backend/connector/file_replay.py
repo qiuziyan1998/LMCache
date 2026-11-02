@@ -10,6 +10,8 @@ No snapshot is inserted into Mooncake by this adapter.
 import base64
 import copy
 import json
+import os
+import socket
 import threading
 import urllib.request
 from typing import Any
@@ -94,6 +96,15 @@ class FileReplayStore:
         self.sources: dict = {}
         self.lock = threading.RLock()
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.reader = json.dumps(
+            dict(
+                host=socket.gethostname(),
+                pid=os.getpid(),
+                role=self.role,
+                rank=int(metadata.worker_id),
+            ),
+            separators=(",", ":"),
+        ).encode()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.native, name)
@@ -270,7 +281,8 @@ class FileReplayStore:
             ack = urllib.request.Request(
                 f"{url}/ack/{group}/{start}/{end}"
                 + ("" if layer is None else f"/{layer}"),
-                data=b"",
+                data=self.reader,
+                headers={"Content-Type": "application/json"},
                 method="POST",
             )
             with self.opener.open(ack, timeout=120) as response:

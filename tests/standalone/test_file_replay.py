@@ -4,6 +4,8 @@
 import base64
 import asyncio
 import json
+import os
+import socket
 import threading
 from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -52,7 +54,7 @@ def fixture(monkeypatch):
         runtime_kv_group_layer_names=(("l0", "l1"), ("i0",)),
     )
     database = ChunkedTokenDatabase(config, metadata)
-    state = NS(role="PD", truncate=False, requests=[], ack=[], native=[])
+    state = NS(role="PD", truncate=False, requests=[], ack=[], readers=[], native=[])
     manifest = dict(
         role="PD",
         model="/model",
@@ -89,6 +91,9 @@ def fixture(monkeypatch):
 
         def do_POST(self):
             state.ack.append(self.path)
+            state.readers.append(
+                json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            )
             self.send_response(204)
             self.end_headers()
 
@@ -168,6 +173,10 @@ def test_full_partial_and_multi_buffer_bytes_are_complete_before_ack(fixture):
         assert memory[:8].tolist() == memory[-8:].tolist() == [255] * 8
         outputs.append(result)
     assert len(f.state.ack) == 6 and not f.state.native
+    assert (
+        f.state.readers
+        == [dict(host=socket.gethostname(), pid=os.getpid(), role="P", rank=0)] * 6
+    )
     # A P replay's history is also reachable by D; its newly computed tail is native.
     f.store.role = "D"
     assert f.store.batch_is_exist([r[-1] for r in records]) == [1] * 6
