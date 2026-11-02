@@ -446,6 +446,13 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": float,
     },
     # Other configurations
+    "file_replay_enabled": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": "Opt-in tagged snapshot file reads for P/D replay. "
+        "LMCACHE_FILE_REPLAY_ENABLED=true; normal requests retain the native store.",
+    },
     # (Deprecated) The url of the actual remote lmcache instance for auditing.
     # Please use extra_config['audit_actual_remote_url'] instead.
     "audit_actual_remote_url": {

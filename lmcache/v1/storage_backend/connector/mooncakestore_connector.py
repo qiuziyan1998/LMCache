@@ -502,6 +502,14 @@ class MooncakestoreConnector(RemoteConnector):
             if self.config.prefer_local_alloc:
                 self.replica_config.preferred_segment = self.store.get_hostname()
 
+            self._file_replay_store = None
+            if getattr(engine_config, "file_replay_enabled", False):
+                from lmcache.v1.storage_backend.connector.file_replay import FileReplayStore
+
+                self.store = FileReplayStore(self.store, engine_config, engine_metadata)
+                self._file_replay_store = self.store
+                logger.info("[KV_FILE_REPLAY] enabled role=%s", self.store.role)
+
             # Passive readers own no LocalCPU allocator or slab.
             if not self._external_page_only:
                 with startup_phase(
@@ -666,6 +674,9 @@ class MooncakestoreConnector(RemoteConnector):
                 allocator.pin_allocator, "buffer"
             ):
                 buffer = allocator.pin_allocator.buffer
+                replay = getattr(self, "_file_replay_store", None)
+                if replay is not None:
+                    replay.memory.bind_cpu(buffer)
                 self.registered_buffer_ptr = buffer.data_ptr()
                 adopt = getattr(
                     getattr(self, "_shared_global_te", None),
@@ -746,6 +757,9 @@ class MooncakestoreConnector(RemoteConnector):
 
     def _register_external_owners(self, owners: tuple[Any, ...]) -> None:
         """Register tensor storages once in this Mooncake transport context."""
+        replay = getattr(self, "_file_replay_store", None)
+        if replay is not None:
+            replay.memory.bind_external(owners)
         active: dict[int, int] = {}
         cpu_ptr = getattr(self, "registered_buffer_ptr", None)
         cpu_size = int(getattr(self, "registered_buffer_size", 0))
@@ -2407,7 +2421,14 @@ class MooncakestoreConnector(RemoteConnector):
         def get() -> Any:
             if owners and owners[0].device.type == "npu":
                 torch.npu.set_device(owners[0].device)
-            self._register_external_owners(owners)
+            file_store = getattr(self, "_file_replay_store", None)
+            if file_store is not None and all(
+                file_store.source_entry(key) is not None for key in page_keys
+            ):
+                # File copies use retained tensor owners, not ADXL registrations.
+                file_store.memory.bind_external(owners)
+            else:
+                self._register_external_owners(owners)
             transfer_started = serving_perf_now() if started is not None else None
             thread_cpu_started = thread_time_ns() if started is not None else None
             statuses = self.store.batch_get_into_multi_buffers(
@@ -2432,13 +2453,22 @@ class MooncakestoreConnector(RemoteConnector):
                 if lock_wait_started is not None
                 else 0.0
             )
-            hard_deadline = self._external_native_deadline()
+            read_deadline = float(self.config.transfer_timeout)
+            if getattr(self, "_file_replay_store", None) is not None:
+                from lmcache.v1.storage_backend.connector.file_replay import read_timeout
+
+                read_deadline = read_timeout(
+                    self._file_replay_store.config, keys, read_deadline
+                )
+            hard_deadline = max(
+                self._external_native_deadline(), perf_counter() + read_deadline
+            )
             task = asyncio.create_task(asyncio.to_thread(get))
             self._inflight_put_tasks.add(task)
             task.add_done_callback(self._inflight_put_tasks.discard)
             try:
                 statuses, transfer_ms, thread_cpu_ms = await _await_native_task(
-                    task, timeout=self.config.transfer_timeout
+                    task, timeout=read_deadline
                 )
             except asyncio.CancelledError:
                 # The native read is not cancellable and still owns the destination
