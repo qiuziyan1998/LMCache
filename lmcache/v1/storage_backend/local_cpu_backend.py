@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import asyncio
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from itertools import islice
@@ -1510,6 +1511,63 @@ class LocalCPUBackend(AllocatorBackendInterface):
             )
         self.stats_monitor.update_local_cpu_evict_metrics(evicted)
         return pages
+
+    async def async_batched_allocate_layer_pages(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        batch_size: int,
+        num_layers: int,
+        fmt: MemoryFormat,
+        valid_tokens: Optional[Union[int, list[int]]] = None,
+        full_tokens: Optional[int] = None,
+        eviction: bool = True,
+    ) -> Optional[list[LayerPageMemoryObj]]:
+        """Allocate pages while allowing native-transfer cleanup to run.
+
+        Arguments follow ``batched_allocate_layer_pages``. Retry until
+        ``config.blocking_timeout_secs`` expires, yielding the event loop when
+        no evictable objects remain. Return None on exhaustion; propagate
+        allocator errors and cancellation. No allocation runs in a new thread.
+
+        Native put completion callbacks release source references on this same
+        event loop. Sleeping synchronously here can prevent the very release
+        needed to make the next allocation succeed.
+        """
+        started = time.monotonic()
+        timeout = float(getattr(self.config, "blocking_timeout_secs", 60))
+        deadline = started + timeout
+        waiting = False
+        while True:
+            pages = self.batched_allocate_layer_pages(
+                shapes, dtypes, batch_size, num_layers, fmt,
+                busy_loop=False, valid_tokens=valid_tokens,
+                full_tokens=full_tokens, eviction=eviction,
+            )
+            if pages is not None:
+                if waiting:
+                    logger.info(
+                        "[LMCACHE_PAGE_ALLOC] status=ready pages=%d layers=%d "
+                        "wait_ms=%.1f", batch_size, num_layers,
+                        (time.monotonic() - started) * 1000,
+                    )
+                return pages
+            remaining = deadline - time.monotonic()
+            if not eviction or not self.use_hot or remaining <= 0:
+                logger.error(
+                    "[LMCACHE_PAGE_ALLOC] status=failed pages=%d layers=%d "
+                    "wait_ms=%.1f transfer_submitted=0", batch_size, num_layers,
+                    (time.monotonic() - started) * 1000,
+                )
+                return None
+            if not waiting:
+                logger.warning(
+                    "[LMCACHE_PAGE_ALLOC] status=waiting pages=%d layers=%d "
+                    "timeout_s=%.1f yielding_event_loop=1",
+                    batch_size, num_layers, timeout,
+                )
+                waiting = True
+            await asyncio.sleep(min(0.1, remaining))
 
     def get_full_chunk_size_bytes(self) -> int:
         logger.info("Calculating the size of a single LMCache chunk")

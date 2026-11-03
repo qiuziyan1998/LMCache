@@ -1427,7 +1427,7 @@ class MooncakestoreConnector(RemoteConnector):
             (serving_perf_now() - perf_started) * 1000 if perf_enabled else 0.0
         )
         allocation_started = serving_perf_now() if perf_enabled else 0.0
-        pages = self.local_cpu_backend.batched_allocate_layer_pages(
+        pages = await self.local_cpu_backend.async_batched_allocate_layer_pages(
             shapes,
             dtypes,
             len(page_keys),
