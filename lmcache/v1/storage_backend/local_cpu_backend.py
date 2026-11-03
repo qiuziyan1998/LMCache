@@ -1683,6 +1683,26 @@ class LocalCPUBackend(AllocatorBackendInterface):
             raise RuntimeError("allocator returned invalid capacity bytes")
         return free_bytes, heap_bytes
 
+    def get_prefill_admission_capacity(self) -> dict[str, int]:
+        """Report actual pool bytes usable by a new prefill reservation.
+
+        Pinned, borrowed and in-flight objects are unavailable. Inspect only
+        host metadata; never synchronize a device or allocate/evict memory.
+        """
+        with self.cpu_lock:
+            free_bytes, heap_bytes = self.get_allocator_capacity_bytes()
+            seen: set[int] = set()
+            evictable_bytes = 0
+            if self.use_hot:
+                for obj in self.hot_cache.values():
+                    if id(obj) not in seen and obj.can_evict:
+                        seen.add(id(obj))
+                        evictable_bytes += obj.get_physical_size()
+        return {
+            "capacity": heap_bytes,
+            "available": min(heap_bytes, free_bytes + evictable_bytes),
+        }
+
     def reclaim_evictable_capacity(
         self,
         required_bytes: int,
