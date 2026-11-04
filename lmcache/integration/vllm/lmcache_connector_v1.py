@@ -215,6 +215,14 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         """Forward the opt-in pre-SFA fence for a registered latent layer."""
         self._lmcache_engine.synchronize_prefill_sfa_inputs(layer_name)
 
+    def synchronize_prefill_vup_output(self, layer_name: str) -> None:
+        """Forward the opt-in post-V-up-projection fence.
+
+        Args:
+            layer_name: Registered attention layer name.
+        """
+        self._lmcache_engine.synchronize_prefill_vup_output(layer_name)
+
     def record_layerwise_prefill_bank_use(self, layer_name: str, event: Any) -> None:
         """Hand off the event recorded after a P layer's final KV access.
 

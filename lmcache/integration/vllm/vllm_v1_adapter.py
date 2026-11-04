@@ -3380,6 +3380,21 @@ class LMCacheConnectorV1Impl:
             kv_group,
         )
 
+    def synchronize_prefill_vup_output(self, layer_name: str) -> None:
+        """Apply the diagnostic post-V-up-projection fence on P nodes only.
+
+        Args:
+            layer_name: Registered attention layer name, resolved to its
+                ordinal within the corresponding KV group.
+        """
+        if not self._layerwise_prefill_p_node:
+            return
+        kv_group = self._layerwise_wait_group(layer_name)
+        self.lmcache_engine.gpu_connector.synchronize_prefill_vup_output(
+            self._layerwise_prefill_transfer_layer_id(layer_name, kv_group),
+            kv_group,
+        )
+
     def record_layerwise_prefill_bank_use(self, layer_name: str, event: Any) -> None:
         """Fence this layer's banks after their final compute access.
 
