@@ -211,6 +211,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         """Submit N+2; virtual N=-1 submits L1 at first-layer entry."""
         self._lmcache_engine.submit_layerwise_prefill_load(layer_name)
 
+    def synchronize_prefill_sfa_inputs(self, layer_name: str) -> None:
+        """Forward the opt-in pre-SFA fence for a registered latent layer."""
+        self._lmcache_engine.synchronize_prefill_sfa_inputs(layer_name)
+
     def record_layerwise_prefill_bank_use(self, layer_name: str, event: Any) -> None:
         """Hand off the event recorded after a P layer's final KV access.
 
