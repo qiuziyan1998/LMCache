@@ -185,6 +185,26 @@ def test_remote_fill_rejects_unknown_submission_mode() -> None:
         config.validate()
 
 
+def test_remote_fill_transaction_idle_timeout_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    defaults = LMCacheEngineConfig.from_defaults()
+    assert defaults.remote_fill_transaction_idle_timeout_sec == 1800
+    path = tmp_path / "lease.yaml"
+    path.write_text("remote_fill_transaction_idle_timeout_sec: 2400\n")
+    loaded = LMCacheEngineConfig.from_file(path)
+    assert loaded.remote_fill_transaction_idle_timeout_sec == 2400
+    monkeypatch.setenv("LMCACHE_REMOTE_FILL_TRANSACTION_IDLE_TIMEOUT_SEC", "3600")
+    environment = LMCacheEngineConfig.from_env()
+    assert environment.remote_fill_transaction_idle_timeout_sec == 3600
+    for value in (0, -1):
+        config = _remote_fill_config(remote_fill_transaction_idle_timeout_sec=value)
+        with pytest.raises(
+            ValueError, match="remote_fill_transaction_idle_timeout_sec"
+        ):
+            config.validate()
+
+
 def test_remote_fill_accepts_final_deferred_rollback_mode() -> None:
     config = _remote_fill_config(remote_fill_submission_mode="final_deferred")
 
