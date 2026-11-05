@@ -95,3 +95,20 @@ def test_former_validation_helper_remains_import_compatible() -> None:
     assert marker == REMOTE_FILL_DIAGNOSTIC_MARKER
     assert fields["event"] == "remote_fill_diagnostic"
     assert fields["diagnostic_name"] == "producer_persistent_fallback"
+
+
+def test_reservation_response_is_structured_bounded_and_redacted() -> None:
+    logger = _RecordingLogger()
+    log_remote_fill_diagnostic(
+        logger, event="remote_fill_fallback", code="RF-P-004",
+        stage="window_terminal", action="PERSISTENT_ONLY",
+        reason="reservation rejected", response_code="RESOURCE_EXHAUSTED",
+        response_message="capacity\nsource_ptr=123456 0x1234abcd " + "x" * 1000,
+    )
+    fields = json.loads(logger.calls[0][2])
+    assert fields["reason"] == "reservation rejected"
+    assert fields["response_code"] == "RESOURCE_EXHAUSTED"
+    assert len(fields["response_message"]) == 512
+    assert "123456" not in fields["response_message"]
+    assert "1234abcd" not in fields["response_message"]
+    assert "\n" not in fields["response_message"]
