@@ -7683,10 +7683,10 @@ class LMCacheEngine:
                 if mem_obj_generator is not None:
                     close_fn = getattr(mem_obj_generator, "close", None)
                     if close_fn is not None:
-                        try:
-                            close_fn()
-                        except (GeneratorExit, RuntimeError, ValueError):
-                            pass
+                        # Closing the connector fences unfinished D2H writes.
+                        # A failed fence must propagate before destinations
+                        # can be returned to the allocator.
+                        close_fn()
                 for mem_obj in list(pending_store_release.values()):
                     if mem_obj.is_valid():
                         mem_obj.ref_count_down()

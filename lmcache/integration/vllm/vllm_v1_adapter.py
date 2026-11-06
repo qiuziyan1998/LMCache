@@ -10793,10 +10793,9 @@ class LMCacheConnectorV1Impl:
     def _close_layerwise_storer(storer) -> None:
         if storer is None:
             return
-        try:
-            storer.close()
-        except (GeneratorExit, RuntimeError, ValueError):
-            pass
+        # A connector close can be the last fence for outstanding D2H writes.
+        # Propagate failure so request cleanup cannot treat it as completion.
+        storer.close()
 
     def _finalize_layerwise_storer(
         self,
