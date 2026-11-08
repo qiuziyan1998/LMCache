@@ -211,18 +211,6 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
         """Submit N+2; virtual N=-1 submits L1 at first-layer entry."""
         self._lmcache_engine.submit_layerwise_prefill_load(layer_name)
 
-    def synchronize_prefill_sfa_inputs(self, layer_name: str) -> None:
-        """Forward the opt-in pre-SFA fence for a registered latent layer."""
-        self._lmcache_engine.synchronize_prefill_sfa_inputs(layer_name)
-
-    def synchronize_prefill_vup_output(self, layer_name: str) -> None:
-        """Forward the opt-in post-V-up-projection fence.
-
-        Args:
-            layer_name: Registered attention layer name.
-        """
-        self._lmcache_engine.synchronize_prefill_vup_output(layer_name)
-
     def record_layerwise_prefill_bank_use(self, layer_name: str, event: Any) -> None:
         """Hand off the event recorded after a P layer's final KV access.
 
@@ -235,10 +223,6 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
     def finish_layerwise_prefill_save(self, layer_name: str) -> None:
         """Run storage publication after the layer's HCOM is submitted."""
         self._lmcache_engine.finish_layerwise_prefill_save(layer_name)
-
-    def trace_attention_kv(self, layer_name: str, **kwargs: Any) -> None:
-        """Forward opt-in model-visible KV diagnostics to the NPU connector."""
-        self._lmcache_engine.trace_attention_kv(layer_name, **kwargs)
 
     def save_kv_layer(
         self,

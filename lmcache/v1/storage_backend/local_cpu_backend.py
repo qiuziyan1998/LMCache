@@ -29,7 +29,6 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
-from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     LayerPageMemoryObj,
@@ -199,7 +198,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.cpu_lock = threading.Lock()
 
         # Cold-start diagnostics are armed only by a successful external
-        # two-group commit while PD_SERVING_PERF is enabled. Keeping an
+        # two-group commit. Keeping an
         # empty list in ordinary operation makes every mutation hook a single
         # predictable branch, with no logging or cache inspection.
         self._external_retention_trace_sequence = 0
@@ -628,7 +627,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             required_keys,
             ready_reservations,
             context="External two-group commit",
-            arm_retention_trace=serving_perf_enabled(),
+            arm_retention_trace=False,
         )
 
     def commit_external_group0_prefix_if_absent(
@@ -1546,11 +1545,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             )
             if pages is not None:
                 if waiting:
-                    logger.info(
-                        "[LMCACHE_PAGE_ALLOC] status=ready pages=%d layers=%d "
-                        "wait_ms=%.1f", batch_size, num_layers,
-                        (time.monotonic() - started) * 1000,
-                    )
+                    pass
                 return pages
             remaining = deadline - time.monotonic()
             if not eviction or not self.use_hot or remaining <= 0:
@@ -1749,7 +1744,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
             or (max_scan_entries is not None and max_scan_entries <= 0)
         ):
             raise ValueError("invalid LocalCPU capacity-reclaim request")
-        started = time.perf_counter() if serving_perf_enabled() else None
         free_before, heap_bytes = self.get_allocator_capacity_bytes()
         target_free_bytes = required_bytes + max(
             min_free_bytes,
@@ -1813,33 +1807,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.stats_monitor.update_local_cpu_evict_metrics(evicted_keys)
         if not sufficient:
             self.stats_monitor.update_local_cpu_evict_failed_count(1)
-        if started is not None:
-            serving_perf_log(
-                logger,
-                cause,
-                started=started,
-                target_free_bytes=target_free_bytes,
-                free_before=free_before,
-                free_after=free_after,
-                evictable_bytes=evictable_bytes,
-                evictable_bytes_scope=(
-                    "eligible_candidates"
-                    if max_scan_entries is not None
-                    or type(self.cache_policy) is LRUCachePolicy
-                    else "cache"
-                ),
-                evicted_bytes=evicted_bytes,
-                evicted_keys=evicted_keys,
-                outcome=(
-                    "reclaimed"
-                    if sufficient and evicted_keys
-                    else "not_needed"
-                    if sufficient
-                    else "raced"
-                    if evicted_keys
-                    else "insufficient"
-                ),
-            )
         return sufficient
 
     def _pop_bounded_reclaim_locked(

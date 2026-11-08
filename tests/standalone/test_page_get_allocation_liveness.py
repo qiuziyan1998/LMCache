@@ -200,7 +200,7 @@ def test_cancellation_during_allocation_never_submits_get():
 @pytest.mark.parametrize("exact", [False, True])
 @pytest.mark.parametrize("failure", ["allocation", "short_read", "native"])
 def test_resolver_stops_instead_of_returning_unfilled_history(exact, failure):
-    from test_prefill_page_source_debug import resolver
+    from test_prefill_page_source import resolver
 
     class LayerKey(Key):
         chunk = 0
@@ -209,7 +209,7 @@ def test_resolver_stops_instead_of_returning_unfilled_history(exact, failure):
             return [(0, layer) for layer in range(count)]
 
     connector, state = setup(failure=failure, timeout=0)
-    engine, _, _, _ = resolver(set(), enabled=False)
+    engine, _, _, _ = resolver(set())
     engine._release_shared_retrieve_objs = lambda rows, **kw: [
         obj.ref_count_down() for obj in rows
     ]

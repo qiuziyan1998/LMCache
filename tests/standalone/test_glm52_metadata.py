@@ -99,6 +99,7 @@ def adapter():
     )
     obj = ns[cls.name]()
     obj.config = NS(dsa_two_groups=True)
+    obj._layerwise_prefill_p_node = False
     obj._layerwise_retriever_is_sparse = [False]
     obj._layerwise_waited_groups = set()
     return obj

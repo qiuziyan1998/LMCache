@@ -11,9 +11,6 @@ import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeAlias, TypedDict
 from weakref import WeakMethod
 
-# First Party
-from lmcache.v1.serving_perf import serving_perf_enabled
-
 logger = logging.getLogger("lmcache.integration.vllm.vllm_v1_adapter")
 
 if TYPE_CHECKING:
@@ -116,7 +113,7 @@ class ColdLoadCoordinator:
         futures = self.futures
         if not futures:
             return None
-        perf_enabled = serving_perf_enabled()
+        perf_enabled = False
         finished: set[str] = set()
         for req_id, entry in list(futures.items()):
             (

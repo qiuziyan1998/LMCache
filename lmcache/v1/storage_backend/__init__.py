@@ -12,7 +12,6 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.startup_trace import startup_phase
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.gds_backend import GdsBackend
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -137,9 +136,7 @@ def CreateStorageBackends(
     if config.enable_pd and "PDBackend" not in _skip:
         # First Party
         from lmcache.v1.storage_backend.pd_backend import PDBackend
-
-        with startup_phase("backend_pd", rank=metadata.worker_id):
-            storage_backends["PDBackend"] = PDBackend(config, metadata)
+        storage_backends["PDBackend"] = PDBackend(config, metadata)
 
     # TODO(Jiayi): The hierarchy is fixed for now
     # NOTE(Jiayi): The local_cpu backend is always created because
@@ -159,13 +156,12 @@ def CreateStorageBackends(
         if "LocalCPUBackend" in _skip:
             pass  # Skipped — already exists
         elif config.max_local_cpu_size > 0:
-            with startup_phase("backend_cpu", rank=metadata.worker_id):
-                local_cpu_backend = LocalCPUBackend(
-                    config,
-                    metadata,
-                    dst_device,
-                    lmcache_worker,
-                )
+            local_cpu_backend = LocalCPUBackend(
+                config,
+                metadata,
+                dst_device,
+                lmcache_worker,
+            )
             backend_name = str(local_cpu_backend)
             storage_backends[backend_name] = local_cpu_backend
         else:
@@ -240,14 +236,13 @@ def CreateStorageBackends(
             "Remote backend requires local CPU backend as a buffer."
             "Please turn on local cpu backend with max_local_cpu_size > 0"
         )
-        with startup_phase("backend_remote", rank=metadata.worker_id):
-            remote_backend = RemoteBackend(
-                config,
-                metadata,
-                loop,
-                local_cpu_backend,
-                dst_device,
-            )
+        remote_backend = RemoteBackend(
+            config,
+            metadata,
+            loop,
+            local_cpu_backend,
+            dst_device,
+        )
         backend_name = str(remote_backend)
         storage_backends[backend_name] = remote_backend
 
