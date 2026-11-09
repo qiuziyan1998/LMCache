@@ -2,7 +2,7 @@
 # Standard
 from functools import cached_property
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from threading import Lock
@@ -7165,6 +7165,28 @@ class LMCacheEngine:
         The base engine has no additional persistence dependency to register.
         """
 
+    @staticmethod
+    def _require_complete_prefill_source(
+        starts: Sequence[int],
+        ends: Sequence[int],
+        num_required_tokens: int,
+        *,
+        req_id: str,
+        kv_group: int,
+        recalculate_last_token: bool,
+    ) -> None:
+        """Check the resolved dense prefix using its existing endpoints."""
+        required = int(num_required_tokens)
+        if recalculate_last_token and required:
+            required -= 1
+        available = int(ends[-1]) - int(starts[0]) if ends else 0
+        if available < required:
+            raise RuntimeError(
+                "P-node banked prefill source is incomplete during retrieval: "
+                f"req_id={req_id}, kv_group={kv_group}, "
+                f"retrieved_tokens={available}, required_tokens={required}"
+            )
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def retrieve_layer(
@@ -7197,6 +7219,12 @@ class LMCacheEngine:
         """
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
+            if kwargs.get("_require_complete_prefill_prefix", False):
+                raise RuntimeError(
+                    "LMCache is unhealthy during required P-node prefill retrieval: "
+                    f"req_id={kwargs.get('req_id')}, "
+                    f"kv_group={kwargs.get('kv_group', 0)}"
+                )
             logger.warning("LMCache is unhealthy, skipping retrieve_layer operation")
             yield torch.zeros(len(tokens), dtype=torch.bool)
             return
@@ -7594,6 +7622,27 @@ class LMCacheEngine:
                 if remote_fill_plan is not None
                 else len(batch_plan or [])
             )
+            if kwargs.get("_require_complete_prefill_prefix", False):
+                try:
+                    self._require_complete_prefill_source(
+                        starts, ends, num_required_tokens,
+                        req_id=req_id, kv_group=kv_group,
+                        recalculate_last_token=kwargs.get(
+                            "_prefill_recalculate_last_token", False
+                        ),
+                    )
+                except RuntimeError as error:
+                    self._broadcast_shared_envelope(
+                        self._shared_layerwise_error_envelope(
+                            req_id=req_id,
+                            phase=phase,
+                            request_ordinal=request_ordinal,
+                            layer_id=0,
+                            kv_group=kv_group,
+                            message=str(error),
+                        )
+                    )
+                    raise
             if missing_shared_chunks and self.shared_cpu_cache_strict:
                 message = (
                     "Shared CPU dense prefix layerwise retrieve missing required "
@@ -7729,6 +7778,15 @@ class LMCacheEngine:
             segment_keys.append(keys_multi_layer)
 
             ret_mask[start:end] = True
+
+        if kwargs.get("_require_complete_prefill_prefix", False):
+            self._require_complete_prefill_source(
+                starts, ends, num_required_tokens,
+                req_id=req_id, kv_group=kv_group,
+                recalculate_last_token=kwargs.get(
+                    "_prefill_recalculate_last_token", False
+                ),
+            )
 
         if segment_location is not None and segment_keys:
             segments.append(

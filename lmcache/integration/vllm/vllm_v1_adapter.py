@@ -6888,56 +6888,14 @@ class LMCacheConnectorV1Impl:
     def _prime_dense_prefix_retrievers(
         layerwise_retriever: Generator[Optional[torch.Tensor], None, None],
         indexer_retriever: Optional[Generator[Optional[torch.Tensor], None, None]],
-        req_id: Optional[str] = None,
-        prefix_tokens: int = 0,
-        required_mask: Optional[torch.Tensor] = None,
-        recalc_last_token: bool = False,
     ) -> None:
-        """Prepare both groups and reject a short banked reload before H2D.
-
-        ``required_mask`` is the existing CPU retrieve mask, supplied only for
-        deferred P loads. Their first yield reports all-layer source coverage.
-        Ordinary/D priming retains its existing behavior when it is omitted.
-        """
-        timed = req_id is not None and False
-        if required_mask is None and not timed:
-            next(layerwise_retriever)
-            if indexer_retriever is not None:
-                next(indexer_retriever)
-            next(layerwise_retriever)
-            if indexer_retriever is not None:
-                next(indexer_retriever)
-            return
-        required_tokens = 0
-        if required_mask is not None:
-            required_tokens = int(required_mask.sum().item())
-            if recalc_last_token and required_mask.numel() and required_mask[-1]:
-                required_tokens -= 1
-        for step in (0, 1):
-            prepared_counts = []
-            for kv_group, retriever in enumerate(
-                (layerwise_retriever, indexer_retriever)
-            ):
-                if retriever is None:
-                    continue
-                count = next(retriever)
-                if step == 0:
-                    prepared_counts.append((kv_group, count))
-            if step == 0 and required_mask is not None:
-                # Finish both groups' preparation broadcasts before checking;
-                # no rank may leave its peer waiting for the other group.
-                for kv_group, count in prepared_counts:
-                    available = 0 if count is None else int(count)
-                    if available < required_tokens:
-                        raise RuntimeError(
-                            "P-node banked prefill reload is incomplete before "
-                            "model execution: "
-                            f"req_id={req_id}, kv_group={kv_group}, "
-                            f"prepared_tokens={available}, "
-                            f"required_tokens={required_tokens}, "
-                            f"prefix_tokens={prefix_tokens}. Refusing to use "
-                            "unloaded history."
-                        )
+        """Prepare both groups, then submit their first layer loads."""
+        next(layerwise_retriever)
+        if indexer_retriever is not None:
+            next(indexer_retriever)
+        next(layerwise_retriever)
+        if indexer_retriever is not None:
+            next(indexer_retriever)
 
     @_lmcache_nvtx_annotate
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -8475,6 +8433,16 @@ class LMCacheConnectorV1Impl:
                         if self._deferred_layerwise_prefill_load_active
                         else {}
                     )
+                    if (
+                        self._layerwise_prefill_p_node
+                        and self._deferred_layerwise_prefill_load_active
+                    ):
+                        deferred_prefill_kwargs[
+                            "_require_complete_prefill_prefix"
+                        ] = True
+                        deferred_prefill_kwargs[
+                            "_prefill_recalculate_last_token"
+                        ] = recalc_last_applied
                     if reuse_dense_prefix:
                         deferred_prefill_kwargs["_reuse_shared_dense_prefix"] = True
                         if retrieve_state.prefill_metadata_cache is not None:
@@ -8593,17 +8561,6 @@ class LMCacheConnectorV1Impl:
                     self._prime_dense_prefix_retrievers(
                         layerwise_retriever,
                         indexer_retriever,
-                        req_id=(
-                            request.req_id if self._layerwise_prefill_p_node else None
-                        ),
-                        prefix_tokens=len(retrieve_tokens),
-                        required_mask=(
-                            token_mask
-                            if self._layerwise_prefill_p_node
-                            and self._deferred_layerwise_prefill_load_active
-                            else None
-                        ),
-                        recalc_last_token=recalc_last_applied,
                     )
                     if retain_dense_seed:
                         retrieve_state.location = "LocalCPUBackend"
