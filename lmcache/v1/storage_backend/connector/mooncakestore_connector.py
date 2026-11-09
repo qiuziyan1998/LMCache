@@ -8,7 +8,7 @@ from importlib import import_module
 import json
 import os
 from threading import Lock
-from time import perf_counter, thread_time_ns
+from time import perf_counter
 from typing import Any, Callable, List, Optional, cast, no_type_check
 
 # Third Party
@@ -1934,12 +1934,10 @@ class MooncakestoreConnector(RemoteConnector):
             self._external_page_key(key, sizes)
             for key, sizes in zip(keys, buffer_sizes, strict=True)
         ]
-        started = None
 
         def put() -> Any:
             if owners and owners[0].device.type == "npu":
                 torch.npu.set_device(owners[0].device)
-            wait_started = 0 if started is not None else None
             normalized_events = (
                 producer_events
                 if isinstance(producer_events, tuple)
@@ -1951,22 +1949,11 @@ class MooncakestoreConnector(RemoteConnector):
                     continue
                 seen_events.add(id(producer_event))
                 producer_event.synchronize()
-            wait_ms = (
-                (0 - wait_started) * 1000
-                if wait_started is not None
-                else 0.0
-            )
             self._register_external_owners(owners)
-            transfer_started = 0 if started is not None else None
             placement = self._batch_put_multi_buffers_by_segment(
                 keys, page_keys, buffer_ptrs, buffer_sizes
             )
-            transfer_ms = (
-                (0 - transfer_started) * 1000
-                if transfer_started is not None
-                else 0.0
-            )
-            return placement, wait_ms, transfer_ms
+            return placement
 
         async with self._external_put_lock:
             hard_deadline = self._external_native_deadline()
@@ -1974,7 +1961,7 @@ class MooncakestoreConnector(RemoteConnector):
             self._inflight_put_tasks.add(task)
             task.add_done_callback(self._inflight_put_tasks.discard)
             try:
-                placement, wait_ms, transfer_ms = await _await_native_task(
+                placement = await _await_native_task(
                     task, timeout=self.config.transfer_timeout
                 )
             except asyncio.CancelledError:
@@ -1995,7 +1982,7 @@ class MooncakestoreConnector(RemoteConnector):
                     self.config.transfer_timeout,
                 )
                 try:
-                    placement, wait_ms, transfer_ms = (
+                    placement = (
                         await _wait_external_native_until_hard_deadline(
                             task,
                             deadline=hard_deadline,
@@ -2044,7 +2031,6 @@ class MooncakestoreConnector(RemoteConnector):
         req_id: str,
     ) -> None:
         """Read exact Mooncake pages directly into accelerator tensor storage."""
-        started = None
         native_unknown = getattr(self, "_external_native_unknown_error", None)
         if native_unknown is not None:
             raise native_unknown
@@ -2072,22 +2058,10 @@ class MooncakestoreConnector(RemoteConnector):
                 file_store.memory.bind_external(owners)
             else:
                 self._register_external_owners(owners)
-            transfer_started = 0 if started is not None else None
-            thread_cpu_started = thread_time_ns() if started is not None else None
             statuses = self.store.batch_get_into_multi_buffers(
                 page_keys, buffer_ptrs, buffer_sizes
             )
-            thread_cpu_ms = (
-                (thread_time_ns() - thread_cpu_started) / 1_000_000
-                if thread_cpu_started is not None
-                else 0.0
-            )
-            transfer_ms = (
-                (0 - transfer_started) * 1000
-                if transfer_started is not None
-                else 0.0
-            )
-            return statuses, transfer_ms, thread_cpu_ms
+            return statuses
         async with self._external_put_lock:
             read_deadline = float(self.config.transfer_timeout)
             if getattr(self, "_file_replay_store", None) is not None:
@@ -2103,7 +2077,7 @@ class MooncakestoreConnector(RemoteConnector):
             self._inflight_put_tasks.add(task)
             task.add_done_callback(self._inflight_put_tasks.discard)
             try:
-                statuses, transfer_ms, thread_cpu_ms = await _await_native_task(
+                statuses = await _await_native_task(
                     task, timeout=read_deadline
                 )
             except asyncio.CancelledError:

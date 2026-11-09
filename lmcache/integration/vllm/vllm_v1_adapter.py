@@ -7036,7 +7036,6 @@ class LMCacheConnectorV1Impl:
                 f"is still active: req_id={request.req_id}, "
                 f"active_generation={existing[0]}, generation={generation}"
             )
-        plan_started = 0.0
         indexer_slots = request.indexer_slot_mapping[0]
         indexer_block_ids = _cold_indexer_block_ids(indexer_slots, self._block_size)
         npu_device_id = (
@@ -7051,11 +7050,8 @@ class LMCacheConnectorV1Impl:
             "indexer_slots_cpu": request.indexer_slot_mapping[0],
             "latent_kvcaches": self._kvcaches_for_group(0),
             "indexer_kvcaches": self._kvcaches_for_group(1),
-            "planned_at": 0.0,
-            "plan_started": plan_started,
             "latent_shared_ready": Future(),
         }
-        submitted_at = 0.0
         executor = self._get_dsa_cold_load_executor()
         prepare_chunks = getattr(self.lmcache_engine, "prepare_cold_chunk_plan", None)
         if (
@@ -7067,7 +7063,7 @@ class LMCacheConnectorV1Impl:
             if chunks is not None:
                 plan["chunk_plan"] = chunks
         coordinator.submit_pair(
-            plan, generation, indexer_block_ids, submitted_at, npu_device_id,
+            plan, generation, indexer_block_ids, npu_device_id,
             executor, self._run_dsa_cold_indexer_load, self._run_dsa_cold_compact_load,
         )
 
@@ -7097,7 +7093,6 @@ class LMCacheConnectorV1Impl:
             return False
         assert request.load_spec is not None
         token_count = request.load_spec.lmcache_cached_tokens
-        plan_started = 0.0
         plan: ColdLoadPlan = {
             "request": request,
             "tokens": request.token_ids[:token_count],
@@ -7106,8 +7101,6 @@ class LMCacheConnectorV1Impl:
             "indexer_slots_cpu": request.indexer_slot_mapping[0],
             "latent_kvcaches": self._kvcaches_for_group(0),
             "indexer_kvcaches": self._kvcaches_for_group(1),
-            "planned_at": 0.0,
-            "plan_started": plan_started,
             "latent_shared_ready": Future(),
         }
         indexer_completion: Future = Future()
@@ -7159,7 +7152,6 @@ class LMCacheConnectorV1Impl:
             completion,
             request,
             indexer_blocks,
-            0.0,
             indexer_completion,
         )
         if pending is None:
@@ -7355,7 +7347,7 @@ class LMCacheConnectorV1Impl:
                     entry["plan"]["indexer_source_owners"] = tuple(
                         context.get("destination_owners", ())
                     )
-                    completion.set_result((None, readiness, 0.0, 0.0))
+                    completion.set_result((None, readiness))
                     gate = entry["latent_gate"]
                     if not gate.done():
                         gate.set_result(None)
@@ -7376,20 +7368,9 @@ class LMCacheConnectorV1Impl:
         self, plan: ColdLoadPlan, npu_device_id: Optional[int]
     ) -> ColdIndexerResult:
         """Load Group 1 densely after Group 0 shared-CPU publication."""
-
-        def stage_start() -> float:
-            return 0.0
-
-        def finish_stage(name: str, stage_started: float) -> None:
-            pass
-
-        producer_setup_started = stage_start()
         if npu_device_id is not None:
             torch.npu.set_device(npu_device_id)
-        finish_stage("producer_setup_ms", producer_setup_started)
         assert self.lmcache_engine is not None
-        started = 0.0
-        queue_ms = (started - plan["planned_at"]) * 1000
         request = plan["request"]
         indexer_slots_cpu = plan["indexer_slots_cpu"]
         indexer_kvcaches = plan["indexer_kvcaches"]
@@ -7398,10 +7379,8 @@ class LMCacheConnectorV1Impl:
             "validate_layerwise_slot_mapping",
             None,
         )
-        slot_validate_started = stage_start()
         if callable(validate_slots):
             validate_slots(indexer_slots_cpu, indexer_kvcaches, kv_group=1)
-        finish_stage("slot_validate_ms", slot_validate_started)
         if request.load_spec.dsa_group1_direct_hbm:
             direct_load = getattr(
                 self.lmcache_engine,
@@ -7410,7 +7389,6 @@ class LMCacheConnectorV1Impl:
             )
             if not callable(direct_load):
                 raise RuntimeError("Group-1 direct-HBM loader is unavailable")
-            direct_started = stage_start()
             direct_load(
                 plan["tokens"],
                 indexer_slots_cpu,
@@ -7419,15 +7397,10 @@ class LMCacheConnectorV1Impl:
                 request.req_id,
                 **({"chunk_plan": plan["chunk_plan"]} if "chunk_plan" in plan else {}),
             )
-            finish_stage("direct_page_load_ms", direct_started)
             return (
                 plan["token_mask"],
                 None,
-                0.0
-                - started,
-                queue_ms,
             )
-        slot_submit_started = stage_start()
         stage_tensor = getattr(
             self.lmcache_engine.gpu_connector,
             "stage_dense_load_tensor",
@@ -7442,7 +7415,6 @@ class LMCacheConnectorV1Impl:
                 device=self.device,
                 dtype=torch.long,
             )
-        finish_stage("slot_mapping_submit_ms", slot_submit_started)
         retrieve_state = WorkerRetrieveState(req_id=request.req_id)
         supports_dense_retention = getattr(
             self.lmcache_engine, "supports_dense_sparse_cache_retention", None
@@ -7451,7 +7423,6 @@ class LMCacheConnectorV1Impl:
             raise RuntimeError(
                 "Cold compact indexer load requires dense source retention"
             )
-        retrieve_kwargs_started = stage_start()
         readiness_out: list[Any] = []
         retrieve_kwargs = {
             "kvcaches": indexer_kvcaches,
@@ -7466,7 +7437,6 @@ class LMCacheConnectorV1Impl:
             "_dense_load_readiness_out": readiness_out,
             **retrieve_state.cache_kwargs(1, dsa_two_groups=True),
         }
-        finish_stage("retrieve_kwargs_ms", retrieve_kwargs_started)
         prefetch_owners: tuple[Any, ...] = ()
         if (
             getattr(
@@ -7504,7 +7474,6 @@ class LMCacheConnectorV1Impl:
                         request.req_id,
                         error,
                     )
-        latent_gate_started = stage_start()
         try:
             plan["latent_shared_ready"].result()
         except BaseException:
@@ -7514,8 +7483,6 @@ class LMCacheConnectorV1Impl:
                 synchronize=False,
             )
             raise
-        finish_stage("latent_gate_wait_ms", latent_gate_started)
-        generator_started = stage_start()
         try:
             retriever = self.lmcache_engine.retrieve_layer(
                 plan["tokens"],
@@ -7529,11 +7496,9 @@ class LMCacheConnectorV1Impl:
                 synchronize=False,
             )
             raise
-        finish_stage("generator_create_ms", generator_started)
         result = None
         load_stream_fenced = False
         try:
-            layer_submit_started = stage_start()
             try:
                 try:
                     result = next(retriever)
@@ -7548,8 +7513,6 @@ class LMCacheConnectorV1Impl:
                     raise
             finally:
                 retriever.close()
-            finish_stage("layer_submit_host_ms", layer_submit_started)
-            result_check_started = stage_start()
             if result is None or int(result.sum().item()) != plan["token_count"]:
                 raise RuntimeError("Cold compact indexer retrieve was incomplete")
             if plan["token_count"] and not (
@@ -7559,12 +7522,9 @@ class LMCacheConnectorV1Impl:
                 raise RuntimeError(
                     "Cold compact indexer retrieve did not retain its sources"
                 )
-            finish_stage("result_check_ms", result_check_started)
-            readiness_started = stage_start()
             if len(readiness_out) != 1:
                 raise RuntimeError("Cold compact indexer readiness was not recorded")
             readiness = readiness_out[0]
-            finish_stage("readiness_record_ms", readiness_started)
         except BaseException:
             if not load_stream_fenced:
                 self._synchronize_dsa_cold_dense_load()
@@ -7579,17 +7539,9 @@ class LMCacheConnectorV1Impl:
             self.lmcache_engine,
             synchronize=False,
         )
-        # Do not publish a request while Group 1 can still be writing its
-        # final HBM blocks from this background worker.
-        readiness_wait_started = stage_start()
+        # Complete the indexer write before publishing its resident state.
         self._synchronize_dsa_cold_dense_readiness(readiness)
-        finish_stage("dense_readiness_wait_ms", readiness_wait_started)
-        return (
-            result,
-            readiness,
-            0.0 - started,
-            queue_ms,
-        )
+        return result, readiness
 
     def synchronize_staged_sfa_capture_unsafe_loads(self) -> None:
         """Finish legacy background NPU loads before serving-time graph capture.
@@ -7762,12 +7714,7 @@ class LMCacheConnectorV1Impl:
             latent_shared_ready = plan["latent_shared_ready"]
             if not latent_shared_ready.done():
                 latent_shared_ready.set_result(None)
-            (
-                _,
-                indexer_readiness,
-                indexer_remote_s,
-                indexer_queue_ms,
-            ) = indexer_future.result()
+            _, indexer_readiness = indexer_future.result()
             if request.load_spec.dsa_group1_direct_hbm:
                 if indexer_readiness is not None:
                     raise RuntimeError(
@@ -7796,8 +7743,6 @@ class LMCacheConnectorV1Impl:
                 state,
                 additional_owners=tuple(plan.get("indexer_source_owners", ())),
             )
-            completed_at = 0.0
-            state._dsa_cold_load_completed_at = completed_at
             return state
         except BaseException as exc:
             latent_shared_ready = plan["latent_shared_ready"]
@@ -7808,7 +7753,7 @@ class LMCacheConnectorV1Impl:
             # producer-stream fence; a failed result fenced its stream locally.
             if indexer_readiness is None:
                 try:
-                    _, indexer_readiness, _, _ = indexer_future.result()
+                    _, indexer_readiness = indexer_future.result()
                 except BaseException:
                     pass
             owners_by_id = {
@@ -10840,9 +10785,8 @@ class LMCacheConnectorV1Impl:
         entry: ColdLoadEntry,
         state: Any,
         was_aborted: bool,
-        perf_enabled: bool,
     ) -> None:
-        generation, future, request, indexer_block_ids, submitted_at, indexer_future = entry
+        generation, future, request, indexer_block_ids, indexer_future = entry
         if was_aborted:
             self._release_unadopted_shared_request_objects(state, request)
             self._release_shared_worker_retrieve_state(state, self.lmcache_engine)
@@ -10875,9 +10819,8 @@ class LMCacheConnectorV1Impl:
         entry: ColdLoadEntry,
         state: Any,
         exc: BaseException,
-        perf_enabled: bool,
     ) -> bool:
-        generation, future, request, indexer_block_ids, submitted_at, indexer_future = entry
+        generation, future, request, indexer_block_ids, indexer_future = entry
         requires_restart = getattr(
             self.lmcache_engine,
             "remote_fill_requires_paired_restart",
@@ -10934,11 +10877,10 @@ class LMCacheConnectorV1Impl:
         else:
             logger.exception(
                 "[DSA_COLD_COMPACT] request=%s generation=%d "
-                "status=failed indexer_blocks=%d elapsed_ms=%.3f",
+                "status=failed indexer_blocks=%d",
                 req_id,
                 generation,
                 len(indexer_block_ids),
-                (0.0 - submitted_at) * 1000,
             )
         # Both workers are terminal and request owners have either
         # retired or moved to the existing readiness retirement queue.

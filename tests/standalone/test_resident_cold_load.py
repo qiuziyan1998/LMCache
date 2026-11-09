@@ -78,7 +78,7 @@ def test_prepared_pointer_publication_waits_for_final_device_event(
     state = NS(dense_load_readiness=NS(query=lambda: ready[0]))
 
     class Owner:
-        def publish(self, req_id, entry, result, was_aborted, perf):
+        def publish(self, req_id, entry, result, was_aborted):
             assert ready[0] and result is state
             actions.append("retire" if was_aborted else "publish")
 
@@ -94,7 +94,7 @@ def test_prepared_pointer_publication_waits_for_final_device_event(
     latent.set_result(state)
     indexer.set_result(None)
     request = NS(load_spec=NS(dsa_cold_load_generation=7))
-    coordinator.futures["r"] = (7, latent, request, {12}, 0.0, indexer)
+    coordinator.futures["r"] = (7, latent, request, {12}, indexer)
     coordinator.aborted = {"r"} if aborted else None
     assert coordinator.poll() is None
     assert coordinator.futures and not actions
@@ -154,7 +154,7 @@ def test_resident_worker_loads_before_publication_and_unblocks_failures(
     engine = NS(gpu_connector=connector, retrieve_layer=dense)
     gate = Future()
     indexer = Future()
-    indexer.set_result((None, None if spec.dsa_group1_direct_hbm else object(), 0, 0))
+    indexer.set_result((None, None if spec.dsa_group1_direct_hbm else object()))
     plan = dict(
         request=request,
         token_count=length,
@@ -162,8 +162,6 @@ def test_resident_worker_loads_before_publication_and_unblocks_failures(
         token_mask=torch.ones(length, dtype=torch.bool),
         latent_kvcaches=[0, 1],
         latent_shared_ready=gate,
-        planned_at=0,
-        plan_started=0,
     )
 
     def seal(state, count):
@@ -304,7 +302,7 @@ def test_compact_and_live_workers_publish_their_owned_snapshot(
         _set_worker_retrieve_state=lambda *a: calls.append("publish"),
     )
     indexer = Future()
-    indexer.set_result((None, None, 0., 0.))
+    indexer.set_result((None, None))
     run = method("_run_dsa_cold_compact_load", torch=torch,
                  WorkerRetrieveState=lambda **kw: state)
     result = run(adapter, plan, None, indexer, live_state=state if live else None)
@@ -377,7 +375,7 @@ def test_cold_pool_reuses_threads_across_bursts_and_shutdown_drains(
             indexer.set_result(None)
             coordinator.last_latent_future = latent
             request = NS(load_spec=NS(dsa_cold_load_generation=generation))
-            coordinator.futures["r"] = (generation, latent, request, set(), 0., indexer)
+            coordinator.futures["r"] = (generation, latent, request, set(), indexer)
             assert coordinator.poll() == {"r"}
             assert coordinator.last_latent_future is None
             assert coordinator.get_executor() is executor
@@ -436,7 +434,7 @@ def test_retained_pool_drops_completed_request_data_without_gc(
         request = NS(req_id="r", load_spec=NS(dsa_cold_load_generation=generation))
         plan = dict(request=request, payload=payload, latent_shared_ready=Future())
         coordinator.submit_pair(
-            plan, generation, set(), 0., None, executor, indexer, latent
+            plan, generation, set(), None, executor, indexer, latent
         )
         coordinator.futures["r"][1].result(timeout=5)
         assert coordinator.poll() == {"r"}
@@ -567,7 +565,7 @@ def test_resident_slot_setup_failure_reaches_shared_error_envelope():
         load_spec=NS(dsa_cold_load_generation=1, dsa_cold_resident_load=True, dsa_group1_direct_hbm=True),
     )
     gate, indexer = Future(), Future()
-    indexer.set_result((None, None, 0, 0))
+    indexer.set_result((None, None))
     plan = dict(
         request=request,
         token_count=280,
@@ -604,7 +602,7 @@ def test_direct_indexer_does_not_allow_failed_resident_dma_retirement():
     error = RuntimeError("resident DMA completion unknown")
     error._lmcache_dsa_cold_state = state
     request = NS(load_spec=NS(dsa_cold_load_generation=1, dsa_group1_direct_hbm=True, dsa_cold_resident_load=True))
-    entry = (1, Future(), request, {3}, 0, Future())
+    entry = (1, Future(), request, {3}, Future())
 
     def unproven():
         raise RuntimeError("cannot prove stream completion")
@@ -625,5 +623,5 @@ def test_direct_indexer_does_not_allow_failed_resident_dma_retirement():
         _clear_terminal_load_tracebacks=lambda *a: None,
         logger=NS(exception=lambda *a: None, critical=lambda *a, **kw: None),
     )
-    assert fail(adapter, "r", entry, None, error, False) is False
+    assert fail(adapter, "r", entry, None, error) is False
     assert not released and not adapter._invalid_block_ids

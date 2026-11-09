@@ -1544,8 +1544,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 full_tokens=full_tokens, eviction=eviction,
             )
             if pages is not None:
-                if waiting:
-                    pass
                 return pages
             remaining = deadline - time.monotonic()
             if not eviction or not self.use_hot or remaining <= 0:

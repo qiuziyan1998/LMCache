@@ -4433,23 +4433,6 @@ class LMCacheEngine:
         acquired: list[MemoryObj] = []
         pinned: list[MemoryObj] = []
         context = self._shared_rank0_object_context(kv_group)
-        timing_hook = getattr(
-            self,
-            "_shared_rank0_resolver_timing_hook",
-            None,
-        )
-        if not callable(timing_hook):
-            timing_hook = None
-        defaultdict(float)
-
-        def start_stage() -> float:
-            return 0.0
-
-        def finish_stage(stage: str, started: float) -> None:
-            if not started:
-                return
-
-        started = start_stage()
         windows: list[
             tuple[int, int, list[tuple[int, int]], list[CacheEngineKey]]
         ] = []
@@ -4465,7 +4448,6 @@ class LMCacheEngine:
                     coordinates.append((layer_id, chunk_index))
                     fetch_keys.append(key)
             windows.append((window_start, window_end, coordinates, fetch_keys))
-        finish_stage("windows", started)
 
         try:
             for (
@@ -4474,15 +4456,10 @@ class LMCacheEngine:
                 coordinates,
                 fetch_keys,
             ) in windows:
-                started = start_stage()
-                try:
-                    fetched = self.storage_manager.batched_get(
-                        fetch_keys,
-                        location="RemoteBackend",
-                    )
-                finally:
-                    finish_stage("remote_get", started)
-                started = start_stage()
+                fetched = self.storage_manager.batched_get(
+                    fetch_keys,
+                    location="RemoteBackend",
+                )
                 if len(fetched) != len(fetch_keys):
                     for fetched_obj in fetched:
                         if fetched_obj is not None:
@@ -4511,11 +4488,9 @@ class LMCacheEngine:
                         f"request_id={req_id}, phase={phase}, "
                         f"kv_group={kv_group}, missing={missing}"
                     )
-                finish_stage("results", started)
 
                 pending_fetched = list(fetched)
                 try:
-                    started = start_stage()
                     batch_validation: dict[int, bool] = {}
                     window_objects: list[
                         tuple[int, int, MemoryObj, Optional[MemoryObjMetadata]]
@@ -4582,9 +4557,6 @@ class LMCacheEngine:
                         window_objects.append(
                             (layer_id, chunk_index, mem_obj, metadata)
                         )
-                    finish_stage("classification", started)
-
-                    started = start_stage()
                     window_mem_objs = [item[2] for item in window_objects]
                     if all(
                         type(mem_obj) is TensorMemoryObj
@@ -4612,26 +4584,20 @@ class LMCacheEngine:
                                 _context=context,
                                 _metadata=metadata,
                             )
-                    finish_stage("pinning", started)
-
-                    started = start_stage()
                     for layer_id, _chunk_index, mem_obj, _metadata in window_objects:
                         resolved_layers[layer_id].append(mem_obj)
-                    finish_stage("scatter", started)
                 finally:
                     for fetched_obj in pending_fetched:
                         if fetched_obj is not None:
                             fetched_obj.ref_count_down()
             return resolved_layers
         except Exception:
-            started = start_stage()
             for mem_obj in reversed(pinned):
                 if mem_obj.is_pinned:
                     mem_obj.unpin()
             for mem_obj in reversed(acquired):
                 if mem_obj.is_valid():
                     mem_obj.ref_count_down()
-            finish_stage("rollback", started)
             raise
 
     @staticmethod
@@ -5121,10 +5087,8 @@ class LMCacheEngine:
         consumer: Any,
         sources: list[Any],
         ret_mask: torch.Tensor,
-        perf_enabled: bool = False,
-    ) -> Generator[Optional[torch.Tensor], Any, float]:
+    ) -> Generator[Optional[torch.Tensor], Any, None]:
         """Relay bank commands; no storage lookup, TP broadcast or pointer upload."""
-        send_s = 0.0
         for layer_id, source in enumerate(sources):
             command = yield torch.sum(ret_mask) if layer_id == 0 else None
             if source is not None:
@@ -5133,7 +5097,6 @@ class LMCacheEngine:
                     if command is None
                     else {"memory_objs": source, "layer_request": command}
                 )
-        return send_s
 
     def _resolve_shared_rank0_prefill_suffix(
         self, *, req_id: str, phase: str, kv_group: int,
@@ -5407,7 +5370,6 @@ class LMCacheEngine:
             and mooncake_layer_pages_enabled(self.config)
         ):
             page_first_resolve = True
-        perf_enabled = False
         try:
             for layer_id in range(self.num_layers_for_group(kv_group)):
                 envelope_required = compact_batch is None
@@ -5695,7 +5657,7 @@ class LMCacheEngine:
                 try:
                     yield from (
                         self._submit_prepared_shared_prefill_layers(
-                            mem_obj_consumer, prepared_sources, ret_mask, perf_enabled
+                            mem_obj_consumer, prepared_sources, ret_mask
                         )
                     )
                 except Exception:
@@ -5845,7 +5807,6 @@ class LMCacheEngine:
         sources_safe_to_release = True
         prepared_sources: list[Any] = []
         consumer_failed = False
-        perf_enabled = False
         retained_lease = (
             self.get_shared_cpu_request_lease(req_id)
             if kwargs.get("_reuse_shared_dense_prefix") else None
@@ -6151,7 +6112,7 @@ class LMCacheEngine:
                 try:
                     yield from (
                         self._submit_prepared_shared_prefill_layers(
-                            mem_obj_consumer, prepared_sources, ret_mask, perf_enabled
+                            mem_obj_consumer, prepared_sources, ret_mask
                         )
                     )
                 except Exception:
