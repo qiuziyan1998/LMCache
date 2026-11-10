@@ -484,30 +484,58 @@ def ordinary_layerwise_load(
         terminal.set_result(None)
 
 
-def _dense_source(
+def load_prepared_dense_source(
     adapter: Any, source: Any, plan: dict[str, Any], group: int, start: int = 0
 ) -> Any:
-    """Use the existing prepared direct kernel's implicit dense selection."""
+    """Restore a prepared prefix on the load stream using its destination layout."""
     engine = adapter.lmcache_engine
     connector = engine.gpu_connector
-    held = source.owner_lease.retain()
+    request = plan["request"]
+    dcp_load = getattr(request, "dsa_dcp_load", None) if group == 0 else None
+    lease = source.owner_lease
+    if lease is None and (
+        dcp_load is None or getattr(engine, "storage_process", None) is not None
+    ):
+        raise ValueError("Prepared process restore requires a source lease")
+    if dcp_load is not None:
+        mask = plan["token_mask"]
+        if mask.numel() != plan["token_count"] or mask.numel() != source.total_tokens:
+            raise ValueError("DCP restore source and mask must cover the same prefix")
+        selected, local_slots = dcp_load.select(plan["dsa_dcp_rank"], mask)
+        if not selected.numel():
+            return None
+    held = lease.retain() if lease is not None else None
     retriever = None
+    payload = slots = ids = counts = None
     try:
-        held.mark_imported()
+        if held is not None:
+            held.mark_imported()
         with torch.npu.stream(connector.load_stream):
-            slots = (
-                plan["request"].slot_mapping[0]
-                if group == 0
-                else plan["indexer_slots_cpu"][start:]
-            )
-            if plan.get("storage_mode") == "dense":
-                slots = slots[: plan["token_count"]].clone()
-                if slots.numel() != plan["token_count"]:
-                    raise ValueError("Ordinary prefix destination slots are incomplete")
-                slots.masked_fill_(
-                    ~plan["token_mask"].to(device=slots.device, dtype=torch.bool), -1
+            if dcp_load is not None:
+                slots = connector.stage_dense_load_tensor(local_slots, dtype=torch.long)
+                ids = connector.stage_dense_load_tensor(selected, dtype=torch.int32)
+                counts = connector.stage_dense_load_tensor(
+                    torch.tensor([selected.numel()], dtype=torch.int32, device="cpu"),
+                    dtype=torch.int32,
                 )
-            slots = connector.stage_dense_load_tensor(slots, dtype=torch.long)
+                payload = (ids, 0, slots, counts)
+            else:
+                slots = (
+                    request.slot_mapping[0]
+                    if group == 0
+                    else plan["indexer_slots_cpu"][start:]
+                )
+                if plan.get("storage_mode") == "dense":
+                    slots = slots[: plan["token_count"]].clone()
+                    if slots.numel() != plan["token_count"]:
+                        raise ValueError(
+                            "Ordinary prefix destination slots are incomplete"
+                        )
+                    slots.masked_fill_(
+                        ~plan["token_mask"].to(device=slots.device, dtype=torch.bool),
+                        -1,
+                    )
+                slots = connector.stage_dense_load_tensor(slots, dtype=torch.long)
             retriever = engine._retrieve_prepared_sparse_layers(
                 plan["tokens"],
                 {
@@ -518,25 +546,30 @@ def _dense_source(
                     "slot_mapping": slots,
                     "kv_group": group,
                     "sync": True,
-                    "req_id": plan["request"].req_id,
+                    "req_id": request.req_id,
                 },
             )
             next(retriever)
             for _ in source.layers:
-                retriever.send(None)
+                retriever.send(payload)
             readiness = connector.record_dense_load_readiness()
         connector.synchronize_dense_load_readiness(readiness)
-        held.release("fenced")
+        if held is not None:
+            held.release("fenced")
         return readiness
     except BaseException:
         try:
             connector.synchronize_dense_load_stream()
-        except BaseException:
-            engine.__dict__.setdefault("_failed_process_source_reads", []).append(
-                (held, source, retriever)
-            )
+        except BaseException as error:
+            if held is not None:
+                engine.__dict__.setdefault("_failed_process_source_reads", []).append(
+                    (held, source, retriever, ids, counts, slots)
+                )
+            else:
+                error._lmcache_dcp_load_operands = (source, ids, counts, slots)
             raise
-        held.release("fenced")
+        if held is not None:
+            held.release("fenced")
         raise
     finally:
         if retriever is not None:
@@ -575,7 +608,9 @@ def run_ordinary(
         if not import_ordinary_sources(adapter, plan, state):
             raise RuntimeError("Ordinary CPU prefix preparation missed safely")
         for group in (0, 1):
-            _dense_source(adapter, state.prepared_sparse_sources[group], plan, group)
+            load_prepared_dense_source(
+                adapter, state.prepared_sparse_sources[group], plan, group
+            )
             if stats is not None:
                 stats.on_retrieve_finished(monitors[group], retrieved_tokens)
                 finished_groups.add(group)
@@ -651,7 +686,7 @@ def run_indexer(adapter: Any, plan: dict[str, Any], device: int | None) -> Any:
     source = sources.get(1)
     readiness = None
     if source is not None:
-        readiness = _dense_source(adapter, source, plan, 1, base)
+        readiness = load_prepared_dense_source(adapter, source, plan, 1, base)
         engine.native_source_lifetime.retire_source(source)
         source.owner_lease.release("fenced")
         sources.pop(1)
@@ -749,7 +784,7 @@ def run_cold(
         plan["storage_sources"] = sources
         plan["latent_shared_ready"].set_result(None)
         if getattr(request.load_spec, "dsa_cold_resident_load", False):
-            _dense_source(adapter, sources[0], plan, 0)
+            load_prepared_dense_source(adapter, sources[0], plan, 0)
             state.dense_prefix_resident_tokens = plan["token_count"]
         mark("resident_load_ms")
         indexer.result()

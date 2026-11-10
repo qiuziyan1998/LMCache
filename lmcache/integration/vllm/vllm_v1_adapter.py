@@ -566,6 +566,38 @@ def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
 
 
+@dataclass(frozen=True, slots=True)
+class DsaDcpDenseLoad:
+    """Rank-independent Group-0 block IDs for an ordinary restore."""
+
+    block_size: int
+    world_size: int
+    block_ids: tuple[int, ...]
+
+    def select(self, rank: int, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the owned global token IDs and physical slots in a CPU mask."""
+        if (
+            not 0 <= rank < self.world_size
+            or mask.ndim != 1
+            or mask.dtype != torch.bool
+            or mask.device.type != "cpu"
+        ):
+            raise ValueError("Invalid DCP restore rank or token mask")
+        block = self.block_size
+        span = block * self.world_size
+        full, tail = divmod(mask.numel(), span)
+        count = full * block + min(block, max(0, tail - rank * block))
+        local = torch.arange(count, dtype=torch.long, device="cpu")
+        columns, offsets = local // block, local % block
+        tokens = columns * span + rank * block + offsets
+        selected = mask[tokens]
+        ids = torch.tensor(self.block_ids, dtype=torch.long, device="cpu")
+        return (
+            tokens[selected].int(),
+            ids[columns[selected]] * block + offsets[selected],
+        )
+
+
 def _build_slot_mapping(
     block_ids: list[int], block_size: int, num_tokens: int
 ) -> torch.Tensor:
@@ -1524,6 +1556,7 @@ class ReqMeta:
     )
     live_split_compact: bool = False
     live_split_latent_cpu: bool = False
+    dsa_dcp_load: Optional[DsaDcpDenseLoad] = None
 
     def retrieve_token_count(self) -> int:
         """Return the logical retrieve prefix represented by this metadata."""
@@ -2298,8 +2331,25 @@ class LMCacheConnectorV1Impl:
         self._checkpoint_cancels: list[tuple[str, int]] = []
 
         indexer_c8_layout = None
+        self._dsa_dcp_size = None
         if runtime_group_layer_counts is not None:
+            latent_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
             indexer_spec = kv_cache_config.kv_cache_groups[1].kv_cache_spec
+            dcp_size = getattr(latent_spec, "dsa_dcp_size", None)
+            if dcp_size is not None:
+                parallel = vllm_config.parallel_config
+                if (
+                    dcp_size <= 1
+                    or dcp_size != parallel.decode_context_parallel_size
+                    or dcp_size != parallel.tensor_parallel_size
+                    or parallel.prefill_context_parallel_size != 1
+                    or getattr(indexer_spec, "dsa_dcp_size", None) != 1
+                    or latent_spec.block_size != indexer_spec.block_size
+                    or parallel.cp_kv_cache_interleave_size != latent_spec.block_size
+                    or config.pd_role != "receiver"
+                ):
+                    raise ValueError("Invalid decoder DCP cache geometry")
+                self._dsa_dcp_size = dcp_size
             if getattr(indexer_spec, "cache_sparse_c8", False):
                 selected = getattr(indexer_spec, "indexer_c8_layer_names", None)
                 mask = (
@@ -2325,6 +2375,7 @@ class LMCacheConnectorV1Impl:
             runtime_kv_group_layer_counts=runtime_group_layer_counts,
             indexer_c8_layout=indexer_c8_layout,
             indexer_hbm_block_map=indexer_hbm_block_map,
+            dsa_dcp_size=self._dsa_dcp_size,
             runtime_kv_group_layer_names=(
                 tuple(
                     tuple(group.layer_names)
@@ -7622,6 +7673,16 @@ class LMCacheConnectorV1Impl:
             "plan_started": plan_started,
             "latent_shared_ready": Future(),
         }
+        dcp_load = getattr(request, "dsa_dcp_load", None)
+        if dcp_load is not None:
+            # Resolve the rank from the same group that owns the worker KV.
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            group = get_dcp_group()
+            if group.world_size != dcp_load.world_size:
+                raise ValueError("DCP restore layout disagrees with the worker group")
+            plan["dsa_dcp_rank"] = group.rank_in_group
+            indexer_block_ids.update(dcp_load.block_ids)
         if perf_enabled:
             build_ms = (serving_perf_now() - build_started) * 1000
         submitted_at = serving_perf_now() if perf_enabled else 0.0
@@ -7654,11 +7715,14 @@ class LMCacheConnectorV1Impl:
             submit_prepare(self, plan)
             if getattr(request.load_spec, "process_ordinary_load", False):
                 first = prefix // self._block_size * self._block_size
-                block_ids = _cold_indexer_block_ids(
-                    indexer_slots[first:], self._block_size
-                ) | _cold_indexer_block_ids(
-                    request.slot_mapping[0][first:], self._block_size
-                )
+                block_ids = _cold_indexer_block_ids(indexer_slots[first:], self._block_size)
+                if dcp_load is not None:
+                    span = dcp_load.block_size * dcp_load.world_size
+                    block_ids.update(dcp_load.block_ids[prefix // span:])
+                else:
+                    block_ids.update(_cold_indexer_block_ids(
+                        request.slot_mapping[0][first:], self._block_size
+                    ))
                 coordinator.submit_ordinary(
                     plan, generation, block_ids, submitted_at, npu_device_id,
                     self._run_process_ordinary_load,
@@ -8369,6 +8433,7 @@ class LMCacheConnectorV1Impl:
         token_count = plan["token_count"]
         tokens = plan["tokens"]
         token_mask = plan["token_mask"]
+        dcp_restore = "dsa_dcp_rank" in plan
         state = live_state or WorkerRetrieveState(req_id=request.req_id)
         load_generation = request.load_spec.dsa_cold_load_generation
         shared_generation = int(
@@ -8429,7 +8494,10 @@ class LMCacheConnectorV1Impl:
                     latent_kwargs_ms = (
                         serving_perf_now() - phase_started
                     ) * 1000
-                resident = getattr(request.load_spec, "dsa_cold_resident_load", False)
+                resident = (
+                    getattr(request.load_spec, "dsa_cold_resident_load", False)
+                    and not dcp_restore
+                )
                 if resident:
                     readiness_out: list[Any] = []
                     # The dense consumer validates/stages CPU slots inside the
@@ -8505,6 +8573,22 @@ class LMCacheConnectorV1Impl:
             latent_shared_ready = plan["latent_shared_ready"]
             if not latent_shared_ready.done():
                 latent_shared_ready.set_result(None)
+            if dcp_restore:
+                from lmcache.integration.vllm.storage_process import (
+                    load_prepared_dense_source,
+                )
+
+                # Group 1 can load on its own native path once the CPU source
+                # is shared. Submit Group 0 before joining Group 1 readiness.
+                seal_started = serving_perf_now() if perf_enabled else 0.0
+                self._refresh_prepared_sparse_sources(state, token_count)
+                source = state.prepared_sparse_sources.get(0)
+                if source is None:
+                    raise RuntimeError("Cold compact latent source was not sealed")
+                load_prepared_dense_source(self, source, plan, 0)
+                state.dense_prefix_resident_tokens = token_count
+                if perf_enabled:
+                    latent_seal_ms = (serving_perf_now() - seal_started) * 1000
             dependency_wait_started = serving_perf_now() if perf_enabled else 0.0
             (
                 _,
@@ -8529,10 +8613,11 @@ class LMCacheConnectorV1Impl:
             # Adopt the detached submission snapshot; publication need not copy
             # the full request history again on the decode thread.
             state.metadata_token_ids = tokens
-            self._refresh_prepared_sparse_sources(state, token_count)
-            if state.prepared_sparse_sources.get(0) is None:
+            if not dcp_restore:
+                self._refresh_prepared_sparse_sources(state, token_count)
+            source = state.prepared_sparse_sources.get(0)
+            if source is None:
                 raise RuntimeError("Cold compact latent source was not sealed")
-            source = state.prepared_sparse_sources[0]
             if live_state is None and source.graph_owners is not None:
                 # Both loading branches have finished modifying this private
                 # state. Readiness is still enforced by the coordinator.
@@ -8547,7 +8632,7 @@ class LMCacheConnectorV1Impl:
             )
             completed_at = serving_perf_now() if perf_enabled else 0.0
             if perf_enabled:
-                latent_seal_ms = (completed_at - seal_started) * 1000
+                latent_seal_ms += (completed_at - seal_started) * 1000
             state._dsa_cold_load_completed_at = completed_at
             if perf_enabled:
                 serving_perf_log(
@@ -12488,7 +12573,14 @@ class LMCacheConnectorV1Impl:
 
     def is_dsa_cold_compact_load(self, req_id: str) -> bool:
         """Return this attempt's layout policy independently of async timing."""
-        return bool(getattr(self.load_specs.get(req_id), "dsa_cold_compact_load", False))
+        spec = self.load_specs.get(req_id)
+        return bool(
+            getattr(spec, "dsa_cold_compact_load", False)
+            and not (
+                getattr(self, "_dsa_dcp_size", None)
+                and getattr(spec, "dsa_cold_resident_load", False)
+            )
+        )
 
     def get_dsa_cold_load_num_tokens(self, req_id: str) -> int:
         """Return the physical restore extent without advancing computed tokens."""
@@ -12893,9 +12985,10 @@ class LMCacheConnectorV1Impl:
     def _build_dsa_cold_compact_meta(
         self, request: Any, blocks: Any, load_spec: LoadSpec
     ) -> ReqMeta:
-        if getattr(load_spec, "process_ordinary_load", False) and hasattr(
-            blocks, "get_block_ids"
-        ):
+        ordinary = getattr(load_spec, "process_ordinary_load", False)
+        resident = getattr(load_spec, "dsa_cold_resident_load", False)
+        dcp_size = getattr(self, "_dsa_dcp_size", None)
+        if (ordinary or dcp_size) and hasattr(blocks, "get_block_ids"):
             # Ordinary slots are absolute logical positions, including the
             # local prefix. Filtering hashed blocks would shift the suffix.
             block_ids = blocks.get_block_ids()
@@ -12918,6 +13011,10 @@ class LMCacheConnectorV1Impl:
                 f"{required_indexer_blocks}, allocated_blocks="
                 f"{len(indexer_block_ids)}"
             )
+        if dcp_size and any(
+            block <= 0 for block in indexer_block_ids[:required_indexer_blocks]
+        ):
+            raise ValueError("DCP cold load requires allocated indexer blocks")
         token_ids = request.all_token_ids[: load_spec.lmcache_cached_tokens]
         if len(token_ids) != load_spec.lmcache_cached_tokens:
             raise ValueError(
@@ -12928,6 +13025,23 @@ class LMCacheConnectorV1Impl:
         mm_hashes, mm_positions = extract_mm_features(request)
         if mm_hashes and mm_positions:
             token_ids = _apply_mm_hashes(token_ids, mm_hashes, mm_positions)
+        latent_slots = []
+        dcp_load = None
+        if ordinary or resident:
+            latent_count = cdiv(len(token_ids), self._block_size * (dcp_size or 1))
+            if len(latent_block_ids) < latent_count:
+                mode = "Ordinary" if ordinary else "Resident"
+                raise ValueError(f"{mode} cold load requires complete latent destinations")
+            if dcp_size:
+                latent_ids = tuple(latent_block_ids[:latent_count])
+                if any(block <= 0 for block in latent_ids):
+                    raise ValueError("DCP dense load requires allocated latent blocks")
+                dcp_load = DsaDcpDenseLoad(self._block_size, dcp_size, latent_ids)
+                latent_slots = [torch.empty(0, dtype=torch.long, device="cpu")]
+            else:
+                latent_slots = [_build_slot_mapping(
+                    latent_block_ids, self._block_size, len(token_ids)
+                )]
         indexer_slot_mapping = [
             _build_slot_mapping(
                 indexer_block_ids,
@@ -12942,20 +13056,19 @@ class LMCacheConnectorV1Impl:
             validation_blocks = {}
             self._dsa_cold_indexer_block_ids = validation_blocks
         validation_blocks[request.request_id] = set(indexer_block_ids)
-        if getattr(load_spec, "process_ordinary_load", False):
-            if len(latent_block_ids) < required_indexer_blocks:
-                raise ValueError("Ordinary cold load requires complete latent destinations")
+        if dcp_load is not None:
+            validation_blocks[request.request_id].update(dcp_load.block_ids)
+        if ordinary:
             validation_blocks[request.request_id].update(latent_block_ids)
             return ReqMeta(
                 req_id=request.request_id,
                 token_ids=token_ids,
-                slot_mapping=[_build_slot_mapping(
-                    latent_block_ids, self._block_size, len(token_ids)
-                )],
+                slot_mapping=latent_slots,
                 indexer_slot_mapping=indexer_slot_mapping,
                 is_last_prefill=False,
                 is_sparse_decode=False,
                 load_spec=load_spec,
+                dsa_dcp_load=dcp_load,
                 request_configs=extract_request_configs(request.sampling_params),
             )
         remap_frontier = (
@@ -12966,19 +13079,15 @@ class LMCacheConnectorV1Impl:
         req_meta = ReqMeta(
             req_id=request.request_id,
             token_ids=token_ids,
+            slot_mapping=latent_slots,
             indexer_slot_mapping=indexer_slot_mapping,
             is_last_prefill=True,
             is_sparse_decode=True,
             dsa_nonresident_frontier=int(remap_frontier or 0),
             load_spec=load_spec,
+            dsa_dcp_load=dcp_load,
             request_configs=extract_request_configs(request.sampling_params),
         )
-        if getattr(load_spec, "dsa_cold_resident_load", False):
-            if len(latent_block_ids) < required_indexer_blocks:
-                raise ValueError("Resident cold load requires complete latent destinations")
-            req_meta.slot_mapping = [
-                _build_slot_mapping(latent_block_ids, self._block_size, len(token_ids))
-            ]
         params = getattr(request, "kv_transfer_params", None)
         raw_capabilities = (
             params.get("live_split_capabilities", ())

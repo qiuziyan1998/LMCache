@@ -54,6 +54,11 @@ def definitions(monkeypatch):
     )
     module = ModuleType("lmcache.integration.vllm.vllm_v1_adapter")
     module.WorkerRetrieveState = state
+    module.DsaDcpDenseLoad = loaded(
+        root / "lmcache/integration/vllm/vllm_v1_adapter.py",
+        "DsaDcpDenseLoad",
+        {"dataclass": dataclass, "torch": torch},
+    )
     module.LoadSpec = loaded(
         root / "lmcache/integration/vllm/vllm_v1_adapter.py",
         "LoadSpec",
@@ -337,6 +342,56 @@ def test_ready_cpu_job_does_not_publish_before_entire_predecessor(definitions):
     worker.release_sources(state, adapter.lmcache_engine)
 
 
+def test_dcp_workers_restore_owned_rows_from_the_same_prepared_prefix(definitions):
+    from lmcache.integration.vllm.vllm_v1_adapter import DsaDcpDenseLoad
+
+    queue = Queue()
+    layout = DsaDcpDenseLoad(2, 2, (7, 11))
+    for rank, expected in enumerate((([1, 4], [15, 22]), ([2], [14]))):
+        adapter, plan, calls, _ = setup(definitions, rank=rank, queue=queue)
+        plan["request"].load_spec.dsa_cold_resident_load = True
+        plan["request"].dsa_dcp_load = layout
+        plan["dsa_dcp_rank"] = rank
+        plan["token_mask"] = torch.tensor([False, True, True, False, True])
+        worker.submit_prepare(adapter, plan)
+        state = worker.run_cold(adapter, plan, None, complete())
+        source = state.prepared_sparse_sources[0]
+        try:
+            assert len(calls) == (1 if rank == 0 else 0)
+            assert source.total_tokens == state.dense_prefix_resident_tokens == 5
+            assert source.owner_lease.is_valid() and state.indexer_npu_resident
+            payloads = adapter.lmcache_engine.gpu_connector.payloads
+            assert len(payloads) == len(source.layers)
+            for group, (ids, start, slots, counts) in payloads:
+                assert group == start == 0
+                assert (ids.tolist(), slots.tolist()) == expected
+                assert counts.tolist() == [len(expected[0])]
+        finally:
+            worker.release_sources(state, adapter.lmcache_engine)
+        assert adapter.lmcache_engine.compact_source_importer.sources_drained()
+
+
+@pytest.mark.parametrize("dcp_size", [4, 8])
+def test_dcp_dense_selection_covers_exact_prefix_and_partial_tail(definitions, dcp_size):
+    from lmcache.integration.vllm.vllm_v1_adapter import DsaDcpDenseLoad
+
+    length = 1025
+    span = 128 * dcp_size
+    blocks = tuple(range(40, 40 + (length + span - 1) // span))
+    mask = torch.arange(length) >= 123
+    mask[256:260] = False
+    layout = DsaDcpDenseLoad(128, dcp_size, blocks)
+    seen = set()
+    for rank in range(dcp_size):
+        ids, slots = layout.select(rank, mask)
+        expected = [t for t in range(length) if mask[t] and t // 128 % dcp_size == rank]
+        assert ids.tolist() == expected
+        assert slots.tolist() == [blocks[t // span] * 128 + t % 128 for t in expected]
+        assert seen.isdisjoint(expected)
+        seen.update(expected)
+    assert seen == set(mask.nonzero().flatten().tolist())
+
+
 def test_constructor_failure_is_broadcast_to_every_rank(definitions):
     queue = Queue()
     first, plan, _, _ = setup(definitions, queue=queue)
@@ -398,7 +453,7 @@ def test_actual_ascend_prepared_generator_accepts_implicit_dense_payload(
         key_plan_digest=b"key-proof",
         source_end=5,
     )[0]
-    worker._dense_source(adapter, source, plan, group)
+    worker.load_prepared_dense_source(adapter, source, plan, group)
     assert adapter.lmcache_engine.gpu_connector.payloads == [(group, None)] * 2
     assert source.owner_lease.is_valid()
     source.owner_lease.release("fenced")
@@ -417,7 +472,7 @@ def test_dense_completion_unknown_retains_child_and_source(definitions):
     )[0]
     adapter.lmcache_engine.gpu_connector.fail_sync = True
     with pytest.raises(RuntimeError, match="unknown dense"):
-        worker._dense_source(adapter, source, plan, 0)
+        worker.load_prepared_dense_source(adapter, source, plan, 0)
     source.owner_lease.release("fenced")
     assert not importer.sources_drained()
     held = adapter.lmcache_engine._failed_process_source_reads[0][0]

@@ -76,6 +76,8 @@ class LMCacheMetadata:
     # Derived from native serving topology, never from a deployment override.
     # Payload format/ownership must still be qualified by the cache integration.
     mla_cache_tp_replicated: bool = False
+    # The DCP receiver reads one global CPU source with rank-local HBM destinations.
+    mla_cache_cpu_source_tp_shared: bool = False
 
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""

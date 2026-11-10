@@ -62,16 +62,20 @@ class StorageLookupClient(LookupClientInterface):
         storage_client: Any = None,
         token_database: Any = None,
     ) -> None:
+        canonical_source = (
+            getattr(metadata, "mla_cache_tp_replicated", False)
+            or getattr(metadata, "mla_cache_cpu_source_tp_shared", False)
+        )
         if (
             config.external_lookup_client is not None
             or config.enable_blending
             or config.pd_role != "receiver"
             or not metadata.use_mla
-            or not getattr(metadata, "mla_cache_tp_replicated", False)
+            or not canonical_source
             or not config.get_extra_config_value("save_only_first_rank", True)
         ):
             raise ValueError(
-                "Decoder process lookup requires replicated MLA receiver keys "
+                "Decoder process lookup requires canonical MLA receiver keys "
                 "and internal chunked lookup"
             )
         self.config = config

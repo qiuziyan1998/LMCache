@@ -9,11 +9,13 @@ from unittest.mock import Mock
 import ast
 import gc
 import socket
+import sys
 import time
 
 # Third Party
 import msgspec
 import pytest
+import torch
 
 # First Party
 from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
@@ -116,6 +118,59 @@ def metadata() -> SimpleNamespace:
         engine_id="cache",
         kv_connector_extra_config={},
     )
+
+
+@pytest.mark.parametrize("canonical_source", [False, True])
+def test_sharded_hbm_lookup_requires_a_canonical_cpu_source(
+    monkeypatch, canonical_source: bool
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "lmcache.integration.vllm.utils",
+        SimpleNamespace(
+            calculate_draft_layers=lambda _: 0,
+            calculate_local_rank_and_world_size=lambda _: (0, 4),
+            mla_enabled=lambda _: True,
+            validate_mla_config=lambda *_: None,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.utils.torch_utils",
+        SimpleNamespace(get_kv_cache_torch_dtype=lambda _, dtype: dtype),
+    )
+    settings = config(
+        local_cpu=True, enable_shared_cpu_cache=True, shared_cpu_cache_strict=True
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="model",
+            served_model_name="model",
+            dtype=torch.bfloat16,
+            get_num_layers=lambda _: 79,
+            get_num_kv_heads=lambda _: 1,
+            get_head_size=lambda: 576,
+        ),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+        parallel_config=SimpleNamespace(
+            world_size=4, rank=0, tensor_parallel_size=4, decode_context_parallel_size=4
+        ),
+    )
+    source_metadata = VllmServiceFactory(
+        settings, vllm_config, "scheduler", dsa_dcp_size=4 if canonical_source else None
+    ).get_or_create_metadata()
+    assert not source_metadata.mla_cache_tp_replicated
+    assert source_metadata.mla_cache_cpu_source_tp_shared is canonical_source
+    if not canonical_source:
+        with pytest.raises(ValueError, match="MLA receiver keys"):
+            StorageLookupClient(
+                settings, source_metadata, token_database=TokenDatabase()
+            )
+        return
+    client = StorageLookupClient(
+        settings, source_metadata, token_database=TokenDatabase()
+    )
+    client.close()
 
 
 @pytest.mark.parametrize("async_loading", [False, True])

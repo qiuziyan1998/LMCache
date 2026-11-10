@@ -57,6 +57,7 @@ class VllmServiceFactory(BaseServiceFactory):
         runtime_kv_group_layer_names: Optional[tuple[tuple[str, ...], ...]] = None,
         indexer_c8_layout: Optional[IndexerC8Layout] = None,
         indexer_hbm_block_map: Optional[tuple[int, ...]] = None,
+        dsa_dcp_size: Optional[int] = None,
     ) -> None:
         self.lmcache_config = lmcache_config
         self.vllm_config = vllm_config
@@ -65,6 +66,7 @@ class VllmServiceFactory(BaseServiceFactory):
         self.runtime_kv_group_layer_names = runtime_kv_group_layer_names
         self.indexer_c8_layout = indexer_c8_layout
         self.indexer_hbm_block_map = indexer_hbm_block_map
+        self.dsa_dcp_size = dsa_dcp_size
         self.metadata: Optional[LMCacheMetadata] = None
         self.lmcache_engine: Optional[LMCacheEngine] = None
 
@@ -152,6 +154,15 @@ class VllmServiceFactory(BaseServiceFactory):
             local_worker_id, local_world_size = calculate_local_rank_and_world_size(
                 self.vllm_config
             )
+        local_mla = (
+            use_mla
+            and num_kv_head == 1
+            and parallel_config.world_size == parallel_config.tensor_parallel_size
+            and getattr(parallel_config, "pipeline_parallel_size", 1) == 1
+            and getattr(parallel_config, "prefill_context_parallel_size", 1) == 1
+            and not getattr(parallel_config, "enable_elastic_ep", False)
+        )
+        dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
         self.metadata = LMCacheMetadata(
             model_name=model_config.model,
             world_size=parallel_config.world_size,
@@ -171,19 +182,16 @@ class VllmServiceFactory(BaseServiceFactory):
             runtime_kv_group_layer_names=self.runtime_kv_group_layer_names,
             indexer_c8_layout=self.indexer_c8_layout,
             indexer_hbm_block_map=self.indexer_hbm_block_map,
-            mla_cache_tp_replicated=(
-                use_mla
-                and num_kv_head == 1
-                and parallel_config.world_size == parallel_config.tensor_parallel_size
-                and all(
-                    getattr(parallel_config, name, 1) == 1
-                    for name in (
-                        "pipeline_parallel_size",
-                        "prefill_context_parallel_size",
-                        "decode_context_parallel_size",
-                    )
-                )
-                and not getattr(parallel_config, "enable_elastic_ep", False)
+            mla_cache_tp_replicated=local_mla and dcp_size == 1,
+            mla_cache_cpu_source_tp_shared=(
+                local_mla
+                and dcp_size > 1
+                and dcp_size == self.dsa_dcp_size
+                and dcp_size == parallel_config.tensor_parallel_size
+                and self.lmcache_config.pd_role == "receiver"
+                and self.lmcache_config.enable_shared_cpu_cache
+                and self.lmcache_config.shared_cpu_cache_strict
+                and self.lmcache_config.local_cpu
             ),
         )
         return self.metadata
