@@ -2350,6 +2350,7 @@ class LMCacheConnectorV1Impl:
         indexer_c8_layout = None
         self._dsa_dcp_size = None
         self._dsa_dcp_live_origin = 0
+        self._dsa_dcp_cold_geometry = None
         if runtime_group_layer_counts is not None:
             latent_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
             indexer_spec = kv_cache_config.kv_cache_groups[1].kv_cache_spec
@@ -2378,6 +2379,13 @@ class LMCacheConnectorV1Impl:
                     kv_cache_config.dsa_num_speculative_tokens + 1,
                 )
                 self._dsa_dcp_live_origin = cdiv(scratch, bundle) * bundle
+                from lmcache.integration.vllm.dcp import DcpColdLoadGeometry
+
+                self._dsa_dcp_cold_geometry = DcpColdLoadGeometry(
+                    self._dsa_dcp_live_origin * latent_spec.block_size * dcp_size,
+                    vllm_config.model_config.max_model_len,
+                    kv_cache_config.dsa_num_speculative_tokens,
+                )
             if getattr(indexer_spec, "cache_sparse_c8", False):
                 selected = getattr(indexer_spec, "indexer_c8_layer_names", None)
                 mask = (
@@ -12869,7 +12877,19 @@ class LMCacheConnectorV1Impl:
                     and getattr(self.config, "decode_preemption_checkpoint", False)
                 )
             )
-            and 1 < num_external_hit_tokens <= self._dsa_scratch_capacity
+            and (
+                1 < num_external_hit_tokens <= self._dsa_scratch_capacity
+                or (
+                    getattr(self, "_dsa_dcp_cold_geometry", None) is not None
+                    and num_external_hit_tokens > self._dsa_kv_policy_threshold
+                    and self._dsa_dcp_cold_geometry.fits(
+                        num_external_hit_tokens, request.num_tokens,
+                        getattr(request, "max_tokens", None),
+                        getattr(request, "num_output_tokens", 0),
+                        getattr(request, "resumable", False),
+                    )
+                )
+            )
         )
         dsa_cold_compact_load = (
             self.supports_dsa_cold_compact_load()
@@ -12890,8 +12910,8 @@ class LMCacheConnectorV1Impl:
                     and num_external_hit_tokens % self._block_size == 1
                 )
             )
-            # Short D prefixes restore both groups into resident slots and
-            # use a zero remap frontier. Long prefixes keep compact scratch.
+            # Bounded D prefixes restore both groups into resident slots and
+            # use a zero remap frontier. Other prefixes keep compact scratch.
             and (resident_cold_load or compact_remap_frontier >= self._dsa_scratch_capacity)
             # Preserve policy-controlled dense loading beyond the bounded
             # resident-prefix range; do not compact those requests implicitly.

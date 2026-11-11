@@ -10,6 +10,90 @@ import pytest
 import torch
 from test_checkpoint_adapter import method
 
+from lmcache.integration.vllm.dcp import DcpColdLoadGeometry
+
+
+@pytest.mark.parametrize(
+    "length,world,model_limit,max_output,output,resumable,threshold,hit_delta,expected",
+    [
+        (16464, 8, 20000, None, 0, False, 0, 0, True),
+        (20000, 8, 20000, None, 0, False, 0, 0, True),
+        (18433, 8, 20000, None, 0, False, 0, 0, True),
+        (16464, 4, 20000, None, 0, False, 0, 0, False),
+        (16464, 1, 20000, None, 0, False, 0, 0, False),
+        (32768, 8, 32768, None, 0, False, 0, 0, True),
+        (32769, 8, 40000, None, 0, False, 0, 0, False),
+        (16464, 8, 1000000, None, 0, False, 0, 0, False),
+        (16464, 8, 1000000, 16303, 0, False, 0, 0, True),
+        (16464, 8, 1000000, 16304, 0, False, 0, 0, False),
+        (16464, 8, 1000000, 16304, 1, False, 0, 0, True),
+        (16464, 8, 1000000, 1, 0, True, 0, 0, False),
+        (16464, 8, 20000, None, 0, True, 0, 0, True),
+        (16464, 8, 16000, None, 0, False, 0, 0, False),
+        (16464, 8, 20000, None, 0, False, 16464, 0, False),
+        (16464, 8, 20000, None, 0, False, 0, 128, False),
+    ],
+)
+@pytest.mark.parametrize("capable", [False, True])
+def test_dcp_resident_admission_bounds_growth_and_preserves_policy(
+    length, world, model_limit, max_output, output, resumable, threshold,
+    hit_delta, expected, capable,
+):
+    request = NS(
+        request_id="r", num_tokens=length, prompt_token_ids=[1] * length,
+        all_token_ids=[1] * length, num_preemptions=0, status="waiting",
+        max_tokens=max_output, num_output_tokens=output, resumable=resumable,
+    )
+    adapter = NS(
+        _resident_cold_load_enabled=capable, kv_role="kv_both",
+        _dsa_dcp_size=world if world > 1 else None,
+        _dsa_dcp_cold_geometry=(
+            DcpColdLoadGeometry(32 * 128 * world, model_limit, 1)
+            if world > 1 else None
+        ),
+        lookup_client=NS(lookup_cache=lambda **kw: length - hit_delta),
+        _cold_perf_lookup_started={}, _lmcache_chunk_size=1024, _block_size=128,
+        _dsa_scratch_capacity=4096, _dsa_kv_policy_threshold=threshold,
+        config=NS(pd_role="receiver", min_retrieve_tokens=0,
+                  dsa_group1_load_mode="p2p_preferred"),
+        enable_sparse_attention=True, supports_dsa_cold_compact_load=lambda: True,
+        load_specs={}, _requests_priority={},
+    )
+    matched = method(
+        "get_num_new_matched_tokens", cdiv=lambda a, b: (a + b - 1) // b, LoadSpec=NS
+    )(adapter, request, 0)
+    spec = adapter.load_specs["r"]
+    assert matched == length - (hit_delta or 1)
+    resident = expected and capable
+    assert getattr(spec, "dsa_cold_resident_load", False) == resident
+    if resident:
+        assert spec.dsa_cold_compact_load
+        assert spec.dsa_committed_end == length
+        assert spec.dsa_remap_frontier == spec.dsa_release_frontier == 0
+        assert spec.dsa_cold_resume_computed_end == length - 1
+        assert not method("is_dsa_cold_compact_load")(adapter, "r")
+        adapter.should_load_kv_async = lambda req_id: method("should_load_kv_async")(
+            adapter, req_id
+        )
+        assert method("get_dsa_cold_load_num_tokens")(adapter, "r") == length
+        # A scoped checkpoint restore credits its whole source, while retaining
+        # the un-restored accepted suffix for the existing recompute path.
+        request.status = "preempted"
+        request.num_preemptions = 1
+        request.prompt_token_ids = request.prompt_token_ids[:-128]
+        adapter._resume_lookup_queries = {"r": (length - 1, "preemption_checkpoint", 0)}
+        adapter.lookup_client.lookup_cache = lambda **kw: length - 1
+        matched = method(
+            "get_num_new_matched_tokens", cdiv=lambda a, b: (a + b - 1) // b,
+            LoadSpec=NS,
+        )(adapter, request, 0)
+        spec = adapter.load_specs["r"]
+        assert matched == length - 1 and spec.dsa_cold_resident_load
+        assert spec.dsa_cold_resume_computed_end == spec.dsa_committed_end == length - 1
+        assert spec.dsa_remap_frontier == spec.dsa_release_frontier == 0
+        assert spec.checkpoint_generation == 1
+        assert request.kv_resume_checkpoint == (1, length, length - 1)
+
 
 @pytest.mark.parametrize("length", [2, 127, 128, 129, 280, 1025, 4095, 4096, 4097])
 @pytest.mark.parametrize("role", [None, "sender", "receiver"])
@@ -562,8 +646,8 @@ def test_completed_resident_restore_requires_both_groups(resident_tokens):
     assert not check(NS(load_spec=spec), state)
 
 
-@pytest.mark.parametrize("length", [129, 280, 4096])
-@pytest.mark.parametrize("dcp_size", [None, 4])
+@pytest.mark.parametrize("length", [129, 280, 4096, 16464, 18433, 20000])
+@pytest.mark.parametrize("dcp_size", [None, 4, 8])
 def test_resident_metadata_covers_full_hit_in_both_groups(length, dcp_size):
     from dataclasses import dataclass
     from tests.standalone.test_storage_process_worker import loaded
@@ -609,6 +693,17 @@ def test_resident_metadata_covers_full_hit_in_both_groups(length, dcp_size):
     else:
         assert meta.slot_mapping[0].numel() == 0
         assert meta.dsa_dcp_load.block_ids == tuple(latent)
+        owned = []
+        for rank in range(dcp_size):
+            tokens, slots = meta.dsa_dcp_load.select(
+                rank, torch.ones(length, dtype=torch.bool)
+            )
+            assert torch.all((tokens // 128) % dcp_size == rank)
+            local = (tokens // (128 * dcp_size)) * 128 + tokens % 128
+            expected = torch.tensor(latent)[local // 128] * 128 + local % 128
+            assert torch.equal(slots, expected)
+            owned.extend(tokens.tolist())
+        assert sorted(owned) == list(range(length))
         with pytest.raises(ValueError, match="allocated indexer"):
             build(adapter, request, (latent, [0, *indexer[1:]]), spec)
     with pytest.raises(ValueError, match="complete latent"):

@@ -7,6 +7,38 @@ from typing import Iterator
 
 
 @dataclass(frozen=True)
+class DcpColdLoadGeometry:
+    """Bound complete-shard residency by the existing rounded scratch budget."""
+
+    resident_token_capacity: int
+    max_model_len: int
+    speculative_tokens: int
+
+    def fits(
+        self,
+        prefix: int,
+        history: int,
+        max_output: int | None,
+        output: int,
+        resumable: bool,
+    ) -> bool:
+        """Check source coverage and worst-case growth in global token units.
+
+        Unknown output limits or streaming input use the full model limit.
+        The capacity is scratch_blocks * physical_block_size * DCP_size;
+        scratch_blocks already includes bundle rounding. Thus any admitted
+        resident allocation fits within compact's scratch alone, while compact
+        admission also needs a live boundary bundle. Group 1 costs are equal.
+        """
+        end = self.max_model_len
+        if max_output is not None and not resumable:
+            end = min(
+                end, history + max(0, max_output - output) + self.speculative_tokens
+            )
+        return 1 < prefix <= history <= end <= self.resident_token_capacity
+
+
+@dataclass(frozen=True)
 class DcpWriteLayout:
     """Describe Group-0 addressing without changing canonical CPU page positions.
 
