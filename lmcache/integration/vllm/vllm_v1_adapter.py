@@ -5252,6 +5252,13 @@ class LMCacheConnectorV1Impl:
         committed_end: int,
     ) -> int:
         """Return a safe release authorization for a persisted frontier."""
+        if getattr(self, "_dsa_dcp_size", None):
+            # Dense DCP requests keep their ordinary sharded HBM layout even
+            # after persistence. Sparse decode needs the scheduler-allocated
+            # shifted scratch table; a completed save cannot establish it.
+            request = self._unfinished_requests.get(tracker.req_id)
+            if request is None or not request.dsa_compact_allocated:
+                return 0
         policy_threshold = int(
             getattr(self, "_dsa_kv_policy_threshold", 0) or 0
         )

@@ -6,6 +6,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
 from queue import Queue
 from threading import Barrier
@@ -13,10 +14,14 @@ from types import MethodType, ModuleType, SimpleNamespace as NS
 import sys
 
 import msgspec
+import numpy as np
 import pytest
 import torch
 
 from lmcache.integration.vllm import storage_process as worker
+from lmcache.integration.vllm.decode_window_commit import (
+    publish_delayed_decode_window_commit,
+)
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.rpc.storage_lifetime import NativeSourceLifetime
 from lmcache.v1.rpc.storage_protocol import (
@@ -91,7 +96,9 @@ def complete(value=None):
     "world,phase,compact",
     [(4, "miss", False), (8, "resume", False), (4, "resident_resume", False),
      (4, "decode", False), (8, "long_decode", False), (4, "decode", True),
-     (1, "decode", False)],
+     (1, "decode", False), (8, "persisted_decode", False),
+     (4, "persisted_decode", False), (8, "persisted_long_decode", False),
+     (8, "persisted_decode", True), (1, "persisted_decode", False)],
 )
 def test_dcp_scheduler_metadata_follows_the_allocated_layout(world, phase, compact):
     path = Path(__file__).resolve().parents[2] / "lmcache/integration/vllm/vllm_v1_adapter.py"
@@ -106,6 +113,8 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(world, phase, compa
         extract_mm_features=lambda *a, **kw: (None, None),
         extract_request_configs=lambda _: None,
         logger=NS(debug=lambda *a: None, error=lambda *a: None),
+        _mtp_dw_event=lambda *a, **kw: None,
+        publish_delayed_decode_window_commit=publish_delayed_decode_window_commit,
     )
     for name in (
         "_flatten_block_ids", "_split_kv_group_block_ids", "_copy_block_ids_by_bank",
@@ -116,7 +125,11 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(world, phase, compa
         loaded(path, name, ns)
 
     resident = phase == "resident_resume"
-    prompt_len = {"resident_resume": 257, "long_decode": 16385}.get(phase, 6145)
+    persisted = phase.startswith("persisted_")
+    prompt_len = {
+        "resident_resume": 257, "long_decode": 16385,
+        "persisted_decode": 16385, "persisted_long_decode": 49153,
+    }.get(phase, 6145)
     prompt = list(range(prompt_len))
     first = phase in ("miss", "resume", "resident_resume")
     computed = {"miss": 0, "resume": 4096, "resident_resume": 256}.get(phase, prompt_len)
@@ -141,7 +154,8 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(world, phase, compa
         spec.dsa_cold_resume_computed_end = computed
     adapter = NS(
         config=NS(dsa_two_groups=True, priority_limit=None, save_decode_cache=False),
-        kv_role="kv_consumer", enable_sparse_attention=True, _dsa_dcp_size=world if world > 1 else None,
+        kv_role="kv_both" if persisted else "kv_consumer", force_skip_save=False,
+        enable_sparse_attention=True, _dsa_dcp_size=world if world > 1 else None,
         _dsa_scratch_capacity=4096, _dsa_kv_policy_threshold=0, _dsa_kv_policy_log=False,
         _dsa_dcp_live_origin=32,
         _block_size=128, _lmcache_chunk_size=1024, _discard_partial_chunks=True,
@@ -153,13 +167,35 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(world, phase, compa
     )
     if not first:
         tracker = ns["RequestTracker"].from_new_request(
-            adapter.config, request, len(prompt), 4096, True,
+            adapter.config, request, len(prompt),
+            0 if persisted and not compact else 4096, not persisted,
         )
         if compact:
             tracker.dsa_nonresident_frontier = tracker.sparse_remap_frontier = len(prompt) - 1
         adapter._request_trackers["r"] = tracker
     for name in ("_take_completed_cold_load", "_build_request_meta", "_dcp_write_layout"):
         setattr(adapter, name, MethodType(loaded(path, name, ns, "LMCacheConnectorV1Impl"), adapter))
+    if persisted:
+        # Actual final-prefill completion followed by scheduler reconciliation.
+        # Saving the prompt also reports completion when decode-window size is 0.
+        mark = loaded(path, "_mark_prefill_committed", ns, "LMCacheConnectorV1Impl")
+        saved = NS(
+            _completed_decode_window_saves={}, _lmcache_chunk_size=1024,
+            _is_decode_window_save_request=lambda _: False,
+        )
+        mark(
+            saved, NS(req_id="r", token_ids=prompt,
+                      is_last_prefill=True, is_sparse_decode=False), len(prompt),
+        )
+        adapter._eligible_dsa_release_frontier = MethodType(
+            loaded(path, "_eligible_dsa_release_frontier", ns,
+                   "LMCacheConnectorV1Impl"), adapter,
+        )
+        consume = loaded(path, "update_connector_output", ns, "LMCacheConnectorV1Impl")
+        consume(
+            adapter,
+            NS(completed_decode_window_saves=saved._completed_decode_window_saves),
+        )
     build = loaded(path, "build_connector_meta", ns, "LMCacheConnectorV1Impl")
     result = build(adapter, NS(
         finished_req_ids=set(), scheduled_new_reqs=[request] if first else [],
@@ -168,6 +204,71 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(world, phase, compa
         ),
         num_scheduled_tokens={"r": scheduled},
     )).requests[0]
+    if persisted:
+        # Exercise the deployed Ascend graph classifier, not a test-only oracle.
+        ascend = path.parents[4] / "vllm-ascend/vllm_ascend"
+        route_ns = {
+            "Enum": Enum, "dataclass": dataclass, "np": np,
+            "sfa_full_graph_enabled": lambda _: True,
+            "unwrap_staged_sfa_connector_metadata": lambda metadata: metadata,
+            "CUDAGraphMode": NS(PIECEWISE="piecewise"),
+        }
+        loaded(path.parents[4] / "vllm/vllm/forward_context.py",
+               "BatchDescriptor", route_ns)
+        for name in ("StagedSFAQueryProfile", "StagedSFAGraphKey"):
+            loaded(ascend / "ascend_forward_context.py", name, route_ns)
+        for name in (
+            "StagedSFARouteAction", "StagedSFARouteReason", "StagedSFARouteDecision",
+        ):
+            loaded(ascend / "utils.py", name, route_ns)
+        loaded(ascend / "attention/attention_v1.py", "AscendAttentionState", route_ns)
+        for name in ("_dsa_remap_frontier", "staged_sfa_metadata_sparse_route"):
+            loaded(ascend / "attention/utils.py", name, route_ns)
+        route = loaded(ascend / "worker/model_runner_v1.py", "_staged_sfa_local_route",
+                       route_ns, "NPUModelRunner")
+        bind = loaded(ascend / "worker/model_runner_v1.py", "_staged_sfa_live_route",
+                      route_ns, "NPUModelRunner")
+        apply = loaded(ascend / "worker/model_runner_v1.py", "_apply_staged_sfa_route",
+                       route_ns, "NPUModelRunner")
+        runner = NS(
+            _staged_sfa_graph_capture_sizes=[2, 4, 8, 16, 32],
+            speculative_config=NS(num_speculative_tokens=1), decode_threshold=2,
+            vllm_config=NS(lora_config=None),
+            parallel_config=NS(data_parallel_size=1),
+            attn_state=route_ns["AscendAttentionState"].DecodeOnly,
+        )
+        for query_width in (1, 2):
+            decision = route(
+                runner, num_tokens_unpadded=query_width, num_reqs=1,
+                num_scheduled_tokens=np.array([query_width]),
+                index_topk=2048, has_cascade_attention=False, request_ids=["r"],
+                kv_connector_metadata=NS(requests=[result]),
+                num_computed_tokens=[computed], prompt_lens=[prompt_len],
+            )
+            assert decision.action == route_ns["StagedSFARouteAction"].STAGED, (
+                decision.reason
+            )
+            live = bind(
+                runner, local_route=decision, dp_route_action=decision.action,
+                cudagraph_mode="piecewise",
+                batch_descriptor=route_ns["BatchDescriptor"](num_tokens=2),
+                num_tokens_unpadded=query_width, num_tokens_padded=2,
+                num_reqs=1, should_ubatch=False,
+            )
+            key = apply(runner, live)
+            assert key is not None and key.token_capacity == 2
+            assert key.query_profile == (
+                route_ns["StagedSFAQueryProfile"].DECODE_BOUNDED if query_width == 1
+                else route_ns["StagedSFAQueryProfile"].SPEC_FIXED
+            )
+        release_expected = prompt_len // 1024 * 1024 if compact or world == 1 else 0
+        assert tracker.dsa_current_released_frontier == release_expected
+        assert tracker.dsa_nonresident_frontier == release_expected
+        assert tracker.decode_window_save_committed_end == prompt_len // 1024 * 1024
+        assert saved._completed_decode_window_saves == (
+            {"r": release_expected} if release_expected else {}
+        )
+        assert decision.frontiers == (release_expected,)
     if compact or world == 1:
         assert result.is_sparse_decode and result.load_spec.can_load
         assert result.load_spec.dsa_remap_frontier == len(prompt) - 1
