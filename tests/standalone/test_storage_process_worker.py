@@ -98,9 +98,13 @@ def complete(value=None):
      (4, "decode", False), (8, "long_decode", False), (4, "decode", True),
      (1, "decode", False), (8, "persisted_decode", False),
      (4, "persisted_decode", False), (8, "persisted_long_decode", False),
-     (8, "persisted_decode", True), (1, "persisted_decode", False)],
+     (8, "persisted_decode", True), (1, "persisted_decode", False),
+     (1, "persisted_logged_decode", False), (1, "persisted_aligned_decode", False)],
 )
-def test_dcp_scheduler_metadata_follows_the_allocated_layout(world, phase, compact):
+@pytest.mark.parametrize("storage_mode", ["local", "process"])
+def test_dcp_scheduler_metadata_follows_the_allocated_layout(
+    world, phase, compact, storage_mode,
+):
     path = Path(__file__).resolve().parents[2] / "lmcache/integration/vllm/vllm_v1_adapter.py"
 
     def cdiv(n, d):
@@ -129,6 +133,8 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(world, phase, compa
     prompt_len = {
         "resident_resume": 257, "long_decode": 16385,
         "persisted_decode": 16385, "persisted_long_decode": 49153,
+        "persisted_logged_decode": 11577,
+        "persisted_aligned_decode": 16384,
     }.get(phase, 6145)
     prompt = list(range(prompt_len))
     first = phase in ("miss", "resume", "resident_resume")
@@ -153,7 +159,8 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(world, phase, compa
         spec.dsa_remap_frontier = 0
         spec.dsa_cold_resume_computed_end = computed
     adapter = NS(
-        config=NS(dsa_two_groups=True, priority_limit=None, save_decode_cache=False),
+        config=NS(dsa_two_groups=True, priority_limit=None, save_decode_cache=False,
+                  decoder_storage_mode=storage_mode),
         kv_role="kv_both" if persisted else "kv_consumer", force_skip_save=False,
         enable_sparse_attention=True, _dsa_dcp_size=world if world > 1 else None,
         _dsa_scratch_capacity=4096, _dsa_kv_policy_threshold=0, _dsa_kv_policy_log=False,
@@ -271,7 +278,47 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(world, phase, compa
         assert decision.frontiers == (release_expected,)
     if compact or world == 1:
         assert result.is_sparse_decode and result.load_spec.can_load
-        assert result.load_spec.dsa_remap_frontier == len(prompt) - 1
+        assert result.load_spec.dsa_remap_frontier == (
+            len(prompt) - 1 if compact else len(prompt) // 1024 * 1024
+        )
+        if persisted and world == 1:
+            extent = (len(prompt) if storage_mode == "process"
+                      else len(prompt) // 1024 * 1024)
+            assert result.load_spec.lmcache_cached_tokens == extent
+            assert result.retrieve_token_count() == extent
+            assert result.load_spec.cpu_source_ticket is None
+            assert request.num_computed_tokens == computed
+            assert result.load_spec.dsa_committed_end == release_expected
+            assert result.load_spec.dsa_release_frontier == release_expected
+            assert result.indexer_slot_mapping[0].numel() == extent
+            last_block = block_ids[1][(extent - 1) // 128]
+            assert result.indexer_slot_mapping[0][-1] == (
+                last_block * 128 + (extent - 1) % 128
+            )
+            if storage_mode == "process":
+                # A locally stored paired source includes the partial tail.
+                # Its exact-length certificate must survive first sparse decode.
+                source = NS(total_tokens=len(prompt))
+                state = NS(
+                    shared_request_active=True, prepared_sparse_sources={0: source}
+                )
+                worker = NS(lmcache_engine=NS(enable_shared_cpu_cache=True))
+                select = loaded(path, "_prepared_sparse_source", ns,
+                                "LMCacheConnectorV1Impl")
+                assert select(worker, state, 0, extent) is source
+                request.num_computed_tokens = len(tracker.token_ids)
+                request.all_token_ids.append(9998)
+                following = build(adapter, NS(
+                    finished_req_ids=set(), scheduled_new_reqs=[],
+                    scheduled_cached_reqs=NS(
+                        req_ids=["r"], resumed_req_ids=set(), new_block_ids=[None],
+                    ),
+                    num_scheduled_tokens={"r": 1},
+                )).requests[0]
+                assert following.sparse_warm_ref and following.token_ids == []
+                assert following.retrieve_token_count() == extent
+                assert following.load_spec.dsa_remap_frontier == release_expected
+                assert following.load_spec.cpu_source_ticket is None
     elif resident:
         assert result.is_sparse_decode and result.load_spec.dsa_cold_compact_resume
         assert result.load_spec.dsa_remap_frontier == 0
