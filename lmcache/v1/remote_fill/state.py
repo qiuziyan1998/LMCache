@@ -1020,6 +1020,25 @@ class RemoteFillStateCore:
                 (p.kv_group, p.chunk_index) for p in existing.control_pages
             )
         if selector_conflicts:
+            logger.warning(
+                "remote_fill_selector_conflict transfer=%s req_window=%s "
+                "conflicting=%s owners=%s",
+                transaction.transfer_id,
+                request.window_id,
+                sorted(selector_conflicts)[:8],
+                {
+                    window.window_id: [
+                        (page.kv_group, page.chunk_index)
+                        for page in window.control_pages
+                        if (page.kv_group, page.chunk_index) in selector_conflicts
+                    ]
+                    for window in transaction.windows.values()
+                    if any(
+                        (page.kv_group, page.chunk_index) in selector_conflicts
+                        for page in window.control_pages
+                    )
+                },
+            )
             return self._response(
                 request,
                 ResultCode.WINDOW_CONFLICT,
@@ -1885,6 +1904,14 @@ class RemoteFillStateCore:
         window: _Window,
         reason: str,
     ) -> bool:
+        # A released window no longer owns its selectors. Keeping them would
+        # reject any later reservation that re-covers the same chunk, even
+        # though the previous attempt transferred nothing usable.
+        for page in window.control_pages:
+            transaction.registered_selectors.discard(
+                (page.kv_group, page.chunk_index)
+            )
+            transaction.registered_keys.discard(page.canonical_key)
         pages = tuple(
             reservation.view()
             for reservation in window.reservations
