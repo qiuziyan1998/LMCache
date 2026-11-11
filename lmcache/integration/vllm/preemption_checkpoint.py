@@ -29,6 +29,8 @@ class CaptureSpec:
     blocks: tuple[tuple[int, ...], ...]
     request_configs: dict[str, Any] | None = None
     prefix_end: int = 0
+    # Value-only DcpWriteLayout for Group 0; absent for ordinary replicated KV.
+    dcp_write_layout: Any = None
 
 
 @dataclass(frozen=True)

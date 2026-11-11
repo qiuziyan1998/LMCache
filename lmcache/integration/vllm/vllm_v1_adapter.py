@@ -1557,6 +1557,7 @@ class ReqMeta:
     live_split_compact: bool = False
     live_split_latent_cpu: bool = False
     dsa_dcp_load: Optional[DsaDcpDenseLoad] = None
+    dcp_write_layout: Any = None
 
     def retrieve_token_count(self) -> int:
         """Return the logical retrieve prefix represented by this metadata."""
@@ -1572,6 +1573,7 @@ class ReqMeta:
         window_end: int,
         window_size: int,
         windowed_sparse_layerwise_save: bool = False,
+        dcp_write_layout: Any = None,
     ) -> Optional["ReqMeta"]:
         """Create isolated metadata for a decode-window save."""
         if window_start < 0 or window_end <= window_start:
@@ -1587,7 +1589,10 @@ class ReqMeta:
         )
 
         num_blocks = len(tracker.allocated_block_ids)
-        if window_end > num_blocks * block_size:
+        capacity = num_blocks * block_size
+        if dcp_write_layout is not None:
+            capacity = (num_blocks - dcp_write_layout.live_origin) * block_size * dcp_write_layout.world_size
+        if window_end > capacity:
             logger.warning(
                 "Skipping decode window save for request %s: "
                 "window_end=%d exceeds slot capacity %d",
@@ -1628,7 +1633,7 @@ class ReqMeta:
 
         save_slot_mapping: list[torch.Tensor] = []
         save_indexer_slot_mapping: list[torch.Tensor] = []
-        if windowed_sparse_layerwise_save:
+        if windowed_sparse_layerwise_save and dcp_write_layout is None:
             save_slot_mapping = [
                 _build_slot_mapping_window(
                     tracker.allocated_block_ids,
@@ -1637,10 +1642,10 @@ class ReqMeta:
                     window_end,
                 )
             ]
-            if indexer_slot_mapping:
-                save_indexer_slot_mapping = indexer_slot_mapping
+        if windowed_sparse_layerwise_save and indexer_slot_mapping:
+            save_indexer_slot_mapping = indexer_slot_mapping
 
-        slot_mapping = (
+        slot_mapping = [] if dcp_write_layout is not None else (
             save_slot_mapping
             if windowed_sparse_layerwise_save
             else [
@@ -1675,6 +1680,7 @@ class ReqMeta:
             decode_window_start=window_start,
             decode_window_end=window_end,
             decode_window_size=window_size,
+            dcp_write_layout=dcp_write_layout,
         )
 
     @staticmethod
@@ -1692,6 +1698,7 @@ class ReqMeta:
         save_entire_prefix: bool = False,
         live_source_requested: bool = False,
         layerwise_prefill_dma: bool = False,
+        dsa_dcp_size: Optional[int] = None,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -1706,6 +1713,7 @@ class ReqMeta:
                 mappings and preserve chunked-prefill tails.
             save_entire_prefix (bool): retain a full source mapping for producer
                 roles that intentionally resend the complete prefix.
+            dsa_dcp_size: Number of ranks sharing the logical Group-0 extent.
 
         Returns:
             the request metadata if we need to perform load/save
@@ -1829,6 +1837,13 @@ class ReqMeta:
             (load_spec is not None and load_spec.can_load)
             or not skip_save
             or live_source_requested
+        )
+        # A completed dense restore only needs its generation and readiness.
+        # A dense miss with saving disabled only carries metrics. Neither needs
+        # global slot mappings derived from the sharded latent block table.
+        dcp_metadata_only = dsa_dcp_size is not None and (
+            not requires_indexer_slots
+            or getattr(load_spec, "process_ordinary_resume", False)
         )
         if requires_indexer_slots and not tracker.allocated_block_ids_indexer:
             raise RuntimeError(
@@ -1979,7 +1994,7 @@ class ReqMeta:
 
         num_blocks = len(tracker.allocated_block_ids)
 
-        if len(token_ids) > num_blocks * block_size:
+        if len(token_ids) > num_blocks * block_size * (dsa_dcp_size or 1):
             logger.error(
                 "The number of tokens is more than the number of blocks"
                 " for request %s. "
@@ -2009,7 +2024,7 @@ class ReqMeta:
                 skip_leading_tokens // lmcache_chunk_size * lmcache_chunk_size
             )
             save_end = len(token_ids)
-            save_slot_mapping = [
+            save_slot_mapping = [] if dsa_dcp_size is not None else [
                 _build_slot_mapping_window(
                     tracker.allocated_block_ids,
                     block_size,
@@ -2030,7 +2045,9 @@ class ReqMeta:
         needs_full_slots = bool(
             (load_spec is not None and load_spec.can_load) or save_entire_prefix
         )
-        if is_sparse_decode and load_spec is not None:
+        if dcp_metadata_only or (dsa_dcp_size is not None and not is_sparse_decode):
+            slot_mapping = []
+        elif is_sparse_decode and load_spec is not None:
             num_slots = _sparse_slot_mapping_len(load_spec.lmcache_cached_tokens)
             current_slots = (
                 int(tracker.sparse_slot_mapping[0].numel())
@@ -2055,7 +2072,7 @@ class ReqMeta:
             ]
 
         indexer_slot_mapping: list[torch.Tensor] = []
-        if dsa_two_groups and tracker.allocated_block_ids_indexer:
+        if dsa_two_groups and tracker.allocated_block_ids_indexer and not dcp_metadata_only:
             indexer_num_blocks = len(tracker.allocated_block_ids_indexer)
             if len(token_ids) > indexer_num_blocks * block_size:
                 logger.error(
@@ -2125,7 +2142,7 @@ class ReqMeta:
 
         decode_token_mask: Optional[torch.Tensor] = None
         decode_ret_mask: Optional[torch.Tensor] = None
-        if is_sparse_decode and load_spec is not None:
+        if is_sparse_decode and load_spec is not None and not dcp_metadata_only:
             num_retrieve_tokens = len(token_ids)
             if load_spec.vllm_cached_tokens > 0:
                 if (
@@ -2332,6 +2349,7 @@ class LMCacheConnectorV1Impl:
 
         indexer_c8_layout = None
         self._dsa_dcp_size = None
+        self._dsa_dcp_live_origin = 0
         if runtime_group_layer_counts is not None:
             latent_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
             indexer_spec = kv_cache_config.kv_cache_groups[1].kv_cache_spec
@@ -2350,6 +2368,16 @@ class LMCacheConnectorV1Impl:
                 ):
                     raise ValueError("Invalid decoder DCP cache geometry")
                 self._dsa_dcp_size = dcp_size
+                from vllm.v1.core.dsa_shared_pool import (
+                    dsa_scratch_blocks_for_topk, dsa_shared_block_layout,
+                )
+
+                bundle = dsa_shared_block_layout(latent_spec, indexer_spec).latent_blocks_per_bundle
+                scratch = dsa_scratch_blocks_for_topk(
+                    kv_cache_config.dsa_index_topk, latent_spec.block_size,
+                    kv_cache_config.dsa_num_speculative_tokens + 1,
+                )
+                self._dsa_dcp_live_origin = cdiv(scratch, bundle) * bundle
             if getattr(indexer_spec, "cache_sparse_c8", False):
                 selected = getattr(indexer_spec, "indexer_c8_layer_names", None)
                 mask = (
@@ -8870,7 +8898,8 @@ class LMCacheConnectorV1Impl:
             if (getattr(load_spec, "dsa_cold_compact_load", False)
                     or getattr(load_spec, "process_ordinary_load", False)):
                 continue
-            if getattr(load_spec, "process_ordinary_resume", False):
+            ordinary_resume = getattr(load_spec, "process_ordinary_resume", False)
+            if ordinary_resume:
                 if not self._completed_cold_resume(request):
                     raise RuntimeError("Ordinary prefix resume lost its prepared generation")
                 self._consume_dsa_cold_dense_load_readiness(
@@ -8886,7 +8915,7 @@ class LMCacheConnectorV1Impl:
             has_load_spec = True
             vllm_hit_tokens += load_spec.vllm_cached_tokens
             prompt_tokens += request.retrieve_token_count()
-            if not load_spec.can_load:
+            if not load_spec.can_load or ordinary_resume:
                 continue
             loadable_requests.append((idx, request))
             if self.use_layerwise and not request.is_sparse_decode:
@@ -13492,8 +13521,27 @@ class LMCacheConnectorV1Impl:
             save_entire_prefix=self.kv_role == "kv_producer",
             live_source_requested=live_source_requested,
             layerwise_prefill_dma=getattr(self, "_layerwise_prefill_dma", False),
+            dsa_dcp_size=getattr(self, "_dsa_dcp_size", None),
         )
+        if (metadata is not None and metadata.save_spec is not None
+                and metadata.save_spec.can_save and getattr(self, "_dsa_dcp_size", None)):
+            metadata.dcp_write_layout = self._dcp_write_layout(tracker)
         return metadata
+
+    def _dcp_write_layout(self, tracker: RequestTracker, blocks: Any = None) -> Any:
+        """Freeze the scheduler-selected physical source layout for one write."""
+        world = getattr(self, "_dsa_dcp_size", None)
+        if world is None:
+            return None
+        from lmcache.integration.vllm.dcp import DcpWriteLayout
+
+        request = self._unfinished_requests.get(tracker.req_id)
+        if request is None:
+            raise ValueError("DCP write lost its scheduler request")
+        origin = self._dsa_dcp_live_origin if request.dsa_compact_allocated else 0
+        return DcpWriteLayout(world, self._block_size, tuple(
+            tracker.allocated_block_ids if blocks is None else blocks
+        ), origin)
 
     def _add_decode_window_save_metas(
         self,
@@ -13529,6 +13577,8 @@ class LMCacheConnectorV1Impl:
                 windowed_sparse_layerwise_save=(
                     self._windowed_sparse_layerwise_save_enabled()
                 ),
+                dcp_write_layout=(self._dcp_write_layout(tracker)
+                                  if getattr(self, "_dsa_dcp_size", None) else None),
             )
             if req_meta is None:
                 self._trace_decode_window_decision(
@@ -13671,6 +13721,7 @@ class LMCacheConnectorV1Impl:
         """
 
         force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
+        dsa_dcp = getattr(self, "_dsa_dcp_size", None)
 
         meta = LMCacheConnectorMetadata()
         pending_cold = getattr(self, "_pending_dsa_cold_load_metas", None)
@@ -14032,6 +14083,8 @@ class LMCacheConnectorV1Impl:
             # attention remains sparse under both policies.
             is_sparse_decode = (
                 self.enable_sparse_attention
+                # Only the scheduler can reserve the shifted DCP scratch table.
+                and (not dsa_dcp or request.dsa_compact_allocated)
                 and (
                     (
                         request.num_computed_tokens
@@ -14345,6 +14398,11 @@ class LMCacheConnectorV1Impl:
             delattr(load_spec, "dsa_cold_compact_load")
         load_spec.can_load = True
         load_spec.dsa_cold_compact_resume = True
+        if getattr(self, "_dsa_dcp_size", None) and getattr(
+            load_spec, "dsa_cold_resident_load", False
+        ):
+            # Keep the cold graph marker while using the dense readiness path.
+            load_spec.process_ordinary_resume = True
         return True
 
     def _completed_cold_resume(self, request: ReqMeta) -> bool:
@@ -14388,6 +14446,12 @@ class LMCacheConnectorV1Impl:
 
     def prepare_preemption_checkpoint(self, snapshot: tuple) -> None:
         """Arm one metadata emission from the scheduler's preemption branch."""
+        if getattr(self, "_dsa_dcp_size", None):
+            tracker = self._request_trackers.get(snapshot[0])
+            if tracker is not None:
+                # Capture before _preempt_request clears the compact allocation
+                # flag; metadata construction happens after that mutation.
+                snapshot = (*snapshot, self._dcp_write_layout(tracker, snapshot[2][0]))
         self._checkpoint_snapshots.append(snapshot)
         self._arm_preemption_controls()
 
@@ -14420,7 +14484,8 @@ class LMCacheConnectorV1Impl:
         cancels = list(getattr(self, "_checkpoint_cancels", ()))
         self._checkpoint_cancels = []
         chunk = self._lmcache_chunk_size
-        for req_id, generation, blocks, end in snapshots:
+        for snapshot in snapshots:
+            req_id, generation, blocks, end = snapshot[:4]
             tracker = self._request_trackers.get(req_id)
             if (
                 tracker is None
@@ -14451,6 +14516,7 @@ class LMCacheConnectorV1Impl:
                 blocks,
                 tracker.request_configs,
                 prefix_end=prefix_end,
+                dcp_write_layout=snapshot[4] if len(snapshot) > 4 else None,
             )
             self._preemption_checkpoints[req_id] = PendingCheckpoint(capture)
             self._resume_lookup_queries.pop(req_id, None)

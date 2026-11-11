@@ -109,6 +109,31 @@ def test_capture_is_not_sealed_until_accepted_output_is_available():
     assert meta.preemption_seals == ()
 
 
+def test_dcp_snapshot_preserves_compact_origin_before_scheduler_preempts():
+    from types import MethodType
+
+    req = request()
+    req.dsa_compact_allocated = True
+    tracker = NS(req_id="r", skip_save=False, request_configs=None, dsa_nonresident_frontier=6)
+    adapter = NS(
+        _dsa_dcp_size=8, _dsa_dcp_live_origin=32, _block_size=128,
+        _lmcache_chunk_size=4, _request_trackers={"r": tracker},
+        _unfinished_requests={"r": req}, _checkpoint_snapshots=[],
+        _arm_preemption_controls=lambda: None, _preemption_checkpoints={},
+        _resume_lookup_queries={}, config=NS(dsa_two_groups=True), kv_role="kv_both",
+    )
+    adapter._dcp_write_layout = MethodType(method("_dcp_write_layout"), adapter)
+    blocks = (tuple(range(1, 37)), tuple(range(50, 54)))
+    method("prepare_preemption_checkpoint")(adapter, ("r", 1, blocks, 14))
+    req.dsa_compact_allocated = False
+    meta = NS()
+    method("_build_preemption_controls")(
+        adapter, meta, NS(finished_req_ids=set()), adapter._checkpoint_snapshots,
+    )
+    layout = meta.preemption_captures[0].dcp_write_layout
+    assert (layout.world_size, layout.live_origin, layout.block_ids) == (8, 32, blocks[0])
+
+
 @pytest.mark.parametrize("invalid", [False, True])
 def test_seal_reuses_detached_slice_and_preserves_multimodal_isolation(invalid):
     slices = []

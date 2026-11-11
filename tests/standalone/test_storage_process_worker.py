@@ -2,6 +2,7 @@
 """Real worker helpers/importer/envelopes; source-loaded Ascend generator, fake NPU."""
 
 import ast
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
@@ -84,6 +85,158 @@ def complete(value=None):
     future = Future()
     future.set_result(value)
     return future
+
+
+@pytest.mark.parametrize(
+    "world,phase,compact",
+    [(4, "miss", False), (8, "resume", False), (4, "resident_resume", False),
+     (4, "decode", False), (8, "long_decode", False), (4, "decode", True),
+     (1, "decode", False)],
+)
+def test_dcp_scheduler_metadata_follows_the_allocated_layout(world, phase, compact):
+    path = Path(__file__).resolve().parents[2] / "lmcache/integration/vllm/vllm_v1_adapter.py"
+
+    def cdiv(n, d):
+        return (n + d - 1) // d
+
+    ns = dict(
+        dataclass=dataclass, field=field, deque=deque, torch=torch,
+        cdiv=cdiv, utils=NS(cdiv=cdiv), KVConnectorMetadata=object,
+        _lmcache_nvtx_annotate=lambda fn: fn, SPARSE_DECODE_RETRIEVE_TOKENS=2048,
+        extract_mm_features=lambda *a, **kw: (None, None),
+        extract_request_configs=lambda _: None,
+        logger=NS(debug=lambda *a: None, error=lambda *a: None),
+    )
+    for name in (
+        "_flatten_block_ids", "_split_kv_group_block_ids", "_copy_block_ids_by_bank",
+        "_block_allocation_mode_value", "_disagg_spec_from_request", "_apply_mm_hashes",
+        "_build_slot_mapping", "_sparse_slot_mapping_len", "LoadSpec", "SaveSpec",
+        "RequestTracker", "ReqMeta", "LMCacheConnectorMetadata",
+    ):
+        loaded(path, name, ns)
+
+    resident = phase == "resident_resume"
+    prompt_len = {"resident_resume": 257, "long_decode": 16385}.get(phase, 6145)
+    prompt = list(range(prompt_len))
+    first = phase in ("miss", "resume", "resident_resume")
+    computed = {"miss": 0, "resume": 4096, "resident_resume": 256}.get(phase, prompt_len)
+    scheduled = 1024 if phase == "miss" else len(prompt) - computed if first else 1
+    end = computed + scheduled
+    # Mixed BF16/C8 paired bundles expose two latent and 18 indexer IDs.
+    blocks0 = cdiv(end, 128 * world * 2) * 2
+    blocks1 = cdiv(end, 128 * 18) * 18
+    if compact:
+        blocks0 += 32
+    block_ids = (list(range(2, blocks0 + 2)), list(range(200, 200 + blocks1)))
+    request = NS(req_id="r", prompt_token_ids=prompt, num_computed_tokens=computed,
+                 all_token_ids=[*prompt, 9999], block_ids=block_ids, sampling_params=None,
+                 dsa_compact_allocated=compact)
+    spec = ns["LoadSpec"](0, len(prompt) if resident else computed, False,
+                         process_ordinary_load=phase == "resume")
+    spec.dsa_cold_load_generation = 3
+    if resident:
+        spec.dsa_cold_compact_load = spec.dsa_cold_resident_load = True
+        spec.dsa_committed_end = len(prompt)
+        spec.dsa_remap_frontier = 0
+        spec.dsa_cold_resume_computed_end = computed
+    adapter = NS(
+        config=NS(dsa_two_groups=True, priority_limit=None, save_decode_cache=False),
+        kv_role="kv_consumer", enable_sparse_attention=True, _dsa_dcp_size=world if world > 1 else None,
+        _dsa_scratch_capacity=4096, _dsa_kv_policy_threshold=0, _dsa_kv_policy_log=False,
+        _dsa_dcp_live_origin=32,
+        _block_size=128, _lmcache_chunk_size=1024, _discard_partial_chunks=True,
+        _decode_window_save_window_size=0, _requests_priority={}, _request_trackers={},
+        _unfinished_requests={"r": request}, load_specs={"r": spec} if first else {},
+        _dsa_cold_loaded_req_ids={"r"} if phase in ("resume", "resident_resume") else set(),
+        _add_decode_window_save_metas=lambda *a: None,
+        _windowed_sparse_layerwise_save_enabled=lambda: False,
+    )
+    if not first:
+        tracker = ns["RequestTracker"].from_new_request(
+            adapter.config, request, len(prompt), 4096, True,
+        )
+        if compact:
+            tracker.dsa_nonresident_frontier = tracker.sparse_remap_frontier = len(prompt) - 1
+        adapter._request_trackers["r"] = tracker
+    for name in ("_take_completed_cold_load", "_build_request_meta", "_dcp_write_layout"):
+        setattr(adapter, name, MethodType(loaded(path, name, ns, "LMCacheConnectorV1Impl"), adapter))
+    build = loaded(path, "build_connector_meta", ns, "LMCacheConnectorV1Impl")
+    result = build(adapter, NS(
+        finished_req_ids=set(), scheduled_new_reqs=[request] if first else [],
+        scheduled_cached_reqs=NS(
+            req_ids=[] if first else ["r"], resumed_req_ids=set(), new_block_ids=[None],
+        ),
+        num_scheduled_tokens={"r": scheduled},
+    )).requests[0]
+    if compact or world == 1:
+        assert result.is_sparse_decode and result.load_spec.can_load
+        assert result.load_spec.dsa_remap_frontier == len(prompt) - 1
+    elif resident:
+        assert result.is_sparse_decode and result.load_spec.dsa_cold_compact_resume
+        assert result.load_spec.dsa_remap_frontier == 0
+        assert spec.process_ordinary_resume and spec.dsa_cold_load_generation == 3
+        assert not result.slot_mapping and not result.indexer_slot_mapping
+    else:
+        assert not result.is_sparse_decode
+        assert not result.slot_mapping and not result.indexer_slot_mapping
+        assert result.load_spec is (spec if first else None)
+        if first:
+            assert not spec.can_load and len(result.token_ids) == end // 1024 * 1024
+        if phase == "resume":
+            assert spec.process_ordinary_resume and spec.dsa_cold_load_generation == 3
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_dcp_resident_resume_consumes_readiness_without_a_layer_load(stale):
+    path = Path(__file__).resolve().parents[2] / "lmcache/integration/vllm/vllm_v1_adapter.py"
+    spec = NS(
+        can_load=True, process_ordinary_resume=True, dsa_cold_compact_resume=True,
+        dsa_cold_resident_load=True, dsa_cold_load_generation=3, lmcache_cached_tokens=257,
+        vllm_cached_tokens=0,
+    )
+    request = NS(req_id="r", load_spec=spec, resumed_from_preemption=False,
+                 is_sparse_decode=True, retrieve_token_count=lambda: 257)
+    ready = object()
+    state = NS(
+        completed_cold_load_generation=2 if stale else 3, token_count=257,
+        dense_prefix_resident_tokens=257, indexer_npu_resident=True,
+        prepared_sparse_sources={0: object()}, dense_load_readiness=ready,
+        dense_load_readiness_consumed=False,
+    )
+    waits = []
+    adapter = NS(
+        _parent=NS(_get_connector_metadata=lambda: NS(requests=[request])),
+        kv_caches={"latent": object()}, _kvcaches_list=[object()],
+        lmcache_engine=NS(gpu_connector=NS(consume_dense_load_readiness=waits.append)),
+        _worker_retrieve_state={"r": state}, _layerwise_prefill_p_node=False, use_layerwise=True,
+        _is_decode_window_save_request=lambda _: False,
+        _prune_worker_retrieve_state=lambda *a: None, _drain_layerwise_retrievers=lambda: None,
+        _prepare_p_node_layerwise_save_storers=lambda _: None,
+        _stats_monitor=NS(update_interval_vllm_hit_tokens=lambda _: None,
+                          update_interval_prompt_tokens=lambda _: None),
+    )
+
+    def check_loads(requests):
+        assert not list(requests)
+        return False
+
+    adapter._is_deferred_layerwise_prefill_load_step = check_loads
+    scope = dict(LMCacheConnectorMetadata=NS)
+    completed = loaded(path, "completed_cold_resume_state", scope)
+    adapter._completed_cold_resume = lambda req: completed(req, state)
+    adapter._consume_dsa_cold_dense_load_readiness = MethodType(
+        loaded(path, "_consume_dsa_cold_dense_load_readiness", scope, "LMCacheConnectorV1Impl"), adapter,
+    )
+    start = loaded(path, "_start_load_kv", scope, "LMCacheConnectorV1Impl")
+    context = NS(attn_metadata={})
+    if stale:
+        with pytest.raises(RuntimeError, match="lost its prepared generation"):
+            start(adapter, context)
+        assert not waits
+    else:
+        start(adapter, context)
+        start(adapter, context)
+        assert waits == [ready]
 
 
 class Connector:
