@@ -149,13 +149,12 @@ def CreateStorageBackends(
         if isinstance(_existing_cpu, LocalCPUBackend):
             local_cpu_backend = _existing_cpu
 
-    if metadata.role == "scheduler":
-        # For scheduler role, local_cpu_backend is None
-        pass
-    elif not config.enable_pd or config.local_cpu:
-        if "LocalCPUBackend" in _skip:
-            pass  # Skipped — already exists
-        elif config.max_local_cpu_size > 0:
+    if (
+        metadata.role != "scheduler"
+        and (not config.enable_pd or config.local_cpu)
+        and "LocalCPUBackend" not in _skip
+    ):
+        if config.max_local_cpu_size > 0:
             local_cpu_backend = LocalCPUBackend(
                 config,
                 metadata,

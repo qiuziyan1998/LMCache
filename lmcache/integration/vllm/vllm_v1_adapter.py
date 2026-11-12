@@ -102,9 +102,6 @@ INDEXER_RETRIEVE_RESIDENT_SKIP = "resident_skip"
 DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS_ENV = (
     "VLLM_ASCEND_LMCACHE_DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS"
 )
-RETRIEVE_STATS_INTERVAL_SECONDS_ENV = (
-    "VLLM_ASCEND_LMCACHE_RETRIEVE_STATS_INTERVAL_SECONDS"
-)
 LayerwiseSaveKey = tuple[str, str, int, int, int]
 
 
@@ -420,27 +417,6 @@ def _block_allocation_mode_value(value) -> Optional[str]:
     if value is None:
         return None
     return str(getattr(value, "value", value))
-
-
-def _retrieve_stats_interval_seconds() -> int:
-    raw_value = os.environ.get(RETRIEVE_STATS_INTERVAL_SECONDS_ENV, "0")
-    try:
-        interval = int(raw_value)
-    except ValueError:
-        logger.warning(
-            "Ignoring invalid %s=%r; expected a non-negative integer.",
-            RETRIEVE_STATS_INTERVAL_SECONDS_ENV,
-            raw_value,
-        )
-        return 0
-    if interval < 0:
-        logger.warning(
-            "Ignoring invalid %s=%d; expected a non-negative integer.",
-            RETRIEVE_STATS_INTERVAL_SECONDS_ENV,
-            interval,
-        )
-        return 0
-    return interval
 
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
@@ -2327,25 +2303,9 @@ class LMCacheConnectorV1Impl:
         self._deferred_latent_pending: set[LayerwiseSaveKey] = set()
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.enable_sparse_attention = config.enable_sparse_attention
-        self._retrieve_stats_interval_seconds = (
-            _retrieve_stats_interval_seconds()
-        )
-        self._retrieve_stats_window_started_at: Optional[float] = None
-        self._retrieve_stats_request_count = 0
-        self._retrieve_stats_row_count = 0
-        self._retrieve_stats_token_count = 0
         # Freeze (query_end, scope, committed_end) while an async lookup is
         # pending so a later decode-window completion cannot change its meaning.
         self._resume_lookup_queries: dict[str, tuple[int, str, int]] = {}
-        if (
-            role != KVConnectorRole.SCHEDULER
-            and self._retrieve_stats_interval_seconds > 0
-        ):
-            logger.info(
-                "LMCache sparse retrieve statistics enabled; reporting every "
-                "%d seconds.",
-                self._retrieve_stats_interval_seconds,
-            )
 
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
@@ -2907,27 +2867,6 @@ class LMCacheConnectorV1Impl:
 
     def _is_dsa_two_groups(self) -> bool:
         return bool(getattr(getattr(self, "config", None), "dsa_two_groups", False))
-
-    def _ensure_retrieve_stats_state(self) -> int:
-        """Lazily initialize stats for lightweight/test connector instances."""
-        interval = getattr(self, "_retrieve_stats_interval_seconds", None)
-        if interval is None:
-            interval = _retrieve_stats_interval_seconds()
-            self._retrieve_stats_interval_seconds = interval
-            self._retrieve_stats_window_started_at = None
-            self._retrieve_stats_request_count = 0
-            self._retrieve_stats_row_count = 0
-            self._retrieve_stats_token_count = 0
-        return int(interval)
-
-    def _record_sparse_retrieve_stats(
-        self,
-        selected_tokens: Any,
-        selected_token_counts: Any,
-        row_count: int,
-    ) -> None:
-        """Record one request, combining all of its MTP rows."""
-        return
 
     def _is_indexer_layer_wait(self, layer_name: str) -> bool:
         if not self._is_dsa_two_groups():
@@ -4795,8 +4734,6 @@ class LMCacheConnectorV1Impl:
                     release_end,
                 )
                 published[req_id] = release_end
-            if tracker.decode_window_save_committed_end < committed_before:
-                pass
         # The vLLM scheduler consumes this same mapping after this callback to
         # release local blocks. Replacing raw completions with delayed
         # frontiers keeps release and split_boundary on the same commit point.
@@ -9507,12 +9444,6 @@ class LMCacheConnectorV1Impl:
                             else:
                                 selected_tokens_per_req = selected_tokens_payload
                                 token_start_index_per_req = token_start_payload
-                    if self.current_layer == 0 and wait_group == 0:
-                        self._record_sparse_retrieve_stats(
-                            selected_tokens_per_req,
-                            selected_token_counts_per_req,
-                            row_count,
-                        )
                     sparse_payload = (
                         payload
                         if payload is not None

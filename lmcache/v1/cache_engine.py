@@ -6866,11 +6866,6 @@ class LMCacheEngine:
             pending_persist_futures: list[Any] = []
             mem_obj_generator = None
 
-            # Calculate total KV size for logging
-            sum(
-                mo.get_size() for layer_objs in memory_objs for mo in layer_objs
-            )
-
             assert_layerwise_gpu_connector(self.gpu_connector)
 
             try:
@@ -7112,8 +7107,6 @@ class LMCacheEngine:
         # Skip chunk 1, retrieve chunk 2, overwrite [256..287] (32-token overlap)
         # need_to_load: 512 - 288 = 224 tokens
         # retrieved: 256 tokens
-        if not self._is_passive():
-            pass
         return ret_mask
 
     def track_prefill_retrieve_keys(
