@@ -3,10 +3,11 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, get_ident
-from types import SimpleNamespace as NS
+from types import ModuleType, SimpleNamespace as NS
 import ctypes
 import importlib
 import ast
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,11 @@ def peers(setup, monkeypatch):
         Path(__file__).resolve().parents[3]
         / "LMCache-Ascend/lmcache_ascend/v1/npu_connector/npu_connectors.py"
     )
+    # Import the real CPU capture planner without bootstrapping the parent
+    # package's NPU factory or requiring a generated native build manifest.
+    package = ModuleType("lmcache_ascend.v1.npu_connector")
+    package.__path__ = [str(capture_path.parent)]
+    monkeypatch.setitem(sys.modules, package.__name__, package)
     capture_method = next(
         n
         for n in ast.walk(ast.parse(capture_path.read_text(encoding="utf-8")))
