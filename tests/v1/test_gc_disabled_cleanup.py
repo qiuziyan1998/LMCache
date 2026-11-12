@@ -171,7 +171,9 @@ class _PageBackend:
         self.pages = [_Page(mode), _Page(mode)]
         self.published = False
 
-    def batched_allocate_layer_pages(self, *args: Any, **kwargs: Any) -> list[_Page]:
+    async def async_batched_allocate_layer_pages(
+        self, *args: Any, **kwargs: Any
+    ) -> list[_Page]:
         return self.pages
 
     def batched_submit_layer_pages(self, keys: list[Any], pages: list[_Page]) -> None:

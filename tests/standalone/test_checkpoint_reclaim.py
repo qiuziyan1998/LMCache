@@ -353,17 +353,3 @@ def test_unbounded_release_is_outside_cache_lock_and_preserves_ratio_floor():
         cause="remote_fill_capacity_reclaim",
     )
     assert removed == [0, 1, 2] and pool.free == 120
-
-
-def test_perf_log_distinguishes_selected_bytes_from_total_cache(monkeypatch):
-    obj, pool, _ = backend()
-    obj.hot_cache.update((i, LayerPage(pool)) for i in range(10))
-    scope = obj.reclaim_evictable_capacity.__func__.__globals__
-    logs = []
-    monkeypatch.setitem(scope, "serving_perf_enabled", lambda: True)
-    monkeypatch.setitem(scope, "time", NS(perf_counter=lambda: 1.0))
-    monkeypatch.setitem(scope, "logger", object())
-    monkeypatch.setitem(scope, "serving_perf_log", lambda *args, **kw: logs.append(kw))
-    assert reclaim(obj, 20, limit=None)
-    assert logs[0]["evictable_bytes"] == logs[0]["evicted_bytes"] == 20
-    assert logs[0]["evictable_bytes_scope"] == "eligible_candidates"

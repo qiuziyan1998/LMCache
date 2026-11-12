@@ -2,7 +2,7 @@
 # Standard
 from functools import cached_property
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from threading import Lock
@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 # Standard
 import asyncio
 import gc
-import json
 import math
 import multiprocessing
 import os
@@ -53,16 +52,6 @@ from lmcache.utils import (
     compress_slot_mapping,
     convert_tokens_to_list,
 )
-from lmcache.v1.serving_perf import (
-    prefill_reuse_debug_enabled,
-    prefill_reuse_debug_log,
-    prefill_start_timing_enabled,
-    prefill_start_timing_log,
-    serving_perf_enabled,
-    serving_perf_log,
-    serving_perf_now,
-    serving_perf_scope,
-)
 from lmcache.v1.config import LMCacheEngineConfig, prefill_cpu_prefetch_enabled
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
@@ -88,19 +77,8 @@ from lmcache.v1.mooncake_layout import (
 )
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.prefill_locations import PrefillLocationPlan
-from lmcache.v1.prefill_kv_hash import (
-    drain_kv_hash,
-    finish_kv_hash,
-    kv_hash_enabled,
-    submit_kv_hash,
-)
 from lmcache.v1.prefill_metadata import PrefillSequenceView
-from lmcache.v1.prefill_audit import audit_enabled, audit_sources
 from lmcache.v1.prefill_sources import SharedPrefillSources, same_chunk_key
-from lmcache.v1.prefill_store_debug import (
-    prefill_store_debug_enabled,
-    prefill_store_debug_sources,
-)
 from lmcache.v1.remote_fill.security import content_digest
 from lmcache.v1.remote_fill_diagnostics import log_remote_fill_diagnostic
 from lmcache.v1.kv_layer_groups import (
@@ -120,7 +98,6 @@ from lmcache.v1.shared_cpu_cache import (
     chunk_hash_to_int,
     validate_shared_handle_batch,
 )
-from lmcache.v1.startup_trace import startup_phase
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
@@ -150,26 +127,6 @@ LayerwiseRetrieveSegment = Tuple[
     List[List[CacheEngineKey]],
 ]
 _SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
-_PREFILL_REUSE_DEBUG_KEY = "_prefill_reuse_debug_stats"
-
-
-def _log_prefill_reuse_preparation(
-    rank: int, req_id: str, prefix_tokens: int, kv_group: int,
-    stats: dict[str, Any], prepare_ms: float,
-) -> None:
-    """Report disjoint planning/preparation spans for either shared rank role."""
-    prefill_reuse_debug_log(
-        rank, "plan", req_id=req_id, p=prefix_tokens, g=kv_group,
-        h=stats["hash_source"], k=stats["keys_new"],
-        ms=stats["plan_ms"],
-    )
-    prefill_reuse_debug_log(
-        rank, "src", req_id=req_id, p=prefix_tokens, g=kv_group,
-        v=f"{stats['page_reuse']}/{stats['page_new']}",
-        t=f"{stats['tail_reuse']}/{stats['tail_new']}",
-        x=f"{stats['ptr_keep']}/{stats['ptr_add']}",
-        c=stats["compact"], w=stats["wait_ms"], ms=prepare_ms,
-    )
 
 
 @dataclass
@@ -1012,13 +969,6 @@ class LMCacheEngine:
         self.config.extra_config[
             "shared_cpu_sparse_startup_capacity_estimate"
         ] = estimate
-        logger.info(
-            "[LMCACHE_CAPACITY] rank=%s estimate=%s. These are empty-pool "
-            "KV payload upper bounds, not runtime admission guarantees; "
-            "prompt plus output must also fit vLLM max_model_len.",
-            self.metadata.worker_id,
-            estimate,
-        )
 
         if one_request_bytes > slab_bytes:
             raise ValueError(
@@ -1095,21 +1045,11 @@ class LMCacheEngine:
                     )
                 )
                 if self.shared_cpu_cache_strict:
-                    with startup_phase(
-                        "shared_device_ptr",
-                        rank=self.metadata.worker_id,
-                        slab_bytes=self.shared_cpu_cache_slab_size,
-                    ):
-                        self.shared_cpu_cache_mapping.preflight_device_ptr()
-                with startup_phase(
-                    "shared_startup_broadcast",
-                    rank=self.metadata.worker_id,
-                    src=self.metadata.first_rank,
-                ):
-                    self.broadcast_object_fn(
-                        self._shared_cpu_cache_startup_envelope("ok"),
-                        self.metadata.first_rank,
-                    )
+                    self.shared_cpu_cache_mapping.preflight_device_ptr()
+                self.broadcast_object_fn(
+                    self._shared_cpu_cache_startup_envelope("ok"),
+                    self.metadata.first_rank,
+                )
             except Exception as exc:
                 mapping = getattr(self, "shared_cpu_cache_mapping", None)
                 if mapping is not None:
@@ -1143,13 +1083,7 @@ class LMCacheEngine:
                 self.shared_cpu_cache_generation,
             )
             return
-
-        with startup_phase(
-            "shared_startup_receive",
-            rank=self.metadata.worker_id,
-            src=self.metadata.first_rank,
-        ):
-            envelope = self.broadcast_object_fn(None, self.metadata.first_rank)
+        envelope = self.broadcast_object_fn(None, self.metadata.first_rank)
         if not isinstance(envelope, dict):
             raise ValueError(
                 "Shared CPU cache passive preflight expected dict envelope, "
@@ -1183,26 +1117,14 @@ class LMCacheEngine:
         for writable in writable_attempts:
             mapping = None
             try:
-                with startup_phase(
-                    "shared_slab_attach",
-                    rank=self.metadata.worker_id,
-                    slab_bytes=self.shared_cpu_cache_slab_size,
+                mapping = SharedSlabMapping.attach(
                     shm_name=self.shared_cpu_cache_name,
+                    size=self.shared_cpu_cache_slab_size,
+                    generation=self.shared_cpu_cache_generation,
                     writable=writable,
-                ):
-                    mapping = SharedSlabMapping.attach(
-                        shm_name=self.shared_cpu_cache_name,
-                        size=self.shared_cpu_cache_slab_size,
-                        generation=self.shared_cpu_cache_generation,
-                        writable=writable,
-                    )
+                )
                 if self.shared_cpu_cache_strict:
-                    with startup_phase(
-                        "shared_device_ptr",
-                        rank=self.metadata.worker_id,
-                        slab_bytes=self.shared_cpu_cache_slab_size,
-                    ):
-                        mapping.preflight_device_ptr()
+                    mapping.preflight_device_ptr()
                 self.shared_cpu_cache_mapping = mapping
                 if self.config.extra_config is None:
                     self.config.extra_config = {}
@@ -1292,34 +1214,11 @@ class LMCacheEngine:
         )
 
     def _broadcast_shared_envelope(self, envelope: SharedHandleEnvelope) -> None:
-        perf_enabled = serving_perf_enabled()
-        started = serving_perf_now() if perf_enabled else None
-        thread_started = time.thread_time_ns() if perf_enabled else 0
         condition, _, _ = self._shared_envelope_mailbox()
         with condition:
             self.broadcast_object_fn(envelope.to_dict(), self.metadata.first_rank)
-        if perf_enabled:
-            serving_perf_log(
-                logger,
-                "shared_handle_broadcast",
-                started=started,
-                req_id=envelope.request_id,
-                phase=envelope.phase,
-                kv_group=envelope.kv_group,
-                layer=envelope.layer_id,
-                handles=len(envelope.handles),
-                batch_offsets=len(envelope.batch.offsets) if envelope.batch else 0,
-                status=envelope.status,
-                rank=self.metadata.worker_id,
-                thread_cpu_ms=round(
-                    (time.thread_time_ns() - thread_started) / 1e6, 3
-                ),
-            )
 
     def _receive_shared_envelope(self) -> SharedHandleEnvelope:
-        perf_enabled = serving_perf_enabled()
-        started = serving_perf_now() if perf_enabled else None
-        thread_started = time.thread_time_ns() if perf_enabled else 0
         raw = self.broadcast_object_fn(None, self.metadata.first_rank)
         if not isinstance(raw, dict):
             raise ValueError(
@@ -1333,23 +1232,6 @@ class LMCacheEngine:
                 "Shared CPU cache received corrupt envelope before view "
                 f"creation: error={exc}, raw={raw!r}"
             ) from exc
-        if perf_enabled:
-            serving_perf_log(
-                logger,
-                "shared_handle_receive",
-                started=started,
-                req_id=envelope.request_id,
-                phase=envelope.phase,
-                kv_group=envelope.kv_group,
-                layer=envelope.layer_id,
-                handles=len(envelope.handles),
-                batch_offsets=len(envelope.batch.offsets) if envelope.batch else 0,
-                status=envelope.status,
-                rank=self.metadata.worker_id,
-                thread_cpu_ms=round(
-                    (time.thread_time_ns() - thread_started) / 1e6, 3
-                ),
-            )
         return envelope
 
     @staticmethod
@@ -1397,12 +1279,6 @@ class LMCacheEngine:
         layer_id: int,
         kv_group: int,
     ) -> SharedHandleEnvelope:
-        perf_enabled = serving_perf_enabled()
-        matching_started = serving_perf_now() if perf_enabled else 0.0
-        matching_thread_started = time.thread_time_ns() if perf_enabled else 0
-        condition_wait_s = collective_receive_s = 0.0
-        receive_count = 0
-        outcome = "error"
         expected = (
             req_id,
             phase,
@@ -1424,31 +1300,15 @@ class LMCacheEngine:
                 with condition:
                     buffered = pending.pop(expected, None)
                     if buffered is not None:
-                        outcome = "buffered"
                         condition.notify_all()
                         return buffered
                     if self._shared_envelope_receive_active:
-                        wait_started = (
-                            serving_perf_now() if perf_enabled else 0.0
-                        )
                         condition.wait()
-                        if perf_enabled:
-                            condition_wait_s += (
-                                serving_perf_now() - wait_started
-                            )
                         continue
                     self._shared_envelope_receive_active = True
 
                 try:
-                    receive_started = (
-                        serving_perf_now() if perf_enabled else 0.0
-                    )
                     envelope = self._receive_shared_envelope()
-                    if perf_enabled:
-                        collective_receive_s += (
-                            serving_perf_now() - receive_started
-                        )
-                        receive_count += 1
                     if envelope.generation != self.shared_cpu_cache_generation:
                         raise ValueError(
                             "Shared CPU cache received a layerwise envelope from "
@@ -1465,7 +1325,6 @@ class LMCacheEngine:
                 with condition:
                     self._shared_envelope_receive_active = False
                     if identity == expected:
-                        outcome = "collective"
                         condition.notify_all()
                         return envelope
                     if identity in pending:
@@ -1486,35 +1345,6 @@ class LMCacheEngine:
                 else:
                     waiters.pop(expected)
                 condition.notify_all()
-            if perf_enabled:
-                elapsed_ms = (
-                    serving_perf_now() - matching_started
-                ) * 1000
-                if elapsed_ms >= 100.0:
-                    serving_perf_log(
-                        logger,
-                        "shared_handle_match_slow",
-                        started=matching_started,
-                        req_id=req_id,
-                        phase=phase,
-                        kv_group=kv_group,
-                        layer=layer_id,
-                        rank=self.metadata.worker_id,
-                        outcome=outcome,
-                        condition_wait_ms=round(condition_wait_s * 1000, 3),
-                        collective_receive_ms=round(
-                            collective_receive_s * 1000, 3
-                        ),
-                        receive_count=receive_count,
-                        thread_cpu_ms=round(
-                            (
-                                time.thread_time_ns()
-                                - matching_thread_started
-                            )
-                            / 1e6,
-                            3,
-                        ),
-                    )
 
     def _remote_fill_all_ranks_materialized(
         self,
@@ -1537,16 +1367,6 @@ class LMCacheEngine:
             )
             return False
         result = bool(collective(bool(local_ready)))
-        if serving_perf_enabled():
-            serving_perf_log(
-                logger,
-                "remote_fill_materialization_consensus",
-                req_id=req_id,
-                kv_group=kv_group,
-                rank=self.metadata.worker_id,
-                local_ready=bool(local_ready),
-                all_ranks_ready=result,
-            )
         return result
 
     def _validate_shared_layerwise_envelope(
@@ -1640,8 +1460,6 @@ class LMCacheEngine:
         chunk_index_base: int = 0,
         validate_memory_objs: bool = True,
     ) -> list[SharedChunkHandle]:
-        perf_enabled = serving_perf_enabled()
-        started = serving_perf_now() if perf_enabled else None
         if self.shared_cpu_cache_name is None:
             raise ValueError("Shared CPU cache name is not initialized")
         if len(keys_layer) != len(mem_objs_layer):
@@ -1679,19 +1497,6 @@ class LMCacheEngine:
                     producer_rank=self.metadata.worker_id,
                 )
             )
-        if perf_enabled:
-            serving_perf_log(
-                logger,
-                "shared_handle_build",
-                started=started,
-                req_id=req_id,
-                phase=phase,
-                kv_group=kv_group,
-                layer=layer_id,
-                handles=len(handles),
-                validate=validate_memory_objs,
-                rank=self.metadata.worker_id,
-            )
         return handles
 
     def _make_shared_handle_batch(
@@ -1704,7 +1509,6 @@ class LMCacheEngine:
         reuse_chunks: int = 0,
     ) -> Optional[SharedHandleBatch]:
         """Compact a homogeneous all-layer page-first result."""
-        started = serving_perf_now() if serving_perf_enabled() else None
         num_layers = self.num_layers_for_group(kv_group)
         if (
             getattr(self, "shared_cpu_cache_name", None) is None
@@ -1792,17 +1596,6 @@ class LMCacheEngine:
                 for chunk in range(reuse_chunks, page_chunks)
             ],
         )
-        if started is not None:
-            serving_perf_log(
-                logger,
-                "shared_handle_batch_build",
-                started=started,
-                layers=num_layers,
-                chunks=chunks,
-                offsets=len(batch.offsets),
-                pages=page_chunks,
-                rank=self.metadata.worker_id,
-            )
         return batch
 
     def _make_passive_layer_page_views(
@@ -2109,7 +1902,6 @@ class LMCacheEngine:
         if not chunks:
             return 0
         assert self.storage_manager is not None
-        perf_enabled = serving_perf_enabled()
 
         def tiered_locations(
             base_keys: list[CacheEngineKey],
@@ -2362,26 +2154,6 @@ class LMCacheEngine:
 
         def chunk_exists(index: int) -> bool:
             locations = tiered_locations([chunks[index][1]])
-            if perf_enabled and index == 0:
-                try:
-                    details = diagnose(chunks[index][1])
-                    diagnostic_error = None
-                except Exception as error:
-                    details = []
-                    diagnostic_error = f"{type(error).__name__}: {error}"
-                serving_perf_log(
-                    logger,
-                    "scheduler_sample_probe",
-                    lookup_id=lookup_id,
-                    chunk_index=index,
-                    chunk_end=chunks[index][0],
-                    chunk_hash=chunks[index][1].chunk_hash_hex,
-                    sample_count=len(chunks),
-                    found=locations is not None,
-                    diagnostic_extra_probes=True,
-                    diagnostic_error=diagnostic_error,
-                    groups=details,
-                )
             if locations is None:
                 return False
             local_groups_by_chunk[index] = {
@@ -2899,53 +2671,6 @@ class LMCacheEngine:
                     exc_info=True,
                 )
 
-        fields = {
-            "schema": 1,
-            "event": "remote_fill_actual_load",
-            "outcome": outcome,
-            "required_store_end": required_store_end,
-            "common_local_end": common_local_end,
-            "actual_load_end": actual_load_end,
-            "destination_engine_epoch": destination_engine_epoch,
-            "remote_suffix": actual_load_end > common_local_end,
-            **(diagnostics or {}),
-        }
-        if serving_perf_enabled():
-            serving_perf_log(
-                logger,
-                "remote_fill_actual_load",
-                req_id=lookup_id,
-                outcome=outcome,
-                required_store_end=required_store_end,
-                common_local_end=common_local_end,
-                actual_load_end=actual_load_end,
-                destination_engine_epoch=destination_engine_epoch,
-                remote_suffix=actual_load_end > common_local_end,
-                **(diagnostics or {}),
-            )
-        logger.info(
-            "[LMCACHE_REMOTE_FILL] %s",
-            json.dumps(fields, separators=(",", ":"), sort_keys=True),
-        )
-        if not retained:
-            fields["event"] = "remote_fill_local_prefix_missing_at_load"
-            if serving_perf_enabled():
-                serving_perf_log(
-                    logger,
-                    "remote_fill_local_prefix_missing_at_load",
-                    req_id=lookup_id,
-                    required_store_end=required_store_end,
-                    common_local_end=common_local_end,
-                    actual_load_end=actual_load_end,
-                    destination_engine_epoch=destination_engine_epoch,
-                    remote_suffix=actual_load_end > common_local_end,
-                    **(diagnostics or {}),
-                )
-            logger.info(
-                "[LMCACHE_REMOTE_FILL] %s",
-                json.dumps(fields, separators=(",", ":"), sort_keys=True),
-            )
-
     def remote_fill_actual_load_metrics_snapshot(
         self,
     ) -> RemoteFillActualLoadMetricsSnapshot:
@@ -3210,36 +2935,6 @@ class LMCacheEngine:
                     lease.prefill_sources.pop(group, None)
             lease.active = True
             self._shared_cpu_request_leases[req_id] = lease
-            if (
-                prepared_source is not None
-                and kv_hash_enabled()
-                and self.metadata.is_first_rank()
-                and not getattr(self, "_force_layerwise_prefill_store", False)
-            ):
-                counts = prepared_source.chunk_token_counts
-                ends = []
-                frontier = 0
-                for length in counts:
-                    frontier += int(length)
-                    ends.append(frontier)
-                starts = [0] + ends[:-1]
-                submit_kv_hash(
-                    "D",
-                    req_id,
-                    0,
-                    starts,
-                    ends,
-                    [layer.memory_objs for layer in prepared_source.layers],
-                    int(self.config.chunk_size),
-                    feature_mode=getattr(
-                        self.gpu_connector, "uses_token_byte_features", False
-                    ),
-                )
-            if (prepared_source is not None and kv_hash_enabled()
-                    and not getattr(self, "_force_layerwise_prefill_store", False)):
-                trace = getattr(self.gpu_connector, "trace_prepared_kv", None)
-                if callable(trace):
-                    trace(req_id, prepared_source)
         except Exception:
             if created:
                 lease.close()
@@ -3337,19 +3032,9 @@ class LMCacheEngine:
     def release_shared_cpu_sparse_request(self, req_id: Optional[str]) -> None:
         if not req_id:
             return
-        if kv_hash_enabled():
-            finish_kv_hash(req_id)
-            trace = getattr(self.gpu_connector, "finish_kv_trace", None)
-            if callable(trace):
-                trace(req_id)
         lease = self._shared_cpu_request_leases.pop(req_id, None)
         if lease is not None:
             lease.close()
-        if audit_enabled() and not kv_hash_enabled():
-            # Do not extend cache-object leases for diagnostic file output.
-            trace = getattr(self.gpu_connector, "finish_kv_trace", None)
-            if callable(trace):
-                trace(req_id)
 
     def _release_all_shared_cpu_request_leases(self) -> None:
         leases = list(self._shared_cpu_request_leases.values())
@@ -4562,19 +4247,6 @@ class LMCacheEngine:
                     kv_group=kv_group,
                     chunk_index=chunk_index,
                 )
-            if (
-                getattr(self, "_force_layerwise_prefill_store", False)
-                and prefill_store_debug_enabled()
-            ):
-                prefill_store_debug_sources(
-                    req_id,
-                    kv_group,
-                    local_pages=local_pages,
-                    remote_pages=remote_pages,
-                    legacy_chunks=chunks - page_chunks,
-                    num_layers=self.num_layers_for_group(kv_group),
-                    first_page_bytes=pages[0].get_size() if pages else 0,
-                )
             return [list(pages) + layer for layer in tail], page_chunks
         except Exception:
             for obj in reversed(pinned):
@@ -4636,26 +4308,16 @@ class LMCacheEngine:
                 if not callable(contains) or not callable(retrieve):
                     raise RuntimeError("RemoteBackend does not support layer pages")
                 remote_page_keys = page_keys[tail_start:page_chunks]
-                resolver_call_id = (
-                    f"{os.getpid()}:{time.monotonic_ns()}"
-                    if serving_perf_enabled()
-                    else None
-                )
-                with (serving_perf_scope(
-                    req_id=req_id,
-                    rank=self.metadata.worker_id,
-                    resolver_call_id=resolver_call_id,
-                ) if resolver_call_id is not None else nullcontext()):
-                    remote_count = contains(remote_page_keys)
-                    if not 0 <= remote_count <= len(remote_page_keys):
-                        raise ValueError(
-                            "Remote layer-page lookup returned invalid count"
-                        )
-                    fetched = (
-                        retrieve(remote_page_keys[:remote_count])
-                        if remote_count
-                        else []
+                remote_count = contains(remote_page_keys)
+                if not 0 <= remote_count <= len(remote_page_keys):
+                    raise ValueError(
+                        "Remote layer-page lookup returned invalid count"
                     )
+                fetched = (
+                    retrieve(remote_page_keys[:remote_count])
+                    if remote_count
+                    else []
+                )
                 if remote_count:
                     if len(fetched) != remote_count:
                         raise ValueError(
@@ -4740,20 +4402,6 @@ class LMCacheEngine:
                     kv_group=kv_group,
                     chunk_index=chunk_index,
                 )
-
-            if (
-                getattr(self, "_force_layerwise_prefill_store", False)
-                and prefill_store_debug_enabled()
-            ):
-                prefill_store_debug_sources(
-                    req_id,
-                    kv_group,
-                    local_pages=local_pages,
-                    remote_pages=remote_pages,
-                    legacy_chunks=len(keys_layer_major[0]) - expected_pages,
-                    num_layers=self.num_layers_for_group(kv_group),
-                    first_page_bytes=pages[0].get_size() if pages else 0,
-                )
             return [list(pages) + layer for layer in tail], expected_pages
         except Exception:
             for page in reversed(pinned):
@@ -4791,37 +4439,6 @@ class LMCacheEngine:
         acquired: list[MemoryObj] = []
         pinned: list[MemoryObj] = []
         context = self._shared_rank0_object_context(kv_group)
-        timing_hook = getattr(
-            self,
-            "_shared_rank0_resolver_timing_hook",
-            None,
-        )
-        if not callable(timing_hook):
-            timing_hook = None
-        perf_enabled = serving_perf_enabled()
-        perf_started = serving_perf_now() if perf_enabled else 0.0
-        resolver_call_id = (
-            f"{os.getpid()}:{time.monotonic_ns()}" if perf_enabled else None
-        )
-        stage_times: dict[str, float] = defaultdict(float)
-
-        def start_stage() -> float:
-            return (
-                time.perf_counter()
-                if timing_hook is not None or perf_enabled
-                else 0.0
-            )
-
-        def finish_stage(stage: str, started: float) -> None:
-            if not started:
-                return
-            elapsed = time.perf_counter() - started
-            if timing_hook is not None:
-                timing_hook(stage, elapsed)
-            if perf_enabled:
-                stage_times[stage] += elapsed
-
-        started = start_stage()
         windows: list[
             tuple[int, int, list[tuple[int, int]], list[CacheEngineKey]]
         ] = []
@@ -4837,7 +4454,6 @@ class LMCacheEngine:
                     coordinates.append((layer_id, chunk_index))
                     fetch_keys.append(key)
             windows.append((window_start, window_end, coordinates, fetch_keys))
-        finish_stage("windows", started)
 
         try:
             for (
@@ -4846,20 +4462,10 @@ class LMCacheEngine:
                 coordinates,
                 fetch_keys,
             ) in windows:
-                started = start_stage()
-                try:
-                    with (serving_perf_scope(
-                        req_id=req_id,
-                        rank=self.metadata.worker_id,
-                        resolver_call_id=resolver_call_id,
-                    ) if perf_enabled else nullcontext()):
-                        fetched = self.storage_manager.batched_get(
-                            fetch_keys,
-                            location="RemoteBackend",
-                        )
-                finally:
-                    finish_stage("remote_get", started)
-                started = start_stage()
+                fetched = self.storage_manager.batched_get(
+                    fetch_keys,
+                    location="RemoteBackend",
+                )
                 if len(fetched) != len(fetch_keys):
                     for fetched_obj in fetched:
                         if fetched_obj is not None:
@@ -4888,11 +4494,9 @@ class LMCacheEngine:
                         f"request_id={req_id}, phase={phase}, "
                         f"kv_group={kv_group}, missing={missing}"
                     )
-                finish_stage("results", started)
 
                 pending_fetched = list(fetched)
                 try:
-                    started = start_stage()
                     batch_validation: dict[int, bool] = {}
                     window_objects: list[
                         tuple[int, int, MemoryObj, Optional[MemoryObjMetadata]]
@@ -4959,9 +4563,6 @@ class LMCacheEngine:
                         window_objects.append(
                             (layer_id, chunk_index, mem_obj, metadata)
                         )
-                    finish_stage("classification", started)
-
-                    started = start_stage()
                     window_mem_objs = [item[2] for item in window_objects]
                     if all(
                         type(mem_obj) is TensorMemoryObj
@@ -4989,91 +4590,20 @@ class LMCacheEngine:
                                 _context=context,
                                 _metadata=metadata,
                             )
-                    finish_stage("pinning", started)
-
-                    started = start_stage()
                     for layer_id, _chunk_index, mem_obj, _metadata in window_objects:
                         resolved_layers[layer_id].append(mem_obj)
-                    finish_stage("scatter", started)
                 finally:
                     for fetched_obj in pending_fetched:
                         if fetched_obj is not None:
                             fetched_obj.ref_count_down()
-
-            if perf_enabled:
-                serving_perf_log(
-                    logger,
-                    "remote_resolver",
-                    started=perf_started,
-                    req_id=req_id,
-                    phase=phase,
-                    kv_group=kv_group,
-                    layers=len(keys_layer_major),
-                    chunks=(
-                        len(keys_layer_major[0]) if keys_layer_major else 0
-                    ),
-                    objects=sum(len(layer) for layer in resolved_layers),
-                    windows=len(windows),
-                    status="ok",
-                    rank=self.metadata.worker_id,
-                    resolver_call_id=resolver_call_id,
-                    exclusive_ms=round(
-                        max(
-                            0.0,
-                            serving_perf_now()
-                            - perf_started
-                            - stage_times.get("remote_get", 0.0),
-                        )
-                        * 1000,
-                        3,
-                    ),
-                    **{
-                        f"{stage}_ms": round(elapsed * 1000, 3)
-                        for stage, elapsed in stage_times.items()
-                    },
-                )
             return resolved_layers
-        except Exception as exc:
-            started = start_stage()
+        except Exception:
             for mem_obj in reversed(pinned):
                 if mem_obj.is_pinned:
                     mem_obj.unpin()
             for mem_obj in reversed(acquired):
                 if mem_obj.is_valid():
                     mem_obj.ref_count_down()
-            finish_stage("rollback", started)
-            if perf_enabled:
-                serving_perf_log(
-                    logger,
-                    "remote_resolver",
-                    started=perf_started,
-                    req_id=req_id,
-                    phase=phase,
-                    kv_group=kv_group,
-                    layers=len(keys_layer_major),
-                    chunks=(
-                        len(keys_layer_major[0]) if keys_layer_major else 0
-                    ),
-                    windows=len(windows),
-                    status="error",
-                    error=type(exc).__name__,
-                    rank=self.metadata.worker_id,
-                    resolver_call_id=resolver_call_id,
-                    exclusive_ms=round(
-                        max(
-                            0.0,
-                            serving_perf_now()
-                            - perf_started
-                            - stage_times.get("remote_get", 0.0),
-                        )
-                        * 1000,
-                        3,
-                    ),
-                    **{
-                        f"{stage}_ms": round(elapsed * 1000, 3)
-                        for stage, elapsed in stage_times.items()
-                    },
-                )
             raise
 
     @staticmethod
@@ -5151,9 +4681,6 @@ class LMCacheEngine:
             if kv_group == 1 and isinstance(state, dict)
             else None
         )
-        debug_stats = kwargs.get(_PREFILL_REUSE_DEBUG_KEY)
-        if debug_stats is not None:
-            debug_stats["hash_source"] = "g0" if plan is not None else "tok"
         if plan is not None:
             generated = self.token_database.process_tokens(
                 hashes=[entry[2] for entry in plan],
@@ -5490,7 +5017,6 @@ class LMCacheEngine:
         """
         host_rows = kwargs.setdefault("cached_chunk_dev_ptrs", [])
         device_rows = kwargs.setdefault("cached_chunk_ptrs_npu", [])
-        debug_stats = kwargs.get(_PREFILL_REUSE_DEBUG_KEY)
         if kwargs.get("_reuse_shared_dense_prefix"):
             old_rows = kwargs.get("cached_memory_objs", ())
             prefix = min((len(row) for row in host_rows), default=0)
@@ -5543,11 +5069,6 @@ class LMCacheEngine:
         prepare = getattr(
             self.gpu_connector, "prepare_layerwise_prefill_source_pointers", None
         )
-        # These are host-list lengths after the existing prefix validation.
-        # Observe the successful append without rescanning any source objects.
-        kept_pointers = (
-            len(host_rows[0]) if debug_stats is not None and host_rows else 0
-        )
         if callable(prepare):
             prepare(
                 sources,
@@ -5566,33 +5087,22 @@ class LMCacheEngine:
                 device_rows,
                 kv_group=kv_group,
             )
-        if debug_stats is not None:
-            debug_stats["ptr_keep"] = kept_pointers
-            debug_stats["ptr_add"] = (
-                len(host_rows[0]) - kept_pointers if host_rows else 0
-            )
 
     def _submit_prepared_shared_prefill_layers(
         self,
         consumer: Any,
         sources: list[Any],
         ret_mask: torch.Tensor,
-        perf_enabled: bool = False,
-    ) -> Generator[Optional[torch.Tensor], Any, float]:
+    ) -> Generator[Optional[torch.Tensor], Any, None]:
         """Relay bank commands; no storage lookup, TP broadcast or pointer upload."""
-        send_s = 0.0
         for layer_id, source in enumerate(sources):
             command = yield torch.sum(ret_mask) if layer_id == 0 else None
             if source is not None:
-                started = serving_perf_now() if perf_enabled else 0.0
                 consumer.send(
                     source
                     if command is None
                     else {"memory_objs": source, "layer_request": command}
                 )
-                if started:
-                    send_s += serving_perf_now() - started
-        return send_s
 
     def _resolve_shared_rank0_prefill_suffix(
         self, *, req_id: str, phase: str, kv_group: int,
@@ -5866,8 +5376,6 @@ class LMCacheEngine:
             and mooncake_layer_pages_enabled(self.config)
         ):
             page_first_resolve = True
-        perf_enabled = serving_perf_enabled()
-        consume_started = consumer_send_s = consumer_finish_s = 0.0
         try:
             for layer_id in range(self.num_layers_for_group(kv_group)):
                 envelope_required = compact_batch is None
@@ -5982,25 +5490,6 @@ class LMCacheEngine:
                                 raise ValueError(
                                     "Layer pages require compact shared publication"
                                 )
-                            debug_stats = kwargs.get(_PREFILL_REUSE_DEBUG_KEY)
-                            if debug_stats is not None:
-                                pages = (
-                                    len(compact_batch.page_offsets)
-                                    if compact_batch else 0
-                                )
-                                debug_stats["compact"] = int(compact_batch is not None)
-                                debug_stats["page_reuse"] = min(source_prefix, pages)
-                                debug_stats["page_new"] = (
-                                    pages - min(source_prefix, pages)
-                                )
-                                debug_stats["tail_reuse"] = (
-                                    max(0, source_prefix - pages)
-                                    * len(pre_resolved_layers)
-                                )
-                                debug_stats["tail_new"] = (
-                                    (len(starts) - max(pages, source_prefix))
-                                    * len(pre_resolved_layers)
-                                )
                         mem_objs_layer = pre_resolved_layers[layer_id]
                     else:
                         mem_objs_layer = self._resolve_shared_rank0_layer_mem_objs(
@@ -6049,24 +5538,6 @@ class LMCacheEngine:
                         )
                         if callable(wait_publication):
                             wait_publication(kv_group)
-                        if kv_hash_enabled() and pre_resolved_layers is not None:
-                            submit_kv_hash(
-                                "P",
-                                req_id,
-                                kv_group,
-                                starts,
-                                ends,
-                                pre_resolved_layers,
-                                int(self.config.chunk_size),
-                                feature_mode=getattr(
-                                    self.gpu_connector, "uses_token_byte_features", False
-                                ),
-                            )
-                    if (
-                        audit_enabled() and layer_id == 0
-                        and pre_resolved_layers is not None
-                    ):
-                        audit_sources(req_id, keys_layer_major, pre_resolved_layers)
                     handles = (
                         [None] * len(mem_objs_layer)
                         if compact_batch is not None
@@ -6151,15 +5622,10 @@ class LMCacheEngine:
                         else mem_objs_layer
                     )
                     continue
-
-                if perf_enabled and not consume_started:
-                    consume_started = serving_perf_now()
                 if layer_id == 0:
                     layer_request = yield torch.sum(ret_mask)
                 else:
                     layer_request = yield None
-
-                send_started = serving_perf_now() if perf_enabled else 0.0
                 try:
                     memory_objs_layer = (
                         LayerPageSource(
@@ -6181,8 +5647,6 @@ class LMCacheEngine:
                 except BaseException:
                     consumer_failed = deferred_layerwise_get
                     raise
-                if send_started:
-                    consumer_send_s += serving_perf_now() - send_started
 
             if deferred_layerwise_get:
                 if prepare_c8_packets:
@@ -6196,12 +5660,10 @@ class LMCacheEngine:
                     prepared_sources, kv_group, kwargs
                 )
                 sources_safe_to_release = False
-                if perf_enabled:
-                    consume_started = serving_perf_now()
                 try:
-                    consumer_send_s = yield from (
+                    yield from (
                         self._submit_prepared_shared_prefill_layers(
-                            mem_obj_consumer, prepared_sources, ret_mask, perf_enabled
+                            mem_obj_consumer, prepared_sources, ret_mask
                         )
                     )
                 except Exception:
@@ -6211,7 +5673,6 @@ class LMCacheEngine:
                 # last-layer entry resumes this generator to synchronize the
                 # consumer and release shared-source ownership.
                 yield None
-            finish_started = serving_perf_now() if perf_enabled else 0.0
             try:
                 next(mem_obj_consumer)
             except BaseException:
@@ -6220,8 +5681,6 @@ class LMCacheEngine:
             sources_safe_to_release = True
             self._close_shared_retrieve_consumer(mem_obj_consumer)
             mem_obj_consumer = None
-            if finish_started:
-                consumer_finish_s += serving_perf_now() - finish_started
             adoption_keys = keys_layer_major
             preplanned_keys = kwargs.get("_prefill_layer_keys")
             if preplanned_keys is not None:
@@ -6278,35 +5737,6 @@ class LMCacheEngine:
                 kv_group,
                 retrieved_tokens,
             )
-            if consume_started:
-                elapsed_s = serving_perf_now() - consume_started
-                serving_perf_log(
-                    logger,
-                    "dense_shared_consume",
-                    started=consume_started,
-                    req_id=req_id,
-                    phase=phase,
-                    kv_group=kv_group,
-                    rank=self.metadata.worker_id,
-                    role="rank0",
-                    layers=len(resolved_layers),
-                    objects=sum(map(len, resolved_layers)),
-                    unique_objects=len(
-                        {id(obj) for layer in resolved_layers for obj in layer}
-                    ),
-                    compact=compact_batch is not None,
-                    view_build_ms=0.0,
-                    consumer_send_ms=round(consumer_send_s * 1000, 3),
-                    consumer_final_wait_ms=round(consumer_finish_s * 1000, 3),
-                    suspended_or_other_ms=round(
-                        max(
-                            elapsed_s - consumer_send_s - consumer_finish_s,
-                            0.0,
-                        )
-                        * 1000,
-                        3,
-                    ),
-                )
             if not deferred_layerwise_get:
                 yield None
             # Keep request-owned shared objects through the final layer wait,
@@ -6364,7 +5794,6 @@ class LMCacheEngine:
         deferred_layerwise_get = bool(
             kwargs.get("deferred_layerwise_get", False)
         )
-        prefill_timing = deferred_layerwise_get and prefill_start_timing_enabled()
         prepare_c8_packets = bool(
             deferred_layerwise_get and kv_group == 1
             and kwargs.get("prefill_dma_block_ids_by_bank") is not None
@@ -6384,8 +5813,6 @@ class LMCacheEngine:
         sources_safe_to_release = True
         prepared_sources: list[Any] = []
         consumer_failed = False
-        perf_enabled = serving_perf_enabled()
-        consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
         retained_lease = (
             self.get_shared_cpu_request_lease(req_id)
             if kwargs.get("_reuse_shared_dense_prefix") else None
@@ -6394,15 +5821,11 @@ class LMCacheEngine:
         source_prefix = 0
         if deferred_layerwise_get and kwargs.get("_reuse_shared_dense_prefix"):
             kwargs.pop("_shared_prefill_reuse_count", None)
-        debug_stats = kwargs.get(_PREFILL_REUSE_DEBUG_KEY)
 
         try:
             for layer_id in range(self.num_layers_for_group(kv_group)):
                 envelope = None
                 if compact_batch is None:
-                    receive_started = (
-                        time.perf_counter() if debug_stats is not None else 0.0
-                    )
                     envelope = self._receive_matching_shared_envelope(
                         req_id=req_id,
                         phase=phase,
@@ -6410,12 +5833,6 @@ class LMCacheEngine:
                         layer_id=layer_id,
                         kv_group=kv_group,
                     )
-                    if debug_stats is not None:
-                        debug_stats["wait_ms"] += (
-                            time.perf_counter() - receive_started
-                        ) * 1000
-                    if perf_enabled and not consume_started:
-                        consume_started = serving_perf_now()
                     try:
                         self._validate_shared_layerwise_envelope(
                             envelope,
@@ -6450,8 +5867,6 @@ class LMCacheEngine:
                         continue
                     if envelope.batch is not None:
                         compact_batch = envelope.batch
-                        if debug_stats is not None:
-                            debug_stats["compact"] = 1
 
                 if expected_handle_count is None:
                     assert envelope is not None
@@ -6470,9 +5885,6 @@ class LMCacheEngine:
                         )
                         next(mem_obj_consumer)
                     if compact_batch is not None:
-                        page_view_started = (
-                            serving_perf_now() if perf_enabled else 0.0
-                        )
                         if kwargs.get("_reuse_shared_dense_prefix"):
                             kwargs["_shared_prefill_reuse_count"] = 0
                         if source_state is not None:
@@ -6529,14 +5941,6 @@ class LMCacheEngine:
                         for page in passive_pages[reused_pages:]:
                             if retained_lease is None or not retained_lease.owns(page):
                                 to_release.append(page)
-                                if debug_stats is not None:
-                                    debug_stats["page_new"] += 1
-                            elif debug_stats is not None:
-                                debug_stats["page_reuse"] += 1
-                        if debug_stats is not None:
-                            debug_stats["page_reuse"] += reused_pages
-                        if page_view_started:
-                            view_build_s += serving_perf_now() - page_view_started
                 elif (
                     compact_batch is None
                     and envelope is not None
@@ -6559,14 +5963,11 @@ class LMCacheEngine:
                     if compact_batch is not None
                     else envelope.handles  # type: ignore[union-attr]
                 )
-                view_started = serving_perf_now() if perf_enabled else 0.0
                 page_chunks = len(passive_pages)
                 if source_prefix > page_chunks:
                     mem_objs_layer.extend(
                         kwargs["cached_memory_objs"][layer_id][page_chunks:source_prefix]
                     )
-                    if debug_stats is not None:
-                        debug_stats["tail_reuse"] += source_prefix - page_chunks
                 for chunk_index in range(
                     max(page_chunks, source_prefix), expected_handle_count
                 ):
@@ -6648,12 +6049,6 @@ class LMCacheEngine:
                     mem_objs_layer.append(mem_obj)
                     if retained_lease is None or not retained_lease.owns(mem_obj):
                         to_release.append(mem_obj)
-                        if debug_stats is not None:
-                            debug_stats["tail_new"] += 1
-                    elif debug_stats is not None:
-                        debug_stats["tail_reuse"] += 1
-                if view_started:
-                    view_build_s += serving_perf_now() - view_started
                 resolved_layers.append(mem_objs_layer)
                 handles_by_layer.append(layer_handles)
 
@@ -6675,7 +6070,6 @@ class LMCacheEngine:
                     layer_request = yield None
 
                 assert mem_obj_consumer is not None
-                send_started = serving_perf_now() if perf_enabled else 0.0
                 try:
                     memory_objs_layer = (
                         LayerPageSource(
@@ -6697,8 +6091,6 @@ class LMCacheEngine:
                 except BaseException:
                     consumer_failed = deferred_layerwise_get
                     raise
-                if send_started:
-                    consumer_send_s += serving_perf_now() - send_started
 
             if deferred_layerwise_get:
                 if prepare_c8_packets and resolved_layers and (
@@ -6713,7 +6105,6 @@ class LMCacheEngine:
                     # A skipped group has no consumer. Preserve that protocol;
                     # ordinary P prefix loads prepare every layer here.
                     if all(source is not None for source in prepared_sources):
-                        pointer_started = time.perf_counter() if prefill_timing else 0.0
                         if prepare_c8_packets:
                             mem_obj_consumer = self.gpu_connector.batched_to_gpu(
                                 starts, ends,
@@ -6723,21 +6114,11 @@ class LMCacheEngine:
                         self._prepare_shared_prefill_sources(
                             prepared_sources, kv_group, kwargs
                         )
-                        if pointer_started:
-                            prefill_start_timing_log(
-                                logger,
-                                "passive_pointer_prepare",
-                                pointer_started,
-                                req_id=req_id,
-                                kv_group=kv_group,
-                                prefix_tokens=ends[-1] if ends else 0,
-                                chunks=len(starts),
-                            )
                     sources_safe_to_release = False
                 try:
-                    consumer_send_s = yield from (
+                    yield from (
                         self._submit_prepared_shared_prefill_layers(
-                            mem_obj_consumer, prepared_sources, ret_mask, perf_enabled
+                            mem_obj_consumer, prepared_sources, ret_mask
                         )
                     )
                 except Exception:
@@ -6749,7 +6130,6 @@ class LMCacheEngine:
             if deferred_cleanup_gate_used:
                 yield None
             if mem_obj_consumer is not None:
-                finish_started = serving_perf_now() if perf_enabled else 0.0
                 try:
                     next(mem_obj_consumer)
                 except BaseException:
@@ -6758,8 +6138,6 @@ class LMCacheEngine:
                 sources_safe_to_release = True
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
                 mem_obj_consumer = None
-                if finish_started:
-                    consumer_finish_s += serving_perf_now() - finish_started
             if resolved_layers:
                 adopted = self._adopt_dense_shared_retrieve_cache(
                     req_id=req_id,
@@ -6788,32 +6166,6 @@ class LMCacheEngine:
                 kv_group,
                 retrieved_tokens,
             )
-            if consume_started and resolved_layers:
-                elapsed_s = serving_perf_now() - consume_started
-                active_s = view_build_s + consumer_send_s + consumer_finish_s
-                serving_perf_log(
-                    logger,
-                    "dense_shared_consume",
-                    started=consume_started,
-                    req_id=req_id,
-                    phase=phase,
-                    kv_group=kv_group,
-                    rank=self.metadata.worker_id,
-                    role="passive",
-                    layers=len(resolved_layers),
-                    objects=sum(map(len, resolved_layers)),
-                    unique_objects=len(
-                        {id(obj) for layer in resolved_layers for obj in layer}
-                    ),
-                    compact=compact_batch is not None,
-                    view_build_ms=round(view_build_s * 1000, 3),
-                    consumer_send_ms=round(consumer_send_s * 1000, 3),
-                    consumer_final_wait_ms=round(consumer_finish_s * 1000, 3),
-                    suspended_or_other_ms=round(
-                        max(elapsed_s - active_s, 0.0) * 1000,
-                        3,
-                    ),
-                )
             if not deferred_cleanup_gate_used:
                 yield None
             # Keep request-owned shared objects through the final layer wait,
@@ -6955,22 +6307,19 @@ class LMCacheEngine:
             logger.info("Post initializing LMCacheEngine")
             phase = "lookup_worker_ids"
             try:
-                with startup_phase(phase, rank=self.metadata.worker_id):
-                    lookup_server_worker_ids = (
-                        self.config.get_lookup_server_worker_ids(
-                            self.metadata.use_mla, self.metadata.world_size
-                        )
+                lookup_server_worker_ids = (
+                    self.config.get_lookup_server_worker_ids(
+                        self.metadata.use_mla, self.metadata.world_size
                     )
+                )
                 if getattr(
                     self, "_shared_cpu_sparse_capacity_sanity_pending", False
                 ):
                     phase = "capacity_check"
-                    with startup_phase(phase, rank=self.metadata.worker_id):
-                        self._report_shared_cpu_sparse_capacity_sanity()
+                    self._report_shared_cpu_sparse_capacity_sanity()
                     self._shared_cpu_sparse_capacity_sanity_pending = False
                 phase = "shm_space_check"
-                with startup_phase(phase, rank=self.metadata.worker_id):
-                    self._preflight_shared_cpu_shm_capacity()
+                self._preflight_shared_cpu_shm_capacity()
                 shared_passive_rank = (
                     self.enable_shared_cpu_cache
                     and self._is_passive()
@@ -6996,18 +6345,13 @@ class LMCacheEngine:
                         self.save_only_first_rank,
                     )
                     async_lookup_server = kwargs.get("async_lookup_server", None)
-                    with startup_phase(
-                        "storage_manager",
-                        rank=self.metadata.worker_id,
-                        cpu_cache_gb=self.config.max_local_cpu_size,
-                    ):
-                        self.storage_manager = StorageManager(
-                            self.config,
-                            self.metadata,
-                            event_manager=self.event_manager,
-                            lmcache_worker=self.lmcache_worker,
-                            async_lookup_server=async_lookup_server,
-                        )
+                    self.storage_manager = StorageManager(
+                        self.config,
+                        self.metadata,
+                        event_manager=self.event_manager,
+                        lmcache_worker=self.lmcache_worker,
+                        async_lookup_server=async_lookup_server,
+                    )
             except Exception as exc:
                 # Passive ranks are already waiting for the startup envelope.
                 # Capacity/shm failures must reach them just like allocator
@@ -7028,24 +6372,18 @@ class LMCacheEngine:
                     )
                     logger.error("[LMCACHE_INIT_FAILED] %s", message)
                     try:
-                        with startup_phase(
-                            "shared_startup_failure_broadcast",
-                            rank=self.metadata.worker_id,
-                            failed_stage=phase,
-                        ):
-                            self.broadcast_object_fn(
-                                self._shared_cpu_cache_startup_envelope(
-                                    "error", message
-                                ),
-                                self.metadata.first_rank,
-                            )
+                        self.broadcast_object_fn(
+                            self._shared_cpu_cache_startup_envelope(
+                                "error", message
+                            ),
+                            self.metadata.first_rank,
+                        )
                     except Exception:
                         logger.exception(
                             "Failed to broadcast shared CPU cache startup error"
                         )
                 raise
-            with startup_phase("shared_cache_setup", rank=self.metadata.worker_id):
-                self._post_init_shared_cpu_cache()
+            self._post_init_shared_cpu_cache()
             self.post_inited = True
 
     def freeze(self, enabled: bool) -> None:
@@ -7142,9 +6480,6 @@ class LMCacheEngine:
             return
 
         assert self.storage_manager is not None
-
-        # Get req_id for logging
-        req_id = self._get_req_id(kwargs)
 
         # Initialize num_to_store_tokens to avoid reference before assignment
         num_to_store_tokens = 0
@@ -7292,22 +6627,6 @@ class LMCacheEngine:
             store_stats,
             tot_token_num,
         )
-        if serving_perf_enabled():
-            tot_time = store_stats.time_to_store()
-            logger.info(
-                "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
-                "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
-                "offload_time: %.4f ms, put_time: %.4f ms",
-                req_id,
-                kv_group,
-                tot_token_num,
-                num_to_store_tokens,
-                tot_kv_size / 1024**3,
-                tot_time * 1000,
-                tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
-                (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
-                store_stats.put_time * 1000,
-            )
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -7443,15 +6762,6 @@ class LMCacheEngine:
         prev_key = 0
         kv_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
         store_fmt = self._memory_format_for_kv_group(kv_group)
-        prefill_plan_started = (
-            time.perf_counter()
-            if deferred_layerwise_put and prefill_start_timing_enabled()
-            else 0.0
-        )
-        lookup_ms = 0.0
-        allocation_ms = 0.0
-        scanned_chunks = 0
-        existing_chunks = 0
         store_plan = None
         metadata_cache = kwargs.get("_prefill_metadata_cache")
         if metadata_cache is not None and deferred_layerwise_put:
@@ -7470,8 +6780,6 @@ class LMCacheEngine:
         for candidate_index, (start, end, key) in enumerate(store_candidates):
             assert isinstance(key, CacheEngineKey)
             requested_end = end
-
-            lookup_started = time.perf_counter() if prefill_plan_started else 0.0
             keys_multi_layer = (
                 store_plan.keys_chunk_major[candidate_index]
                 if store_plan is not None else key.split_layers(num_layers)
@@ -7483,10 +6791,6 @@ class LMCacheEngine:
                 start=start,
                 end=end,
             )
-            if lookup_started:
-                lookup_ms += (time.perf_counter() - lookup_started) * 1000
-                scanned_chunks += 1
-                existing_chunks += int(fully_stored)
             if fully_stored:
                 continue
 
@@ -7505,8 +6809,6 @@ class LMCacheEngine:
                         "or an engine-specific store_layer override."
                     ) from exc
                 kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
-
-            allocation_started = time.perf_counter() if prefill_plan_started else 0.0
             memory_objs_multi_layer = self.storage_manager.batched_allocate(
                 kv_shape_single_layer,
                 kv_dtype,
@@ -7514,8 +6816,6 @@ class LMCacheEngine:
                 fmt=store_fmt,
                 busy_loop=self.config.get_extra_config_value("force_store_wait", False),
             )
-            if allocation_started:
-                allocation_ms += (time.perf_counter() - allocation_started) * 1000
 
             if memory_objs_multi_layer is None:
                 logger.warning(
@@ -7556,15 +6856,6 @@ class LMCacheEngine:
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
 
-        if prefill_plan_started:
-            prefill_start_timing_log(
-                logger, "store_chunk_scan", prefill_plan_started,
-                req_id=req_id, kv_group=kv_group, tokens=len(tokens),
-                scanned_chunks=scanned_chunks, existing_chunks=existing_chunks,
-                new_chunks=len(starts), lookup_ms=round(lookup_ms, 3),
-                allocation_ms=round(allocation_ms, 3),
-            )
-
         if keys:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
@@ -7581,16 +6872,9 @@ class LMCacheEngine:
             pending_persist_futures: list[Any] = []
             mem_obj_generator = None
 
-            # Calculate total KV size for logging
-            tot_kv_size = sum(
-                mo.get_size() for layer_objs in memory_objs for mo in layer_objs
-            )
-
             assert_layerwise_gpu_connector(self.gpu_connector)
 
             try:
-                store_perf_enabled = serving_perf_enabled()
-                t_start = time.perf_counter() if store_perf_enabled else 0.0
                 mem_obj_generator = self.gpu_connector.batched_from_gpu(
                     memory_objs, starts, ends, **kwargs
                 )
@@ -7671,28 +6955,14 @@ class LMCacheEngine:
                         yield
                         next(mem_obj_generator)
                         persist_layer(layer_id)
-
-                if store_perf_enabled:
-                    tot_time = time.perf_counter() - t_start
-                    logger.info(
-                        "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
-                        "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
-                        req_id,
-                        kv_group,
-                        tot_token_num,
-                        len(tokens),
-                        tot_kv_size / 1024**3,
-                        tot_time * 1000,
-                        tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
-                    )
             finally:
                 if mem_obj_generator is not None:
                     close_fn = getattr(mem_obj_generator, "close", None)
                     if close_fn is not None:
-                        try:
-                            close_fn()
-                        except (GeneratorExit, RuntimeError, ValueError):
-                            pass
+                        # Closing the connector fences unfinished D2H writes.
+                        # A failed fence must propagate before destinations
+                        # can be returned to the allocator.
+                        close_fn()
                 for mem_obj in list(pending_store_release.values()):
                     if mem_obj.is_valid():
                         mem_obj.ref_count_down()
@@ -7751,9 +7021,6 @@ class LMCacheEngine:
         assert self.gpu_connector is not None, (
             "gpu_connector is required for retrieve operation"
         )
-
-        # Get req_id for logging
-        req_id = self._get_req_id(kwargs)
 
         tot_kv_size = 0
 
@@ -7846,23 +7113,6 @@ class LMCacheEngine:
         # Skip chunk 1, retrieve chunk 2, overwrite [256..287] (32-token overlap)
         # need_to_load: 512 - 288 = 224 tokens
         # retrieved: 256 tokens
-        if not self._is_passive():
-            kv_group = kwargs.get("kv_group", 0)
-            if serving_perf_enabled():
-                onload_time = retrieve_stats.time_to_retrieve()
-                logger.info(
-                    "[req_id=%s kv_group=%s] Retrieved %d out of %d required tokens "
-                    "(from %d total tokens). size: %.4f gb, "
-                    "cost %.4f ms, throughput: %.4f GB/s;",
-                    req_id,
-                    kv_group,
-                    retrieved_tokens,
-                    num_required_tokens,
-                    len(tokens),
-                    tot_kv_size / 1024**3,
-                    onload_time * 1000,
-                    tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
-                )
         return ret_mask
 
     def track_prefill_retrieve_keys(
@@ -7874,6 +7124,28 @@ class LMCacheEngine:
         request-to-put dependencies when a prepared plan bypasses tokenization.
         The base engine has no additional persistence dependency to register.
         """
+
+    @staticmethod
+    def _require_complete_prefill_source(
+        starts: Sequence[int],
+        ends: Sequence[int],
+        num_required_tokens: int,
+        *,
+        req_id: str,
+        kv_group: int,
+        recalculate_last_token: bool,
+    ) -> None:
+        """Check the resolved dense prefix using its existing endpoints."""
+        required = int(num_required_tokens)
+        if recalculate_last_token and required:
+            required -= 1
+        available = int(ends[-1]) - int(starts[0]) if ends else 0
+        if available < required:
+            raise RuntimeError(
+                "P-node banked prefill source is incomplete during retrieval: "
+                f"req_id={req_id}, kv_group={kv_group}, "
+                f"retrieved_tokens={available}, required_tokens={required}"
+            )
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -7907,6 +7179,12 @@ class LMCacheEngine:
         """
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
+            if kwargs.get("_require_complete_prefill_prefix", False):
+                raise RuntimeError(
+                    "LMCache is unhealthy during required P-node prefill retrieval: "
+                    f"req_id={kwargs.get('req_id')}, "
+                    f"kv_group={kwargs.get('kv_group', 0)}"
+                )
             logger.warning("LMCache is unhealthy, skipping retrieve_layer operation")
             yield torch.zeros(len(tokens), dtype=torch.bool)
             return
@@ -7927,14 +7205,6 @@ class LMCacheEngine:
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
-
-        prefill_timing = bool(
-            prefill_start_timing_enabled()
-            and deferred_layerwise_get
-            and shared_layerwise_retrieve
-            and self._is_passive()
-        )
-        mask_setup_started = time.perf_counter() if prefill_timing else 0.0
         prefix_tokens = len(tokens)
         prefill_skip = (
             kwargs.get("_prefill_skip_tokens")
@@ -7952,15 +7222,6 @@ class LMCacheEngine:
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
         ret_mask = torch.zeros(prefix_tokens, dtype=torch.bool, device="cpu")
-        if mask_setup_started:
-            prefill_start_timing_log(
-                logger,
-                "passive_mask_setup",
-                mask_setup_started,
-                req_id=req_id,
-                kv_group=kv_group,
-                prefix_tokens=prefix_tokens,
-            )
 
         starts = []
         ends = []
@@ -7975,24 +7236,6 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
-
-        debug_rank = getattr(self.metadata, "worker_id", -1)
-        debug_stats: Optional[dict[str, Any]] = None
-        if (
-            shared_layerwise_retrieve and deferred_layerwise_get
-            and prefill_reuse_debug_enabled(debug_rank)
-        ):
-            debug_stats = {
-                "hash_source": "-", "keys_new": 0,
-                "page_reuse": 0, "page_new": 0,
-                "tail_reuse": 0, "tail_new": 0,
-                "ptr_keep": 0, "ptr_add": 0,
-                "compact": 0, "wait_ms": 0.0,
-            }
-            kwargs[_PREFILL_REUSE_DEBUG_KEY] = debug_stats
-        token_plan_started = (
-            time.perf_counter() if prefill_timing or debug_stats is not None else 0.0
-        )
         metadata_plan = None
         metadata_cache = kwargs.get("_prefill_metadata_cache")
         if (
@@ -8006,11 +7249,6 @@ class LMCacheEngine:
             )
             self.track_prefill_retrieve_keys(req_id, metadata_plan.base_keys)
             kwargs["_prefill_layer_keys"] = metadata_plan.keys_layer_major
-            if debug_stats is not None:
-                debug_stats["hash_source"] = (
-                    "inc" if metadata_plan.hashes_new else "hit"
-                )
-                debug_stats["keys_new"] = metadata_plan.keys_new
 
         if shared_layerwise_retrieve and self._is_passive():
             if metadata_plan is not None:
@@ -8026,25 +7264,8 @@ class LMCacheEngine:
                     starts.append(start)
                     ends.append(end)
                     keys.append(key.split_layers(num_layers))
-                    if debug_stats is not None:
-                        debug_stats["keys_new"] += len(keys[-1])
                 keys_layer_major = (
                     [list(row) for row in zip(*keys, strict=False)] if keys else []
-                )
-            if debug_stats is not None:
-                debug_stats["plan_ms"] = (
-                    time.perf_counter() - token_plan_started
-                ) * 1000
-            if prefill_timing:
-                prefill_start_timing_log(
-                    logger,
-                    "passive_token_plan",
-                    token_plan_started,
-                    req_id=req_id,
-                    kv_group=kv_group,
-                    prefix_tokens=prefix_tokens,
-                    chunks=len(starts),
-                    layers=num_layers,
                 )
             yielded_steps = 0
             try:
@@ -8064,30 +7285,7 @@ class LMCacheEngine:
                         yield result
                 else:
                     try:
-                        prepare_started = (
-                            time.perf_counter()
-                            if prefill_timing or debug_stats is not None
-                            else 0.0
-                        )
                         result = next(passive_retriever)
-                        if debug_stats is not None:
-                            prepare_ms = (time.perf_counter() - prepare_started) * 1000
-                            _log_prefill_reuse_preparation(
-                                debug_rank, req_id, prefix_tokens, kv_group,
-                                debug_stats, prepare_ms,
-                            )
-                            kwargs.pop(_PREFILL_REUSE_DEBUG_KEY, None)
-                        if prefill_timing:
-                            prefill_start_timing_log(
-                                logger,
-                                "passive_prepare_first_yield",
-                                prepare_started,
-                                req_id=req_id,
-                                kv_group=kv_group,
-                                prefix_tokens=prefix_tokens,
-                                chunks=len(starts),
-                                layers=num_layers,
-                            )
                         while True:
                             yielded_steps += 1
                             try:
@@ -8131,9 +7329,6 @@ class LMCacheEngine:
             return
 
         if shared_layerwise_retrieve:
-            plan_started = (
-                serving_perf_now() if serving_perf_enabled() else None
-            )
             location = None
             chunk_locations: list[list[str]] = []
             missing_shared_chunks: list[dict[str, Any]] = []
@@ -8387,62 +7582,27 @@ class LMCacheEngine:
                 if remote_fill_plan is not None
                 else len(batch_plan or [])
             )
-            if serving_perf_enabled():
-                planned_locations = (
-                    [location for location, _ in remote_fill_plan]
-                    if remote_fill_plan is not None
-                    else list(batch_plan or [])
-                )
-                planned_page_locations = (
-                    [location for location, page in remote_fill_plan if page]
-                    if remote_fill_plan is not None
-                    else list(batch_plan or [])
-                )
-                partial_pages = (
-                    sum(
-                        end - start != self.config.chunk_size
-                        for (start, end, _), (_, page) in zip(
-                            candidates,
-                            remote_fill_plan,
-                            strict=True,
+            if kwargs.get("_require_complete_prefill_prefix", False):
+                try:
+                    self._require_complete_prefill_source(
+                        starts, ends, num_required_tokens,
+                        req_id=req_id, kv_group=kv_group,
+                        recalculate_last_token=kwargs.get(
+                            "_prefill_recalculate_last_token", False
+                        ),
+                    )
+                except RuntimeError as error:
+                    self._broadcast_shared_envelope(
+                        self._shared_layerwise_error_envelope(
+                            req_id=req_id,
+                            phase=phase,
+                            request_ordinal=request_ordinal,
+                            layer_id=0,
+                            kv_group=kv_group,
+                            message=str(error),
                         )
-                        if page
                     )
-                    if remote_fill_plan is not None
-                    else sum(
-                        end - start != self.config.chunk_size
-                        for start, end, _ in candidates[:planned_page_chunks]
-                    )
-                )
-                serving_perf_log(
-                    logger,
-                    "shared_location_plan",
-                    started=plan_started,
-                    req_id=req_id,
-                    rank=self.metadata.worker_id,
-                    phase=phase,
-                    kv_group=kv_group,
-                    chunks=len(keys),
-                    objects=planned_page_chunks
-                    + max(0, len(keys) - planned_page_chunks) * num_layers,
-                    logical_objects=sum(map(len, keys)),
-                    physical_pages=planned_page_chunks,
-                    partial_pages=partial_pages,
-                    local_pages=planned_page_locations.count("LocalCPUBackend"),
-                    remote_pages=planned_page_locations.count("RemoteBackend"),
-                    unresolved_pages=max(0, len(candidates) - len(planned_locations)),
-                    logical_layers_avoided=planned_page_chunks
-                    * max(0, num_layers - 1),
-                    mode=(
-                        "remote_fill_plan"
-                        if remote_fill_plan is not None
-                        else "page_batch"
-                        if batch_plan is not None and "RemoteBackend" in batch_plan
-                        else "local_batch"
-                        if batch_plan is not None
-                        else "per_object"
-                    ),
-                )
+                    raise
             if missing_shared_chunks and self.shared_cpu_cache_strict:
                 message = (
                     "Shared CPU dense prefix layerwise retrieve missing required "
@@ -8489,19 +7649,7 @@ class LMCacheEngine:
                         yield result
                 else:
                     try:
-                        if debug_stats is not None:
-                            debug_stats["plan_ms"] = (
-                                time.perf_counter() - token_plan_started
-                            ) * 1000
-                            prepare_started = time.perf_counter()
                         result = next(rank0_retriever)
-                        if debug_stats is not None:
-                            _log_prefill_reuse_preparation(
-                                debug_rank, req_id, prefix_tokens, kv_group,
-                                debug_stats,
-                                (time.perf_counter() - prepare_started) * 1000,
-                            )
-                            kwargs.pop(_PREFILL_REUSE_DEBUG_KEY, None)
                         while True:
                             yielded_steps += 1
                             try:
@@ -8590,6 +7738,15 @@ class LMCacheEngine:
             segment_keys.append(keys_multi_layer)
 
             ret_mask[start:end] = True
+
+        if kwargs.get("_require_complete_prefill_prefix", False):
+            self._require_complete_prefill_source(
+                starts, ends, num_required_tokens,
+                req_id=req_id, kv_group=kv_group,
+                recalculate_last_token=kwargs.get(
+                    "_prefill_recalculate_last_token", False
+                ),
+            )
 
         if segment_location is not None and segment_keys:
             segments.append(
@@ -9054,14 +8211,7 @@ class LMCacheEngine:
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
                     chunks.append((start, end, key))
-                remote_fill_diagnostics = (
-                    {}
-                    if pin
-                    and serving_perf_enabled()
-                    and self._remote_fill_local_full_hint(request_configs)
-                    is not None
-                    else None
-                )
+                remote_fill_diagnostics = None
                 try:
                     res = self._lookup_remote_fill_two_group_prefix(
                         chunks,
@@ -9829,8 +8979,6 @@ class LMCacheEngine:
     def close(self) -> None:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
-        if kv_hash_enabled() and not drain_kv_hash():
-            raise RuntimeError("KV hash worker has not drained; keep CPU slabs alive")
 
         if self.lmcache_worker is not None:
             try:
@@ -10320,25 +9468,23 @@ class LMCacheEngineBuilder:
         """
         logger.info(f"Creating LMCacheEngine instance {instance_id}")
         if instance_id not in cls._instances:
-            with startup_phase("engine_numa", rank=metadata.worker_id):
-                numa_mapping = NUMADetector.get_numa_mapping(config)
+            numa_mapping = NUMADetector.get_numa_mapping(config)
             logger.info(f"NUMA mapping for instance {instance_id}: {numa_mapping}")
-            with startup_phase("engine_create", rank=metadata.worker_id):
-                token_database = cls._Create_token_database(config, metadata)
-                stat_logger = LMCacheStatsLogger(
-                    metadata,
-                    log_interval=10,
-                    config=config,
-                )
-                engine = LMCacheEngine(
-                    config,
-                    metadata,
-                    token_database,
-                    gpu_connector,
-                    broadcast_fn,
-                    broadcast_object_fn,
-                    collective_all_true_fn,
-                )
+            token_database = cls._Create_token_database(config, metadata)
+            stat_logger = LMCacheStatsLogger(
+                metadata,
+                log_interval=10,
+                config=config,
+            )
+            engine = LMCacheEngine(
+                config,
+                metadata,
+                token_database,
+                gpu_connector,
+                broadcast_fn,
+                broadcast_object_fn,
+                collective_all_true_fn,
+            )
 
             cls._instances[instance_id] = engine
             cls._cfgs[instance_id] = config

@@ -195,9 +195,7 @@ def test_background_writer_observes_d2h_before_reading_every_layer() -> None:
     assert len(wait_threads) == 1 and wait_threads[0] != host_thread
     assert all(torch.all(tensor == 37) for tensor in archived)
     assert all(item.refs == 0 for item in flattened)
-    assert trace == [
-        (("flat_done", "prefill", 0), {"error": False, "status": "ok", "chunks": 2})
-    ]
+    assert trace == []
 
 
 @pytest.mark.parametrize("unknown", [False, True])
@@ -220,8 +218,7 @@ def test_remote_failure_propagates_and_unknown_completion_keeps_sources(
     assert all(item.refs == (3 if unknown else 2) for item in flattened)
     if unknown:
         assert error.layerwise_source_pages == flattened
-    assert trace[0][1]["error"] is True
-    assert trace[0][1]["status"] == type(error).__name__
+    assert trace == []
 
 
 def test_submission_failure_does_not_consume_the_callers_allocation() -> None:

@@ -446,6 +446,13 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": float,
     },
     # Other configurations
+    "file_replay_enabled": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": "Opt-in tagged snapshot file reads for P/D replay. "
+        "LMCACHE_FILE_REPLAY_ENABLED=true; normal requests retain the native store.",
+    },
     # (Deprecated) The url of the actual remote lmcache instance for auditing.
     # Please use extra_config['audit_actual_remote_url'] instead.
     "audit_actual_remote_url": {
@@ -528,17 +535,6 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": _to_bool,
         "description": "Validate NPU transfer slots, cached destinations, and "
         "registered source spans before native kernel launch.",
-    },
-    "enable_npu_content_diagnostics": {
-        "type": bool,
-        "default": False,
-        "env_converter": _to_bool,
-        "description": (
-            "Fingerprint sampled Group-1 source, P2P destination, first "
-            "decoder-consume, and selected top-k tensors. Diagnostic NPU-to-CPU "
-            "readback may synchronize device work; keep disabled outside "
-            "correctness investigations."
-        ),
     },
     "enable_shared_cpu_cache": {
         "type": bool,

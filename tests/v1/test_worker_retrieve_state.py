@@ -264,8 +264,6 @@ def test_capture_barrier_waits_for_indexer_after_latent_failure() -> None:
 def test_cold_compact_indexer_uses_dense_retrieve_path(
     monkeypatch, indexer_layers
 ) -> None:
-    monkeypatch.setenv("PD_SERVING_PERF", "1")
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     impl = _make_impl()
     impl.num_layers = 2
     impl.device = "cpu"
@@ -326,7 +324,7 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(
         "token_count": 4,
         "indexer_slots_cpu": torch.arange(4),
         "indexer_kvcaches": [object() for _ in range(indexer_layers)],
-        "planned_at": adapter_mod.serving_perf_now(),
+        "planned_at": 0.0,
         "latent_shared_ready": Future(),
     }
     plan["latent_shared_ready"].set_result(None)
@@ -336,8 +334,6 @@ def test_cold_compact_indexer_uses_dense_retrieve_path(
     assert torch.equal(result[0], torch.ones(4, dtype=torch.bool))
     assert result[1] is readiness
     assert "indexer_source_owners" not in plan
-    assert plan["indexer_perf"]["layer_submit_host_ms"] >= 0
-    assert plan["indexer_perf"]["readiness_record_ms"] >= 0
     npu.set_device.assert_called_once_with(3)
     record.assert_not_called()
     synchronize.assert_called_once_with(readiness)
@@ -385,7 +381,7 @@ def test_cold_compact_shared_indexer_waits_for_latent_publication() -> None:
         "token_count": 4,
         "indexer_slots_cpu": torch.arange(4),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.serving_perf_now(),
+        "planned_at": 0.0,
         "latent_shared_ready": gate,
     }
 
@@ -472,7 +468,7 @@ def test_cold_compact_prefetches_before_dense_retrieve() -> None:
         "token_count": 4,
         "indexer_slots_cpu": torch.arange(4),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.serving_perf_now(),
+        "planned_at": 0.0,
         "latent_shared_ready": gate,
     }
 
@@ -527,7 +523,7 @@ def test_cold_compact_prefetch_owner_released_when_latent_load_fails() -> None:
         "token_count": 1,
         "indexer_slots_cpu": torch.arange(1),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.serving_perf_now(),
+        "planned_at": 0.0,
         "latent_shared_ready": gate,
     }
 
@@ -589,7 +585,7 @@ def test_cold_compact_prefetch_failure_releases_and_uses_dense_path() -> None:
         "token_count": 1,
         "indexer_slots_cpu": torch.arange(1),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.serving_perf_now(),
+        "planned_at": 0.0,
         "latent_shared_ready": gate,
     }
 
@@ -719,7 +715,7 @@ def test_cold_compact_dense_failure_releases_prefetch_owner_only() -> None:
         "token_count": 1,
         "indexer_slots_cpu": torch.arange(1),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.serving_perf_now(),
+        "planned_at": 0.0,
         "latent_shared_ready": gate,
     }
 
@@ -752,7 +748,7 @@ def test_cold_compact_dense_path_requires_source_retention_support() -> None:
         "token_count": 1,
         "indexer_slots_cpu": torch.arange(1),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.serving_perf_now(),
+        "planned_at": 0.0,
         "latent_shared_ready": Future(),
     }
 
@@ -828,7 +824,7 @@ def test_failed_cold_indexer_does_not_double_release_adopted_source(
         "token_count": 4,
         "indexer_slots_cpu": torch.arange(4),
         "indexer_kvcaches": [object()],
-        "planned_at": adapter_mod.serving_perf_now(),
+        "planned_at": 0.0,
         "latent_shared_ready": Future(),
     }
     plan["latent_shared_ready"].set_result(None)
@@ -3497,137 +3493,10 @@ class TestWorkerRetrieveState:
 
         assert impl.current_layer == 1
 
-    def test_retrieve_stats_combine_mtp_rows_and_reset_each_window(
-        self, monkeypatch
-    ):
-        monkeypatch.setenv(
-            adapter_mod.RETRIEVE_STATS_INTERVAL_SECONDS_ENV,
-            "10",
-        )
-        monkeypatch.setenv("PD_SERVING_PERF", "1")
-        monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
-        timestamps = iter((100.0, 105.0, 111.0, 112.0))
-        monkeypatch.setattr(
-            adapter_mod.time,
-            "monotonic",
-            lambda: next(timestamps),
-        )
-        log_records = []
-        monkeypatch.setattr(
-            adapter_mod.logger,
-            "info",
-            lambda message, *args: log_records.append((message, args)),
-        )
 
-        impl, _, _ = make_worker_connector([], use_layerwise=True)
-        impl._record_sparse_retrieve_stats(
-            torch.zeros((2, 4), dtype=torch.int32),
-            [3, 4],
-            row_count=2,
-        )
-        impl._record_sparse_retrieve_stats(
-            torch.zeros(4, dtype=torch.int32),
-            5,
-            row_count=1,
-        )
-        impl._record_sparse_retrieve_stats(
-            torch.zeros((2, 4), dtype=torch.int32),
-            [2, 6],
-            row_count=2,
-        )
 
-        assert len(log_records) == 1
-        message, args = log_records[0]
-        assert message.startswith("[LMCacheRetrieveStats]")
-        assert args[1:4] == (3, 5, 20)
-        assert args[4] == pytest.approx(20 / 3)
 
-        impl._record_sparse_retrieve_stats(
-            torch.zeros(4, dtype=torch.int32),
-            4,
-            row_count=1,
-        )
-        assert len(log_records) == 1
-        assert impl._retrieve_stats_request_count == 1
-        assert impl._retrieve_stats_row_count == 1
-        assert impl._retrieve_stats_token_count == 4
 
-    def test_retrieve_stats_omit_tensor_counts_without_readback(self, monkeypatch):
-        monkeypatch.setenv("PD_SERVING_PERF", "1")
-        monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
-        monkeypatch.setenv(adapter_mod.RETRIEVE_STATS_INTERVAL_SECONDS_ENV, "10")
-        impl, _, _ = make_worker_connector([], use_layerwise=True)
-        # Meta tensors cannot be read back; even CPU tensors must be omitted
-        # rather than introducing reduction/copy work into this diagnostic.
-        counts = torch.empty(2, device="meta", dtype=torch.int32)
-        impl._record_sparse_retrieve_stats(None, counts, row_count=2)
-        assert impl._retrieve_stats_request_count == 0
-
-    def test_retrieve_stats_cold_perf_off_overrides_interval(self, monkeypatch):
-        monkeypatch.setenv("PD_SERVING_PERF", "0")
-        monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "0")
-        monkeypatch.setenv(adapter_mod.RETRIEVE_STATS_INTERVAL_SECONDS_ENV, "10")
-        impl, _, _ = make_worker_connector([], use_layerwise=True)
-        impl._record_sparse_retrieve_stats(None, object(), row_count=2)
-        assert impl._retrieve_stats_request_count == 0
-
-    def test_retrieve_stats_default_off_does_not_read_counts(self, monkeypatch):
-        monkeypatch.delenv(
-            adapter_mod.RETRIEVE_STATS_INTERVAL_SECONDS_ENV,
-            raising=False,
-        )
-        impl, _, _ = make_worker_connector([], use_layerwise=True)
-        impl._record_sparse_retrieve_stats(
-            selected_tokens=None,
-            selected_token_counts=object(),
-            row_count=2,
-        )
-        assert impl._retrieve_stats_interval_seconds == 0
-        assert impl._retrieve_stats_request_count == 0
-
-    def test_wait_for_layer_load_passes_all_request_rows_to_retrieve_stats(self):
-        req = make_sparse_req_meta("req-1", token_count=4)
-        impl, _, _ = make_worker_connector([req], use_layerwise=True)
-        impl.current_layer = 0
-        impl.num_layers = 2
-        impl._layerwise_retriever_is_sparse = [True]
-        stats_inputs = []
-        impl._record_sparse_retrieve_stats = (
-            lambda selected, counts, rows: stats_inputs.append(
-                (selected, counts, rows)
-            )
-        )
-
-        def _retriever():
-            yield None
-            yield torch.ones(4, dtype=torch.bool)
-
-        retriever = _retriever()
-        next(retriever)
-        impl.layerwise_retrievers = [(retriever, None)]
-        selected = torch.tensor(
-            [[1, 2, 0, 0], [3, 4, 5, 0]],
-            dtype=torch.int32,
-        )
-        targets = torch.tensor(
-            [[100, 101, 0, 0], [102, 103, 104, 0]],
-            dtype=torch.long,
-        )
-        counts = torch.tensor([2, 3], dtype=torch.int32)
-
-        impl.wait_for_layer_load(
-            "model.layers.0.self_attn.attn",
-            selected_tokens=selected,
-            request_ids=["req-1", "req-1"],
-            target_slot_mapping=targets,
-            selected_token_counts=counts,
-        )
-
-        assert len(stats_inputs) == 1
-        selected_per_request, counts_per_request, row_count = stats_inputs[0]
-        assert torch.equal(selected_per_request, selected)
-        assert torch.equal(counts_per_request, counts)
-        assert row_count == 2
 
     def test_wait_for_layer_load_routes_exact_batch_rows_per_request(self):
         requests = [

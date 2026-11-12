@@ -27,7 +27,6 @@ from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.offload_server.zmq_server import ZMQOffloadServer
 from lmcache.v1.plugin.runtime_plugin_launcher import RuntimePluginLauncher
-from lmcache.v1.startup_trace import startup_phase
 
 if TYPE_CHECKING:
     # First Party
@@ -213,13 +212,8 @@ class LMCacheManager:
             if self._config.enable_async_loading and self._lookup_server is not None:
                 assert isinstance(self._lookup_server, LMCacheAsyncLookupServer)
                 async_lookup_server = self._lookup_server
-
-            with startup_phase("engine_post_init"):
-                self._lmcache_engine.post_init(async_lookup_server=async_lookup_server)
-
-            # Initialize health monitor after engine post_init completes
-            with startup_phase("health_monitor"):
-                self._init_health_monitor()
+            self._lmcache_engine.post_init(async_lookup_server=async_lookup_server)
+            self._init_health_monitor()
         except Exception as e:
             self._handle_post_init_failure(e)
             if self._shared_cpu_startup_required():

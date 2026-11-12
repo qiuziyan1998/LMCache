@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import asyncio
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from itertools import islice
@@ -28,7 +29,6 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
-from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     LayerPageMemoryObj,
@@ -198,7 +198,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.cpu_lock = threading.Lock()
 
         # Cold-start diagnostics are armed only by a successful external
-        # two-group commit while PD_SERVING_PERF is enabled. Keeping an
+        # two-group commit. Keeping an
         # empty list in ordinary operation makes every mutation hook a single
         # predictable branch, with no logging or cache inspection.
         self._external_retention_trace_sequence = 0
@@ -627,7 +627,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             required_keys,
             ready_reservations,
             context="External two-group commit",
-            arm_retention_trace=serving_perf_enabled(),
+            arm_retention_trace=False,
         )
 
     def commit_external_group0_prefix_if_absent(
@@ -1511,6 +1511,57 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.stats_monitor.update_local_cpu_evict_metrics(evicted)
         return pages
 
+    async def async_batched_allocate_layer_pages(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        batch_size: int,
+        num_layers: int,
+        fmt: MemoryFormat,
+        valid_tokens: Optional[Union[int, list[int]]] = None,
+        full_tokens: Optional[int] = None,
+        eviction: bool = True,
+    ) -> Optional[list[LayerPageMemoryObj]]:
+        """Allocate pages while allowing native-transfer cleanup to run.
+
+        Arguments follow ``batched_allocate_layer_pages``. Retry until
+        ``config.blocking_timeout_secs`` expires, yielding the event loop when
+        no evictable objects remain. Return None on exhaustion; propagate
+        allocator errors and cancellation. No allocation runs in a new thread.
+
+        Native put completion callbacks release source references on this same
+        event loop. Sleeping synchronously here can prevent the very release
+        needed to make the next allocation succeed.
+        """
+        started = time.monotonic()
+        timeout = float(getattr(self.config, "blocking_timeout_secs", 60))
+        deadline = started + timeout
+        waiting = False
+        while True:
+            pages = self.batched_allocate_layer_pages(
+                shapes, dtypes, batch_size, num_layers, fmt,
+                busy_loop=False, valid_tokens=valid_tokens,
+                full_tokens=full_tokens, eviction=eviction,
+            )
+            if pages is not None:
+                return pages
+            remaining = deadline - time.monotonic()
+            if not eviction or not self.use_hot or remaining <= 0:
+                logger.error(
+                    "[LMCACHE_PAGE_ALLOC] status=failed pages=%d layers=%d "
+                    "wait_ms=%.1f transfer_submitted=0", batch_size, num_layers,
+                    (time.monotonic() - started) * 1000,
+                )
+                return None
+            if not waiting:
+                logger.warning(
+                    "[LMCACHE_PAGE_ALLOC] status=waiting pages=%d layers=%d "
+                    "timeout_s=%.1f yielding_event_loop=1",
+                    batch_size, num_layers, timeout,
+                )
+                waiting = True
+            await asyncio.sleep(min(0.1, remaining))
+
     def get_full_chunk_size_bytes(self) -> int:
         logger.info("Calculating the size of a single LMCache chunk")
         assert self.metadata is not None, (
@@ -1625,6 +1676,26 @@ class LocalCPUBackend(AllocatorBackendInterface):
             raise RuntimeError("allocator returned invalid capacity bytes")
         return free_bytes, heap_bytes
 
+    def get_prefill_admission_capacity(self) -> dict[str, int]:
+        """Report actual pool bytes usable by a new prefill reservation.
+
+        Pinned, borrowed and in-flight objects are unavailable. Inspect only
+        host metadata; never synchronize a device or allocate/evict memory.
+        """
+        with self.cpu_lock:
+            free_bytes, heap_bytes = self.get_allocator_capacity_bytes()
+            seen: set[int] = set()
+            evictable_bytes = 0
+            if self.use_hot:
+                for obj in self.hot_cache.values():
+                    if id(obj) not in seen and obj.can_evict:
+                        seen.add(id(obj))
+                        evictable_bytes += obj.get_physical_size()
+        return {
+            "capacity": heap_bytes,
+            "available": min(heap_bytes, free_bytes + evictable_bytes),
+        }
+
     def reclaim_evictable_capacity(
         self,
         required_bytes: int,
@@ -1671,7 +1742,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
             or (max_scan_entries is not None and max_scan_entries <= 0)
         ):
             raise ValueError("invalid LocalCPU capacity-reclaim request")
-        started = time.perf_counter() if serving_perf_enabled() else None
         free_before, heap_bytes = self.get_allocator_capacity_bytes()
         target_free_bytes = required_bytes + max(
             min_free_bytes,
@@ -1735,33 +1805,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.stats_monitor.update_local_cpu_evict_metrics(evicted_keys)
         if not sufficient:
             self.stats_monitor.update_local_cpu_evict_failed_count(1)
-        if started is not None:
-            serving_perf_log(
-                logger,
-                cause,
-                started=started,
-                target_free_bytes=target_free_bytes,
-                free_before=free_before,
-                free_after=free_after,
-                evictable_bytes=evictable_bytes,
-                evictable_bytes_scope=(
-                    "eligible_candidates"
-                    if max_scan_entries is not None
-                    or type(self.cache_policy) is LRUCachePolicy
-                    else "cache"
-                ),
-                evicted_bytes=evicted_bytes,
-                evicted_keys=evicted_keys,
-                outcome=(
-                    "reclaimed"
-                    if sufficient and evicted_keys
-                    else "not_needed"
-                    if sufficient
-                    else "raced"
-                    if evicted_keys
-                    else "insufficient"
-                ),
-            )
         return sufficient
 
     def _pop_bounded_reclaim_locked(
