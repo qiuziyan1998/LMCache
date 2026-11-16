@@ -249,6 +249,17 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "remote_fill_enabled": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+        "description": (
+            "Runtime kill switch for RemoteFill. False keeps every layout and "
+            "layerwise setting selected by enable_remote_lmcache_store, but "
+            "disables direct fill on the sender and the decoder placement "
+            "advertisement so all KV traffic uses the persistent Mooncake path."
+        ),
+    },
     "remote_fill_prefix_hole_repair": {
         "type": bool,
         "default": False,

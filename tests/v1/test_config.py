@@ -145,6 +145,13 @@ def test_npu_content_diagnostics_defaults_off_and_can_be_enabled(monkeypatch):
     assert LMCacheEngineConfig.from_env().enable_npu_content_diagnostics is True
 
 
+def test_remote_fill_enabled_defaults_on_and_can_be_disabled(monkeypatch):
+    assert LMCacheEngineConfig.from_defaults().remote_fill_enabled is True
+
+    monkeypatch.setenv("LMCACHE_REMOTE_FILL_ENABLED", "0")
+    assert LMCacheEngineConfig.from_env().remote_fill_enabled is False
+
+
 def _remote_fill_config(**overrides):
     kwargs = {
         "enable_remote_lmcache_store": True,
