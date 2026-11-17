@@ -26,6 +26,7 @@ from lmcache.integration.base_service_factory import BaseServiceFactory
 from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.control_group import LMCacheControlGroup
 from lmcache.v1.health_monitor.base import HealthMonitor
 from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.internal_api_server.api_server import InternalAPIServer
@@ -197,6 +198,11 @@ class VllmServiceFactory(BaseServiceFactory):
         return self.metadata
 
     def get_or_create_lmcache_engine(self) -> Optional[LMCacheEngine]:
+        """Return the role's engine, creating worker control collectives once.
+
+        Worker engines own a Gloo group separate from model collectives. The
+        scheduler and cached-engine paths never create a distributed group.
+        """
         self._ensure_metadata()
         assert self.metadata is not None
 
@@ -227,30 +233,18 @@ class VllmServiceFactory(BaseServiceFactory):
             self.lmcache_engine = curr_engine
             return curr_engine
 
+        control_group: Optional[LMCacheControlGroup] = None
         if self.role == "scheduler":
             tpg = SimpleNamespace()
             tpg.broadcast = lambda tensor, src: tensor
-            tpg.broadcast_object = lambda obj, src: obj
+            broadcast_object = lambda obj, src: obj
             collective_all_true = bool
             vllm_gpu_connector = None
         else:
             # Third Party
-            import torch
-            import torch.distributed as dist
             from vllm.distributed.parallel_state import get_tp_group
 
             tpg = get_tp_group()
-
-            def collective_all_true(local_ready: bool) -> bool:
-                flag = torch.tensor(
-                    [int(local_ready)], dtype=torch.int32, device="cpu"
-                )
-                dist.all_reduce(
-                    flag,
-                    op=dist.ReduceOp.MIN,
-                    group=tpg.cpu_group,
-                )
-                return bool(flag.item())
             # First Party
             from lmcache.integration.vllm.utils import vllm_layout_hints
 
@@ -260,16 +254,31 @@ class VllmServiceFactory(BaseServiceFactory):
                 EngineType.VLLM,
                 layout_hints=vllm_layout_hints(),
             )
+            # Create synchronously on every TP worker, before the engine starts
+            # its mailbox/loading threads. Both control protocols must avoid
+            # tpg.cpu_group: the model may use it concurrently for SFA votes.
+            control_group = LMCacheControlGroup(tpg.ranks)
+            broadcast_object = control_group.broadcast_object
+            collective_all_true = control_group.collective_all_true
 
-        engine = LMCacheEngineBuilder.get_or_create(
-            ENGINE_NAME,
-            self.lmcache_config,
-            self.metadata,
-            vllm_gpu_connector,
-            tpg.broadcast,
-            tpg.broadcast_object,
-            collective_all_true,
-        )
+        try:
+            engine = LMCacheEngineBuilder.get_or_create(
+                ENGINE_NAME,
+                self.lmcache_config,
+                self.metadata,
+                vllm_gpu_connector,
+                tpg.broadcast,
+                broadcast_object,
+                collective_all_true,
+            )
+        except BaseException:
+            if control_group is not None:
+                try:
+                    control_group.close()
+                except Exception:
+                    logger.exception("Failed to close LMCache startup control group")
+            raise
+        engine.control_group = control_group
         self.lmcache_engine = engine
 
         if (
