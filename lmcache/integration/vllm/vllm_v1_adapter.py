@@ -2341,6 +2341,15 @@ class LMCacheConnectorV1Impl:
             kv_cache_config,
         )
         self.config = config
+        if (
+            role == KVConnectorRole.SCHEDULER
+            and config.pd_role == "receiver"
+            and config.disable_decoder_live_source
+        ):
+            logger.info(
+                "Decoder live-source metadata and advertisement disabled "
+                "(LMCACHE_DISABLE_DECODER_LIVE_SOURCE)."
+            )
         if getattr(config, "decode_preemption_checkpoint", False):
             self._validate_preemption_checkpoint_setup(config, vllm_config)
         self._preemption_checkpoints: dict[str, PendingCheckpoint] = {}
@@ -12544,6 +12553,12 @@ class LMCacheConnectorV1Impl:
         )
 
     def supports_dsa_live_split(self) -> bool:
+        """Whether this node can publish live-source KV for a P/D handoff."""
+        if (
+            getattr(self.config, "pd_role", None) == "receiver"
+            and getattr(self.config, "disable_decoder_live_source", False)
+        ):
+            return False
         return bool(
             self._group1_p2p_preferred()
             and self.config.get_extra_config_value(
@@ -13528,6 +13543,14 @@ class LMCacheConnectorV1Impl:
         live_source_requested = bool(
             params and params.get("do_remote_decode")
         )
+        if (
+            getattr(self.config, "pd_role", None) == "receiver"
+            and getattr(self.config, "disable_decoder_live_source", False)
+        ):
+            # D may inherit do_remote_decode from P's handoff. Its DCP block
+            # table cannot describe a dense live source. Disable only source
+            # capture; keep the handoff, persistent loads and local KV saves.
+            live_source_requested = False
         metadata = ReqMeta.from_request_tracker(
             tracker,
             self._block_size,

@@ -94,6 +94,16 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "description": "Decoder CPU storage ownership: local or process.",
         "mutable": False,
     },
+    "disable_decoder_live_source": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": (
+            "Disable live-source metadata and advertisement on pd_role=receiver; "
+            "preserve the configured persistent/process load and save paths."
+        ),
+        "mutable": False,
+    },
     "max_local_cpu_size": {"type": float, "default": 5.0, "env_converter": float},
     "reserve_local_cpu_size": {"type": float, "default": 0.0, "env_converter": float},
     "local_disk": {
