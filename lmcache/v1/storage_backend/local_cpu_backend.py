@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import islice
 from typing import (
     TYPE_CHECKING,
@@ -39,6 +39,7 @@ from lmcache.v1.memory_management import (
     PagedCpuGpuMemoryAllocator,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.page_slot_pool import PageSlotPool, PageSlotSpec
 from lmcache.v1.mooncake_layout import (
     mooncake_layer_pages_enabled,
     mooncake_valid_tokens,
@@ -56,6 +57,98 @@ logger = init_logger(__name__)
 
 _MAX_EXTERNAL_RETENTION_TRACES = 16
 _MAX_EXTERNAL_RETENTION_MUTATIONS = 128
+
+
+def _fixed_page_slot_specs(
+    config: LMCacheEngineConfig,
+    metadata: Optional[LMCacheMetadata],
+    slab_bytes: int,
+    alignment: int,
+) -> Optional[tuple[PageSlotSpec, ...]]:
+    """Size shared group pools from the effective slab and runtime page layout.
+
+    Compatible two-group layer-page deployments use equal slot counts by
+    default: one slot per group covers the same token chunk. Explicit counts
+    override this split; ``local_cpu.fixed_slots_enabled: false`` opts out.
+    """
+    extra = config.extra_config or {}
+    counts = extra.get("local_cpu.fixed_slot_counts")
+    enabled = extra.get("local_cpu.fixed_slots_enabled")
+    if enabled is not None and type(enabled) is not bool:
+        raise ValueError("local_cpu.fixed_slots_enabled must be a boolean")
+    if enabled is False:
+        if counts is not None:
+            raise ValueError(
+                "Fixed slot counts conflict with fixed_slots_enabled=false"
+            )
+        return None
+    if (
+        metadata is None
+        or not metadata.use_mla
+        or not config.dsa_two_groups
+        or config.enable_p2p
+        or not mooncake_layer_pages_enabled(config)
+    ):
+        if counts is not None or enabled is True:
+            raise ValueError("Fixed slots require shared MLA/DSA Mooncake layer pages")
+        return None
+    layers = metadata.runtime_kv_group_layer_counts
+    if layers is None or len(layers) != 2 or any(n <= 0 for n in layers):
+        raise ValueError("Fixed slots require two resolved runtime KV groups")
+    if counts is not None and (
+        not isinstance(counts, (list, tuple)) or len(counts) != 2
+    ):
+        raise ValueError("Fixed slot counts must be a two-element list")
+    retired_reserves = [
+        name
+        for name in (
+            "local_cpu.checkpoint_slot_reserve",
+            "local_cpu.workspace_slot_reserve",
+        )
+        if name in extra
+    ]
+    if retired_reserves:
+        logger.warning(
+            "[CPU_FIXED_SLOTS] ignoring retired reserve settings %s; all purposes "
+            "share fixed_slot_counts without additional reserved slots",
+            retired_reserves,
+        )
+    shapes, dtypes = metadata.get_shapes(config.chunk_size), metadata.get_dtypes()
+    if len(shapes) != 2 or len(dtypes) != 2:
+        raise ValueError("Fixed slots require a complete two-group payload layout")
+    specs = []
+    for group in (0, 1):
+        if group == 1 and metadata.indexer_c8_layout is not None:
+            widths = tuple(
+                metadata.indexer_c8_layout.token_bytes_for(i)
+                for i in range(layers[group])
+            )
+        else:
+            size = shapes[group].numel() * dtypes[group].itemsize
+            divisor = config.chunk_size * layers[group]
+            if size % divisor:
+                raise ValueError("Invalid uniform fixed-slot layer layout")
+            widths = (size // divisor,) * layers[group]
+        specs.append(
+            PageSlotSpec(
+                widths,
+                config.chunk_size,
+                counts[group] if counts is not None else 1,
+                alignment=alignment,
+            )
+        )
+    if counts is None:
+        pair_bytes = sum(spec.slot_bytes for spec in specs)
+        slots_per_group = slab_bytes // pair_bytes
+        if slots_per_group < 1:
+            raise ValueError(
+                "Effective CPU slab cannot fit one fixed page slot per group: "
+                f"slab_bytes={slab_bytes}, pair_bytes={pair_bytes}"
+            )
+        specs = [replace(spec, slots=slots_per_group) for spec in specs]
+    if sum(spec.slots * spec.slot_bytes for spec in specs) > slab_bytes:
+        raise ValueError("Fixed page-slot quotas exceed the effective CPU slab")
+    return tuple(specs)
 
 
 @dataclass
@@ -1079,6 +1172,25 @@ class LocalCPUBackend(AllocatorBackendInterface):
         cpu_size_bytes = int(cpu_size * 1024**3)
 
         allocator_align_bytes = self._resolve_local_cpu_allocator_alignment(config)
+        page_slot_specs = _fixed_page_slot_specs(
+            config, metadata, cpu_size_bytes, allocator_align_bytes or 4096
+        )
+        if page_slot_specs is not None:
+            assigned_bytes = sum(s.slots * s.slot_bytes for s in page_slot_specs)
+            logger.info(
+                "[CPU_FIXED_SLOTS] sizing=%s slab_bytes=%d slot_counts=%s "
+                "slot_bytes=%s assigned_bytes=%d unassigned_bytes=%d runtime quotas=%s",
+                "auto"
+                if config.get_extra_config_value("local_cpu.fixed_slot_counts", None)
+                is None
+                else "explicit",
+                cpu_size_bytes,
+                [s.slots for s in page_slot_specs],
+                [s.slot_bytes for s in page_slot_specs],
+                assigned_bytes,
+                cpu_size_bytes - assigned_bytes,
+                page_slot_specs,
+            )
         if allocator_align_bytes is not None:
             logger.info(
                 "LocalCPUBackend: using pinned allocation alignment=%d bytes",
@@ -1154,12 +1266,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     align_bytes=allocator_align_bytes,
                     config=config,
                     shm_interleave_nodes=shm_interleave_nodes,
+                    page_slot_specs=page_slot_specs,
                 )
             return MixedMemoryAllocator(
                 cpu_size_bytes,
                 numa_mapping=numa_mapping,
                 config=config,
                 shm_interleave_nodes=shm_interleave_nodes,
+                page_slot_specs=page_slot_specs,
             )
 
     @staticmethod
@@ -1472,12 +1586,38 @@ class LocalCPUBackend(AllocatorBackendInterface):
         valid_tokens: Optional[Union[int, list[int]]] = None,
         full_tokens: Optional[int] = None,
         eviction: bool = True,
+        allocation_purpose: str = "cache",
     ) -> Optional[list[LayerPageMemoryObj]]:
-        """Allocate exact-size layer pages, evicting entries when required."""
+        """Allocate all-layer pages, optionally evicting eligible owners.
+
+        Fixed-slot mode charges full slots and performs at most one group-aware
+        reclaim/retry, irrespective of busy_loop. allocation_purpose labels
+        cache, checkpoint capture, or workspace accounting; all share the pool.
+        """
         allocate = getattr(self.memory_allocator, "batched_allocate_layer_pages", None)
         if not callable(allocate):
             return None
         allocation_args = (shapes, dtypes, batch_size, num_layers, fmt)
+        if self.fixed_slots_enabled:
+            group = {
+                MemoryFormat.KV_MLA_LATENT_FMT: 0,
+                MemoryFormat.KV_DSA_INDEX_FMT: 1,
+            }[fmt]
+            pages = allocate(
+                *allocation_args, valid_tokens, full_tokens, allocation_purpose
+            )
+            if (
+                pages is None
+                and eviction
+                and self.reclaim_layer_page_slots(
+                    {group: batch_size},
+                    allocation_purpose=allocation_purpose,
+                )
+            ):
+                pages = allocate(
+                    *allocation_args, valid_tokens, full_tokens, allocation_purpose
+                )
+            return pages
         pages = allocate(
             *allocation_args,
             valid_tokens,
@@ -1510,6 +1650,87 @@ class LocalCPUBackend(AllocatorBackendInterface):
             )
         self.stats_monitor.update_local_cpu_evict_metrics(evicted)
         return pages
+
+    @property
+    def fixed_slots_enabled(self) -> bool:
+        """Whether every CPU KV owner must occupy a group-specific full slot."""
+        return getattr(self.memory_allocator, "page_slot_pool", None) is not None
+
+    def get_page_slot_pool(self) -> PageSlotPool:
+        """Return the fixed pool; raise ValueError when this mode is disabled."""
+        pool = getattr(self.memory_allocator, "page_slot_pool", None)
+        if pool is None:
+            raise ValueError("Fixed page slots are disabled")
+        return pool
+
+    def reclaim_layer_page_slots(
+        self,
+        counts: Mapping[int, int],
+        *,
+        allocation_purpose: str = "cache",
+        max_scan_entries: Optional[int] = None,
+    ) -> bool:
+        """Reclaim eligible owners of the required groups without blocking retry.
+
+        Counts include only incoming pages, with no purpose-specific reserve.
+        A snapshot is advisory; actual take-slot admission stays atomic.
+        Insufficient eligible owners leave the hot cache unchanged. A bounded
+        scan also uses a nonblocking cache lock. Pins and extra refs are retained.
+        """
+        if max_scan_entries is not None and max_scan_entries <= 0:
+            raise ValueError("Slot reclaim scan limit must be positive")
+        pool = self.get_page_slot_pool()
+        missing = pool.shortages(counts, allocation_purpose)
+        if not any(missing.values()):
+            return True
+        if not self.use_hot or not self.cpu_lock.acquire(
+            blocking=max_scan_entries is None
+        ):
+            return False
+        removed: list[MemoryObj] = []
+        try:
+            missing = pool.shortages(counts, allocation_purpose)
+            candidates: list[tuple[CacheEngineKey, MemoryObj]] = []
+            seen: set[int] = set()
+            entries = self.hot_cache.items()
+            if max_scan_entries is not None:
+                entries = islice(entries, max_scan_entries)
+            for key, obj in entries:
+                if not any(missing.values()):
+                    break
+                group = key.kv_group
+                if missing.get(group, 0) and obj.can_evict and id(obj) not in seen:
+                    if not isinstance(obj, LayerPageMemoryObj):
+                        continue
+                    seen.add(id(obj))
+                    candidates.append((key, obj))
+                    missing[group] -= 1
+            if not any(missing.values()):
+                for key, obj in candidates:
+                    _, owners = self._pop_layer_page_evict_candidate_locked(
+                        obj.num_layers,
+                        cause="fixed_slot_capacity_reclaim",
+                        selected_key=key,
+                    )
+                    removed.extend(owners)
+        finally:
+            self.cpu_lock.release()
+        for obj in removed:
+            obj.ref_count_down()
+        sufficient = not any(pool.shortages(counts, allocation_purpose).values())
+        self.stats_monitor.update_local_cpu_evict_metrics(len(removed))
+        if not sufficient:
+            self.stats_monitor.update_local_cpu_evict_failed_count(1)
+        logger.info(
+            "[CPU_FIXED_SLOTS] reclaim purpose=%s counts=%s released=%d "
+            "success=%s pools=%s",
+            allocation_purpose,
+            dict(counts),
+            len(removed),
+            sufficient,
+            pool.snapshot(),
+        )
+        return sufficient
 
     def get_full_chunk_size_bytes(self) -> int:
         logger.info("Calculating the size of a single LMCache chunk")

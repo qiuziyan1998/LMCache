@@ -3340,9 +3340,10 @@ class LMCacheEngine:
                 for i in range(self.num_layers_for_group(kv_group))
             )
         try:
-            allocator = getattr(
-                self._shared_local_cpu_backend(), "memory_allocator", None
-            )
+            local = self._shared_local_cpu_backend()
+            if getattr(local, "fixed_slots_enabled", False):
+                return local.get_page_slot_pool().specs[kv_group].slot_bytes
+            allocator = getattr(local, "memory_allocator", None)
             align_bytes = int(getattr(allocator, "align_bytes", 4096) or 4096)
         except Exception:
             align_bytes = 4096
@@ -3623,6 +3624,12 @@ class LMCacheEngine:
             if callable(get_free_size):
                 free_bytes = int(get_free_size())
 
+        slot_pool = getattr(root_allocator, "page_slot_pool", None)
+        if slot_pool is not None:
+            slots = slot_pool.snapshot()[kv_group]
+            # All purposes share this group's slots; other groups remain separate.
+            free_bytes = slots["free_slots"] * slots["slot_bytes"]
+
         if required_bytes <= free_bytes:
             return {
                 "request_id": req_id,
@@ -3654,7 +3661,12 @@ class LMCacheEngine:
         else:
             with cpu_lock:
                 cache_items = list(hot_cache.items())
+        seen_owners: set[int] = set()
         for key, mem_obj in cache_items:
+            if slot_pool is not None:
+                if key.kv_group != kv_group or id(mem_obj) in seen_owners:
+                    continue
+                seen_owners.add(id(mem_obj))
             is_shared_hot_obj = self._is_rank0_shared_mem_obj(mem_obj)
             physical_size = self._shared_cpu_mem_obj_physical_size(mem_obj)
             if is_shared_hot_obj and getattr(mem_obj, "is_pinned", False):
