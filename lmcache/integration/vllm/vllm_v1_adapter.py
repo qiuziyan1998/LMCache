@@ -12544,8 +12544,10 @@ class LMCacheConnectorV1Impl:
         )
 
     def supports_dsa_live_split(self) -> bool:
+        """Whether this node can export a dense live HBM source."""
         return bool(
-            self._group1_p2p_preferred()
+            getattr(self, "_dsa_dcp_size", None) is None
+            and self._group1_p2p_preferred()
             and self.config.get_extra_config_value(
                 "mooncake_direct_npu_prefill_store", False
             )
@@ -13525,8 +13527,11 @@ class LMCacheConnectorV1Impl:
                 can_load=True,
             )
         params = getattr(request, "kv_transfer_params", None)
+        # Handoff intent also reaches DCP receivers, whose local latent block
+        # tables cannot be mapped as a dense live source.
         live_source_requested = bool(
             params and params.get("do_remote_decode")
+            and getattr(self, "_dsa_dcp_size", None) is None
         )
         metadata = ReqMeta.from_request_tracker(
             tracker,
