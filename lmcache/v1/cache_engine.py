@@ -20,6 +20,7 @@ from typing import (
 
 if TYPE_CHECKING:
     # First Party
+    from lmcache.v1.control_group import LMCacheControlGroup
     from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
     from lmcache.v1.health_monitor.base import HealthMonitor
 
@@ -274,6 +275,8 @@ class LMCacheEngine(CPUCacheOperations):
         self.broadcast_fn = broadcast_fn
         self.broadcast_object_fn = broadcast_object_fn
         self.collective_all_true_fn = collective_all_true_fn
+        # The vLLM factory transfers ownership only after successful startup.
+        self.control_group: Optional["LMCacheControlGroup"] = None
         # save_only_first_rank only works when use mla
         self.save_only_first_rank = (
             self.config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
@@ -8137,6 +8140,9 @@ class LMCacheEngine(CPUCacheOperations):
                 importer.wait_for_retirements(self.storage_process.timeout_s)
             self.storage_process.close()
             self.shared_cpu_cache_mapping = None
+            if getattr(self, "control_group", None) is not None:
+                self.control_group.close()
+                self.control_group = None
             return
 
         if self.lmcache_worker is not None:
@@ -8170,6 +8176,9 @@ class LMCacheEngine(CPUCacheOperations):
         except Exception as e:
             logger.error(f"Error closing shared CPU cache mapping: {e}")
 
+        if getattr(self, "control_group", None) is not None:
+            self.control_group.close()
+            self.control_group = None
         logger.info("LMCacheEngine closed.")
 
     def _async_process_tokens_internal(
