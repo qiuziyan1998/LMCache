@@ -12832,6 +12832,25 @@ class LMCacheConnectorV1Impl:
                 else 0.0,
             )
 
+        # The P and D launchers can both use kv_both. An explicit layerwise
+        # prefiller must be able to compute a prompt even on a complete miss.
+        if (
+            not getattr(self, "_layerwise_prefill_p_node", False)
+            and getattr(self.config, "pd_role", None) == "receiver"
+            and self.kv_role != "kv_producer"
+        ):
+            # Even a full hit runs the last input for logits. A one-token
+            # request with zero hits still needs a source on a dedicated decoder.
+            required = max(request.num_tokens - 1, int(num_external_hit_tokens == 0))
+            if resumed and checkpoint is not None and checkpoint.sealed_end:
+                required = checkpoint.sealed_end
+            request.min_kv_prefix_tokens = required
+            if resumed and max(num_computed_tokens, num_external_hit_tokens) < required:
+                # Withdraw the short offer before waiting for an HBM slot or
+                # dispatching another restore. The scheduler checks all sources.
+                self.load_specs.pop(req_id, None)
+                return 0
+
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.
         # This will be removed in the future if vLLM's scheduler provides
@@ -14267,6 +14286,8 @@ class LMCacheConnectorV1Impl:
         checkpoints = getattr(self, "_preemption_checkpoints", None)
         if checkpoints:
             checkpoints.pop(req_id, None)
+        if getattr(request, "min_kv_prefix_tokens", 0):
+            self._requests_priority.pop(req_id, None)
         self._cold_perf_lookup_started.pop(request.request_id, None)
         self._resume_lookup_queries.pop(request.request_id, None)
         self._dsa_kv_policy_states.pop(request.request_id, None)
@@ -14332,10 +14353,8 @@ class LMCacheConnectorV1Impl:
 
         # NOTE: Used to stream back the first token
         # for disagg prefill
-        if params is not None and "ret_first_tok" in params:
-            return_params = {
-                "first_tok": request._output_token_ids[0],
-            }
+        if params and "ret_first_tok" in params and request.output_token_ids:
+            return_params = {"first_tok": request.output_token_ids[0]}
 
         if self.config.get_extra_config_value(
             "enable_cache_usage_details_in_response", False

@@ -77,9 +77,10 @@ def scheduler_adapter_class(ascend):
 
 
 @pytest.mark.parametrize("ascend", [False, True])
-def test_aborted_emitted_direct_load_releases_scheduler_ticket_on_terminal_receive(
-    ascend,
-):
+@pytest.mark.parametrize("dispatched", [False, True])
+def test_rejection_or_abort_releases_lookup_ticket_at_its_ownership_boundary(
+    ascend: bool, dispatched: bool,
+) -> None:
     runtime = LookupRuntime()
     work, lifecycle = endpoint(), endpoint()
     service = StorageService(
@@ -109,6 +110,7 @@ def test_aborted_emitted_direct_load_releases_scheduler_ticket_on_terminal_recei
         config=settings,
         lookup_client=client,
         _manager=NS(lmcache_engine=None, lookup_client=client),
+        _requests_priority={},
         _cold_perf_lookup_started={},
         _resume_lookup_queries={},
         _dsa_kv_policy_states={},
@@ -132,23 +134,59 @@ def test_aborted_emitted_direct_load_releases_scheduler_ticket_on_terminal_recei
             ticket = client.peek_ticket(req_id)
             assert ticket.identity.request_attempt != prior_attempt
             prior_attempt = ticket.identity.request_attempt
-            # Allocation transferred the ticket. M's actual prepare finally
-            # releases the lookup hold independently of its prepared leases.
-            client.clear_lookup_status(req_id)
-            runtime.tickets.pop(ticket.identity.key)
-            runtime.registry.set_ticket(ticket.identity, None)
-            adapter._dsa_group1_direct_hbm_active_req_id = req_id
+            if dispatched:
+                # Allocation transferred the ticket. Prepare releases the lookup
+                # hold independently of the worker's prepared leases.
+                client.clear_lookup_status(req_id)
+                runtime.tickets.pop(ticket.identity.key)
+                runtime.registry.set_ticket(ticket.identity, None)
+                adapter._dsa_group1_direct_hbm_active_req_id = req_id
+            adapter._requests_priority[req_id] = 0
             request = NS(
-                request_id=req_id, kv_transfer_params=None, dsa_compact_allocated=True
+                request_id=req_id, kv_transfer_params={"ret_first_tok": True},
+                output_token_ids=[], dsa_compact_allocated=dispatched,
+                min_kv_prefix_tokens=3,
             )
-            assert adapter.request_finished(request, []) == (True, None)
-            assert transport._records  # Keep the emitted load's lookup until terminal.
-            adapter.update_connector_output(NS(finished_recving={req_id}))
+            assert adapter.request_finished(request, []) == (ascend or dispatched, None)
+            assert req_id not in adapter._requests_priority
+            if dispatched:
+                assert transport._records  # Keep the issued lookup until terminal.
+                adapter.update_connector_output(NS(finished_recving={req_id}))
             wait_for(lambda: not transport._records)
+            assert not runtime.tickets
             assert runtime.registry.snapshot()["operations"] == 0
     finally:
         client.close()
         service.close()
+
+
+def test_layerwise_prefiller_returns_first_token_after_local_prefill() -> None:
+    adapter = scheduler_adapter_class(True)()
+    adapter.__dict__.update(
+        config=NS(pd_role="sender", get_extra_config_value=lambda _, default: default),
+        _layerwise_prefill_p_node=True,
+        kv_role="kv_both",
+        store_async=True,
+        lookup_client=NS(clear_lookup_status=lambda _: None),
+        _cold_perf_lookup_started={},
+        _resume_lookup_queries={},
+        _dsa_kv_policy_states={},
+        _scheduler_live_sources={},
+        _release_request_lookup_pins=lambda _: None,
+        _discard_request_set=lambda *_: None,
+        _drop_worker_retrieve_state=lambda *_, **kw: None,
+        supports_dsa_live_split=lambda: False,
+    )
+    request = NS(
+        request_id="prefill",
+        kv_transfer_params={"ret_first_tok": True, "do_remote_decode": True},
+        output_token_ids=[0, 17],
+        num_cached_tokens=0,
+    )
+    assert adapter.request_finished(request, []) == (
+        True,
+        {"first_tok": 0, "remote_prefill_cached_tokens": 0},
+    )
 
 
 def test_actual_scheduler_rejects_request_id_reuse_while_delayed_receiver_is_owned():

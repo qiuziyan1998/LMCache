@@ -216,6 +216,81 @@ def test_ready_checkpoint_queries_exact_generated_partial_history():
     assert adapter._resume_lookup_queries["r"][1] == "preemption_checkpoint"
 
 
+def receiver_lookup(
+    req: NS, hit: int | None, local: int = 0, *, role: str | None = "receiver",
+    checkpoint: control.PendingCheckpoint | None = None, busy: bool = False,
+    prefill_p_node: bool = False,
+) -> int | None:
+    """Run the ordinary adapter lookup with a controlled storage result."""
+    adapter = NS(
+        kv_role="kv_both", _layerwise_prefill_p_node=prefill_p_node,
+        config=NS(pd_role=role, min_retrieve_tokens=0,
+                  dsa_group1_load_mode="persistent_direct_hbm"),
+        lookup_client=NS(lookup_cache=lambda **kw: hit),
+        _preemption_checkpoints={"r": checkpoint},
+        _resume_lookup_queries={}, _cold_perf_lookup_started={}, _request_trackers={},
+        _lmcache_chunk_size=4, _block_size=4, _dsa_scratch_capacity=4,
+        enable_sparse_attention=True, supports_dsa_cold_compact_load=lambda: True,
+        load_specs={}, _dsa_group1_direct_hbm_active_req_id="peer" if busy else None,
+    )
+    return method(
+        "get_num_new_matched_tokens", cdiv=lambda a, b: (a + b - 1) // b, LoadSpec=NS
+    )(adapter, req, local)
+
+
+@pytest.mark.parametrize("length,hit,local,admit", [
+    (12, 0, 0, False), (12, 10, 0, False), (12, 11, 0, True),
+    (12, 12, 0, True), (12, 0, 11, True), (1, 0, 0, False), (1, 1, 0, True),
+])
+def test_receiver_initial_admission_preserves_the_last_logit(
+    length: int, hit: int, local: int, admit: bool
+) -> None:
+    req = NS(request_id="r", num_tokens=length, prompt_token_ids=[1] * length,
+             status="waiting", num_preemptions=0)
+    external = receiver_lookup(req, hit, local)
+    assert external is not None
+    assert (local + external >= req.min_kv_prefix_tokens) is admit
+
+
+@pytest.mark.parametrize("role,p_node", [
+    (None, False), ("sender", False), ("sender", True), ("receiver", True),
+])
+@pytest.mark.parametrize("hit", [0, 10])
+def test_local_and_sender_lookups_do_not_require_a_decoder_prefix(
+    role: str | None, p_node: bool, hit: int
+) -> None:
+    req = NS(request_id="r", num_tokens=12, prompt_token_ids=[1] * 12,
+             status="waiting", num_preemptions=0)
+    assert receiver_lookup(req, hit, role=role, prefill_p_node=p_node) == hit
+    assert not getattr(req, "min_kv_prefix_tokens", 0)
+
+
+@pytest.mark.parametrize("hit,retry", [(9, False), (8, False), (8, True)])
+def test_receiver_resume_requires_the_original_seal_instead_of_full_history(
+    hit: int, retry: bool
+) -> None:
+    req = request()  # 12 accepted tokens; only [0, 9) was sealed.
+    capture = control.CaptureSpec("r", 1, 4, 14, 6, ((1,), (2,)), prefix_end=4)
+    pending = control.PendingCheckpoint(capture, "persisting", end=9)
+    assert pending.accept(control.CheckpointResult("r", 1, "ready", 9))
+    if retry:
+        pending.retry_shorter(4)
+        assert pending.end == 8
+    external = receiver_lookup(req, hit, checkpoint=pending, busy=(hit < 9))
+    assert req.min_kv_prefix_tokens == 9
+    assert external == (9 if hit == 9 else 0)
+
+
+def test_stale_seal_cannot_authorize_checkpoint_resume() -> None:
+    req = request()
+    req.min_kv_prefix_tokens = 9  # Previous preemption generation.
+    capture = control.CaptureSpec("r", 0, 4, 14, 6, ((1,), (2,)), prefix_end=4)
+    pending = control.PendingCheckpoint(capture, "persisting", end=9)
+    assert pending.accept(control.CheckpointResult("r", 0, "ready", 9))
+    assert receiver_lookup(req, 4, checkpoint=pending) == 0
+    assert req.min_kv_prefix_tokens == req.num_tokens - 1
+
+
 def test_cold_promotion_is_one_shot_and_preserves_exact_frontier():
     take = method("_take_completed_cold_load")
     load = NS(
