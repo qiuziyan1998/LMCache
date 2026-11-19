@@ -22,6 +22,7 @@ from lmcache.v1.cpu_cache import (
 from lmcache.v1.cpu_cache_operations import CPUCacheOperations
 from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
+from lmcache.v1.lookup_diagnostics import collect_lookup_failure
 from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryFormat
 from lmcache.v1.mooncake_layout import mooncake_payload_layout
 from lmcache.v1.pin_monitor import PinMonitor
@@ -365,13 +366,14 @@ class CPUCacheRuntime(CPUCacheOperations):
         with self._lock:
             self._lookup_request_ids[ticket_id] = identity.request_id
         try:
-            matched = self._lookup_remote_fill_two_group_prefix(
-                chunks,
-                search_range=search,
-                lookup_id=ticket_id,
-                pin=True,
-                request_configs=request_configs,
-            )
+            with collect_lookup_failure() as diagnostics:
+                matched = self._lookup_remote_fill_two_group_prefix(
+                    chunks,
+                    search_range=search,
+                    lookup_id=ticket_id,
+                    pin=True,
+                    request_configs=request_configs,
+                )
             if self.registry.cancellation_requested(identity):
                 raise StorageFailedSafe("CPU lookup was cancelled")
             retained = self._remote_fill_lookup_plans.get(ticket_id)
@@ -402,6 +404,13 @@ class CPUCacheRuntime(CPUCacheOperations):
                     tuple(b for _, b, _ in selected),
                     hashes[: len(selected)],
                     request_configs,
+                    dict(
+                        diagnostics,
+                        search_range=search,
+                        group1_load_mode=self.config.dsa_group1_load_mode,
+                    )
+                    if not matched
+                    else {},
                 )
                 if matched:
                     self._tickets[ticket_id] = _LookupTicket(identity, reply)

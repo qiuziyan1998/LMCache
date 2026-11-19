@@ -15,6 +15,7 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
+from lmcache.v1.lookup_diagnostics import record_lookup_failure
 from lmcache.v1.memory_management import (
     LayerPageMemoryObj,
     MemoryAllocatorInterface,
@@ -164,6 +165,7 @@ class CPUCacheOperations:
 
         assert self.storage_manager is not None
         if "RemoteBackend" not in search_range:
+            record_lookup_failure("remote_backend_not_in_search_range")
             return 0
 
         local_mapping: dict[str, list[CacheEngineKey]] = defaultdict(list)

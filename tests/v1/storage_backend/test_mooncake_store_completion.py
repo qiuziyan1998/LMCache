@@ -21,6 +21,7 @@ from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1 import startup_trace
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.lookup_diagnostics import page_key_fingerprint
 from lmcache.v1.memory_management import MemoryFormat, TensorMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
@@ -1313,8 +1314,10 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
     assert exists[1] == [mooncake_page_key(_key(7), 2)]
 
 
+@pytest.mark.parametrize("last_group", [0, 1])
 def test_mooncake_direct_page_put_uses_latent_segment_hint(
     monkeypatch: pytest.MonkeyPatch,
+    last_group: int,
 ) -> None:
     class _ReplicateConfig:
         pass
@@ -1371,7 +1374,7 @@ def test_mooncake_direct_page_put_uses_latent_segment_hint(
 
     asyncio.run(
         connector.batched_put_external_pages(
-            [hinted, _key(11)],
+            [hinted, _key(11, last_group)],
             [[owner.data_ptr()], [owner.data_ptr() + 16]],
             [[16], [16]],
             (owner,),
@@ -1385,6 +1388,12 @@ def test_mooncake_direct_page_put_uses_latent_segment_hint(
     assert calls[1][1] is connector.replica_config
     event, fields = events[-1]
     assert event == "direct_npu_page_put"
+    assert fields["req_id"] == "request"
+    assert fields["status"] == "ok"
+    expected_fps = {0: page_key_fingerprint(calls[0][0][0])}
+    if last_group == 1:
+        expected_fps[1] = page_key_fingerprint(calls[-1][0][0])
+    assert fields["first_page_key_fps"] == expected_fps
     assert fields["preferred_segments"] == ["decoder-segment"]
     assert fields["preferred_pages"] == 1
     assert fields["default_pages"] == 1

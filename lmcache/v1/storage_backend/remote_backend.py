@@ -17,6 +17,7 @@ from lmcache.utils import (
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.exceptions import IrrecoverableException
+from lmcache.v1.lookup_diagnostics import record_lookup_failure
 from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
@@ -292,15 +293,20 @@ class RemoteBackend(StorageBackendInterface):
     ) -> int:
         """Check Mooncake page keys without accepting legacy layer objects."""
         if self.connection is None:
+            record_lookup_failure("remote_connection_unavailable")
             return 0
         contains = getattr(self.connection, "batched_contains_layer_pages", None)
         if not callable(contains):
+            record_lookup_failure("remote_page_lookup_unsupported")
             return 0
         if self._mla_worker_id_as0_mode:
             keys = [key.with_new_worker_id(0) for key in keys]
         try:
             return contains(keys)
         except Exception as error:
+            record_lookup_failure(
+                "remote_page_lookup_exception", backend_error=str(error)[:256]
+            )
             logger.warning(f"Remote layer-page lookup failed: {error}")
             return 0
 

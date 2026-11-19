@@ -476,7 +476,9 @@ class GroupManifest(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
         )
 
 
-class LookupReply(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class LookupReply(
+    msgspec.Struct, frozen=True, forbid_unknown_fields=True, omit_defaults=True
+):
     """A source ticket and the canonical group key plan, not an execution-ready hit."""
 
     matched_tokens: int
@@ -487,6 +489,8 @@ class LookupReply(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     ends: tuple[int, ...]
     hashes: tuple[int | bytes, ...]
     request_configs: dict[str, Any]
+    # Zero-result evidence only; successful replies keep their existing wire shape.
+    diagnostics: dict[str, Any] = msgspec.field(default_factory=dict)
 
 
 class StorageLookupTicket(msgspec.Struct, frozen=True, forbid_unknown_fields=True):

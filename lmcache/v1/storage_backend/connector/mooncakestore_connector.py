@@ -17,6 +17,11 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
+from lmcache.v1.lookup_diagnostics import (
+    lookup_failure_pending,
+    page_key_fingerprint,
+    record_lookup_failure,
+)
 from lmcache.v1.serving_perf import (
     serving_perf_enabled,
     serving_perf_log,
@@ -67,6 +72,19 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.system_detection import NUMADetector
 
 logger = init_logger(__name__)
+
+
+def _first_page_key_fps(
+    keys: List[CacheEngineKey], page_keys: List[str]
+) -> dict[int, str]:
+    """Keep one publication fingerprint per KV group, including mixed batches."""
+    fingerprints: dict[int, str] = {}
+    for key, page_key in zip(keys, page_keys, strict=True):
+        group = int(key.kv_group or 0)
+        if group not in fingerprints:
+            fingerprints[group] = page_key_fingerprint(page_key)
+    return fingerprints
+
 
 async def _await_native_task(task: asyncio.Future[Any], *, timeout: float) -> Any:
     """Wait without cancellation or a failed wait_for Future/traceback cycle."""
@@ -1212,6 +1230,7 @@ class MooncakestoreConnector(RemoteConnector):
         started = serving_perf_now() if serving_perf_enabled() else None
         page_keys = self._page_keys_for(keys)
         if any(key is None for key in page_keys):
+            record_lookup_failure("page_key_unavailable")
             return 0
         batch_exists = getattr(self.store, "batch_is_exist", None)
         results = (
@@ -1229,6 +1248,14 @@ class MooncakestoreConnector(RemoteConnector):
             (index for index, result in enumerate(results) if result != 1),
             len(results),
         )
+        if found < len(page_keys) and lookup_failure_pending():
+            record_lookup_failure(
+                "page_unavailable",
+                page_key=page_keys[found],
+                page_index=found,
+                kv_group=int(keys[found].kv_group or 0),
+                exists_status=int(results[found]) if found < len(results) else None,
+            )
         if started is not None:
             serving_perf_log(
                 logger,
@@ -2510,6 +2537,7 @@ class MooncakestoreConnector(RemoteConnector):
                 "direct_npu_page_put",
                 started=started,
                 req_id=req_id,
+                first_page_key_fps=_first_page_key_fps(keys, page_keys),
                 pages=len(page_keys) - legacy_objects,
                 legacy_objects=legacy_objects,
                 buffers=sum(map(len, buffer_ptrs)),
@@ -2935,6 +2963,9 @@ class MooncakestoreConnector(RemoteConnector):
                     ),
                     first_page_key=page_keys[0],
                     last_page_key=page_keys[-1],
+                    first_page_key_fps=_first_page_key_fps(
+                        [keys[indices[0]] for _, indices in page_groups], page_keys
+                    ),
                     legacy_objects=len(legacy_indices),
                     preferred_segments=preferred_segments,
                     preferred_pages=preferred_pages,

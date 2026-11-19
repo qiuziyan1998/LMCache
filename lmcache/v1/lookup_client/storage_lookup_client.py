@@ -14,6 +14,7 @@ import msgspec
 
 # First Party
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
+from lmcache.v1.lookup_diagnostics import log_lookup_zero
 from lmcache.v1.rpc.storage_client import StorageClient, StorageFuture
 from lmcache.v1.rpc.storage_protocol import (
     LookupReply,
@@ -114,7 +115,7 @@ class StorageLookupClient(LookupClientInterface):
                     time.monotonic() - entry.started
                 ) * 1000 > self.config.lookup_timeout_ms:
                     self.cleanup_lookup(lookup_id)
-                    self.reqs_status[lookup_id] = 0
+                    self._zero_lookup(lookup_id, "timeout", "PENDING", entry=entry)
                 return None
             return self._accept(lookup_id, entry)
 
@@ -127,12 +128,14 @@ class StorageLookupClient(LookupClientInterface):
                 return self.lookup_cache(lookup_id)
             if not self._poll_cleanup(lookup_id):
                 return None
+            started = time.monotonic()
             chunks = tuple(
                 self.token_database.process_tokens(token_ids, make_key=False)
             )
             if not chunks:
-                self.reqs_status[lookup_id] = 0
-                return 0
+                return self._zero_lookup(
+                    lookup_id, "no_query_chunks", "NOT_SUBMITTED", started=started
+                )
             kind = "bytes" if self.token_database.chunk_hash_type is bytes else "int"
             width = (
                 self.token_database.chunk_hash_bytes * 8
@@ -159,9 +162,14 @@ class StorageLookupClient(LookupClientInterface):
                     load_generation=0,
                     purpose="lookup",
                 )
-            except BufferError:
-                self.reqs_status[lookup_id] = 0  # Existing cache-miss/recompute policy.
-                return 0
+            except BufferError as error:
+                return self._zero_lookup(
+                    lookup_id,
+                    "submission_backpressure",
+                    "NOT_SUBMITTED",
+                    started=started,
+                    error=str(error),
+                )
             entry = _Lookup(
                 future,
                 time.monotonic(),
@@ -180,7 +188,7 @@ class StorageLookupClient(LookupClientInterface):
         except TimeoutError:
             self.cleanup_lookup(lookup_id)
             with self._lock:
-                self.reqs_status[lookup_id] = 0
+                self._zero_lookup(lookup_id, "timeout", "PENDING", entry=entry)
             return 0  # The unresolved lookup remains retained for reconciliation.
         with self._lock:
             return self._accept(lookup_id, entry)
@@ -294,8 +302,13 @@ class StorageLookupClient(LookupClientInterface):
         result = entry.future.result()
         if result.status in ("BUSY", "CANCELLED_NOT_STARTED", "FAILED_SAFE"):
             self.cleanup_lookup(lookup_id)
-            self.reqs_status[lookup_id] = 0
-            return 0
+            return self._zero_lookup(
+                lookup_id,
+                "storage_" + result.status.lower(),
+                result.status,
+                entry=entry,
+                error=result.error,
+            )
         if result.status != "COMPLETED" or result.error:
             raise RuntimeError(
                 result.error or f"Storage lookup returned {result.status}"
@@ -322,8 +335,45 @@ class StorageLookupClient(LookupClientInterface):
         entry.ticket = StorageLookupTicket(
             reply, entry.future.identity, entry.future.payload_digest
         )
+        if reply.matched_tokens == 0:
+            return self._zero_lookup(
+                lookup_id,
+                "no_complete_prefix",
+                result.status,
+                entry=entry,
+                diagnostics=reply.diagnostics,
+            )
         self.reqs_status[lookup_id] = reply.matched_tokens
         return reply.matched_tokens
+
+    def _zero_lookup(
+        self,
+        lookup_id: str,
+        reason: str,
+        status: str,
+        *,
+        entry: _Lookup | None = None,
+        started: float | None = None,
+        error: str | None = None,
+        diagnostics: dict | None = None,
+    ) -> int:
+        if lookup_id not in self.reqs_status:
+            now = time.monotonic()
+            started = entry.started if entry else started
+            log_lookup_zero(
+                lookup_id,
+                reason,
+                status=status,
+                elapsed_ms=(now - started) * 1000 if started is not None else 0.0,
+                identity=entry.future.identity if entry else None,
+                error=error,
+                query_tokens=entry.expected_plan[1][-1] if entry else None,
+                query_chunks=len(entry.expected_plan[0]) if entry else None,
+                timeout_ms=self.config.lookup_timeout_ms,
+                diagnostics=diagnostics or {},
+            )
+        self.reqs_status[lookup_id] = 0
+        return 0
 
     def _poll_cleanup(self, lookup_id: str, *, retry_pending: bool = False) -> bool:
         entries = self._cleaning.get(lookup_id, [])
