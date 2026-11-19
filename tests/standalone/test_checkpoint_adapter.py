@@ -38,7 +38,7 @@ def method(name, **extra):
     ns.update(
         RequestStatus=NS(PREEMPTED="preempted"),
         serving_perf_enabled=lambda: False,
-        logger=NS(debug=lambda *a, **kw: None),
+        logger=NS(debug=lambda *a, **kw: None, info=lambda *a, **kw: None),
         extract_mm_features=lambda r: ([], []),
         extract_request_configs=lambda p: None,
     )

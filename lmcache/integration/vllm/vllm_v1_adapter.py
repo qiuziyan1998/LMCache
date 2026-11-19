@@ -4929,6 +4929,17 @@ class LMCacheConnectorV1Impl:
                     and getattr(load_spec, "dsa_cold_compact_load", False)
                 ):
                     cold_loaded.add(req_id)
+                    checkpoint_generation = getattr(
+                        load_spec, "checkpoint_generation", None
+                    )
+                    if checkpoint_generation is not None:
+                        logger.info(
+                            "[CHECKPOINT_RESTORE_COMPLETE] req=%s generation=%d "
+                            "load_generation=%d frontier=%d",
+                            req_id, checkpoint_generation,
+                            load_spec.dsa_cold_load_generation,
+                            load_spec.lmcache_cached_tokens,
+                        )
                 self._discard_request_set("_dsa_cold_failed_req_ids", req_id)
             if not validation_blocks:
                 del self._dsa_cold_indexer_block_ids
@@ -12380,6 +12391,10 @@ class LMCacheConnectorV1Impl:
         ):
             # A local offer is evictable while HBM admission is pending. Treat
             # the fresh paired frontier as the query result, never the old offer.
+            logger.info(
+                "[CHECKPOINT_LOOKUP_SHORTENED] req=%s generation=%d offered=%d available=%d",
+                req_id, request.num_preemptions, query_end, num_external_hit_tokens,
+            )
             query_end = lookup_query_tokens = num_external_hit_tokens
             self._resume_lookup_queries[req_id] = (query_end, query_scope, decode_committed_end)
         lookup_started = self._cold_perf_lookup_started.pop(
@@ -13854,6 +13869,10 @@ class LMCacheConnectorV1Impl:
                 pending.restore_miss = result
             return
         if pending is not None and pending.accept(result):
+            logger.info(
+                "[CHECKPOINT_STATE] req=%s generation=%d status=%s end=%d reason=%s",
+                result.req_id, result.generation, result.status, result.end, result.reason,
+            )
             if pending.status == "captured" or pending.cancel_pending:
                 self._arm_preemption_controls()
             if serving_perf_enabled():
@@ -14017,6 +14036,10 @@ class LMCacheConnectorV1Impl:
             self._preemption_checkpoints[req_id] = PendingCheckpoint(capture)
             self._resume_lookup_queries.pop(req_id, None)
             captures.append(capture)
+            logger.info(
+                "[CHECKPOINT_PREEMPT] req=%s generation=%d prefix=%d captured_limit=%d",
+                req_id, generation, prefix_end, end,
+            )
         for req_id, pending in tuple(self._preemption_checkpoints.items()):
             request = self._unfinished_requests.get(req_id)
             if (

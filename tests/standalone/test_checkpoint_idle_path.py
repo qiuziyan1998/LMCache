@@ -168,7 +168,10 @@ def test_checkpoint_controls_preserve_simultaneous_cold_load_trigger(monkeypatch
     prefix = ast.ImportFrom(
         module="__future__", names=[ast.alias(name="annotations")], level=0
     )
-    ns = {"LMCacheConnectorMetadata": plain, "logger": NS(debug=lambda *a: None)}
+    ns = {
+        "LMCacheConnectorMetadata": plain,
+        "logger": NS(debug=lambda *a: None, info=lambda *a: None),
+    }
     exec(
         compile(
             ast.fix_missing_locations(ast.Module(body=[prefix, fn], type_ignores=[])),
