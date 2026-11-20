@@ -2288,6 +2288,7 @@ class LMCacheConnectorV1Impl:
         self._deferred_layerwise_prefill_load_active = False
         self._initial_layerwise_prefill_load_submitted = False
         self._deferred_layerwise_prefill_drained_groups: set[int] = set()
+        self._layerwise_group0_dma_skipped: set[str] = set()
         self._layerwise_save_storers: dict[
             LayerwiseSaveKey, Generator[Optional[LayerwiseStoreResult], None, None]
         ] = {}
@@ -3970,6 +3971,7 @@ class LMCacheConnectorV1Impl:
             self._deferred_layerwise_prefill_load_active = False
             self._initial_layerwise_prefill_load_submitted = False
             self._deferred_layerwise_prefill_drained_groups = set()
+            self._layerwise_group0_dma_skipped = set()
 
     @staticmethod
     def _close_layerwise_retriever(
@@ -7776,6 +7778,7 @@ class LMCacheConnectorV1Impl:
         self._wait_for_save_done = False
         self._deferred_layerwise_prefill_load_active = False
         self._initial_layerwise_prefill_load_submitted = False
+        self._layerwise_group0_dma_skipped = set()
 
         attn_metadata = forward_context.attn_metadata
         metadata = self._parent._get_connector_metadata()
@@ -8347,6 +8350,11 @@ class LMCacheConnectorV1Impl:
                                     self._lmcache_chunk_size,
                                 )
                             )
+                    skip_group0_dma = self._should_skip_group0_prefill_dma(
+                        request.req_id, gpu_connector, request=request
+                    )
+                    if skip_group0_dma:
+                        self._layerwise_group0_dma_skipped.add(request.req_id)
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         retrieve_tokens,
                         token_mask,
@@ -8361,6 +8369,11 @@ class LMCacheConnectorV1Impl:
                         shared_cpu_request_preflight_state=dense_preflight_state,
                         _retain_shared_dense_cache=retain_dense_seed,
                         **deferred_prefill_kwargs,
+                        **(
+                            {"_selected_skip_group0_dma": True}
+                            if skip_group0_dma
+                            else {}
+                        ),
                         **(
                             {"prefill_dma_block_ids_by_bank":
                              self._layerwise_prefill_dma_block_ids(request, 0),
@@ -8872,7 +8885,17 @@ class LMCacheConnectorV1Impl:
                         "non-PREFILL_CHILD request: "
                         f"req_id={request.req_id}"
                     )
-                if wait_group not in drained_groups and should_advance_retriever:
+                skip_group0_advance = (
+                    wait_group == 0
+                    and not finish_current
+                    and request.req_id
+                    in getattr(self, "_layerwise_group0_dma_skipped", ())
+                )
+                if (
+                    wait_group not in drained_groups
+                    and should_advance_retriever
+                    and not skip_group0_advance
+                ):
                     ret_token_mask = self._advance_dense_layerwise_retriever(
                         request,
                         self.layerwise_retrievers[idx],
@@ -8903,6 +8926,60 @@ class LMCacheConnectorV1Impl:
             metadata,
         )
 
+    def _should_skip_group0_prefill_dma(
+        self,
+        req_id: str,
+        gpu_connector: Any,
+        request: Optional[Any] = None,
+    ) -> bool:
+        """Return whether Selected-KV prefill owns Group-0 HBM materialization."""
+        if getattr(self, "kv_role", None) == "kv_both":
+            if not getattr(self, "enable_sparse_attention", False):
+                return False
+            if request is not None:
+                if not getattr(request, "is_last_prefill", True):
+                    return False
+                cs = int(getattr(self, "_lmcache_chunk_size", 256) or 256)
+                cached_toks = int(
+                    getattr(
+                        getattr(request, "load_spec", None),
+                        "lmcache_cached_tokens",
+                        0,
+                    )
+                    or 0
+                )
+                committed_end = (
+                    (cached_toks // cs) * cs if cs > 0 else cached_toks
+                )
+                release_gate = max(
+                    int(getattr(self, "_dsa_scratch_capacity", 0) or 0),
+                    int(getattr(self, "_dsa_kv_policy_threshold", 0) or 0),
+                )
+                if committed_end <= release_gate:
+                    return False
+        shared_pred = getattr(
+            self.lmcache_engine, "_should_use_shared_layerwise_retrieve", None
+        )
+        return bool(
+            getattr(self, "_deferred_layerwise_prefill_load_active", False)
+            and getattr(self, "_layerwise_prefill_dma", False)
+            and not getattr(self, "enable_blending", False)
+            and callable(shared_pred)
+            and bool(shared_pred(0))
+            and callable(
+                getattr(
+                    gpu_connector,
+                    "prepare_layerwise_prefill_group0_skip",
+                    None,
+                )
+            )
+            and getattr(gpu_connector, "fence_debug", None) is None
+            and not hasattr(gpu_connector, "kv_trace")
+            and not hasattr(gpu_connector, "prefill_audit")
+            and req_id
+            in getattr(self, "_selected_skip_group0_dma_req_ids", ())
+        )
+
     def _submit_initial_layerwise_prefill_load(self) -> None:
         """Submit the remaining initial banks without advancing model layers."""
         if self._initial_layerwise_prefill_load_submitted:
@@ -8912,13 +8989,19 @@ class LMCacheConnectorV1Impl:
             for request, retriever_pair in zip(
                 requests, self.layerwise_retrievers, strict=True
             ):
-                for layer_id in range(1, min(
-                    getattr(self, "_layerwise_prefill_bank_count", 2),
-                    len(self._latent_layer_names),
-                )):
-                    self._advance_dense_layerwise_retriever(
-                        request, retriever_pair, 0, layer_id
-                    )
+                if request.req_id not in getattr(
+                    self, "_layerwise_group0_dma_skipped", ()
+                ):
+                    for layer_id in range(
+                        1,
+                        min(
+                            getattr(self, "_layerwise_prefill_bank_count", 2),
+                            len(self._latent_layer_names),
+                        ),
+                    ):
+                        self._advance_dense_layerwise_retriever(
+                            request, retriever_pair, 0, layer_id
+                        )
                 for layer_id in range(1, min(
                     getattr(self, "_layerwise_prefill_bank_count", 2),
                     len(self._indexer_layer_names)
