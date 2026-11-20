@@ -102,10 +102,11 @@ class PinMonitor(PeriodicThread):
             self._pinned_objects.update(
                 (id(obj), (obj, current_time)) for obj in memory_objs
             )
-            logger.debug(
-                "Registered %d pinned objects for timeout monitoring",
-                len(memory_objs),
-            )
+            if logger.isEnabledFor(10):
+                logger.debug(
+                    "Registered %d pinned objects for timeout monitoring",
+                    len(memory_objs),
+                )
 
     def on_unpin(self, memory_obj: "MemoryObj"):
         """Unregister a memory object from timeout monitoring."""
@@ -113,9 +114,29 @@ class PinMonitor(PeriodicThread):
         with self._objects_lock:
             if obj_id in self._pinned_objects:
                 del self._pinned_objects[obj_id]
+                if logger.isEnabledFor(10):
+                    logger.debug(
+                        "Unregistered pinned object %s from timeout monitoring",
+                        obj_id,
+                    )
+
+    def on_unpin_many(self, memory_objs: Sequence["MemoryObj"]) -> None:
+        """Unregister a batch of pinned objects under one monitor lock."""
+        if not memory_objs:
+            return
+        with self._objects_lock:
+            pinned = self._pinned_objects
+            removed = 0
+            for obj in memory_objs:
+                if (
+                    getattr(getattr(obj, "meta", None), "pin_count", 0) <= 0
+                    and pinned.pop(id(obj), None) is not None
+                ):
+                    removed += 1
+            if removed and logger.isEnabledFor(10):
                 logger.debug(
-                    "Unregistered pinned object %s from timeout monitoring",
-                    obj_id,
+                    "Unregistered %d pinned objects from timeout monitoring",
+                    removed,
                 )
 
     def _check_timeouts(self) -> tuple[int, int, int]:

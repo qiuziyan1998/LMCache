@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import deque
+from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -612,6 +613,14 @@ class TensorMemoryObj(MemoryObj):
         )
         self._allocation_batch: Optional[_TensorAllocationBatch] = None
         self._allocation_batch_index = -1
+        self._cached_npu_base_dva: Optional[
+            tuple[int, str, int, int, bool, int]
+        ] = None
+        self._cached_typed_tensor: Optional[
+            tuple[torch.Tensor, int, int, torch.dtype, torch.Size, torch.Tensor]
+        ] = None
+        self._passive_descriptor: Optional[tuple[Any, ...]] = None
+        self._live_views_id: int = 0
         if group_prefix_sum is None:
             self.refresh_metadata_view()
 
@@ -627,6 +636,8 @@ class TensorMemoryObj(MemoryObj):
         self.group_prefix_sum = _group_prefix_sums(
             self.meta.shapes, self.meta.dtypes, fallback_size
         )
+        self._cached_npu_base_dva = None
+        self._cached_typed_tensor = None
 
     @cached_property
     def raw_data(self) -> torch.Tensor:
@@ -663,6 +674,8 @@ class TensorMemoryObj(MemoryObj):
                 raise ValueError(f"Raw tensor view size is unaligned: {size}")
             self.raw_data = raw_data[: size // element_size]
         self._raw_view_size = size
+        self._cached_npu_base_dva = None
+        self._cached_typed_tensor = None
 
     @property
     def has_tensor_storage(self) -> bool:
@@ -701,6 +714,8 @@ class TensorMemoryObj(MemoryObj):
         self.valid = False
         self._allocation_batch = None
         self._allocation_batch_index = -1
+        self._cached_npu_base_dva = None
+        self._cached_typed_tensor = None
 
     def is_valid(self):
         return self.valid
@@ -839,8 +854,44 @@ class TensorMemoryObj(MemoryObj):
                     cls.monitor.update_pinned_memory_objs_count(newly_pinned)
                     stats_updated = True
                 PinMonitor.GetOrCreate().on_pin_many(unique)
-            except Exception:
+            except BaseException:
                 for obj in memory_objs:
+                    obj.meta.pin_count -= 1
+                if stats_updated:
+                    cls.monitor.update_pinned_memory_objs_count(-newly_pinned)
+                raise
+            return True
+        finally:
+            for obj in reversed(locked):
+                obj.lock.release()
+
+    @classmethod
+    def acquire_and_pin_many(cls, memory_objs: list["TensorMemoryObj"]) -> bool:
+        """Increment ref_count and pin_count for a batch in a single lock pass."""
+        if not memory_objs:
+            return True
+        unique = sorted({id(obj): obj for obj in memory_objs}.values(), key=id)
+        locked: list[TensorMemoryObj] = []
+        newly_pinned = 0
+        stats_updated = False
+        try:
+            for obj in unique:
+                obj.lock.acquire()
+                locked.append(obj)
+                if not obj.valid:
+                    return False
+            newly_pinned = sum(obj.meta.pin_count == 0 for obj in unique)
+            for obj in memory_objs:
+                obj.meta.ref_count += 1
+                obj.meta.pin_count += 1
+            try:
+                if newly_pinned:
+                    cls.monitor.update_pinned_memory_objs_count(newly_pinned)
+                    stats_updated = True
+                PinMonitor.GetOrCreate().on_pin_many(unique)
+            except BaseException:
+                for obj in memory_objs:
+                    obj.meta.ref_count -= 1
                     obj.meta.pin_count -= 1
                 if stats_updated:
                     cls.monitor.update_pinned_memory_objs_count(-newly_pinned)
@@ -880,6 +931,100 @@ class TensorMemoryObj(MemoryObj):
                 self.meta.pin_count = 0
             return True
 
+    @classmethod
+    def unpin_and_release_many(
+        cls,
+        memory_objs: Iterable["MemoryObj"],
+        *,
+        catch_errors: bool = False,
+    ) -> None:
+        """Unpin (if pinned) and release ref_count with coalesced monitor/free."""
+        newly_unpinned: list[MemoryObj] = []
+        by_alloc: dict[int, tuple[Any, list[TensorMemoryObj]]] = {}
+        queued_free: set[int] = set()
+        missing_alloc_count = 0
+        for obj in memory_objs:
+            if (
+                isinstance(obj, TensorMemoryObj)
+                and type(obj) in (TensorMemoryObj, LayerPageMemoryObj)
+                and "unpin" not in obj.__dict__
+                and "ref_count_down" not in obj.__dict__
+            ):
+                should_free = False
+                with obj.lock:
+                    if obj.meta.pin_count > 0:
+                        obj.meta.pin_count -= 1
+                        if obj.meta.pin_count == 0:
+                            newly_unpinned.append(obj)
+                            if obj.meta.ref_count <= 0 and obj.valid:
+                                should_free = True
+                    if not should_free and obj.valid:
+                        obj.meta.ref_count -= 1
+                        if obj.meta.ref_count < 0:
+                            logger.warning(
+                                "Ref count of MemoryObj %s is negative: %d.",
+                                obj.meta.address,
+                                obj.meta.ref_count,
+                            )
+                            obj.meta.ref_count = 0
+                        if obj.meta.ref_count == 0 and obj.meta.pin_count == 0:
+                            should_free = True
+                if should_free and id(obj) not in queued_free:
+                    queued_free.add(id(obj))
+                    alloc = obj.parent_allocator
+                    if alloc is None:
+                        missing_alloc_count += 1
+                    else:
+                        by_alloc.setdefault(id(alloc), (alloc, []))[1].append(
+                            obj
+                        )
+            else:
+                unpin_fn = getattr(obj, "unpin", None)
+                if callable(unpin_fn) and getattr(obj, "is_pinned", False):
+                    try:
+                        unpin_fn()
+                    except Exception as exc:
+                        if not catch_errors:
+                            raise
+                        logger.warning("Failed to unpin MemoryObj: %s", exc)
+                release_fn = getattr(obj, "ref_count_down", None)
+                if callable(release_fn):
+                    try:
+                        is_valid = getattr(obj, "is_valid", None)
+                        if not callable(is_valid) or bool(is_valid()):
+                            release_fn()
+                    except Exception as exc:
+                        if not catch_errors:
+                            raise
+                        logger.warning("Failed to release MemoryObj ref: %s", exc)
+        if newly_unpinned:
+            cls.monitor.update_pinned_memory_objs_count(-len(newly_unpinned))
+            mon = PinMonitor.GetOrCreate()
+            _unpin_many = getattr(mon, "on_unpin_many", None)
+            if callable(_unpin_many):
+                _unpin_many(newly_unpinned)
+            else:
+                for item in newly_unpinned:
+                    mon.on_unpin(item)
+        if missing_alloc_count:
+            logger.error(
+                "Parent allocator is None when trying to free %d MemoryObjs.",
+                missing_alloc_count,
+            )
+        for alloc, to_free in by_alloc.values():
+            try:
+                if hasattr(alloc, "batched_free") and "free" not in getattr(
+                    alloc, "__dict__", ()
+                ):
+                    alloc.batched_free(to_free)
+                else:
+                    for item in to_free:
+                        alloc.free(item)
+            except Exception as exc:
+                if not catch_errors:
+                    raise
+                logger.warning("Failed to free MemoryObj batch: %s", exc)
+
     @property
     def metadata(self) -> MemoryObjMetadata:
         with self.lock:
@@ -890,11 +1035,50 @@ class TensorMemoryObj(MemoryObj):
         if not self.valid:
             logger.warning("Trying to access an invalidated MemoryObj")
             return None
-        assert self.meta.dtype is not None
-        # TODO(Jiayi): consider caching the `get_size()`
-        return self.raw_data[: self.get_size()].view(self.meta.dtype).view(
-            self.meta.shape
-        )
+        dtype = self.meta.dtype
+        assert dtype is not None
+        size = self.get_size()
+        shape = self.meta.shape
+        raw = self.__dict__.get("raw_data")
+        if raw is None:
+            buf = getattr(self.parent_allocator, "buffer", None)
+            if (
+                isinstance(buf, torch.Tensor)
+                and buf.dtype == torch.uint8
+                and buf.ndim == 1
+            ):
+                addr = self.meta.address
+                end = addr + self._raw_view_size
+                if addr < 0 or end > buf.numel():
+                    raise RuntimeError("Address-backed tensor storage is unavailable")
+                span = min(self._raw_view_size, size)
+                cached = self._cached_typed_tensor
+                if (
+                    cached is not None
+                    and cached[0] is buf
+                    and cached[1] == addr
+                    and cached[2] == span
+                    and cached[3] == dtype
+                    and cached[4] == shape
+                ):
+                    return cached[5]
+                typed = buf[addr : addr + span].view(dtype).view(shape)
+                self._cached_typed_tensor = (buf, addr, span, dtype, shape, typed)
+                return typed
+            raw = self.raw_data
+        cached = self._cached_typed_tensor
+        if (
+            cached is not None
+            and cached[0] is raw
+            and cached[1] == 0
+            and cached[2] == size
+            and cached[3] == dtype
+            and cached[4] == shape
+        ):
+            return cached[5]
+        typed = raw[:size].view(dtype).view(shape)
+        self._cached_typed_tensor = (raw, 0, size, dtype, shape, typed)
+        return typed
 
     @property
     def byte_array(self) -> memoryview:
@@ -923,13 +1107,16 @@ class TensorMemoryObj(MemoryObj):
         raw_data = self.__dict__.get("raw_data")
         if raw_data is not None:
             return raw_data.data_ptr()
-        if not self.has_tensor_storage:
+        buffer = getattr(self.parent_allocator, "buffer", None)
+        start = self.meta.address
+        if (
+            not self.valid
+            or not isinstance(buffer, torch.Tensor)
+            or start < 0
+            or start + self._raw_view_size > buffer.numel()
+        ):
             raise RuntimeError("Address-backed tensor storage is unavailable")
-        assert self.parent_allocator is not None
-        return (
-            self.parent_allocator.buffer.data_ptr()  # type: ignore[attr-defined]
-            + self.meta.address
-        )
+        return buffer.data_ptr() + start
 
     @property
     def is_pinned(self) -> bool:
@@ -989,41 +1176,52 @@ class LayerPageMemoryObj(TensorMemoryObj):
             group_prefix_sum,
             raw_view_size,
         )
-        if num_layers < 1 or len(self.group_prefix_sum) != num_layers + 1:
-            raise ValueError("Layer page requires one tensor group per layer")
-        sizes = {
-            right - left
-            for left, right in zip(
-                self.group_prefix_sum, self.group_prefix_sum[1:], strict=False
-            )
-        }
-        self.num_layers = num_layers
-        # Preserve the homogeneous fast path; mixed pages must use a layer ID.
-        self.layer_size = sizes.pop() if len(sizes) == 1 else None
-        if valid_tokens is None:
-            token_dim = metadata.fmt.token_dim()
-            if token_dim >= len(metadata.shape) and len(metadata.shape) == 1:
-                raise ValueError("Flat layer page requires valid_tokens")
-            valid_tokens = int(
-                metadata.shape[token_dim]
-                if token_dim < len(metadata.shape)
-                else metadata.shape[0]
-            )
-        self.valid_tokens = valid_tokens
-        if (
-            _layer_page_shape(
-                metadata.shape,
-                metadata.fmt,
-                valid_tokens,
-                full_tokens=valid_tokens,
-            )
-            != metadata.shape
-        ):
-            raise ValueError(
-                "Layer-page valid_tokens must match its physical layer shape"
-            )
-        self.meta.valid_tokens = self.valid_tokens
-        self._base_data_ptr = self.data_ptr
+        try:
+            if num_layers < 1 or len(self.group_prefix_sum) != num_layers + 1:
+                raise ValueError("Layer page requires one tensor group per layer")
+            sizes = {
+                right - left
+                for left, right in zip(
+                    self.group_prefix_sum, self.group_prefix_sum[1:], strict=False
+                )
+            }
+            self.num_layers = num_layers
+            # Preserve the homogeneous fast path; mixed pages must use a layer ID.
+            self.layer_size = sizes.pop() if len(sizes) == 1 else None
+            if valid_tokens is None:
+                token_dim = metadata.fmt.token_dim()
+                if token_dim >= len(metadata.shape) and len(metadata.shape) == 1:
+                    raise ValueError("Flat layer page requires valid_tokens")
+                valid_tokens = int(
+                    metadata.shape[token_dim]
+                    if token_dim < len(metadata.shape)
+                    else metadata.shape[0]
+                )
+            self.valid_tokens = valid_tokens
+            if (
+                _layer_page_shape(
+                    metadata.shape,
+                    metadata.fmt,
+                    valid_tokens,
+                    full_tokens=valid_tokens,
+                )
+                != metadata.shape
+            ):
+                raise ValueError(
+                    "Layer-page valid_tokens must match its physical layer shape"
+                )
+            self.meta.valid_tokens = self.valid_tokens
+            self._base_data_ptr = self.data_ptr
+        except BaseException:
+            self._base_data_ptr = 0
+            self.meta.ref_count = 0
+            self.meta.pin_count = 0
+            self.valid = False
+            raise
+
+    def invalidate(self):
+        super().invalidate()
+        self._base_data_ptr = 0
 
     @property
     def tensor(self) -> Optional[torch.Tensor]:
@@ -1043,6 +1241,13 @@ class LayerPageMemoryObj(TensorMemoryObj):
         """Return the host address of one layer without constructing a view."""
         if not self.valid:
             raise RuntimeError("Layer page storage is no longer valid")
+        if not self._base_data_ptr or (
+            self.__dict__.get("raw_data") is None
+            and not isinstance(
+                getattr(self.parent_allocator, "buffer", None), torch.Tensor
+            )
+        ):
+            raise RuntimeError("Address-backed tensor storage is unavailable")
         if not 0 <= layer_id < self.num_layers:
             raise IndexError(f"Invalid layer page index: {layer_id}")
         return self._base_data_ptr + self.group_prefix_sum[layer_id]
@@ -1690,6 +1895,10 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             LazyMemoryAllocator can be decoupled from TensorMemoryAllocator.
         """
         self.buffer = tensor.view(torch.uint8).flatten()
+        self._unregistered = False
+        self._cached_npu_slab_dva: Optional[
+            tuple[int, str, int, int, bool, int]
+        ] = None
 
         # Use AddressManager for address space management
         self.address_manager = AddressManager(
@@ -2139,6 +2348,10 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
         self.buffer = tensor.view(torch.uint8).flatten()
         self.buffer_size = self.buffer.numel() * self.buffer.element_size()
         self.buffer_ptr = self.buffer.data_ptr()
+        self._unregistered = False
+        self._cached_npu_slab_dva: Optional[
+            tuple[int, str, int, int, bool, int]
+        ] = None
 
         self.shapes = shapes
         self.dtypes = dtypes
@@ -2541,6 +2754,9 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
         self.size = size
         self.buffer = _allocate_cpu_memory(size)
         self._unregistered = False
+        self._cached_npu_slab_dva: Optional[
+            tuple[int, str, int, int, bool, int]
+        ] = None
 
         self.allocator: MemoryAllocatorInterface
         if use_paging:
@@ -2614,10 +2830,13 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
 
     def close(self):
         if not self._unregistered:
+            self._unregistered = True
+            self.allocator._unregistered = True
+            self._cached_npu_slab_dva = None
+            self.allocator._cached_npu_slab_dva = None
             if self.buffer.numel() == 0:
                 return
             _free_cpu_memory(self.buffer, self.size)
-            self._unregistered = True
 
     def __str__(self):
         return "PinMemoryAllocator"
@@ -2658,6 +2877,9 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         )
 
         self._unregistered = False
+        self._cached_npu_slab_dva: Optional[
+            tuple[int, str, int, int, bool, int]
+        ] = None
 
         self.pin_allocator: MemoryAllocatorInterface
         if use_paging:
@@ -2844,6 +3066,10 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
 
     def close(self):
         if not self._unregistered:
+            self._unregistered = True
+            self.pin_allocator._unregistered = True
+            self._cached_npu_slab_dva = None
+            self.pin_allocator._cached_npu_slab_dva = None
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             if self.buffer.numel() == 0:
@@ -2854,7 +3080,6 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
                 self.numa_mapping,
                 self.shm_name,
             )
-            self._unregistered = True
 
     def __str__(self):
         return "MixedMemoryAllocator"
@@ -3127,6 +3352,8 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         numa_mapping: Optional[NUMAMapping] = None,
     ):
+        self.cpu_size = size
+        self.cpu_numa_mapping = numa_mapping
         self.cpu_buffer = _allocate_cpu_memory(size, numa_mapping)
         self.cpu_allocator = PagedTensorMemoryAllocator(
             self.cpu_buffer,
@@ -3185,6 +3412,20 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
             self.cpu_allocator.batched_free(memory_objs, update_stats=update_stats)
         else:
             raise ValueError(f"Unsupported allocator type: {allocator_type}")
+
+    def close(self):
+        cpu_alloc = getattr(self, "cpu_allocator", None)
+        if cpu_alloc is not None and not getattr(cpu_alloc, "_unregistered", False):
+            cpu_alloc._unregistered = True
+            cpu_alloc._cached_npu_slab_dva = None
+            cpu_buf = getattr(self, "cpu_buffer", None)
+            if isinstance(cpu_buf, torch.Tensor) and cpu_buf.numel() > 0:
+                _free_cpu_memory(
+                    cpu_buf,
+                    getattr(self, "cpu_size", int(cpu_buf.numel())),
+                    getattr(self, "cpu_numa_mapping", None),
+                )
+            self.cpu_buffer = None
 
     def __str__(self):
         return "PDMemoryAllocator"

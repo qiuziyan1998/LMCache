@@ -68,6 +68,7 @@ class MooncakeLookupClient(LookupClientInterface):
             "LMCache v1 blending is not supported in MooncakeLookupClient yet."
         )
         self.token_database = ChunkedTokenDatabase(config, metadata)
+        self._lookup_chunk_hashes: dict[str, tuple] = {}
 
     @cached_property
     def _group_layer_counts(self) -> tuple[int, ...]:
@@ -101,6 +102,18 @@ class MooncakeLookupClient(LookupClientInterface):
         contiguous-prefix contract. Unlike the production lookup-server path,
         this standalone client does not pin and revalidate intermediate chunks.
         """
+        try:
+            return self._lookup_inner(token_ids, lookup_id, request_configs)
+        except BaseException:
+            self._drop_lookup_chunk_hashes(lookup_id)
+            raise
+
+    def _lookup_inner(
+        self,
+        token_ids: Union[torch.Tensor, list[int]],
+        lookup_id: Optional[str] = None,
+        request_configs: Optional[dict] = None,
+    ) -> Optional[int]:
         # process token_ids to cacheengine keys
         ends = []
         chunk_group_keys: list[list[CacheEngineKey]] = []
@@ -129,6 +142,17 @@ class MooncakeLookupClient(LookupClientInterface):
                 token_ids, request_configs=request_configs
             )
         )
+        if lookup_id:
+            if base_chunks:
+                self._stash_lookup_chunk_hashes(
+                    lookup_id,
+                    token_ids,
+                    [key.chunk_hash for _, _, key in base_chunks],
+                    [end - start for start, end, _ in base_chunks],
+                    [int(token_ids[end - 1]) for _, end, _ in base_chunks],
+                )
+            else:
+                self._drop_lookup_chunk_hashes(lookup_id)
         group1_keys: list[CacheEngineKey] = []
         if dsa_two_groups and base_chunks:
             group1_chunks = list(
@@ -262,9 +286,13 @@ class MooncakeLookupClient(LookupClientInterface):
         # All keys were found, return the last end position
         return ends[-1] if ends else 0
 
+    def clear_lookup_status(self, lookup_id: str) -> None:
+        self._drop_lookup_chunk_hashes(lookup_id)
+
     def supports_producer_reuse(self) -> bool:
         """Return True as MooncakeLookupClient supports producer kvcache reuse"""
         return True
 
     def close(self):
+        self._lookup_chunk_hashes.clear()
         self.store.close()

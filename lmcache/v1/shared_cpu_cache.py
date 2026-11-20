@@ -9,10 +9,12 @@ handles after strict validation.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 import ctypes
 from dataclasses import dataclass, field
+import threading
 from typing import Any, Iterable, Optional, Union
-from weakref import WeakKeyDictionary
+from weakref import WeakSet
 
 import torch
 
@@ -98,27 +100,10 @@ class SharedCPURequestLease:
         return bool(is_valid()) if callable(is_valid) else True
 
     def _release(self, objects: Iterable[MemoryObj]) -> None:
-        for memory_obj in objects:
-            if self.is_rank0 and getattr(memory_obj, "is_pinned", False):
-                try:
-                    memory_obj.unpin()
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to unpin shared CPU request object: "
-                        "request_id=%s error=%s",
-                        self.request_id,
-                        exc,
-                    )
-            try:
-                if self._is_valid(memory_obj):
-                    memory_obj.ref_count_down()
-            except Exception as exc:
-                logger.warning(
-                    "Failed to release shared CPU request reference: "
-                    "request_id=%s error=%s",
-                    self.request_id,
-                    exc,
-                )
+        if not self.is_rank0:
+            release_passive_views_batch(objects, catch_errors=True)
+            return
+        TensorMemoryObj.unpin_and_release_many(objects, catch_errors=True)
 
     def replace_groups(
         self,
@@ -1082,6 +1067,10 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
     the local MemoryObj only; it must not return offsets to any AddressManager.
     """
 
+    _MAX_POSITION_TENSOR_CACHE = 8192
+    _MAX_RECYCLED_PAGE_VIEWS = 32768
+    _MAX_RECYCLED_BATCH_VIEWS = 327680
+
     def __init__(
         self,
         *,
@@ -1089,17 +1078,108 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         shm_name: str,
         generation: int,
         reuse_prefill: bool = False,
+        mapping: Optional["SharedSlabMapping"] = None,
     ) -> None:
         self.reuse_prefill = reuse_prefill
         self.slab_tensor = slab_tensor.view(torch.uint8).flatten()
-        self.buffer = self.slab_tensor
         self.shm_name = shm_name
         self.generation = int(generation)
-        # Descriptor identities do not own the views. Request leases retain
-        # the actual allocator references; dropping a lease removes dead keys.
-        self._view_descriptors: Optional[WeakKeyDictionary[MemoryObj, tuple]] = (
-            WeakKeyDictionary() if reuse_prefill else None
+        self._mapping = mapping
+        self._unregistered = False
+        self._cached_npu_slab_dva: Optional[
+            tuple[int, str, int, int, bool, int]
+        ] = None
+        # Descriptor identities live directly on views; WeakSet tracks live views
+        # across both reuse_prefill modes for close() invalidation without blocking GC.
+        self._live_views: WeakSet[TensorMemoryObj] = WeakSet()
+        self._recycle_lock = mapping._lock if mapping is not None else threading.RLock()
+        self._position_tensor_cache: dict[tuple[int, int, int], torch.Tensor] = {}
+        self._recycled_page_views: dict[tuple, list[LayerPageMemoryObj]] = {}
+        self._recycled_page_views_total = 0
+        self._recycled_batch_views: dict[tuple, list[TensorMemoryObj]] = {}
+        self._recycled_batch_views_total = 0
+
+    @property
+    def buffer(self) -> Optional[torch.Tensor]:
+        if self._unregistered or (
+            self._mapping is not None and self._mapping._closed
+        ):
+            return None
+        return self.slab_tensor
+
+    def _register_live_view(
+        self, view: Any, descriptor: Optional[tuple] = None
+    ) -> Any:
+        with self._recycle_lock:
+            if self._unregistered or (
+                self._mapping is not None and self._mapping._closed
+            ):
+                view.meta.ref_count = 0
+                view.__dict__.pop("raw_data", None)
+                view.invalidate()
+                raise SharedCPUCacheError("Passive shared slab mapping is closed")
+            if descriptor is not None:
+                view._passive_descriptor = descriptor
+            live_id = id(self._live_views)
+            if getattr(view, "_live_views_id", 0) != live_id:
+                self._live_views.add(view)
+                view._live_views_id = live_id
+        return view
+
+    def _get_range_positions_tensor(self, positions: range) -> torch.Tensor:
+        key = (positions.start, positions.stop, positions.step)
+        cached = self._position_tensor_cache.get(key)
+        if cached is not None:
+            return cached
+        built = torch.arange(
+            positions.start,
+            positions.stop,
+            positions.step,
+            dtype=torch.int64,
         )
+        with self._recycle_lock:
+            existing = self._position_tensor_cache.get(key)
+            if existing is not None:
+                return existing
+            if len(self._position_tensor_cache) >= self._MAX_POSITION_TENSOR_CACHE:
+                self._position_tensor_cache.pop(
+                    next(iter(self._position_tensor_cache)), None
+                )
+            self._position_tensor_cache[key] = built
+            return built
+
+    def clear_recycled_views(self) -> None:
+        with self._recycle_lock:
+            self._unregistered = True
+            self._cached_npu_slab_dva = None
+            buckets = list(self._recycled_page_views.values())
+            self._recycled_page_views.clear()
+            self._recycled_page_views_total = 0
+            batch_buckets = list(self._recycled_batch_views.values())
+            self._recycled_batch_views.clear()
+            self._recycled_batch_views_total = 0
+            live_views = list(self._live_views)
+            for page_bucket in buckets:
+                for page_view in page_bucket:
+                    page_view._cached_npu_base_dva = None
+                    page_view._cached_typed_tensor = None
+                    page_view.__dict__.pop("raw_data", None)
+                    page_view._base_data_ptr = 0
+                    page_view._live_views_id = 0
+            for batch_bucket in batch_buckets:
+                for batch_view in batch_bucket:
+                    batch_view._cached_npu_base_dva = None
+                    batch_view._cached_typed_tensor = None
+                    batch_view.__dict__.pop("raw_data", None)
+                    batch_view._live_views_id = 0
+            for view in live_views:
+                view.invalidate()
+                view._cached_npu_base_dva = None
+                view._cached_typed_tensor = None
+                view.__dict__.pop("raw_data", None)
+                view._live_views_id = 0
+                if isinstance(view, LayerPageMemoryObj):
+                    view._base_data_ptr = 0
 
     @property
     def slab_size(self) -> int:
@@ -1128,6 +1208,10 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         acquires another reference nor rebuilds its cached-position tensor.
         All normal handle validation still runs before reuse.
         """
+        if self._unregistered or (
+            self._mapping is not None and self._mapping._closed
+        ):
+            raise SharedCPUCacheError("Passive shared slab mapping is closed")
         if not self.reuse_prefill:
             return self._create_view_ordinary(
                 handle,
@@ -1141,7 +1225,7 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
                 expected_cached_positions=expected_cached_positions,
                 expected_producer_rank=expected_producer_rank
             )
-        assert self._view_descriptors is not None
+        assert self._live_views is not None
         validate_shared_handle(
             handle,
             expected_request_id=expected_request_id,
@@ -1213,8 +1297,58 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
             metadata=metadata,
             parent_allocator=self,
         )
-        self._view_descriptors[view] = descriptor
-        return view
+        return self._register_live_view(view, descriptor)
+
+    def _revive_batch_view_locked(
+        self,
+        descriptor: tuple,
+        offset: int,
+        physical_size: int,
+        logical_size: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+        *,
+        exclude: Optional[TensorMemoryObj] = None,
+    ) -> Optional[TensorMemoryObj]:
+        bucket = self._recycled_batch_views.get(descriptor)
+        if not bucket:
+            return None
+        if exclude is not None and bucket[-1] is exclude:
+            if len(bucket) == 1:
+                return None
+            recycled = bucket.pop(-2)
+        else:
+            recycled = bucket.pop()
+        self._recycled_batch_views_total -= 1
+        if not bucket:
+            self._recycled_batch_views.pop(descriptor, None)
+        meta, shapes, dtypes = recycled.meta, recycled.meta.shapes, recycled.meta.dtypes
+        if (
+            type(recycled) is TensorMemoryObj and not recycled.valid
+            and recycled.parent_allocator is self
+            and meta.address == offset and meta.phy_size == physical_size
+            and recycled._raw_view_size == logical_size
+            and recycled.group_prefix_sum == (0, logical_size)
+            and meta.shape == shape and meta.dtype == dtype and meta.fmt == fmt
+            and shapes is not None and len(shapes) == 1 and shapes[0] == shape
+            and dtypes is not None and len(dtypes) == 1 and dtypes[0] == dtype
+            and meta.cached_positions is not None
+            and (
+                "raw_data" not in recycled.__dict__
+                or int(recycled.__dict__["raw_data"].numel()) == logical_size
+            )
+        ):
+            live_id = id(self._live_views)
+            if recycled._live_views_id != live_id:
+                self._live_views.add(recycled)
+                recycled._live_views_id = live_id
+            meta.valid_tokens, meta.ref_count, meta.pin_count = None, 1, 0
+            recycled.valid = True
+            recycled._passive_descriptor = descriptor
+            return recycled
+        recycled._cached_npu_base_dva = recycled._cached_typed_tensor = None
+        return None
 
     def create_batch_view(
         self,
@@ -1233,12 +1367,16 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         The caller validates the batch envelope and expected chunk metadata.
         A reused ``previous`` carries no additional allocator reference.
         """
+        if self._unregistered or (
+            self._mapping is not None and self._mapping._closed
+        ):
+            raise SharedCPUCacheError("Passive shared slab mapping is closed")
         if not self.reuse_prefill:
             return self._create_batch_view_ordinary(
                 batch, layer_id=layer_id, chunk_index=chunk_index, shape=shape,
                 dtype=dtype, fmt=fmt, cached_positions=cached_positions
             )
-        assert self._view_descriptors is not None
+        assert self._live_views is not None
         page_count = len(batch.page_offsets)
         if not page_count <= chunk_index < batch.num_chunks:
             raise SharedCPUCacheValidationError("Page chunks require create_page_view")
@@ -1294,18 +1432,30 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         ):
             assert previous is not None
             return previous
-        positions = (
-            torch.arange(
-                cached_positions.start,
-                cached_positions.stop,
-                cached_positions.step,
-                dtype=torch.int64,
+        with self._recycle_lock:
+            if self._unregistered or (
+                self._mapping is not None and self._mapping._closed
+            ):
+                raise SharedCPUCacheError("Passive shared slab mapping is closed")
+            revived = self._revive_batch_view_locked(
+                descriptor,
+                offset,
+                physical_size,
+                logical_size,
+                shape,
+                dtype,
+                fmt,
+                exclude=previous,
             )
+            if revived is not None:
+                return revived
+        positions = (
+            self._get_range_positions_tensor(cached_positions)
             if isinstance(cached_positions, range)
             else torch.tensor(cached_positions, dtype=torch.int64)
         )
         view = TensorMemoryObj(
-            raw_data=self.slab_tensor[offset : offset + logical_size],
+            raw_data=None,
             metadata=MemoryObjMetadata(
                 shape=shape,
                 dtype=dtype,
@@ -1319,9 +1469,211 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
                 dtypes=[dtype],
             ),
             parent_allocator=self,
+            group_prefix_sum=(0, logical_size),
+            raw_view_size=logical_size,
         )
-        self._view_descriptors[view] = descriptor
-        return view
+        return self._register_live_view(view, descriptor)
+
+    def create_batch_views_for_group(
+        self,
+        batch: SharedHandleBatch,
+        *,
+        start_chunk: int,
+        end_chunk: int,
+        starts: Sequence[int],
+        ends: Sequence[int],
+        row_metas: Optional[
+            Sequence[Sequence[tuple[torch.Size, torch.dtype, MemoryFormat]]]
+        ] = None,
+        meta_fn: Optional[
+            Callable[[int, int], tuple[torch.Size, torch.dtype, MemoryFormat]]
+        ] = None,
+        homogeneous_layers: bool = True,
+    ) -> list[list[TensorMemoryObj]]:
+        """Create or revive all compact tail views for a group under one lock."""
+        if self._unregistered or (
+            self._mapping is not None and self._mapping._closed
+        ):
+            raise SharedCPUCacheError("Passive shared slab mapping is closed")
+        num_layers = len(row_metas) if row_metas is not None else batch.num_layers
+        if end_chunk <= start_chunk:
+            return [[] for _ in range(num_layers)]
+        if row_metas is None:
+            assert meta_fn is not None
+            t_counts = [int(ends[c] - starts[c]) for c in range(start_chunk, end_chunk)]
+            if homogeneous_layers:
+                m1: dict[int, tuple[torch.Size, torch.dtype, MemoryFormat]] = {}
+                one_row = [
+                    m1[nt] if nt in m1 else m1.setdefault(nt, meta_fn(0, nt))
+                    for nt in t_counts
+                ]
+                row_metas = (one_row,) * num_layers
+            else:
+                m2: dict[
+                    tuple[int, int],
+                    tuple[torch.Size, torch.dtype, MemoryFormat],
+                ] = {}
+                row_metas = [
+                    [
+                        m2[(lid, nt)]
+                        if (lid, nt) in m2
+                        else m2.setdefault((lid, nt), meta_fn(lid, nt))
+                        for nt in t_counts
+                    ]
+                    for lid in range(num_layers)
+                ]
+        page_count = len(batch.page_offsets)
+        if not page_count <= start_chunk or end_chunk > batch.num_chunks:
+            raise SharedCPUCacheValidationError("Page chunks require create_page_view")
+        if batch.shm_name != self.shm_name or len(row_metas) != batch.num_layers:
+            raise SharedCPUCacheValidationError(
+                "Invalid compact shared view slab or layer"
+            )
+        if not self.reuse_prefill:
+            rows_ord: list[list[TensorMemoryObj]] = []
+            try:
+                for lid, row_meta in enumerate(row_metas):
+                    if len(row_meta) != end_chunk - start_chunk:
+                        raise SharedCPUCacheValidationError(
+                            "Invalid compact shared view row metadata length"
+                        )
+                    layer_ord: list[TensorMemoryObj] = []
+                    rows_ord.append(layer_ord)
+                    for idx, (sh, dt, fm) in enumerate(row_meta):
+                        c_idx = start_chunk + idx
+                        layer_ord.append(
+                            self._create_batch_view_ordinary(
+                                batch,
+                                layer_id=lid,
+                                chunk_index=c_idx,
+                                shape=sh,
+                                dtype=dt,
+                                fmt=fm,
+                                cached_positions=range(
+                                    int(starts[c_idx]), int(ends[c_idx])
+                                ),
+                            )
+                        )
+                return rows_ord
+            except BaseException:
+                for layer_ord in rows_ord:
+                    for v in layer_ord:
+                        v.meta.ref_count = 0
+                        v.invalidate()
+                raise
+        assert self._live_views is not None
+        tail_chunks = batch.num_chunks - page_count
+        tail_base = start_chunk - page_count
+        tail_len, slab_size = end_chunk - start_chunk, self.slab_size
+        shm_name, gen, prod = (
+            self.shm_name,
+            self.generation,
+            batch.producer_rank,
+        )
+        offsets = batch.offsets
+        phy_sizes = batch.physical_sizes[start_chunk:end_chunk]
+        c_hashes = batch.chunk_hashes[start_chunk:end_chunk]
+        pos_ranges = [
+            range(int(starts[c]), int(ends[c]))
+            for c in range(start_chunk, end_chunk)
+        ]
+        pos_ids = [("range", r.start, r.stop, r.step) for r in pos_ranges]
+        pos_tensors: list[torch.Tensor] = [
+            self._get_range_positions_tensor(r) for r in pos_ranges
+        ]
+        size_cache: dict[
+            tuple[torch.Size, torch.dtype], tuple[int, tuple[int, int]]
+        ] = {}
+        rows_out: list[list[TensorMemoryObj]] = []
+        with self._recycle_lock:
+            if self._unregistered or (
+                self._mapping is not None and self._mapping._closed
+            ):
+                raise SharedCPUCacheError("Passive shared slab mapping is closed")
+            live_id = id(self._live_views)
+            try:
+                for layer_id, row_meta in enumerate(row_metas):
+                    if len(row_meta) != tail_len:
+                        raise SharedCPUCacheValidationError(
+                            "Invalid compact shared view row metadata length"
+                        )
+                    layer_out: list[TensorMemoryObj] = []
+                    rows_out.append(layer_out)
+                    row_off_base = layer_id * tail_chunks + tail_base
+                    for idx in range(tail_len):
+                        offset = offsets[row_off_base + idx]
+                        phy_size = phy_sizes[idx]
+                        shape, dtype, fmt = row_meta[idx]
+                        sized = size_cache.get((shape, dtype))
+                        if sized is None:
+                            ls = shape.numel() * dtype.itemsize
+                            sized = size_cache[(shape, dtype)] = (ls, (0, ls))
+                        logical_size, group_psum = sized
+                        if not (
+                            0 < logical_size <= phy_size
+                            and 0 <= offset
+                            and offset + phy_size <= slab_size
+                        ):
+                            raise SharedCPUCacheValidationError(
+                                "Invalid compact shared view logical size: "
+                                f"logical_size={logical_size}, "
+                                f"physical_size={phy_size}"
+                            )
+                        desc = (
+                            shm_name,
+                            gen,
+                            prod,
+                            c_hashes[idx],
+                            layer_id,
+                            offset,
+                            phy_size,
+                            shape,
+                            dtype,
+                            fmt,
+                            pos_ids[idx],
+                        )
+                        revived = self._revive_batch_view_locked(
+                            desc,
+                            offset,
+                            phy_size,
+                            logical_size,
+                            shape,
+                            dtype,
+                            fmt,
+                        )
+                        if revived is not None:
+                            layer_out.append(revived)
+                            continue
+                        pos_t = pos_tensors[idx]
+                        view = TensorMemoryObj(
+                            raw_data=None,
+                            metadata=MemoryObjMetadata(
+                                shape=shape,
+                                dtype=dtype,
+                                address=offset,
+                                phy_size=phy_size,
+                                ref_count=1,
+                                pin_count=0,
+                                fmt=fmt,
+                                cached_positions=pos_t,
+                                shapes=[shape],
+                                dtypes=[dtype],
+                            ),
+                            parent_allocator=self,
+                            group_prefix_sum=group_psum,
+                            raw_view_size=logical_size,
+                        )
+                        view._passive_descriptor = desc
+                        layer_out.append(view)
+                        self._live_views.add(view)
+                        view._live_views_id = live_id
+            except BaseException:
+                for layer_out in rows_out:
+                    for v in layer_out:
+                        v.meta.ref_count = 0
+                        self._free_locked(v)
+                raise
+        return rows_out
 
     def create_page_view(
         self,
@@ -1340,13 +1692,17 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         The caller validates the batch envelope and expected chunk metadata.
         Reuse preserves the existing request-owned reference and page identity.
         """
+        if self._unregistered or (
+            self._mapping is not None and self._mapping._closed
+        ):
+            raise SharedCPUCacheError("Passive shared slab mapping is closed")
         if not self.reuse_prefill:
             return self._create_page_view_ordinary(
                 batch, chunk_index=chunk_index, shape=shape, dtype=dtype,
                 fmt=fmt, cached_positions=cached_positions,
                 **({"layer_shapes": layer_shapes} if layer_shapes is not None else {}),
             )
-        assert self._view_descriptors is not None
+        assert self._live_views is not None
         if not 0 <= chunk_index < len(batch.page_offsets):
             raise SharedCPUCacheValidationError("Invalid compact page chunk index")
         if batch.shm_name != self.shm_name:
@@ -1414,36 +1770,80 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
             raise SharedCPUCacheValidationError(
                 "Compact layer page must contain at least one token"
             )
-        view = LayerPageMemoryObj(
-            raw_data=None,
-            metadata=MemoryObjMetadata(
-                shape=shape,
-                dtype=dtype,
-                address=offset,
-                phy_size=physical_size,
-                ref_count=1,
-                pin_count=0,
-                fmt=fmt,
-                cached_positions=(
-                    torch.arange(
-                        cached_positions.start,
-                        cached_positions.stop,
-                        cached_positions.step,
-                        dtype=torch.int64,
-                    )
-                    if isinstance(cached_positions, range)
-                    else torch.tensor(cached_positions, dtype=torch.int64)
-                ),
-                shapes=layer_shapes if layer_shapes is not None else [shape] * batch.num_layers,
-                dtypes=[dtype] * batch.num_layers,
-            ),
-            parent_allocator=self,
-            num_layers=batch.num_layers,
-            raw_view_size=logical_size,
-            valid_tokens=len(cached_positions),
+        valid_token_count = len(cached_positions)
+        expected_shapes = (
+            layer_shapes
+            if layer_shapes is not None
+            else [shape] * batch.num_layers
         )
-        self._view_descriptors[view] = descriptor
-        return view
+        expected_dtypes = [dtype] * batch.num_layers
+        positions_tensor = (
+            self._get_range_positions_tensor(cached_positions)
+            if isinstance(cached_positions, range)
+            else torch.tensor(cached_positions, dtype=torch.int64)
+        )
+        with self._recycle_lock:
+            if self._unregistered or (
+                self._mapping is not None and self._mapping._closed
+            ):
+                raise SharedCPUCacheError("Passive shared slab mapping is closed")
+            live_id = id(self._live_views)
+            bucket = self._recycled_page_views.get(descriptor)
+            recycled: Optional[LayerPageMemoryObj] = None
+            if bucket:
+                if previous is not None and bucket[-1] is previous:
+                    if len(bucket) > 1:
+                        recycled = bucket.pop(-2)
+                else:
+                    recycled = bucket.pop()
+            if recycled is not None:
+                self._recycled_page_views_total -= 1
+                if not bucket:
+                    self._recycled_page_views.pop(descriptor, None)
+                m = recycled.meta
+                if (
+                    type(recycled) is LayerPageMemoryObj and not recycled.valid
+                    and recycled.parent_allocator is self
+                    and m.address == offset and m.phy_size == physical_size
+                    and recycled._raw_view_size == logical_size
+                    and recycled.valid_tokens == valid_token_count
+                    and recycled.num_layers == batch.num_layers
+                    and m.shape == shape and m.dtype == dtype and m.fmt == fmt
+                    and m.shapes == expected_shapes and m.dtypes == expected_dtypes
+                    and m.cached_positions is not None
+                ):
+                    if recycled._live_views_id != live_id:
+                        self._live_views.add(recycled)
+                        recycled._live_views_id = live_id
+                    recycled._base_data_ptr = int(self.slab_tensor.data_ptr()) + offset
+                    m.valid_tokens, m.ref_count, m.pin_count = valid_token_count, 1, 0
+                    recycled.valid = True
+                    recycled._passive_descriptor = descriptor
+                    return recycled
+                recycled._cached_npu_base_dva = recycled._cached_typed_tensor = None
+            view = LayerPageMemoryObj(
+                raw_data=None,
+                metadata=MemoryObjMetadata(
+                    shape=shape,
+                    dtype=dtype,
+                    address=offset,
+                    phy_size=physical_size,
+                    ref_count=1,
+                    pin_count=0,
+                    fmt=fmt,
+                    cached_positions=positions_tensor,
+                    shapes=expected_shapes,
+                    dtypes=expected_dtypes,
+                ),
+                parent_allocator=self,
+                num_layers=batch.num_layers,
+                raw_view_size=logical_size,
+                valid_tokens=valid_token_count,
+            )
+            view._passive_descriptor = descriptor
+            self._live_views.add(view)
+            view._live_views_id = live_id
+            return view
 
     def _matches_view(
         self,
@@ -1455,17 +1855,24 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         offset: int,
         physical_size: int,
     ) -> bool:
+        if (
+            not self.reuse_prefill
+            or previous is None
+            or not previous.is_valid()
+            or previous.parent_allocator is not self
+        ):
+            return False
+        if self._unregistered or (
+            self._mapping is not None and self._mapping._closed
+        ):
+            return False
         return bool(
-            previous is not None
-            and previous.is_valid()
-            and previous.parent_allocator is self
-            and self._view_descriptors is not None
-            and self._view_descriptors.get(previous) == descriptor
+            getattr(previous, "_passive_descriptor", None) == descriptor
             and previous.get_shape() == shape
             and previous.get_dtype() == dtype
-            and previous.get_memory_format() == fmt
-            and previous.metadata.address == offset
-            and previous.metadata.phy_size == physical_size
+            and previous.meta.fmt == fmt
+            and previous.meta.address == offset
+            and previous.meta.phy_size == physical_size
         )
 
     def allocate(
@@ -1489,22 +1896,72 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
             "PassiveSharedViewAllocator cannot allocate batches"
         )
 
+    def _free_locked(self, memory_obj: MemoryObj) -> None:
+        if not memory_obj.is_valid():
+            meta = getattr(memory_obj, "meta", None)
+            logger.warning(
+                "Double-free of passive shared CPU view ignored: "
+                "shm_name=%s address=%s size=%s generation=%s",
+                self.shm_name, getattr(meta, "address", None),
+                getattr(meta, "phy_size", None), self.generation,
+            )
+            return
+        obj_type = type(memory_obj)
+        saved_dva = getattr(memory_obj, "_cached_npu_base_dva", None)
+        saved_typed = getattr(memory_obj, "_cached_typed_tensor", None)
+        memory_obj.invalidate()
+        descriptor = getattr(memory_obj, "_passive_descriptor", None)
+        if (
+            not self.reuse_prefill
+            or descriptor is None
+            or not isinstance(memory_obj, TensorMemoryObj)
+            or obj_type not in (LayerPageMemoryObj, TensorMemoryObj)
+            or memory_obj.parent_allocator is not self
+            or self._live_views is None
+            or memory_obj.meta.ref_count != 0
+            or memory_obj.meta.pin_count != 0
+            or self._unregistered
+            or (self._mapping is not None and self._mapping._closed)
+        ):
+            return
+        evicted: Optional[TensorMemoryObj] = None
+        if isinstance(memory_obj, LayerPageMemoryObj):
+            if self._recycled_page_views_total >= self._MAX_RECYCLED_PAGE_VIEWS:
+                oldest_key = next(iter(self._recycled_page_views))
+                oldest_bucket_p = self._recycled_page_views[oldest_key]
+                evicted = oldest_bucket_p.pop(0)
+                self._recycled_page_views_total -= 1
+                if not oldest_bucket_p:
+                    self._recycled_page_views.pop(oldest_key, None)
+            memory_obj._cached_npu_base_dva = saved_dva
+            self._recycled_page_views.setdefault(descriptor, []).append(
+                memory_obj
+            )
+            self._recycled_page_views_total += 1
+        elif len(descriptor) == 11:
+            if self._recycled_batch_views_total >= self._MAX_RECYCLED_BATCH_VIEWS:
+                oldest_key = next(iter(self._recycled_batch_views))
+                oldest_bucket_b = self._recycled_batch_views[oldest_key]
+                evicted = oldest_bucket_b.pop(0)
+                self._recycled_batch_views_total -= 1
+                if not oldest_bucket_b:
+                    self._recycled_batch_views.pop(oldest_key, None)
+            memory_obj._cached_npu_base_dva = saved_dva
+            memory_obj._cached_typed_tensor = saved_typed
+            self._recycled_batch_views.setdefault(descriptor, []).append(
+                memory_obj
+            )
+            self._recycled_batch_views_total += 1
+        if evicted is not None:
+            evicted._cached_npu_base_dva = evicted._cached_typed_tensor = None
+
     def free(
         self,
         memory_obj: MemoryObj,
         allocator_type: Optional[str] = None,
     ) -> None:
-        if not memory_obj.is_valid():
-            logger.warning(
-                "Double-free of passive shared CPU view ignored: "
-                "shm_name=%s address=%s size=%s generation=%s",
-                self.shm_name,
-                memory_obj.metadata.address,
-                memory_obj.metadata.phy_size,
-                self.generation,
-            )
-            return
-        memory_obj.invalidate()
+        with self._recycle_lock:
+            self._free_locked(memory_obj)
 
     def batched_free(
         self,
@@ -1512,8 +1969,11 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         allocator_type: Optional[str] = None,
         update_stats: bool = True,
     ) -> None:
-        for memory_obj in memory_objs:
-            self.free(memory_obj, allocator_type)
+        if not memory_objs:
+            return
+        with self._recycle_lock:
+            for memory_obj in memory_objs:
+                self._free_locked(memory_obj)
 
     def _create_view_ordinary(
         self,
@@ -1568,10 +2028,12 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
             shapes=handle.shapes,
             dtypes=handle.dtypes,
         )
-        return TensorMemoryObj(
-            raw_data=raw_data,
-            metadata=metadata,
-            parent_allocator=self,
+        return self._register_live_view(
+            TensorMemoryObj(
+                raw_data=raw_data,
+                metadata=metadata,
+                parent_allocator=self,
+            )
         )
 
     def _create_batch_view_ordinary(
@@ -1586,34 +2048,51 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         cached_positions: Iterable[int],
     ) -> TensorMemoryObj:
         page_count = len(batch.page_offsets)
-        if chunk_index < page_count:
+        if not page_count <= chunk_index < batch.num_chunks:
             raise SharedCPUCacheValidationError("Page chunks require create_page_view")
+        if batch.shm_name != self.shm_name or not 0 <= layer_id < batch.num_layers:
+            raise SharedCPUCacheValidationError(
+                "Invalid compact shared view slab or layer"
+            )
         tail_chunks = batch.num_chunks - page_count
         tail_index = chunk_index - page_count
         offset = batch.offsets[layer_id * tail_chunks + tail_index]
         physical_size = batch.physical_sizes[chunk_index]
         logical_size = shape.numel() * dtype.itemsize
-        if logical_size <= 0 or logical_size > physical_size:
+        if (
+            logical_size <= 0
+            or logical_size > physical_size
+            or offset < 0
+            or offset + physical_size > self.slab_size
+        ):
             raise SharedCPUCacheValidationError(
                 "Invalid compact shared view logical size: "
                 f"logical_size={logical_size}, physical_size={physical_size}"
             )
-        positions = torch.tensor(list(cached_positions), dtype=torch.int64)
-        return TensorMemoryObj(
-            raw_data=self.slab_tensor[offset : offset + logical_size],
-            metadata=MemoryObjMetadata(
-                shape=shape,
-                dtype=dtype,
-                address=offset,
-                phy_size=physical_size,
-                ref_count=1,
-                pin_count=0,
-                fmt=fmt,
-                cached_positions=positions,
-                shapes=[shape],
-                dtypes=[dtype],
-            ),
-            parent_allocator=self,
+        positions = (
+            self._get_range_positions_tensor(cached_positions)
+            if isinstance(cached_positions, range)
+            else torch.tensor(list(cached_positions), dtype=torch.int64)
+        )
+        return self._register_live_view(
+            TensorMemoryObj(
+                raw_data=None,
+                metadata=MemoryObjMetadata(
+                    shape=shape,
+                    dtype=dtype,
+                    address=offset,
+                    phy_size=physical_size,
+                    ref_count=1,
+                    pin_count=0,
+                    fmt=fmt,
+                    cached_positions=positions,
+                    shapes=[shape],
+                    dtypes=[dtype],
+                ),
+                parent_allocator=self,
+                group_prefix_sum=(0, logical_size),
+                raw_view_size=logical_size,
+            )
         )
 
     def _create_page_view_ordinary(
@@ -1630,6 +2109,8 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         """Create one passive all-layer view from a compact page descriptor."""
         if not 0 <= chunk_index < len(batch.page_offsets):
             raise SharedCPUCacheValidationError("Invalid compact page chunk index")
+        if batch.shm_name != self.shm_name:
+            raise SharedCPUCacheValidationError("Invalid compact page slab")
         offset = batch.page_offsets[chunk_index]
         physical_size = batch.page_physical_sizes[chunk_index]
         layer_size = shape.numel() * dtype.itemsize
@@ -1648,35 +2129,55 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
             layer_size != batch.physical_sizes[chunk_index]
             or logical_size <= 0
             or logical_size > physical_size
+            or offset < 0
+            or offset + physical_size > self.slab_size
         ):
             raise SharedCPUCacheValidationError(
                 "Invalid compact page logical size: "
                 f"logical_size={logical_size}, physical_size={physical_size}"
             )
-        positions = tuple(cached_positions)
-        if not positions:
-            raise SharedCPUCacheValidationError(
-                "Compact layer page must contain at least one token"
+        if isinstance(cached_positions, range):
+            if not cached_positions:
+                raise SharedCPUCacheValidationError(
+                    "Compact layer page must contain at least one token"
+                )
+            positions_tensor = self._get_range_positions_tensor(cached_positions)
+            valid_tokens = len(cached_positions)
+        else:
+            positions = tuple(cached_positions)
+            if not positions:
+                raise SharedCPUCacheValidationError(
+                    "Compact layer page must contain at least one token"
+                )
+            positions_tensor = torch.tensor(positions, dtype=torch.int64)
+            valid_tokens = len(positions)
+        with self._recycle_lock:
+            if self._unregistered or (
+                self._mapping is not None and self._mapping._closed
+            ):
+                raise SharedCPUCacheError("Passive shared slab mapping is closed")
+            view = LayerPageMemoryObj(
+                raw_data=None,
+                metadata=MemoryObjMetadata(
+                    shape=shape,
+                    dtype=dtype,
+                    address=offset,
+                    phy_size=physical_size,
+                    ref_count=1,
+                    pin_count=0,
+                    fmt=fmt,
+                    cached_positions=positions_tensor,
+                    shapes=shapes,
+                    dtypes=[dtype] * batch.num_layers,
+                ),
+                parent_allocator=self,
+                num_layers=batch.num_layers,
+                raw_view_size=logical_size,
+                valid_tokens=valid_tokens,
             )
-        return LayerPageMemoryObj(
-            raw_data=None,
-            metadata=MemoryObjMetadata(
-                shape=shape,
-                dtype=dtype,
-                address=offset,
-                phy_size=physical_size,
-                ref_count=1,
-                pin_count=0,
-                fmt=fmt,
-                cached_positions=torch.tensor(positions, dtype=torch.int64),
-                shapes=shapes,
-                dtypes=[dtype] * batch.num_layers,
-            ),
-            parent_allocator=self,
-            num_layers=batch.num_layers,
-            raw_view_size=logical_size,
-            valid_tokens=len(positions),
-        )
+            self._live_views.add(view)
+            view._live_views_id = id(self._live_views)
+            return view
 
 
 class SharedSlabMapping:
@@ -1705,7 +2206,9 @@ class SharedSlabMapping:
         self.generation = int(generation)
         self.owner = owner
         self._backing_buffer = backing_buffer
+        self._lock = threading.RLock()
         self._closed = False
+        self._passive_allocators: list[PassiveSharedViewAllocator] = []
 
     @staticmethod
     def _tensor_from_ptr(ptr: int, size: int) -> tuple[torch.Tensor, Any]:
@@ -1808,12 +2311,18 @@ class SharedSlabMapping:
     def passive_allocator(
         self, *, reuse_prefill: bool = False
     ) -> PassiveSharedViewAllocator:
-        return PassiveSharedViewAllocator(
-            slab_tensor=self.tensor,
-            shm_name=self.shm_name,
-            generation=self.generation,
-            reuse_prefill=reuse_prefill,
-        )
+        with self._lock:
+            if self._closed:
+                raise SharedCPUCacheError("Passive shared slab mapping is closed")
+            allocator = PassiveSharedViewAllocator(
+                slab_tensor=self.tensor,
+                shm_name=self.shm_name,
+                generation=self.generation,
+                reuse_prefill=reuse_prefill,
+                mapping=self,
+            )
+            self._passive_allocators.append(allocator)
+            return allocator
 
     def preflight_device_ptr(self) -> int:
         lmc_ops = _load_lmc_ops(purpose="preflight")
@@ -1840,20 +2349,24 @@ class SharedSlabMapping:
         return dev_ptr
 
     def close(self) -> None:
-        if self._closed:
-            return
-        if self.owner:
-            self.unlink(self.shm_name)
-        else:
-            lmc_ops = _load_lmc_ops(purpose="detach")
-            if hasattr(lmc_ops, "detach_shm_pinned_ptr"):
-                lmc_ops.detach_shm_pinned_ptr(self.ptr, self.size)
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for allocator in self._passive_allocators:
+                allocator.clear_recycled_views()
+            self._passive_allocators.clear()
+            if self.owner:
+                self.unlink(self.shm_name)
             else:
-                raise SharedCPUCacheError(
-                    "lmcache.c_ops.detach_shm_pinned_ptr is unavailable; "
-                    "cannot safely detach passive shared CPU cache mapping."
-                )
-        self._closed = True
+                lmc_ops = _load_lmc_ops(purpose="detach")
+                if hasattr(lmc_ops, "detach_shm_pinned_ptr"):
+                    lmc_ops.detach_shm_pinned_ptr(self.ptr, self.size)
+                else:
+                    raise SharedCPUCacheError(
+                        "lmcache.c_ops.detach_shm_pinned_ptr is unavailable; "
+                        "cannot safely detach passive shared CPU cache mapping."
+                    )
 
     @staticmethod
     def unlink(shm_name: str) -> None:
@@ -1864,3 +2377,57 @@ class SharedSlabMapping:
         raise SharedCPUCacheError(
             "lmcache.c_ops.unlink_shm is unavailable; rebuild native hooks."
         )
+
+
+def release_passive_views_batch(
+    objects: Iterable[MemoryObj], *, catch_errors: bool = False
+) -> None:
+    """Decrement passive view ref_counts and coalesce allocator frees per slab."""
+    by_alloc: dict[int, tuple[PassiveSharedViewAllocator, list[MemoryObj]]] = {}
+    queued_free: set[int] = set()
+    for obj in objects:
+        if id(obj) in queued_free:
+            continue
+        alloc = getattr(obj, "parent_allocator", None)
+        if (
+            isinstance(obj, TensorMemoryObj)
+            and type(obj) in (TensorMemoryObj, LayerPageMemoryObj)
+            and type(alloc) is PassiveSharedViewAllocator
+            and "free" not in alloc.__dict__
+            and "ref_count_down" not in obj.__dict__
+        ):
+            with obj.lock:
+                if not obj.valid:
+                    continue
+                obj.meta.ref_count -= 1
+                if obj.meta.ref_count < 0:
+                    logger.warning(
+                        "Ref count of MemoryObj %s is negative: %d.",
+                        obj.meta.address,
+                        obj.meta.ref_count,
+                    )
+                    obj.meta.ref_count = 0
+                should_free = (
+                    obj.meta.ref_count == 0 and obj.meta.pin_count == 0
+                )
+            if should_free:
+                queued_free.add(id(obj))
+                by_alloc.setdefault(id(alloc), (alloc, []))[1].append(obj)
+        else:
+            try:
+                is_valid = getattr(obj, "is_valid", None)
+                if not callable(is_valid) or bool(is_valid()):
+                    obj.ref_count_down()
+            except Exception as exc:
+                if not catch_errors:
+                    raise
+                logger.warning(
+                    "Failed to release passive shared CPU view ref: %s", exc
+                )
+    for alloc, to_free in by_alloc.values():
+        try:
+            alloc.batched_free(to_free)
+        except Exception as exc:
+            if not catch_errors:
+                raise
+            logger.warning("Failed to batch-free passive shared CPU views: %s", exc)

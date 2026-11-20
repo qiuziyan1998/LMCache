@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 # Standard
 import asyncio
 import gc
+import itertools
 import math
 import multiprocessing
 import os
@@ -77,7 +78,7 @@ from lmcache.v1.mooncake_layout import (
 )
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.prefill_locations import PrefillLocationPlan
-from lmcache.v1.prefill_metadata import PrefillSequenceView
+from lmcache.v1.prefill_metadata import PrefillSequenceView, split_layers_cached
 from lmcache.v1.prefill_sources import SharedPrefillSources, same_chunk_key
 from lmcache.v1.remote_fill.security import content_digest
 from lmcache.v1.remote_fill_diagnostics import log_remote_fill_diagnostic
@@ -90,12 +91,14 @@ from lmcache.v1.sampled_lookup import (
     first_last_layer_keys,
 )
 from lmcache.v1.shared_cpu_cache import (
+    PassiveSharedViewAllocator,
     SharedChunkHandle,
     SharedCPURequestLease,
     SharedHandleBatch,
     SharedHandleEnvelope,
     SharedSlabMapping,
     chunk_hash_to_int,
+    release_passive_views_batch,
     validate_shared_handle_batch,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
@@ -1502,7 +1505,7 @@ class LMCacheEngine:
     def _make_shared_handle_batch(
         self,
         memory_objs: list[list[MemoryObj]],
-        keys_layer_major: list[list[CacheEngineKey]],
+        keys_layer_major: Sequence[Sequence[CacheEngineKey]],
         *,
         kv_group: int = 0,
         previous: Optional[SharedHandleBatch] = None,
@@ -1524,10 +1527,17 @@ class LMCacheEngine:
             or any(len(layer) != chunks for layer in keys_layer_major)
         ):
             return None
-        reuse_chunks = min(reuse_chunks, chunks) if previous is not None else 0
-        page_chunks = min(reuse_chunks, len(previous.page_offsets)) if previous else 0
-        for chunk in range(reuse_chunks if page_chunks == reuse_chunks else chunks,
-                           chunks):
+        reuse_chunks = (
+            max(0, min(reuse_chunks, chunks, previous.num_chunks))
+            if previous is not None
+            else 0
+        )
+        page_chunks = (
+            min(reuse_chunks, len(previous.page_offsets)) if previous else 0
+        )
+        for chunk in range(
+            reuse_chunks if page_chunks == reuse_chunks else chunks, chunks
+        ):
             page = memory_objs[0][chunk]
             if not isinstance(page, LayerPageMemoryObj):
                 break
@@ -1539,39 +1549,37 @@ class LMCacheEngine:
                 return None
             page_chunks += 1
         tail_start = max(page_chunks, reuse_chunks)
-        tail = [obj for layer in memory_objs for obj in layer[tail_start:]]
-        if any(type(obj) is not TensorMemoryObj for obj in tail):
-            return None
         physical_sizes = (
             previous.physical_sizes[:reuse_chunks] if previous else []
         ) + [
             (
-                memory_objs[0][chunk].layer_size_bytes(0)
+                memory_objs[0][chunk].layer_size_bytes(0)  # type: ignore[attr-defined]
                 if chunk < page_chunks
                 else int(memory_objs[0][chunk].meta.phy_size)
             )
             for chunk in range(reuse_chunks, chunks)
         ]
-        if any(
-            int(obj.meta.phy_size) != physical_sizes[chunk]
-            or obj.get_size() > physical_sizes[chunk]
-            for layer in memory_objs
-            for chunk, obj in enumerate(layer[tail_start:], tail_start)
-        ):
-            return None
         offsets: list[int] = []
         previous_tail = (
             previous.num_chunks - len(previous.page_offsets) if previous else 0
         )
+        reused_tail = max(0, reuse_chunks - page_chunks)
         for layer_id, layer in enumerate(memory_objs):
-            if previous is not None:
+            if previous is not None and reused_tail:
                 begin = layer_id * previous_tail
-                offsets.extend(
-                    previous.offsets[
-                        begin : begin + max(0, reuse_chunks - page_chunks)
-                    ]
-                )
-            offsets.extend(int(obj.meta.address) for obj in layer[tail_start:])
+                offsets.extend(previous.offsets[begin : begin + reused_tail])
+            for chunk in range(tail_start, chunks):
+                obj = layer[chunk]
+                if type(obj) is not TensorMemoryObj:
+                    return None
+                meta = obj.meta
+                phy = int(meta.phy_size)
+                if (
+                    phy != physical_sizes[chunk]
+                    or obj.group_prefix_sum[-1] > phy
+                ):
+                    return None
+                offsets.append(int(meta.address))
         batch = SharedHandleBatch(
             shm_name=self.shared_cpu_cache_name,
             producer_rank=self.metadata.worker_id,
@@ -3660,6 +3668,120 @@ class LMCacheEngine:
                 f"kv_group={kv_group}, chunk_index={chunk_index}"
             )
 
+    def _shared_local_prefix_chunk_count(
+        self, keys_by_chunk: Iterable[Iterable[CacheEngineKey]]
+    ) -> int:
+        """Return contiguous chunk prefix in rank0 LocalCPUBackend."""
+        try:
+            local = self._shared_local_cpu_backend()
+        except Exception:
+            return 0
+        lock = getattr(local, "cpu_lock", None)
+        hot_cache = getattr(local, "hot_cache", None)
+        if lock is None or not isinstance(hot_cache, dict):
+            return 0
+        count = 0
+        with lock:
+            for chunk_keys in keys_by_chunk:
+                keys_list = list(chunk_keys)
+                if not keys_list or any(k not in hot_cache for k in keys_list):
+                    break
+                count += 1
+        return count
+
+    def _resolve_shared_rank0_all_local_layers(
+        self,
+        *,
+        req_id: str,
+        phase: str,
+        kv_group: int,
+        keys_layer_major: Iterable[Iterable[CacheEngineKey]],
+        to_release_out: list[MemoryObj],
+    ) -> Optional[list[list[MemoryObj]]]:
+        """Resolve all layers from LocalCPUBackend under one lock/batch pin."""
+        try:
+            local = self._shared_local_cpu_backend()
+        except Exception:
+            return None
+        lock = getattr(local, "cpu_lock", None)
+        hot_cache = getattr(local, "hot_cache", None)
+        if lock is None or not isinstance(hot_cache, dict):
+            return None
+        context = self._shared_rank0_object_context(kv_group)
+        if context is None:
+            return None
+        rows: list[list[MemoryObj]] = []
+        unique_by_id: dict[int, MemoryObj] = {}
+        acquired: list[MemoryObj] = []
+        batch_pinned = False
+        pinned_single: list[MemoryObj] = []
+        with lock:
+            for row_keys in keys_layer_major:
+                row: list[MemoryObj] = []
+                for key in row_keys:
+                    obj = hot_cache.get(key)
+                    if obj is None or not self._is_rank0_shared_mem_obj(obj):
+                        return None
+                    row.append(obj)
+                    unique_by_id.setdefault(id(obj), obj)
+                rows.append(row)
+            unique_objs = list(unique_by_id.values())
+            if all(isinstance(obj, TensorMemoryObj) for obj in unique_objs):
+                if not TensorMemoryObj.acquire_and_pin_many(
+                    unique_objs  # type: ignore[arg-type]
+                ):
+                    return None
+                acquired, batch_pinned = unique_objs, True
+            else:
+                try:
+                    for obj in unique_objs:
+                        obj.ref_count_up()
+                        acquired.append(obj)
+                except Exception:
+                    for obj in reversed(acquired):
+                        obj.ref_count_down()
+                    raise
+        try:
+            if not batch_pinned:
+                for obj in unique_objs:
+                    if obj.pin() is False:
+                        raise RuntimeError("Pin declined rank0 shared object")
+                    pinned_single.append(obj)
+            validation_cache: dict[int, bool] = {}
+            for layer_id, row in enumerate(rows):
+                for chunk_index, obj in enumerate(row):
+                    if (
+                        isinstance(obj, TensorMemoryObj)
+                        and obj.is_trusted_allocation_batch_member(
+                            validation_cache,
+                            parent=context.parent_allocator,
+                            slab_size=context.slab_size,
+                            dtype=context.dtype,
+                            fmt=context.fmt,
+                        )
+                        and obj.meta.pin_count > 0
+                    ):
+                        continue
+                    self._validate_rank0_shared_mem_obj(
+                        obj,
+                        req_id=req_id,
+                        phase=phase,
+                        layer_id=layer_id,
+                        kv_group=kv_group,
+                        chunk_index=chunk_index,
+                        _context=context,
+                    )
+            to_release_out.extend(unique_objs)
+            return rows
+        except Exception:
+            for obj in reversed(
+                unique_objs if batch_pinned else pinned_single
+            ):
+                obj.unpin()
+            for obj in reversed(acquired):
+                obj.ref_count_down()
+            raise
+
     def _find_shared_rank0_chunk_location(
         self,
         key: CacheEngineKey,
@@ -3685,17 +3807,16 @@ class LMCacheEngine:
         """Prefer LocalCPU and prove Mooncake covers every remaining key."""
         if not keys_by_chunk or not mooncake_page_layout_enabled(self.config):
             return None
-        base_keys = [
-            (chunk[0] if isinstance(chunk, list) else chunk).without_layer()
-            if isinstance(
-                chunk[0] if isinstance(chunk, list) else chunk,
-                LayerCacheEngineKey,
+        base_keys: list[CacheEngineKey] = []
+        for chunk in keys_by_chunk:
+            first_key = (
+                chunk[0] if isinstance(chunk, (list, tuple)) else chunk
             )
-            else chunk[0]
-            if isinstance(chunk, list)
-            else chunk
-            for chunk in keys_by_chunk
-        ]
+            base_keys.append(
+                first_key.without_layer()
+                if isinstance(first_key, LayerCacheEngineKey)
+                else first_key
+            )
         local = self._shared_local_cpu_backend()
         lock = getattr(local, "cpu_lock", None)
         hot_cache = getattr(local, "hot_cache", None)
@@ -3720,7 +3841,11 @@ class LMCacheEngine:
                     return ["LocalCPUBackend"] * local_chunks
                 # Only a complete legacy chunk should suppress its page probe.
                 first_miss = keys_by_chunk[local_chunks]
-                legacy_keys = first_miss if isinstance(first_miss, list) else []
+                legacy_keys = (
+                    first_miss
+                    if isinstance(first_miss, (list, tuple))
+                    else ()
+                )
                 if not legacy_keys or not all(
                     key in hot_cache for key in legacy_keys
                 ):
@@ -3731,7 +3856,7 @@ class LMCacheEngine:
                 for chunk_index, chunk in enumerate(keys_by_chunk):
                     if (
                         layer_pages
-                        and isinstance(chunk, list)
+                        and isinstance(chunk, (list, tuple))
                         and isinstance(chunk[0], LayerCacheEngineKey)
                         and isinstance(
                             hot_cache.get(chunk[0].without_layer()),
@@ -3740,7 +3865,7 @@ class LMCacheEngine:
                     ):
                         continue
                     for layer_id, key in enumerate(
-                        chunk if isinstance(chunk, list) else [chunk]
+                        chunk if isinstance(chunk, (list, tuple)) else (chunk,)
                     ):
                         if key not in hot_cache:
                             missed_layers.add(layer_id)
@@ -3786,7 +3911,9 @@ class LMCacheEngine:
         remote_keys = [
             key
             for chunk in keys_by_chunk[local_chunks:]
-            for key in (chunk if isinstance(chunk, list) else [chunk])
+            for key in (
+                chunk if isinstance(chunk, (list, tuple)) else (chunk,)
+            )
         ]
         hits, mapping = self.storage_manager.batched_contains(
             remote_keys,
@@ -3842,7 +3969,7 @@ class LMCacheEngine:
         phase: str,
         layer_id: int,
         kv_group: int,
-        keys_layer: list[CacheEngineKey],
+        keys_layer: Sequence[CacheEngineKey],
         chunk_locations: Optional[list[str]] = None,
         local_prefix: Optional[LocalCPUPrefixGetResult] = None,
         enforce_planned_location: bool = False,
@@ -4617,14 +4744,14 @@ class LMCacheEngine:
     def _release_shared_retrieve_objs(
         memory_objs: list[MemoryObj], *, unpin: bool
     ) -> None:
-        if unpin:
-            for mem_obj in memory_objs:
-                if mem_obj.is_pinned:
-                    mem_obj.unpin()
-        while memory_objs:
-            mem_obj = memory_objs.pop()
-            if mem_obj.is_valid():
-                mem_obj.ref_count_down()
+        if not memory_objs:
+            return
+        items = list(reversed(memory_objs))
+        memory_objs.clear()
+        if not unpin:
+            release_passive_views_batch(items)
+            return
+        TensorMemoryObj.unpin_and_release_many(items)
 
     def _release_retained_dense_retrieve_objs(
         self,
@@ -4666,15 +4793,202 @@ class LMCacheEngine:
             count,
         )
 
+    @staticmethod
+    def _slice_precomputed_chunk_hashes(
+        token_database: Any,
+        hashes: Any,
+        offsets: Any,
+        skip_tokens: int,
+        total_tokens: int,
+    ) -> Optional[tuple[list[Any], list[int]]]:
+        if (
+            not hashes
+            or not offsets
+            or not isinstance(hashes, (tuple, list))
+            or not isinstance(offsets, (tuple, list))
+            or len(hashes) != len(offsets)
+        ):
+            return None
+        chunk_size = int(getattr(token_database, "chunk_size", 0) or 0)
+        if chunk_size <= 0:
+            return None
+        save_unfull = bool(
+            getattr(
+                getattr(token_database, "config", None),
+                "save_unfull_chunk",
+                True,
+            )
+        )
+        effective_end = (
+            total_tokens
+            if save_unfull
+            else (total_tokens - total_tokens % chunk_size)
+        )
+        if (
+            skip_tokens < 0
+            or effective_end < 0
+            or skip_tokens % chunk_size != 0
+        ):
+            return None
+        pos = 0
+        start_idx = end_idx = None
+        for idx, off in enumerate(offsets):
+            if type(off) is not int or off <= 0 or off > chunk_size:
+                return None
+            if pos == skip_tokens:
+                start_idx = idx
+            if pos == effective_end:
+                end_idx = idx
+                break
+            if off != chunk_size and pos + off != effective_end:
+                return None
+            pos += off
+        if pos == skip_tokens and start_idx is None:
+            start_idx = len(offsets)
+        if pos == effective_end and end_idx is None:
+            end_idx = len(offsets)
+        if effective_end <= skip_tokens:
+            return ([], []) if pos >= skip_tokens else None
+        if start_idx is None or end_idx is None or start_idx > end_idx:
+            return None
+        return (
+            list(hashes[start_idx:end_idx]),
+            list(offsets[start_idx:end_idx]),
+        )
+
+    def _process_tokens_with_precomputed_hashes(
+        self,
+        tokens: Union[torch.Tensor, Sequence[int]],
+        mask: Optional[torch.Tensor],
+        request_configs: Optional[dict],
+        kv_group: int,
+        kwargs: dict[str, Any],
+    ) -> Optional[Iterable[tuple[int, int, CacheEngineKey]]]:
+        assert self.token_database is not None
+        pre_hashes = kwargs.get("prefill_chunk_hashes")
+        pre_offsets = kwargs.get("prefill_chunk_offsets")
+        if not pre_hashes or not pre_offsets:
+            return None
+        if mask is not None:
+            if mask.numel() != len(tokens):
+                return None
+            num_falses = int(mask.numel() - mask.long().sum().item())
+            if num_falses < mask.numel() and not bool(
+                mask[num_falses:].all()
+            ):
+                return None
+        else:
+            num_falses = int(kwargs.get("_prefill_skip_tokens", 0) or 0)
+        sliced = self._slice_precomputed_chunk_hashes(
+            self.token_database,
+            pre_hashes,
+            pre_offsets,
+            num_falses,
+            len(tokens),
+        )
+        if sliced is not None:
+            sub_hashes, sub_offsets = sliced
+            if not sub_hashes:
+                return ()
+            generated = self.token_database.process_tokens(
+                hashes=sub_hashes,
+                offsets=sub_offsets,
+                request_configs=request_configs,
+                kv_group=kv_group,
+            )
+            return (
+                (s + num_falses, e + num_falses, k)
+                for s, e, k in generated
+                if isinstance(k, CacheEngineKey)
+            )
+        chunk_size = int(getattr(self.token_database, "chunk_size", 0) or 0)
+        from_prefix = getattr(
+            self.token_database, "process_tokens_from_prefix", None
+        )
+        if (
+            chunk_size <= 0
+            or not callable(from_prefix)
+            or num_falses < 0
+            or num_falses % chunk_size != 0
+            or not isinstance(pre_hashes, (tuple, list))
+            or not isinstance(pre_offsets, (tuple, list))
+            or len(pre_hashes) != len(pre_offsets)
+        ):
+            return None
+        complete_covered = (
+            len(pre_offsets)
+            if pre_offsets[-1] == chunk_size
+            else len(pre_offsets) - 1
+        )
+        if complete_covered <= 0 or any(
+            type(off) is not int or off != chunk_size
+            for off in pre_offsets[:complete_covered]
+        ):
+            return None
+        save_unfull = bool(
+            getattr(
+                getattr(self.token_database, "config", None),
+                "save_unfull_chunk",
+                True,
+            )
+        )
+        effective_len = (
+            len(tokens)
+            if save_unfull
+            else len(tokens) - (len(tokens) % chunk_size)
+        )
+        if effective_len <= num_falses:
+            return ()
+        usable_complete = min(complete_covered, effective_len // chunk_size)
+        if usable_complete <= 0:
+            return None
+        covered_tokens = usable_complete * chunk_size
+        skip_chunks = num_falses // chunk_size
+        prefix_gen: Iterable[tuple[int, int, CacheEngineKey]] = ()
+        if skip_chunks < usable_complete:
+            prefix_raw = self.token_database.process_tokens(
+                hashes=list(pre_hashes[skip_chunks:usable_complete]),
+                offsets=[chunk_size] * (usable_complete - skip_chunks),
+                request_configs=request_configs,
+                kv_group=kv_group,
+            )
+            prefix_gen = (
+                (s + num_falses, e + num_falses, k)
+                for s, e, k in prefix_raw
+                if isinstance(k, CacheEngineKey)
+            )
+        if covered_tokens >= effective_len:
+            return prefix_gen
+        effective_tokens = (
+            tokens if effective_len == len(tokens) else tokens[:effective_len]
+        )
+        suffix_raw = from_prefix(
+            effective_tokens,
+            prefix_token_count=covered_tokens,
+            prefix_hash=pre_hashes[usable_complete - 1],
+            make_key=True,
+            request_configs=request_configs,
+            kv_group=kv_group,
+        )
+        return itertools.chain(
+            prefix_gen,
+            (
+                (s, e, k)
+                for s, e, k in suffix_raw
+                if s >= num_falses and isinstance(k, CacheEngineKey)
+            ),
+        )
+
     def _dense_retrieve_token_results(
         self,
-        tokens: Union[torch.Tensor, list[int]],
+        tokens: Union[torch.Tensor, Sequence[int]],
         mask: Optional[torch.Tensor],
         request_configs: Optional[dict],
         kv_group: int,
         kwargs: dict[str, Any],
     ) -> Iterable[tuple[int, int, CacheEngineKey]]:
         """Reuse group-0 prefix hashes when constructing group-1 keys."""
+        assert self.token_database is not None
         state = kwargs.get("shared_cpu_request_preflight_state")
         plan = (
             state.get(_SHARED_CPU_CHUNK_PLAN_KEY)
@@ -4695,12 +5009,24 @@ class LMCacheEngine:
                 )
             )
 
-        results = self.token_database.process_tokens(
-            tokens=tokens,
-            mask=mask,
-            request_configs=request_configs,
-            kv_group=kv_group,
+        precomputed = (
+            self._process_tokens_with_precomputed_hashes(
+                tokens, mask, request_configs, kv_group, kwargs
+            )
+            if kwargs.get("prefill_chunk_hashes")
+            and kwargs.get("prefill_chunk_offsets")
+            else None
         )
+        results: Iterable[tuple[int, int, Any]]
+        if precomputed is not None:
+            results = precomputed
+        else:
+            results = self.token_database.process_tokens(
+                tokens=tokens,  # type: ignore[arg-type]
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+            )
         if kv_group != 0 or not isinstance(state, dict):
             return results
 
@@ -4717,9 +5043,9 @@ class LMCacheEngine:
         self,
         *,
         req_id: str,
-        starts: list[int],
-        ends: list[int],
-        keys_layer_major: list[list[CacheEngineKey]],
+        starts: Sequence[int],
+        ends: Sequence[int],
+        keys_layer_major: Sequence[Sequence[CacheEngineKey]],
         memory_objs: list[list[MemoryObj]],
         handles: list[list[Any]],
         kv_group: int,
@@ -4963,8 +5289,13 @@ class LMCacheEngine:
         return None
 
     def _remember_shared_prefill_sources(
-        self, req_id: str, kv_group: int, starts: list[int], ends: list[int],
-        keys: list[list[CacheEngineKey]], batch: Optional[SharedHandleBatch],
+        self,
+        req_id: str,
+        kv_group: int,
+        starts: Sequence[int],
+        ends: Sequence[int],
+        keys: Sequence[Sequence[CacheEngineKey]],
+        batch: Optional[SharedHandleBatch],
         kwargs: dict[str, Any],
     ) -> None:
         if not kwargs.get("_reuse_shared_dense_prefix") or batch is None:
@@ -4998,7 +5329,9 @@ class LMCacheEngine:
             or chunk_index >= min(len(keys[layer_id]), len(objects[layer_id]))
             or starts[chunk_index] != start
             or ends[chunk_index] != end
-            or keys[layer_id][chunk_index] != key
+            or getattr(keys[layer_id][chunk_index], "layer_id", layer_id)
+            != getattr(key, "layer_id", layer_id)
+            or not same_chunk_key(keys[layer_id][chunk_index], key)
         ):
             return None
         obj = objects[layer_id][chunk_index]
@@ -5195,9 +5528,9 @@ class LMCacheEngine:
     def _retrieve_layer_shared_rank0(
         self,
         *,
-        starts: list[int],
-        ends: list[int],
-        keys_layer_major: list[list[CacheEngineKey]],
+        starts: Sequence[int],
+        ends: Sequence[int],
+        keys_layer_major: Sequence[Sequence[CacheEngineKey]],
         chunk_locations_layer_major: list[list[str]],
         location: Optional[str],
         ret_mask: torch.Tensor,
@@ -5406,22 +5739,50 @@ class LMCacheEngine:
                                 # as one existing compact batch even without
                                 # Mooncake pages; do not pay one TP broadcast
                                 # per layer. Keep the original tier selection.
-                                pre_resolved_layers = []
-                                for row_id, row_keys in enumerate(keys_layer_major):
-                                    row = self._resolve_shared_rank0_layer_mem_objs(
-                                        req_id=req_id,
-                                        phase=phase,
-                                        layer_id=row_id,
-                                        kv_group=kv_group,
-                                        keys_layer=row_keys,
-                                        chunk_locations=chunk_locations_layer_major[
-                                            row_id
-                                        ],
+                                if (
+                                    location == "LocalCPUBackend"
+                                    and keys_layer_major
+                                    and len(chunk_locations_layer_major)
+                                    == len(keys_layer_major)
+                                    and all(
+                                        len(locs) == len(keys_layer_major[0])
+                                        and all(
+                                            loc == "LocalCPUBackend"
+                                            for loc in locs
+                                        )
+                                        for locs in chunk_locations_layer_major
                                     )
-                                    pre_resolved_layers.append(row)
-                                    # Own each resolved row immediately so a
-                                    # later failure releases its refs/pins too.
-                                    to_release.extend(row)
+                                ):
+                                    pre_resolved_layers = (
+                                        self._resolve_shared_rank0_all_local_layers(
+                                            req_id=req_id,
+                                            phase=phase,
+                                            kv_group=kv_group,
+                                            keys_layer_major=keys_layer_major,
+                                            to_release_out=to_release,
+                                        )
+                                    )
+                                if pre_resolved_layers is None:
+                                    pre_resolved_layers = []
+                                    for row_id, row_keys in enumerate(
+                                        keys_layer_major
+                                    ):
+                                        row = self._resolve_shared_rank0_layer_mem_objs(
+                                            req_id=req_id,
+                                            phase=phase,
+                                            layer_id=row_id,
+                                            kv_group=kv_group,
+                                            keys_layer=row_keys,
+                                            chunk_locations=(
+                                                chunk_locations_layer_major[
+                                                    row_id
+                                                ]
+                                            ),
+                                        )
+                                        pre_resolved_layers.append(row)
+                                        # Own each resolved row immediately so a
+                                        # later failure releases its refs/pins too.
+                                        to_release.extend(row)
                             elif (
                                 mooncake_layer_pages_enabled(self.config)
                                 and full_chunks
@@ -5693,8 +6054,9 @@ class LMCacheEngine:
                 and kwargs.get("_retain_shared_dense_cache")
                 and planned_page_chunks
             ):
+                num_group_layers = self.num_layers_for_group(kv_group)
                 page_layers = [
-                    key.split_layers(self.num_layers_for_group(kv_group))
+                    split_layers_cached(key, num_group_layers)
                     for key in keys_layer_major[0][source_prefix:planned_page_chunks]
                 ]
                 adoption_keys = [
@@ -5703,11 +6065,11 @@ class LMCacheEngine:
                     + list(keys_layer_major[layer_id][
                         max(planned_page_chunks, source_prefix):
                     ])
-                    for layer_id in range(self.num_layers_for_group(kv_group))
+                    for layer_id in range(num_group_layers)
                 ] if source_prefix else [
                     [page[layer_id] for page in page_layers]
                     + list(keys_layer_major[layer_id][planned_page_chunks:])
-                    for layer_id in range(self.num_layers_for_group(kv_group))
+                    for layer_id in range(num_group_layers)
                 ]
             adopted = self._adopt_dense_shared_retrieve_cache(
                 req_id=req_id,
@@ -5765,9 +6127,9 @@ class LMCacheEngine:
     def _retrieve_layer_shared_passive(
         self,
         *,
-        starts_all: list[int],
-        ends_all: list[int],
-        keys_layer_major: list[list[CacheEngineKey]],
+        starts_all: Sequence[int],
+        ends_all: Sequence[int],
+        keys_layer_major: Sequence[Sequence[CacheEngineKey]],
         ret_mask: torch.Tensor,
         monitor_req_id: int,
         req_id: str,
@@ -5821,9 +6183,12 @@ class LMCacheEngine:
         source_prefix = 0
         if deferred_layerwise_get and kwargs.get("_reuse_shared_dense_prefix"):
             kwargs.pop("_shared_prefill_reuse_count", None)
+        num_group_layers = self.num_layers_for_group(kv_group)
+        lazy_split_chunks: dict[int, Any] = {}
+        prebuilt_batch_tails: Optional[list[list[TensorMemoryObj]]] = None
 
         try:
-            for layer_id in range(self.num_layers_for_group(kv_group)):
+            for layer_id in range(num_group_layers):
                 envelope = None
                 if compact_batch is None:
                     envelope = self._receive_matching_shared_envelope(
@@ -5875,8 +6240,8 @@ class LMCacheEngine:
                         if compact_batch is not None
                         else len(envelope.handles)
                     )
-                    starts = starts_all[:expected_handle_count]
-                    ends = ends_all[:expected_handle_count]
+                    starts = list(starts_all[:expected_handle_count])
+                    ends = list(ends_all[:expected_handle_count])
                     for start, end in zip(starts, ends, strict=False):
                         ret_mask[start:end] = True
                     if not prepare_c8_packets:
@@ -5968,8 +6333,74 @@ class LMCacheEngine:
                     mem_objs_layer.extend(
                         kwargs["cached_memory_objs"][layer_id][page_chunks:source_prefix]
                     )
+                tail_start_chunk = max(page_chunks, source_prefix)
+                reuse_probe_limit = (
+                    min(
+                        len(kwargs.get("cached_starts", ())),
+                        len(kwargs.get("cached_ends", ())),
+                    )
+                    if kwargs.get("_reuse_shared_dense_prefix")
+                    and kwargs.get("cached_memory_objs")
+                    else 0
+                )
+                batch_tail_start = min(
+                    expected_handle_count,
+                    max(tail_start_chunk, reuse_probe_limit),
+                )
+                if (
+                    layer_id == 0
+                    and compact_batch is not None
+                    and batch_tail_start < expected_handle_count
+                ):
+                    alloc = self.shared_cpu_cache_passive_allocator
+                    if (
+                        type(alloc) is PassiveSharedViewAllocator
+                        and "create_batch_view" not in alloc.__dict__
+                    ):
+                        policy = getattr(
+                            self.metadata, "indexer_c8_layout", None
+                        )
+                        try:
+                            prebuilt_batch_tails = (
+                                alloc.create_batch_views_for_group(
+                                    compact_batch,
+                                    start_chunk=batch_tail_start,
+                                    end_chunk=expected_handle_count,
+                                    starts=starts,
+                                    ends=ends,
+                                    meta_fn=lambda lid, nt: (
+                                        self._expected_shared_cpu_chunk_metadata(
+                                            kv_group=kv_group,
+                                            layer_id=lid,
+                                            num_tokens=nt,
+                                        )
+                                    ),
+                                    homogeneous_layers=not (
+                                        kv_group == 1
+                                        and policy is not None
+                                        and getattr(policy, "mixed", False)
+                                    ),
+                                )
+                            )
+                        except Exception as exc:
+                            if not remote_fill_load:
+                                raise
+                            raise _RemoteFillMaterializationError(
+                                "RemoteFill passive shared view "
+                                "materialization failed"
+                            ) from exc
+                        for tail_row in prebuilt_batch_tails:
+                            if retained_lease is None:
+                                to_release.extend(tail_row)
+                            else:
+                                for mem_obj in tail_row:
+                                    if not retained_lease.owns(mem_obj):
+                                        to_release.append(mem_obj)
                 for chunk_index in range(
-                    max(page_chunks, source_prefix), expected_handle_count
+                    tail_start_chunk,
+                    batch_tail_start
+                    if prebuilt_batch_tails is not None
+                    else expected_handle_count,
                 ):
                     handle = layer_handles[chunk_index]
                     expected_shape, expected_dtype, expected_fmt = (
@@ -5986,8 +6417,9 @@ class LMCacheEngine:
                         int(ends_all[chunk_index]),
                     )
                     try:
-                        mem_obj = (
-                            self.shared_cpu_cache_passive_allocator.create_batch_view(
+                        passive_alloc = self.shared_cpu_cache_passive_allocator
+                        if compact_batch is not None:
+                            mem_obj = passive_alloc.create_batch_view(
                                 compact_batch,
                                 layer_id=layer_id,
                                 chunk_index=chunk_index,
@@ -6010,15 +6442,30 @@ class LMCacheEngine:
                                     else {}
                                 ),
                             )
-                            if compact_batch is not None
-                            else self.shared_cpu_cache_passive_allocator.create_view(
+                        else:
+                            raw_expected_key = keys_layer_major[layer_id][
+                                chunk_index
+                            ]
+                            if isinstance(
+                                raw_expected_key, LayerCacheEngineKey
+                            ):
+                                expected_key = raw_expected_key
+                            else:
+                                split_keys = lazy_split_chunks.get(chunk_index)
+                                if split_keys is None:
+                                    split_keys = split_layers_cached(
+                                        raw_expected_key, num_group_layers
+                                    )
+                                    lazy_split_chunks[chunk_index] = split_keys
+                                expected_key = split_keys[layer_id]
+                            mem_obj = passive_alloc.create_view(
                                 handle,
                                 expected_request_id=req_id,
                                 expected_phase=phase,
                                 expected_layer_id=layer_id,
                                 expected_kv_group=kv_group,
                                 expected_chunk_index=chunk_index,
-                                expected_key=keys_layer_major[layer_id][chunk_index],
+                                expected_key=expected_key,
                                 expected_shape=expected_shape,
                                 expected_dtype=expected_dtype,
                                 expected_fmt=expected_fmt,
@@ -6039,7 +6486,6 @@ class LMCacheEngine:
                                     else {}
                                 ),
                             )
-                        )
                     except Exception as exc:
                         if not remote_fill_load:
                             raise
@@ -6049,6 +6495,8 @@ class LMCacheEngine:
                     mem_objs_layer.append(mem_obj)
                     if retained_lease is None or not retained_lease.owns(mem_obj):
                         to_release.append(mem_obj)
+                if prebuilt_batch_tails is not None:
+                    mem_objs_layer.extend(prebuilt_batch_tails[layer_id])
                 resolved_layers.append(mem_objs_layer)
                 handles_by_layer.append(layer_handles)
 
@@ -6139,11 +6587,20 @@ class LMCacheEngine:
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
                 mem_obj_consumer = None
             if resolved_layers:
+                adoption_keys: Any = (
+                    tuple(
+                        PrefillSequenceView(row, 0, len(starts))
+                        for row in keys_layer_major
+                    )
+                    if keys_layer_major
+                    and len(keys_layer_major[0]) != len(starts)
+                    else keys_layer_major
+                )
                 adopted = self._adopt_dense_shared_retrieve_cache(
                     req_id=req_id,
                     starts=starts,
                     ends=ends,
-                    keys_layer_major=keys_layer_major,
+                    keys_layer_major=adoption_keys,
                     memory_objs=resolved_layers,
                     handles=handles_by_layer,
                     kv_group=kv_group,
@@ -6152,8 +6609,13 @@ class LMCacheEngine:
                 if adopted:
                     to_release.clear()
                     self._remember_shared_prefill_sources(
-                        req_id, kv_group, starts, ends, keys_layer_major,
-                        compact_batch, kwargs,
+                        req_id,
+                        kv_group,
+                        starts,
+                        ends,
+                        adoption_keys,
+                        compact_batch,
+                        kwargs,
                     )
                 elif kwargs.get("_retain_shared_dense_cache"):
                     raise RuntimeError("Dense shared source retention failed")
@@ -6632,7 +7094,7 @@ class LMCacheEngine:
     @torch.inference_mode()
     def store_layer(
         self,
-        tokens: Union[torch.Tensor, list[int]],
+        tokens: Union[torch.Tensor, Sequence[int]],
         mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Generator[Optional[LayerwiseStoreResult], Any, None]:
@@ -6770,19 +7232,34 @@ class LMCacheEngine:
                 kv_group=kv_group, num_layers=num_layers,
                 skip_tokens=len(tokens) - int(num_to_store_tokens),
             )
-        store_candidates = (
-            store_plan.candidates if store_plan is not None else
-            self.token_database.process_tokens(
-                tokens=tokens, mask=mask, request_configs=request_configs,
-                kv_group=kv_group,
+        if store_plan is not None:
+            store_candidates = store_plan.candidates
+        else:
+            precomputed_store = (
+                self._process_tokens_with_precomputed_hashes(
+                    tokens, mask, request_configs, kv_group, kwargs
+                )
+                if kwargs.get("prefill_chunk_hashes")
+                and kwargs.get("prefill_chunk_offsets")
+                else None
             )
-        )
+            store_candidates = (
+                precomputed_store
+                if precomputed_store is not None
+                else self.token_database.process_tokens(
+                    tokens=tokens,  # type: ignore[arg-type]
+                    mask=mask,
+                    request_configs=request_configs,
+                    kv_group=kv_group,
+                )
+            )
         for candidate_index, (start, end, key) in enumerate(store_candidates):
             assert isinstance(key, CacheEngineKey)
             requested_end = end
             keys_multi_layer = (
-                store_plan.keys_chunk_major[candidate_index]
-                if store_plan is not None else key.split_layers(num_layers)
+                list(store_plan.keys_chunk_major[candidate_index])
+                if store_plan is not None
+                else list(split_layers_cached(key, num_layers))
             )
             fully_stored = self._layerwise_chunk_fully_stored(
                 keys_multi_layer,
@@ -7243,9 +7720,13 @@ class LMCacheEngine:
             and deferred_layerwise_get and kwargs.get("_reuse_shared_dense_prefix")
         ):
             metadata_plan = metadata_cache.prepare(
-                self.token_database, tokens, request_configs=request_configs,
-                kv_group=kv_group, num_layers=num_layers,
+                self.token_database,
+                tokens,
+                request_configs=request_configs,
+                kv_group=kv_group,
+                num_layers=num_layers,
                 skip_tokens=prefix_tokens - int(num_required_tokens),
+                split_layers=not self._is_passive(),
             )
             self.track_prefill_retrieve_keys(req_id, metadata_plan.base_keys)
             kwargs["_prefill_layer_keys"] = metadata_plan.keys_layer_major
@@ -7263,7 +7744,7 @@ class LMCacheEngine:
                     assert isinstance(key, CacheEngineKey)
                     starts.append(start)
                     ends.append(end)
-                    keys.append(key.split_layers(num_layers))
+                    keys.append(list(split_layers_cached(key, num_layers)))
                 keys_layer_major = (
                     [list(row) for row in zip(*keys, strict=False)] if keys else []
                 )
@@ -7437,7 +7918,7 @@ class LMCacheEngine:
                             else (
                                 list(metadata_plan.keys_chunk_major[index])
                                 if metadata_plan is not None
-                                else item[2].split_layers(num_layers)
+                                else list(split_layers_cached(item[2], num_layers))
                             )
                             for index, item in enumerate(
                                 page_candidates[retained_chunks:], retained_chunks
@@ -7459,8 +7940,10 @@ class LMCacheEngine:
                     batch_plan is not None
                     and len(page_candidates) < len(candidates)
                 ):
-                    tail_keys = candidates[len(page_candidates)][2].split_layers(
-                        num_layers
+                    tail_keys = list(
+                        split_layers_cached(
+                            candidates[len(page_candidates)][2], num_layers
+                        )
                     )
                     hits, mapping = self.storage_manager.batched_contains(
                         tail_keys, self.retrieve_locations
@@ -7479,6 +7962,20 @@ class LMCacheEngine:
                             tail_locations.append(tail_location)
                         else:
                             tail_plan = tail_locations
+            local_batch_chunks = 0
+            if (
+                remote_fill_plan is None
+                and batch_plan is None
+                and len(candidates) > retained_chunks
+            ):
+                local_batch_chunks = self._shared_local_prefix_chunk_count(
+                    metadata_plan.keys_chunk_major[retained_chunks:]
+                    if metadata_plan is not None
+                    else (
+                        split_layers_cached(item[2], num_layers)
+                        for item in candidates[retained_chunks:]
+                    )
+                )
             for candidate_index, (start, end, key) in enumerate(
                 candidates[retained_chunks:], retained_chunks
             ):
@@ -7502,13 +7999,16 @@ class LMCacheEngine:
                     or (ordinary_page_planned and layer_pages)
                     else metadata_plan.keys_chunk_major[candidate_index]
                     if metadata_plan is not None
-                    else key.split_layers(num_layers)
+                    else list(split_layers_cached(key, num_layers))
                 )
                 planned_location = (
                     remote_fill_chunk[0]
                     if remote_fill_chunk is not None
                     else batch_plan[len(keys)]
                     if ordinary_page_planned and batch_plan is not None
+                    else "LocalCPUBackend"
+                    if batch_plan is None
+                    and candidate_index < retained_chunks + local_batch_chunks
                     else None
                 )
                 locations_multi_layer: list[str] = (
@@ -7706,7 +8206,7 @@ class LMCacheEngine:
         ):
             assert isinstance(key, CacheEngineKey)
 
-            keys_multi_layer = key.split_layers(num_layers)
+            keys_multi_layer = list(split_layers_cached(key, num_layers))
 
             # NOTE: Only check the first layer
             if current_location := self.storage_manager.contains(
@@ -8136,6 +8636,150 @@ class LMCacheEngine:
 
         yield ret_mask
 
+    def _lookup_local_cpu_windowed(
+        self,
+        chunk_info_iterator: Iterable[tuple[int, int, Any]],
+        *,
+        search_range: Optional[List[str]],
+        lookup_kv_groups: Sequence[int],
+        page_lookup: bool,
+        request_configs: Optional[dict],
+        pin: bool,
+        lookup_id: Optional[str],
+        call_pinned: dict[str, list[CacheEngineKey]],
+        res: int,
+    ) -> tuple[Iterable[tuple[int, int, Any]], int, bool]:
+        assert self.storage_manager is not None
+        try:
+            active_backends = list(
+                self.storage_manager.get_active_storage_backends(
+                    search_range=search_range
+                )
+            )
+        except TypeError:
+            active_backends = [
+                (n, b)
+                for n, b in self.storage_manager.get_active_storage_backends()
+                if search_range is None or n in search_range
+            ]
+        if not active_backends or active_backends[0][0] != "LocalCPUBackend":
+            return chunk_info_iterator, res, False
+        local_backend = active_backends[0][1]
+        local_lock = getattr(local_backend, "cpu_lock", None)
+        hot_cache = getattr(local_backend, "hot_cache", None)
+        keys_in_request = getattr(local_backend, "keys_in_request", None)
+        if (
+            local_lock is None
+            or not isinstance(hot_cache, dict)
+            or not isinstance(keys_in_request, list)
+        ):
+            return chunk_info_iterator, res, False
+        local_only = len(active_backends) == 1
+        chunk_iter = iter(chunk_info_iterator)
+        window_size = 1
+        while True:
+            window_chunks = list(itertools.islice(chunk_iter, window_size))
+            if not window_chunks:
+                return (), res, True
+            window_hit_end: Optional[int] = None
+            window_pin_objs: list[MemoryObj] = []
+            window_pin_keys: list[CacheEngineKey] = []
+            missed_idx: Optional[int] = None
+            with local_lock:
+                for w_idx, (_start, end, key) in enumerate(window_chunks):
+                    assert isinstance(key, CacheEngineKey)
+                    chunk_objs: list[MemoryObj] = []
+                    chunk_keys: list[CacheEngineKey] = []
+                    chunk_complete = True
+                    for kv_group in lookup_kv_groups:
+                        group_key = self._lookup_key_for_kv_group(
+                            key,
+                            kv_group=kv_group,
+                            request_configs=request_configs,
+                        )
+                        group_num_layers = self.num_layers_for_group(kv_group)
+                        if page_lookup:
+                            page_key = (
+                                group_key.without_layer()
+                                if isinstance(group_key, LayerCacheEngineKey)
+                                else group_key
+                            )
+                            page_obj = hot_cache.get(page_key)
+                            if isinstance(page_obj, LayerPageMemoryObj):
+                                chunk_objs.append(page_obj)
+                                chunk_keys.append(page_key)
+                                continue
+                        group_keys = split_layers_cached(
+                            group_key, group_num_layers
+                        )
+                        group_objs: list[MemoryObj] = []
+                        for gk in group_keys:
+                            gobj = hot_cache.get(gk)
+                            if gobj is None:
+                                chunk_complete = False
+                                break
+                            group_objs.append(gobj)
+                        if not chunk_complete:
+                            break
+                        chunk_objs.extend(group_objs)
+                        chunk_keys.extend(group_keys)
+                    if not chunk_complete:
+                        missed_idx = w_idx
+                        break
+                    window_hit_end = end
+                    if pin:
+                        window_pin_objs.extend(chunk_objs)
+                        window_pin_keys.extend(chunk_keys)
+                if pin and window_pin_objs:
+                    assert lookup_id is not None, (
+                        "lookup_id is required when pin is True"
+                    )
+                    if all(
+                        isinstance(o, TensorMemoryObj) for o in window_pin_objs
+                    ):
+                        if not TensorMemoryObj.pin_many(
+                            window_pin_objs  # type: ignore[arg-type]
+                        ):
+                            raise RuntimeError(
+                                "Batch pin declined lookup objects"
+                            )
+                    else:
+                        pinned_single: list[MemoryObj] = []
+                        try:
+                            for o in window_pin_objs:
+                                if o.pin() is False:
+                                    raise RuntimeError(
+                                        "Pin declined lookup object"
+                                    )
+                                pinned_single.append(o)
+                        except BaseException:
+                            for o in reversed(pinned_single):
+                                o.unpin()
+                            raise
+                    try:
+                        call_pinned["LocalCPUBackend"].extend(window_pin_keys)
+                    except BaseException:
+                        for o in reversed(window_pin_objs):
+                            o.unpin()
+                        raise
+                    keys_in_request.extend(window_pin_keys)
+                    self.lookup_pins[lookup_id]["LocalCPUBackend"].extend(
+                        window_pin_keys
+                    )
+            if window_hit_end is not None:
+                res = window_hit_end
+            if missed_idx is not None:
+                if local_only:
+                    return (), res, True
+                return (
+                    itertools.chain(window_chunks[missed_idx:], chunk_iter),
+                    res,
+                    False,
+                )
+            window_size = (
+                64 if window_size == 1 else (512 if local_only else 64)
+            )
+
     @_lmcache_nvtx_annotate
     def lookup(
         self,
@@ -8273,16 +8917,45 @@ class LMCacheEngine:
 
                 lookup_kv_groups = self._layerwise_lookup_kv_groups()
                 page_lookup = mooncake_layer_pages_enabled(self.config)
+                call_pinned: dict[str, list[CacheEngineKey]] = defaultdict(
+                    list
+                )
+                initial_pin_lens: dict[str, int] = (
+                    {
+                        loc: len(v)
+                        for loc, v in self.lookup_pins[lookup_id].items()
+                    }
+                    if pin
+                    and lookup_id is not None
+                    and lookup_id in self.lookup_pins
+                    else {}
+                )
+                chunk_info_iterator, res, done_local = (
+                    self._lookup_local_cpu_windowed(
+                        chunk_info_iterator,
+                        search_range=search_range,
+                        lookup_kv_groups=lookup_kv_groups,
+                        page_lookup=page_lookup,
+                        request_configs=request_configs,
+                        pin=pin,
+                        lookup_id=lookup_id,
+                        call_pinned=call_pinned,
+                        res=res,
+                    )
+                )
+                if done_local:
+                    return res
+
                 def contains_group(
                     keys: list[CacheEngineKey], page: bool, do_pin: bool
                 ) -> tuple[int, dict]:
                     if page:
-                        return self.storage_manager.batched_contains_layer_pages(
+                        return self.storage_manager.batched_contains_layer_pages(  # type: ignore[union-attr]
                             keys,  # type: ignore[arg-type]
                             search_range,
                             do_pin,
                         )
-                    return self.storage_manager.batched_contains(
+                    return self.storage_manager.batched_contains(  # type: ignore[union-attr]
                         keys, search_range, do_pin
                     )
 
@@ -8297,15 +8970,21 @@ class LMCacheEngine:
                         )
                         page = page_lookup
                         group_num_layers = self.num_layers_for_group(kv_group)
-                        group_keys: list[CacheEngineKey] = group_key.split_layers(
-                            1 if page else group_num_layers
+                        group_keys: list[CacheEngineKey] = list(
+                            split_layers_cached(
+                                group_key, 1 if page else group_num_layers
+                            )
                         )
                         hit_chunks, block_mapping = contains_group(
                             group_keys, page, False
                         )
                         if page and (hit_chunks != 1 or len(block_mapping) != 1):
                             page = False
-                            group_keys = group_key.split_layers(group_num_layers)
+                            group_keys = list(
+                                split_layers_cached(
+                                    group_key, group_num_layers
+                                )
+                            )
                             hit_chunks, block_mapping = contains_group(
                                 group_keys, page, False
                             )
@@ -8323,6 +9002,7 @@ class LMCacheEngine:
                             "lookup_id is required when pin is True"
                         )
                         pinned_mappings: list[tuple[str, list[CacheEngineKey]]] = []
+                        pm_transferred = 0
                         try:
                             for group_keys, page in chunk_groups:
                                 hit_chunks, block_mapping = contains_group(
@@ -8347,11 +9027,15 @@ class LMCacheEngine:
                                 pinned_keys = block_mapping[location]
                                 pinned_mappings.append((location, pinned_keys))
                             for location, pinned_keys in pinned_mappings:
+                                call_pinned[location].extend(pinned_keys)
+                                pm_transferred += 1
                                 self.lookup_pins[lookup_id][location].extend(
                                     pinned_keys
                                 )
-                        except Exception:
-                            for location, pinned_keys in pinned_mappings:
+                        except BaseException:
+                            for location, pinned_keys in pinned_mappings[
+                                pm_transferred:
+                            ]:
                                 self.storage_manager.batched_unpin(
                                     pinned_keys,
                                     [location],
@@ -8386,6 +9070,29 @@ class LMCacheEngine:
 
             # all tokens where found, return the maximal end
             return res
+        except BaseException:
+            if (
+                self.use_layerwise
+                and pin
+                and "call_pinned" in locals()
+                and call_pinned
+            ):
+                if lookup_id is not None and lookup_id in self.lookup_pins:
+                    pin_entry = self.lookup_pins[lookup_id]
+                    init_lens = locals().get("initial_pin_lens") or {}
+                    for loc in call_pinned:
+                        existing_keys = pin_entry.get(loc)
+                        if existing_keys is not None:
+                            del existing_keys[init_lens.get(loc, 0) :]
+                            if not existing_keys:
+                                pin_entry.pop(loc, None)
+                    if not pin_entry:
+                        self.lookup_pins.pop(lookup_id, None)
+                assert self.storage_manager is not None
+                for loc, c_keys in call_pinned.items():
+                    if c_keys:
+                        self.storage_manager.batched_unpin(c_keys, [loc])
+            raise
         finally:
             self.stats_monitor.on_lookup_finished(lookup_stats, res)
             # vllm lookup sets pin to True
@@ -8680,7 +9387,7 @@ class LMCacheEngine:
                     try:
                         result = await asyncio.to_thread(prepare)
                     except Exception:
-                        if prefetch:
+                        if prefetch or pin:
                             self._release_lookup_pins(lookup_id)
                         logger.exception(
                             "Layerwise async lookup failed: lookup_id=%s",

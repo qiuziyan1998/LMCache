@@ -67,6 +67,7 @@ class LMCacheLookupClient(LookupClientInterface):
         # looked up, the following lookups of the same
         # request must have the same result.
         self.reqs_status: dict[str, int] = {}
+        self._lookup_chunk_hashes: dict[str, tuple] = {}
 
         # First Party
         from lmcache.v1.token_database import (
@@ -106,6 +107,7 @@ class LMCacheLookupClient(LookupClientInterface):
         if not self.enable_blending:
             hashes = []
             offsets = []
+            chunk_end_tokens: list[int] = []
 
             for (
                 start,
@@ -114,11 +116,17 @@ class LMCacheLookupClient(LookupClientInterface):
             ) in self.token_database.process_tokens(token_ids, make_key=False):
                 hashes.append(key)
                 offsets.append(end - start)
+                chunk_end_tokens.append(int(token_ids[end - 1]))
 
             # if the token database returns no hashes,
             # return 0
             if not hashes:
+                self._drop_lookup_chunk_hashes(lookup_id)
                 return 0
+
+            self._stash_lookup_chunk_hashes(
+                lookup_id, token_ids, hashes, offsets, chunk_end_tokens
+            )
 
             msg_buf = [
                 hashes,
@@ -129,6 +137,7 @@ class LMCacheLookupClient(LookupClientInterface):
             lookup_mode = "hashes"
             lookup_input_count = len(hashes)
         else:
+            self._drop_lookup_chunk_hashes(lookup_id)
             msg_buf = [
                 token_ids,
                 lookup_id,
@@ -137,28 +146,33 @@ class LMCacheLookupClient(LookupClientInterface):
             lookup_mode = "tokens"
             lookup_input_count = len(token_ids)
 
-        responses = self.transport.send_and_recv_all(msg_buf)
+        try:
+            responses = self.transport.send_and_recv_all(msg_buf)
 
-        # Transport returns empty list on failure
-        if not responses:
-            logger.error(
-                "Lookup RPC returned no responses: failed_at=%s "
-                "caller=LMCacheLookupClient.lookup "
-                "lookup_id=%s mode=%s input_count=%s token_count=%s "
-                "transport=%s timeout_ms=%s",
-                _utc_timestamp(),
-                lookup_id,
-                lookup_mode,
-                lookup_input_count,
-                len(token_ids),
-                type(self.transport).__name__,
-                self.config.lookup_timeout_ms,
-            )
-            return 0
+            # Transport returns empty list on failure
+            if not responses:
+                self._drop_lookup_chunk_hashes(lookup_id)
+                logger.error(
+                    "Lookup RPC returned no responses: failed_at=%s "
+                    "caller=LMCacheLookupClient.lookup "
+                    "lookup_id=%s mode=%s input_count=%s token_count=%s "
+                    "transport=%s timeout_ms=%s",
+                    _utc_timestamp(),
+                    lookup_id,
+                    lookup_mode,
+                    lookup_input_count,
+                    len(token_ids),
+                    type(self.transport).__name__,
+                    self.config.lookup_timeout_ms,
+                )
+                return 0
 
-        results = [int.from_bytes(resp, "big") for resp in responses]
+            results = [int.from_bytes(resp, "big") for resp in responses]
 
-        assert len(results) == self.transport.world_size
+            assert len(results) == self.transport.world_size
+        except BaseException:
+            self._drop_lookup_chunk_hashes(lookup_id)
+            raise
         if len(set(results)) > 1:
             logger.warning(
                 "Lookup results (number of hit tokens) "
@@ -175,6 +189,7 @@ class LMCacheLookupClient(LookupClientInterface):
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.reqs_status.pop(lookup_id, None)
+        self._drop_lookup_chunk_hashes(lookup_id)
 
     def cleanup_lookup(self, lookup_id: str) -> None:
         """Release lookup pins on every worker before forgetting local state."""
