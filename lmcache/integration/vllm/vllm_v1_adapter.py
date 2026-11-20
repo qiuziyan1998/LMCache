@@ -12835,7 +12835,8 @@ class LMCacheConnectorV1Impl:
         # The P and D launchers can both use kv_both. An explicit layerwise
         # prefiller must be able to compute a prompt even on a complete miss.
         if (
-            not getattr(self, "_layerwise_prefill_p_node", False)
+            getattr(self.config, "decoder_require_kv_prefix", False)
+            and not getattr(self, "_layerwise_prefill_p_node", False)
             and getattr(self.config, "pd_role", None) == "receiver"
             and self.kv_role != "kv_producer"
         ):
@@ -14286,8 +14287,8 @@ class LMCacheConnectorV1Impl:
         checkpoints = getattr(self, "_preemption_checkpoints", None)
         if checkpoints:
             checkpoints.pop(req_id, None)
-        if getattr(request, "min_kv_prefix_tokens", 0):
-            self._requests_priority.pop(req_id, None)
+        if priorities := getattr(self, "_requests_priority", None):
+            priorities.pop(req_id, None)
         self._cold_perf_lookup_started.pop(request.request_id, None)
         self._resume_lookup_queries.pop(request.request_id, None)
         self._dsa_kv_policy_states.pop(request.request_id, None)

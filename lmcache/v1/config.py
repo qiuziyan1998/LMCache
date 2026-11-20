@@ -94,6 +94,13 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "description": "Decoder CPU storage ownership: local or process.",
         "mutable": False,
     },
+    "decoder_require_kv_prefix": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": "Require a verified KV prefix for admission on vLLM receivers.",
+        "mutable": False,
+    },
     "max_local_cpu_size": {"type": float, "default": 5.0, "env_converter": float},
     "reserve_local_cpu_size": {"type": float, "default": 0.0, "env_converter": float},
     "local_disk": {
