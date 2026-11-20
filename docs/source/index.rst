@@ -125,6 +125,7 @@ Documentation
    kv_cache_optimizations/compression/index
    kv_cache_optimizations/blending
    kv_cache_optimizations/layerwise
+   kv_cache/prefill_cpu_admission
 
 :raw-html:`<br />`
 

@@ -21,7 +21,6 @@ from lmcache.v1.cache_engine import (
 )
 from lmcache.v1.event_manager import EventStatus
 from lmcache.v1.mooncake_layout import mooncake_valid_tokens
-from lmcache.v1.remote_fill import content_digest
 from lmcache.v1.shared_cpu_cache import SharedHandleEnvelope
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.storage_manager import StorageManager
@@ -853,8 +852,6 @@ def test_missing_local_prefix_rechecks_and_falls_back_to_persistent() -> None:
 def test_local_full_hint_records_retained_paired_actual_load(
     caplog, monkeypatch
 ) -> None:
-    monkeypatch.setenv("PD_SERVING_PERF", "1")
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     storage = _PairStorageManager(local_pairs=2)
     engine = _engine(storage)
 
@@ -873,11 +870,6 @@ def test_local_full_hint_records_retained_paired_actual_load(
     assert snapshot.retained_at_load_total == 1
     assert snapshot.local_prefix_missing_at_load_total == 0
     assert snapshot.unexpected_remote_get_total == 0
-    assert '"event":"remote_fill_actual_load"' in caplog.text
-    assert '"outcome":"retained_at_load"' in caplog.text
-    assert "[LMCACHE_COLD_PERF]" in caplog.text
-    assert '"req_id":"actual"' in caplog.text
-    assert '"clock_domain"' in caplog.text
 
 
 def test_persistent_direct_hbm_group0_overlay_is_retained_actual_load() -> None:
@@ -905,8 +897,6 @@ def test_persistent_direct_hbm_group0_overlay_is_retained_actual_load() -> None:
 def test_local_full_hint_records_missing_local_prefix_and_remote_fallback(
     caplog, monkeypatch
 ) -> None:
-    monkeypatch.setenv("PD_SERVING_PERF", "1")
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
     storage = _PairStorageManager(local_pairs=0, remote_pairs=2)
     engine = _engine(storage)
 
@@ -925,22 +915,6 @@ def test_local_full_hint_records_missing_local_prefix_and_remote_fallback(
     assert snapshot.retained_at_load_total == 0
     assert snapshot.local_prefix_missing_at_load_total == 1
     assert snapshot.unexpected_remote_get_total == 1
-    assert '"event":"remote_fill_actual_load"' in caplog.text
-    assert '"outcome":"local_prefix_missing_at_load"' in caplog.text
-    assert '"event":"remote_fill_local_prefix_missing_at_load"' in caplog.text
-    assert "remote_fill_evicted_before_load" not in caplog.text
-    assert '"remote_suffix":true' in caplog.text
-    group0, group1, _, _ = storage.pair_calls[0]
-    expected_digest = content_digest(
-        (
-            tuple(key.without_layer().to_string() for key in group0),
-            tuple(key.without_layer().to_string() for key in group1),
-        )
-    )
-    assert '"local_lookup_attempted":true' in caplog.text
-    assert '"local_pairs":0' in caplog.text
-    assert '"required_pairs":2' in caplog.text
-    assert f'"required_key_digest":"{expected_digest}"' in caplog.text
 
 
 def test_local_full_hint_without_any_prefix_is_visible_and_recomputes(

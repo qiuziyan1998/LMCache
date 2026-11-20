@@ -5,12 +5,10 @@
 from collections import Counter
 from collections.abc import Callable
 from threading import Lock
-import time
 from typing import Any, Protocol
 
 # Local
 from lmcache.logging import init_logger
-from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
 
 from .codec import (
     decode_request,
@@ -229,9 +227,6 @@ class RemoteFillRpcServer:
         received = self._transport.recv_request()
         if received is None:
             return False
-        diagnose = serving_perf_enabled()
-        started = time.perf_counter() if diagnose else 0.0
-        thread_started = time.thread_time_ns() if diagnose else 0
         identity, frames = received
         if not self._valid_envelope(frames):
             response = encode_response(
@@ -240,22 +235,7 @@ class RemoteFillRpcServer:
             )
         else:
             response = self._service.handle_bytes(frames[2])
-        handle_ms = (time.perf_counter() - started) * 1000 if diagnose else 0.0
         self._transport.send_response(identity, response)
-        if diagnose:
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            if elapsed_ms >= 100.0:
-                serving_perf_log(
-                    logger,
-                    "remote_fill_decoder_rpc_slow",
-                    elapsed_ms=round(elapsed_ms, 3),
-                    thread_cpu_ms=round(
-                        (time.thread_time_ns() - thread_started) / 1_000_000, 3
-                    ),
-                    handle_ms=round(handle_ms, 3),
-                    send_ms=round(elapsed_ms - handle_ms, 3),
-                    response_bytes=len(response),
-                )
         return True
 
     def serve_until(self, should_stop: Callable[[], bool]) -> None:

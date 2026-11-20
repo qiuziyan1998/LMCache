@@ -59,6 +59,8 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         self,
         config: Optional[LMCacheEngineConfig] = None,
         metadata: Optional[LMCacheMetadata] = None,
+        *,
+        initialize_hash: bool = True,
     ):
         global NONE_HASH
 
@@ -80,25 +82,27 @@ class TokenDatabase(metaclass=abc.ABCMeta):
                 "refusing builtin-hash fallback"
             )
 
-        # Initialize NONE_HASH (vLLM >= PR#20511)
-        # NOTE: For centralized cache sharing, ensure PYTHONHASHSEED is
-        # set consistently across all processes (e.g., export PYTHONHASHSEED=0).
-        try:
-            # Third Party
-            from vllm.v1.core import kv_cache_utils
+        # Replay key readers reuse the running engine's hash root.
+        if initialize_hash:
+            # Initialize NONE_HASH (vLLM >= PR#20511)
+            # NOTE: For centralized cache sharing, ensure PYTHONHASHSEED is
+            # set consistently across all processes (e.g., export PYTHONHASHSEED=0).
+            try:
+                # Third Party
+                from vllm.v1.core import kv_cache_utils
 
-            if hasattr(kv_cache_utils, "init_none_hash"):
-                kv_cache_utils.init_none_hash(self.hash_func)
-                NONE_HASH = kv_cache_utils.NONE_HASH
-                logger.info(
-                    f"Initialized NONE_HASH={NONE_HASH} from vLLM (>= PR#20511)"
-                )
-            else:
+                if hasattr(kv_cache_utils, "init_none_hash"):
+                    kv_cache_utils.init_none_hash(self.hash_func)
+                    NONE_HASH = kv_cache_utils.NONE_HASH
+                    logger.info(
+                        f"Initialized NONE_HASH={NONE_HASH} from vLLM (>= PR#20511)"
+                    )
+                else:
+                    NONE_HASH = 0
+                    logger.info("Using default NONE_HASH=0 (vLLM < PR#20511)")
+            except (ImportError, AttributeError):
                 NONE_HASH = 0
-                logger.info("Using default NONE_HASH=0 (vLLM < PR#20511)")
-        except (ImportError, AttributeError):
-            NONE_HASH = 0
-            logger.info("Using default NONE_HASH=0 (vLLM not available)")
+                logger.info("Using default NONE_HASH=0 (vLLM not available)")
 
         (
             self.chunk_hash_type,
@@ -378,8 +382,12 @@ class ChunkedTokenDatabase(TokenDatabase):
         self,
         config: Optional[LMCacheEngineConfig] = None,
         metadata: Optional[LMCacheMetadata] = None,
+        *,
+        initialize_hash: bool = True,
     ):
-        super(ChunkedTokenDatabase, self).__init__(config, metadata)
+        super(ChunkedTokenDatabase, self).__init__(
+            config, metadata, initialize_hash=initialize_hash
+        )
 
         if config is not None:
             self.config = config

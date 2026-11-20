@@ -596,6 +596,13 @@ class RemoteBackend(StorageBackendInterface):
         )
         return future
 
+    def _read_timeout(self, keys: Any, default: float) -> float:
+        if not getattr(self.config, "file_replay_enabled", False):
+            return default
+        from lmcache.v1.storage_backend.connector.file_replay import read_timeout
+
+        return read_timeout(self.config, keys, default)
+
     def batched_get_external_pages(
         self,
         keys: Sequence[CacheEngineKey],
@@ -623,7 +630,11 @@ class RemoteBackend(StorageBackendInterface):
         # HBM. Strict teardown remains sticky even for terminal failure.
         self._strict_external_destination_ownership = True
         try:
-            future.result(self._external_page_outer_timeout_secs())
+            normal_timeout = self._external_page_outer_timeout_secs()
+            read_timeout = self._read_timeout(keys, normal_timeout)
+            if read_timeout > normal_timeout:
+                read_timeout += 1.0  # Let the connector report its terminal state.
+            future.result(read_timeout)
         except NativeExternalPageTransferUnknownError as error:
             self._external_page_fatal_error = error
             raise
@@ -778,7 +789,9 @@ class RemoteBackend(StorageBackendInterface):
                 self.connection.batched_get(keys), self.loop
             )
             try:
-                memory_objs = future.result(self.config.blocking_timeout_secs)
+                memory_objs = future.result(
+                    self._read_timeout(keys, self.config.blocking_timeout_secs)
+                )
             except Exception as e:
                 if isinstance(e, TimeoutError):
                     logger.warning(
@@ -810,7 +823,9 @@ class RemoteBackend(StorageBackendInterface):
             for fut in futures:
                 if not failed:
                     try:
-                        memory_obj = fut.result(self.config.blocking_timeout_secs)
+                        memory_obj = fut.result(
+                            self._read_timeout(keys, self.config.blocking_timeout_secs)
+                        )
                     except Exception as e:
                         failed = True
                         if isinstance(e, TimeoutError):
@@ -878,7 +893,9 @@ class RemoteBackend(StorageBackendInterface):
         """Retrieve pages identified by one representative key per chunk."""
         future = self.submit_layer_pages_get(keys)
         try:
-            return future.result(self.config.blocking_timeout_secs)
+            return future.result(
+                self._read_timeout(keys, self.config.blocking_timeout_secs)
+            )
         except TimeoutError:
 
             def release_late_result(done: Future) -> None:
@@ -970,7 +987,7 @@ class RemoteBackend(StorageBackendInterface):
             # scheduler from waiting for the result
             return await asyncio.wait_for(
                 self.connection.batched_get_non_blocking(lookup_id, keys),
-                self.config.blocking_timeout_secs,
+                self._read_timeout(keys, self.config.blocking_timeout_secs),
             )
         except asyncio.TimeoutError:
             logger.warning("batched_get_non_blocking timed out")

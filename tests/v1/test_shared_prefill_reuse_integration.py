@@ -122,7 +122,6 @@ def test_consecutive_chunks_reuse_views_and_release_only_at_request_end(
     )
     initial_rows = None
     for step, total in enumerate((6, 8, 10, 10)):
-        kwargs["layerwise_prefill_bank_offset"] = step & 1
         starts = list(range(0, total, 4))
         ends = [min(start + 4, total) for start in starts]
         chunks = len(starts)

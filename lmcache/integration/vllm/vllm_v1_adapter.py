@@ -9,7 +9,6 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
-import json
 import os
 import time
 import traceback
@@ -59,7 +58,6 @@ from lmcache.integration.vllm.utils import (
 )
 from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.logging import init_logger
-from lmcache.v1.startup_trace import startup_phase
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
 from lmcache.v1.cache_engine import (
@@ -67,15 +65,6 @@ from lmcache.v1.cache_engine import (
     _SHARED_SPARSE_PREPARE_ONLY,
     LayerwiseStoreResult,
     LMCacheEngine,
-)
-from lmcache.v1.serving_perf import (
-    prefill_reuse_debug_enabled,
-    prefill_reuse_debug_log,
-    prefill_start_timing_enabled,
-    prefill_start_timing_log,
-    serving_perf_enabled,
-    serving_perf_log,
-    serving_perf_now,
 )
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
@@ -112,9 +101,6 @@ INDEXER_RETRIEVE_METADATA_ONLY = "metadata_only"
 INDEXER_RETRIEVE_RESIDENT_SKIP = "resident_skip"
 DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS_ENV = (
     "VLLM_ASCEND_LMCACHE_DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS"
-)
-RETRIEVE_STATS_INTERVAL_SECONDS_ENV = (
-    "VLLM_ASCEND_LMCACHE_RETRIEVE_STATS_INTERVAL_SECONDS"
 )
 LayerwiseSaveKey = tuple[str, str, int, int, int]
 
@@ -431,130 +417,6 @@ def _block_allocation_mode_value(value) -> Optional[str]:
     if value is None:
         return None
     return str(getattr(value, "value", value))
-
-
-def _mtp_dw_diag_enabled() -> bool:
-    return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
-
-
-def _mtp_dw_deep_diag_enabled() -> bool:
-    return _mtp_dw_diag_enabled() and (
-        os.environ.get("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0") == "1"
-    )
-
-
-def _mtp_dw_event(stage: str, **fields: Any) -> None:
-    if not _mtp_dw_diag_enabled():
-        return
-    payload = {"schema": 1, "stage": stage, "owner": "lmcache"}
-    payload.update(fields)
-    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
-
-
-def _retrieve_stats_interval_seconds() -> int:
-    raw_value = os.environ.get(RETRIEVE_STATS_INTERVAL_SECONDS_ENV, "0")
-    try:
-        interval = int(raw_value)
-    except ValueError:
-        logger.warning(
-            "Ignoring invalid %s=%r; expected a non-negative integer.",
-            RETRIEVE_STATS_INTERVAL_SECONDS_ENV,
-            raw_value,
-        )
-        return 0
-    if interval < 0:
-        logger.warning(
-            "Ignoring invalid %s=%d; expected a non-negative integer.",
-            RETRIEVE_STATS_INTERVAL_SECONDS_ENV,
-            interval,
-        )
-        return 0
-    return interval
-
-
-def _dsa_debug_enabled() -> bool:
-    return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _dsa_debug_summary_enabled() -> bool:
-    return os.environ.get(
-        "VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE", "fail_only"
-    ).lower() in ("summary", "trace", "verbose", "all")
-
-
-def _dsa_debug_limit() -> int:
-    try:
-        return max(1, int(os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT", "8")))
-    except ValueError:
-        return 8
-
-
-def _dsa_debug_should_log(owner: Any, site: str) -> bool:
-    if not _dsa_debug_enabled():
-        return False
-    if not _dsa_debug_summary_enabled():
-        return False
-    counts = getattr(owner, "_dsa_shrink_debug_counts", None)
-    if counts is None:
-        counts = {}
-        owner._dsa_shrink_debug_counts = counts
-    count = counts.get(site, 0)
-    if count >= _dsa_debug_limit():
-        return False
-    counts[site] = count + 1
-    return True
-
-
-def _dsa_debug_shape(value: Any) -> Any:
-    if value is None:
-        return None
-    shape = getattr(value, "shape", None)
-    if shape is not None:
-        return tuple(shape)
-    try:
-        return len(value)
-    except TypeError:
-        return type(value).__name__
-
-
-def _dsa_debug_sample(value: Any, limit: Optional[int] = None) -> Any:
-    if value is None:
-        return None
-    limit = _dsa_debug_limit() if limit is None else limit
-    try:
-        if isinstance(value, torch.Tensor):
-            if value.numel() == 0:
-                return []
-            return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
-        return list(value[:limit])
-    except Exception as exc:
-        return f"{type(value).__name__}:sample_failed:{exc}"
-
-
-def _dsa_debug_minmax_count(value: Any) -> Any:
-    if value is None:
-        return None
-    try:
-        if isinstance(value, torch.Tensor):
-            if value.numel() == 0:
-                return None
-            flat = value.detach().reshape(-1)
-            return (
-                flat.min().to(device="cpu").item(),
-                flat.max().to(device="cpu").item(),
-                int(flat.numel()),
-            )
-        seq = list(value)
-        if not seq:
-            return None
-        return (min(seq), max(seq), len(seq))
-    except Exception as exc:
-        return f"{type(value).__name__}:minmax_failed:{exc}"
 
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
@@ -1451,11 +1313,6 @@ class ReqMeta:
     # P-node DMA consumes block IDs directly and derives one destination
     # address per DMA segment; it must not materialize a token-sized map.
     block_ids_by_bank: Optional[tuple[tuple[list[int], ...], ...]] = None
-    # Physical-bank phase for this chunk.  The P-node rotates the two banks
-    # at every LMCache chunk boundary so the first real lightning-indexer
-    # layer does not reuse the previous chunk's final bank while its D2H save
-    # is still in flight.
-    layerwise_prefill_bank_offset: int = 0
     block_allocation_mode: Optional[str] = None
     # Save-only mappings for the exact sparse-layerwise write window. Chunk
     # ranges remain absolute; the worker/connector subtracts this base before
@@ -1685,21 +1542,6 @@ class ReqMeta:
             elif len(tracker.sparse_token_ids) > sparse_token_count:
                 input_token_ids = tracker.sparse_token_ids[:sparse_token_count]
         input_token_len = len(input_token_ids)
-        layerwise_prefill_bank_offset = 0
-        if layerwise_prefill_dma and lmcache_chunk_size > 0:
-            # num_lmcache_cached_tokens is the durable prefix present before
-            # this worker starts computing.  It must not advance the local
-            # bank phase: the corresponding remote DMA has no live source
-            # bank on this worker.  Only chunks computed by this P node rotate
-            # the resident banks.
-            local_saved_tokens = max(
-                0,
-                tracker.num_saved_tokens
-                - tracker.num_lmcache_cached_tokens,
-            )
-            layerwise_prefill_bank_offset = (
-                local_saved_tokens // lmcache_chunk_size
-            ) % 2
         metadata_current_released_frontier = tracker.dsa_current_released_frontier
         if is_sparse_decode and load_spec is not None:
             metadata_current_released_frontier = min(
@@ -1828,7 +1670,6 @@ class ReqMeta:
                 load_spec=None,
                 disagg_spec=tracker.disagg_spec,
                 request_configs=tracker.request_configs,
-                layerwise_prefill_bank_offset=layerwise_prefill_bank_offset,
             )
 
         # Calculate number of tokens to save based on discard_partial_chunks
@@ -2064,9 +1905,9 @@ class ReqMeta:
 
         slot_mappings_by_bank = None
         if tracker.allocated_block_ids_by_bank is not None:
-            if len(tracker.allocated_block_ids_by_bank) != 2:
+            if not tracker.allocated_block_ids_by_bank:
                 raise RuntimeError(
-                    "Layerwise-prefill request must carry exactly two banks"
+                    "Layerwise-prefill request must carry physical banks"
                 )
             if not layerwise_prefill_dma:
                 slot_mappings_by_bank = tuple(
@@ -2143,7 +1984,6 @@ class ReqMeta:
                 if layerwise_prefill_dma
                 else None
             ),
-            layerwise_prefill_bank_offset=layerwise_prefill_bank_offset,
             block_allocation_mode=tracker.block_allocation_mode,
             save_slot_mapping=save_slot_mapping,
             save_indexer_slot_mapping=save_indexer_slot_mapping,
@@ -2227,6 +2067,12 @@ class LMCacheConnectorV1Impl:
         self.device = vllm_config.device_config.device
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self._layerwise_prefill_p_node = _layerwise_prefill_p_node_enabled()
+        self._layerwise_prefill_bank_count = 2
+        if self._layerwise_prefill_p_node:
+            # Read the same startup configuration as the physical allocator.
+            from vllm.v1.core.dsa_shared_pool import layerwise_prefill_bank_count
+
+            self._layerwise_prefill_bank_count = layerwise_prefill_bank_count()
         # The P-node marker is the feature gate shared with vLLM and
         # vllm-ascend.  Once enabled, this connector must use the raw DMA
         # two-bank path; otherwise a P node can silently fall back to the
@@ -2457,29 +2303,9 @@ class LMCacheConnectorV1Impl:
         self._deferred_latent_pending: set[LayerwiseSaveKey] = set()
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.enable_sparse_attention = config.enable_sparse_attention
-        self._retrieve_stats_interval_seconds = (
-            _retrieve_stats_interval_seconds()
-        )
-        self._retrieve_stats_window_started_at: Optional[float] = None
-        self._retrieve_stats_request_count = 0
-        self._retrieve_stats_row_count = 0
-        self._retrieve_stats_token_count = 0
-        self._cold_perf_lookup_started: dict[str, float] = {}
         # Freeze (query_end, scope, committed_end) while an async lookup is
         # pending so a later decode-window completion cannot change its meaning.
         self._resume_lookup_queries: dict[str, tuple[int, str, int]] = {}
-        self._cold_perf_load_started: dict[str, tuple[float, int]] = {}
-        self._cold_perf_dense_load_started: dict[str, tuple[float, int]] = {}
-        self._cold_perf_dense_load_completed: dict[str, float] = {}
-        if (
-            role != KVConnectorRole.SCHEDULER
-            and self._retrieve_stats_interval_seconds > 0
-        ):
-            logger.info(
-                "LMCache sparse retrieve statistics enabled; reporting every "
-                "%d seconds.",
-                self._retrieve_stats_interval_seconds,
-            )
 
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
@@ -2543,13 +2369,6 @@ class LMCacheConnectorV1Impl:
             )
         self.load_specs: dict[str, LoadSpec] = {}
         self._request_trackers: dict[str, RequestTracker] = {}
-        # Per-request KV policy state for diagnostics. This is intentionally
-        # named independently of the attention path: both policies use sparse
-        # attention. Log policy (re)entries/switches once per transition.
-        self._dsa_kv_policy_log = os.environ.get(
-            "LMCACHE_DSA_KV_POLICY_LOG", "0"
-        ).lower() in ("1", "true", "yes", "on")
-        self._dsa_kv_policy_states: dict[str, str] = {}
 
         self._discard_partial_chunks = (
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -3049,87 +2868,6 @@ class LMCacheConnectorV1Impl:
     def _is_dsa_two_groups(self) -> bool:
         return bool(getattr(getattr(self, "config", None), "dsa_two_groups", False))
 
-    def _ensure_retrieve_stats_state(self) -> int:
-        """Lazily initialize stats for lightweight/test connector instances."""
-        interval = getattr(self, "_retrieve_stats_interval_seconds", None)
-        if interval is None:
-            interval = _retrieve_stats_interval_seconds()
-            self._retrieve_stats_interval_seconds = interval
-            self._retrieve_stats_window_started_at = None
-            self._retrieve_stats_request_count = 0
-            self._retrieve_stats_row_count = 0
-            self._retrieve_stats_token_count = 0
-        return int(interval)
-
-    def _record_sparse_retrieve_stats(
-        self,
-        selected_tokens: Any,
-        selected_token_counts: Any,
-        row_count: int,
-    ) -> None:
-        """Record one request, combining all of its MTP rows."""
-        if not serving_perf_enabled():
-            return
-        interval = self._ensure_retrieve_stats_state()
-        if interval <= 0:
-            return
-
-        if selected_token_counts is not None:
-            if isinstance(selected_token_counts, torch.Tensor):
-                # Optional statistics must never reduce or read back tensors.
-                # Omit this sample rather than count padding as retrieved tokens.
-                return
-            elif isinstance(selected_token_counts, (list, tuple)):
-                if not all(type(count) is int for count in selected_token_counts):
-                    return
-                retrieved_tokens = sum(
-                    int(count) for count in selected_token_counts
-                )
-            else:
-                if type(selected_token_counts) is not int:
-                    return
-                retrieved_tokens = int(selected_token_counts)
-        elif selected_tokens is not None:
-            if isinstance(selected_tokens, torch.Tensor):
-                retrieved_tokens = int(selected_tokens.numel())
-            elif hasattr(selected_tokens, "__len__"):
-                retrieved_tokens = len(selected_tokens)
-            else:
-                retrieved_tokens = 1
-        else:
-            return
-
-        now = time.monotonic()
-        if self._retrieve_stats_window_started_at is None:
-            self._retrieve_stats_window_started_at = now
-        self._retrieve_stats_request_count += 1
-        self._retrieve_stats_row_count += max(int(row_count), 1)
-        self._retrieve_stats_token_count += retrieved_tokens
-
-        elapsed = now - self._retrieve_stats_window_started_at
-        if elapsed < interval:
-            return
-
-        request_count = self._retrieve_stats_request_count
-        average = (
-            self._retrieve_stats_token_count / request_count
-            if request_count
-            else 0.0
-        )
-        logger.info(
-            "[LMCacheRetrieveStats] elapsed=%.3fs requests=%d rows=%d "
-            "retrieved_tokens=%d avg_retrieved_tokens_per_request=%.3f",
-            elapsed,
-            request_count,
-            self._retrieve_stats_row_count,
-            self._retrieve_stats_token_count,
-            average,
-        )
-        self._retrieve_stats_window_started_at = now
-        self._retrieve_stats_request_count = 0
-        self._retrieve_stats_row_count = 0
-        self._retrieve_stats_token_count = 0
-
     def _is_indexer_layer_wait(self, layer_name: str) -> bool:
         if not self._is_dsa_two_groups():
             return False
@@ -3159,24 +2897,24 @@ class LMCacheConnectorV1Impl:
                 request,
             )
         assert mappings is not None
-        bank = (
-            layer_index + int(request.layerwise_prefill_bank_offset)
-        ) % 2
+        bank = layer_index % getattr(self, "_layerwise_prefill_bank_count", 2)
         # Layout/allocation mode was checked when materializing this forward's
         # maps. Layer callbacks only select their group's physical bank.
         return mappings[bank][kv_group]
 
     def _layerwise_prefill_dma_block_ids(
         self, request: ReqMeta, kv_group: int
-    ) -> Optional[tuple[list[int], list[int]]]:
+    ) -> Optional[tuple[list[int], ...]]:
         if not getattr(self, "_layerwise_prefill_dma", False):
             return None
         block_ids = request.block_ids_by_bank
-        if block_ids is None or len(block_ids) != 2:
+        if block_ids is None or len(block_ids) != getattr(
+            self, "_layerwise_prefill_bank_count", 2
+        ):
             raise RuntimeError(
-                "P-node DMA needs the two original bank block-ID lists"
+                "P-node DMA bank block-ID lists disagree with the configured count"
             )
-        return block_ids[0][kv_group], block_ids[1][kv_group]
+        return tuple(bank[kv_group] for bank in block_ids)
 
     def _materialize_layerwise_prefill_slot_mappings(
         self,
@@ -3184,7 +2922,7 @@ class LMCacheConnectorV1Impl:
         *,
         force: bool = False,
     ) -> Optional[tuple[tuple[torch.Tensor, ...], ...]]:
-        """Materialize the two-bank mappings once, before model forward."""
+        """Materialize the bank mappings once, before model forward."""
         if not self._layerwise_prefill_p_node:
             return None
         if not force:
@@ -3207,7 +2945,7 @@ class LMCacheConnectorV1Impl:
                 "P-node layerwise prefill request is missing banked slot mappings: "
                 f"req_id={request.req_id}"
             )
-        if len(mappings) != 2:
+        if len(mappings) != getattr(self, "_layerwise_prefill_bank_count", 2):
             raise RuntimeError(
                 "P-node layerwise prefill slot-mapping layout is invalid: "
                 f"req_id={request.req_id}, banks={len(mappings)}"
@@ -3392,18 +3130,10 @@ class LMCacheConnectorV1Impl:
         """
         if not self._layerwise_prefill_p_node:
             return
-        metadata = self._parent._get_connector_metadata()
-        offsets = tuple({
-            int(getattr(request, "layerwise_prefill_bank_offset", 0)) & 1
-            for request in metadata.requests
-        })
-        if not offsets:
-            return
         kv_group = self._layerwise_wait_group(layer_name)
         self.lmcache_engine.gpu_connector.record_layerwise_prefill_bank_use(
             self._layerwise_prefill_transfer_layer_id(layer_name, kv_group),
             kv_group,
-            offsets,
             event,
         )
 
@@ -3423,20 +3153,14 @@ class LMCacheConnectorV1Impl:
                 "GPU connector declares layerwise prefill transfer-window "
                 "support but has no wait_for_layerwise_prefill_load API"
             )
-        offsets = {
-            int(getattr(request, "layerwise_prefill_bank_offset", 0)) & 1
-            for request in getattr(self, "_layerwise_requests", ())
-        }
-        bank_offset = offsets.pop() if len(offsets) == 1 else None
+        # Wait separately for every request's submitted load. All requests
+        # use the same fixed bank for this group-local layer ordinal.
+        metadata = self._parent._get_connector_metadata()
         wait_kwargs = dict(
-            layer_id=self._layerwise_prefill_transfer_layer_id(
-                layer_name,
-                kv_group,
-            ),
+            layer_id=self._layerwise_prefill_transfer_layer_id(layer_name, kv_group),
             kv_group=kv_group,
+            request_ids=tuple(request.req_id for request in metadata.requests),
         )
-        if bank_offset is not None:
-            wait_kwargs["bank_offset"] = bank_offset
         wait(**wait_kwargs)
 
     def _layerwise_prefill_load_position(
@@ -4281,21 +4005,6 @@ class LMCacheConnectorV1Impl:
             # references.
             reset_transfer_state(synchronize=True)
         for request in requests:
-            self._cold_perf_dense_load_started.pop(request.req_id, None)
-            self._cold_perf_dense_load_completed.pop(request.req_id, None)
-            perf_state = self._cold_perf_load_started.pop(
-                request.req_id,
-                None,
-            )
-            if perf_state is not None:
-                request_started, token_count = perf_state
-                serving_perf_log(
-                    logger,
-                    "worker_load_abort",
-                    started=request_started,
-                    req_id=request.req_id,
-                    tokens=token_count,
-                )
             state = self._worker_retrieve_state.get(request.req_id)
             if state is not None:
                 self._release_unadopted_shared_request_objects(state, request)
@@ -4460,18 +4169,6 @@ class LMCacheConnectorV1Impl:
         if groups is None:
             return
         groups.add(self._layerwise_save_storer_key(request, kv_group))
-        _mtp_dw_event(
-            "store",
-            req=request.req_id,
-            event="group_complete",
-            frontier=len(request.token_ids),
-            window_start=request.decode_window_start,
-            window_end=request.decode_window_end,
-            kv_group=kv_group,
-            required_groups=sorted(
-                self._decode_window_save_required_groups(request)
-            ),
-        )
 
     def _note_decode_window_save_seen(self, request: ReqMeta) -> None:
         if not self._is_decode_window_save_request(request):
@@ -4654,50 +4351,6 @@ class LMCacheConnectorV1Impl:
         if callable(is_passive) and is_passive():
             return
         if not self._decode_window_save_has_required_groups(request):
-            if _mtp_dw_deep_diag_enabled():
-                required_groups = self._decode_window_save_required_groups(request)
-                completed_state = getattr(
-                    self, "_decode_window_save_completed_groups", set()
-                )
-                completed_groups = sorted(
-                    kv_group
-                    for kv_group in required_groups
-                    if self._layerwise_save_storer_key(request, kv_group)
-                    in completed_state
-                )
-                metadata = getattr(engine, "metadata", None)
-                worker_rank = getattr(metadata, "worker_id", None)
-                if completed_groups:
-                    seen = getattr(self, "_mtp_dw_deep_window_group_wait_seen", None)
-                    if seen is None:
-                        seen = set()
-                        self._mtp_dw_deep_window_group_wait_seen = seen
-                    key = (
-                        request.req_id,
-                        request.decode_window_start,
-                        request.decode_window_end,
-                    )
-                    if key not in seen:
-                        if len(seen) >= 256:
-                            seen.pop()
-                        seen.add(key)
-                        _mtp_dw_event(
-                            "deep",
-                            event="window_group_wait",
-                            req=request.req_id,
-                            worker_rank=worker_rank,
-                            tp_rank=worker_rank,
-                            tp_world=getattr(metadata, "world_size", None),
-                            frontier=len(request.token_ids),
-                            window_start=request.decode_window_start,
-                            window_end=request.decode_window_end,
-                            kv_group=None,
-                            required_groups=sorted(required_groups),
-                            completed_groups=completed_groups,
-                            missing_groups=sorted(
-                                required_groups - set(completed_groups)
-                            ),
-                        )
             logger.debug(
                 "Decode-window save not marked complete before required "
                 "store groups are seen: req_id=%s required_groups=%s",
@@ -4722,18 +4375,6 @@ class LMCacheConnectorV1Impl:
         if completed is None:
             return
         completed[request.req_id] = max(completed.get(request.req_id, 0), window_end)
-        _mtp_dw_event(
-            "commit",
-            req=request.req_id,
-            event="publish_completed",
-            frontier=len(request.token_ids),
-            window_start=request.decode_window_start,
-            window_end=window_end,
-            required_groups=sorted(
-                self._decode_window_save_required_groups(request)
-            ),
-            completed_end=completed[request.req_id],
-        )
         expected = getattr(self, "_decode_window_save_expected_start", None)
         if expected is not None:
             expected[request.req_id] = max(
@@ -5076,18 +4717,6 @@ class LMCacheConnectorV1Impl:
             )
 
             if publish_end is None:
-                _mtp_dw_event(
-                    "commit",
-                    req=req_id,
-                    event="frontier_delayed",
-                    frontier=len(tracker.token_ids),
-                    completed_end=committed_end,
-                    committed_end=tracker.decode_window_save_committed_end,
-                    pending_windows=len(
-                        tracker.decode_window_save_pending_commits
-                    ),
-                    delay_windows=delay_windows,
-                )
                 continue
 
             committed_before = tracker.decode_window_save_committed_end
@@ -5105,30 +4734,6 @@ class LMCacheConnectorV1Impl:
                     release_end,
                 )
                 published[req_id] = release_end
-            _mtp_dw_event(
-                "commit",
-                req=req_id,
-                event="frontier_update",
-                frontier=len(tracker.token_ids),
-                window_start=max(
-                    0,
-                    tracker.decode_window_save_committed_end - window_size,
-                ),
-                window_end=tracker.decode_window_save_committed_end,
-                committed_before=committed_before,
-                committed_after=tracker.decode_window_save_committed_end,
-                completed_end=int(window_end),
-                published_end=publish_end,
-            )
-            if tracker.decode_window_save_committed_end < committed_before:
-                _mtp_dw_event(
-                    "fail",
-                    req=req_id,
-                    frontier=len(tracker.token_ids),
-                    invariant="committed_frontier_monotonic",
-                    committed_before=committed_before,
-                    committed_after=tracker.decode_window_save_committed_end,
-                )
         # The vLLM scheduler consumes this same mapping after this callback to
         # release local blocks. Replacing raw completions with delayed
         # frontiers keeps release and split_boundary on the same commit point.
@@ -5266,8 +4871,6 @@ class LMCacheConnectorV1Impl:
             forget = getattr(self.lmcache_engine, "forget_checkpoint_request", None)
             if forget is not None:
                 forget(req_id)
-            self._cold_perf_dense_load_started.pop(req_id, None)
-            self._cold_perf_dense_load_completed.pop(req_id, None)
             self._drop_layerwise_save_storers(req_id)
             self._drop_worker_retrieve_state(req_id, defer_dense_release=True)
             release_prefill_pages = getattr(
@@ -6276,141 +5879,6 @@ class LMCacheConnectorV1Impl:
             return True
         return False
 
-    def _trace_deep_retrieve_state(
-        self,
-        request: ReqMeta,
-        prior_state: Optional[WorkerRetrieveState],
-        prior_snapshot: Optional[dict[str, Any]],
-        *,
-        invalidated: bool,
-        invalidation_reason: Optional[str],
-        post_state: Optional[WorkerRetrieveState],
-        prior_state_rebound: bool,
-        kv_group0_retriever_present: bool,
-        kv_group1_retriever_present: bool,
-    ) -> None:
-        if not _mtp_dw_deep_diag_enabled() or request.load_spec is None:
-            return
-        frontier = int(request.load_spec.lmcache_cached_tokens)
-        prior_frontier = (
-            int(prior_snapshot["frontier"])
-            if prior_snapshot is not None
-            else 0
-        )
-        if prior_state is not None and prior_snapshot is None:
-            return
-        if frontier <= prior_frontier:
-            return
-
-        transitions = getattr(self, "_mtp_dw_deep_retrieve_transitions", None)
-        if transitions is None:
-            transitions = {}
-            self._mtp_dw_deep_retrieve_transitions = transitions
-        if request.req_id in transitions:
-            return
-        if len(transitions) >= 256:
-            transitions.pop(next(iter(transitions)))
-        transitions[request.req_id] = frontier
-
-        stale_retained = (
-            prior_state is not None
-            and prior_state_rebound
-            and post_state is prior_state
-            and prior_frontier < frontier
-        )
-        metadata = getattr(getattr(self, "lmcache_engine", None), "metadata", None)
-        worker_rank = getattr(metadata, "worker_id", None)
-        if stale_retained:
-            _mtp_dw_event(
-                "fail",
-                req=request.req_id,
-                invariant="stale_retrieve_state",
-                frontier=frontier,
-                prior_frontier=prior_frontier,
-                window_start=prior_frontier,
-                window_end=frontier,
-            )
-        _mtp_dw_event(
-            "deep",
-            event="retrieve_state",
-            req=request.req_id,
-            worker_rank=worker_rank,
-            tp_rank=worker_rank,
-            tp_world=getattr(metadata, "world_size", None),
-            frontier=frontier,
-            prior_frontier=prior_frontier,
-            window_start=prior_frontier,
-            window_end=frontier,
-            kv_group=None,
-            prior_state_present=prior_state is not None,
-            post_state_present=post_state is not None,
-            invalidated=invalidated,
-            invalidation_reason=invalidation_reason,
-            prior_state_rebound=prior_state_rebound,
-            rebound_range_count=(
-                min(len(post_state.cached_starts), len(post_state.cached_ends))
-                if post_state is not None
-                else 0
-            ),
-            prior_kv_group0_cached_ranges=(
-                prior_snapshot["kv_group0_cached_ranges"]
-                if prior_snapshot is not None
-                else self._deep_retrieve_range_summary([], [])
-            ),
-            prior_kv_group1_cached_ranges=(
-                prior_snapshot["kv_group1_cached_ranges"]
-                if prior_snapshot is not None
-                else self._deep_retrieve_range_summary([], [])
-            ),
-            kv_group0_retriever_present=kv_group0_retriever_present,
-            kv_group1_retriever_present=kv_group1_retriever_present,
-            prior_kv_group0_cache_present=(
-                prior_snapshot["kv_group0_cache_present"]
-                if prior_snapshot is not None
-                else False
-            ),
-            prior_kv_group1_cache_present=(
-                prior_snapshot["kv_group1_cache_present"]
-                if prior_snapshot is not None
-                else False
-            ),
-            post_kv_group0_cache_present=(
-                self._deep_retrieve_group_cache_present(post_state, 0)
-                if post_state is not None
-                else False
-            ),
-            post_kv_group1_cache_present=(
-                self._deep_retrieve_group_cache_present(post_state, 1)
-                if post_state is not None
-                else False
-            ),
-            prior_scope_token=(
-                prior_snapshot["scope_token"] if prior_snapshot is not None else None
-            ),
-            prior_scope_token_present=(
-                prior_snapshot["scope_token_present"]
-                if prior_snapshot is not None
-                else False
-            ),
-            shared_request_active=(
-                prior_snapshot["shared_request_active"]
-                if prior_snapshot is not None
-                else False
-            ),
-            shared_generation=(
-                prior_snapshot["shared_generation"]
-                if prior_snapshot is not None
-                else 0
-            ),
-            pointer_cache_generation=(
-                prior_snapshot["pointer_cache_generation"]
-                if prior_snapshot is not None
-                else 0
-            ),
-            resumed_from_preemption=bool(request.resumed_from_preemption),
-            stale_state_retained=stale_retained,
-        )
-
     def _state_has_retrieve_tensor_cache(self, state: WorkerRetrieveState) -> bool:
         num_layers = self._num_layers_for_group(0)
         tensors = state.cached_tensors
@@ -7357,33 +6825,14 @@ class LMCacheConnectorV1Impl:
     def _prime_dense_prefix_retrievers(
         layerwise_retriever: Generator[Optional[torch.Tensor], None, None],
         indexer_retriever: Optional[Generator[Optional[torch.Tensor], None, None]],
-        req_id: Optional[str] = None,
-        prefix_tokens: int = 0,
     ) -> None:
-        """Prime dense prefix retrievers without breaking two-group ordering."""
-        if req_id is None or not prefill_start_timing_enabled():
-            next(layerwise_retriever)
-            if indexer_retriever is not None:
-                next(indexer_retriever)
-            next(layerwise_retriever)
-            if indexer_retriever is not None:
-                next(indexer_retriever)
-            return
-        for kv_group, layer, retriever in (
-            (0, 0, layerwise_retriever),
-            (1, 0, indexer_retriever),
-            (0, 1, layerwise_retriever),
-            (1, 1, indexer_retriever),
-        ):
-            if retriever is None:
-                continue
-            started = time.perf_counter()
-            next(retriever)
-            prefill_start_timing_log(
-                logger, "prime_retriever", started,
-                req_id=req_id, prefix_tokens=prefix_tokens,
-                kv_group=kv_group, step=layer,
-            )
+        """Prepare both groups, then submit their first layer loads."""
+        next(layerwise_retriever)
+        if indexer_retriever is not None:
+            next(indexer_retriever)
+        next(layerwise_retriever)
+        if indexer_retriever is not None:
+            next(indexer_retriever)
 
     @_lmcache_nvtx_annotate
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -7394,19 +6843,16 @@ class LMCacheConnectorV1Impl:
             raise RuntimeError("Cannot replace sealed KV caches; restart worker")
         assert len(self.kv_caches) == 0 and len(kv_caches) > 0
         self.kv_caches = kv_caches
-        with startup_phase("kv_layer_groups"):
-            self._refresh_kvcaches_list()
-            self._build_kv_layer_groups()
-        with startup_phase("manager_post_init"):
-            self._manager.post_init()
+        self._refresh_kvcaches_list()
+        self._build_kv_layer_groups()
+        self._manager.post_init()
         preflight = getattr(
             self.lmcache_engine,
             "preflight_group1_direct_hbm",
             None,
         )
         if callable(preflight):
-            with startup_phase("group1_direct_hbm_preflight"):
-                preflight(self._kvcaches_for_group(1))
+            preflight(self._kvcaches_for_group(1))
 
     def seal_sparse_destination_layout(self) -> None:
         """Register fixed Group-0 buffers after successful final staged capture.
@@ -7527,24 +6973,11 @@ class LMCacheConnectorV1Impl:
                 f"is still active: req_id={request.req_id}, "
                 f"active_generation={existing[0]}, generation={generation}"
             )
-        perf_enabled = serving_perf_enabled()
-        plan_started = serving_perf_now() if perf_enabled else 0.0
-        plan_thread_started = time.thread_time_ns() if perf_enabled else 0
-        if perf_enabled:
-            block_ids_started = serving_perf_now()
         indexer_slots = request.indexer_slot_mapping[0]
         indexer_block_ids = _cold_indexer_block_ids(indexer_slots, self._block_size)
-        if perf_enabled:
-            block_ids_ms = (serving_perf_now() - block_ids_started) * 1000
-        if perf_enabled:
-            device_started = serving_perf_now()
         npu_device_id = (
             int(torch.npu.current_device()) if hasattr(torch, "npu") else None
         )
-        if perf_enabled:
-            device_ms = (serving_perf_now() - device_started) * 1000
-        if perf_enabled:
-            build_started = serving_perf_now()
         token_count = getattr(request.load_spec, "lmcache_cached_tokens", 0)
         plan: ColdLoadPlan = {
             "request": request,
@@ -7554,22 +6987,8 @@ class LMCacheConnectorV1Impl:
             "indexer_slots_cpu": request.indexer_slot_mapping[0],
             "latent_kvcaches": self._kvcaches_for_group(0),
             "indexer_kvcaches": self._kvcaches_for_group(1),
-            "planned_at": (serving_perf_now() if perf_enabled else 0.0),
-            "plan_started": plan_started,
             "latent_shared_ready": Future(),
         }
-        if perf_enabled:
-            build_ms = (serving_perf_now() - build_started) * 1000
-        submitted_at = serving_perf_now() if perf_enabled else 0.0
-        if perf_enabled:
-            serving_perf_log(
-                logger,
-                "worker_load_start",
-                req_id=request.req_id,
-                tokens=token_count,
-                mode=("dsa_cold_resident" if getattr(request.load_spec,
-                      "dsa_cold_resident_load", False) else "dsa_cold_compact"),
-            )
         executor = self._get_dsa_cold_load_executor()
         prepare_chunks = getattr(self.lmcache_engine, "prepare_cold_chunk_plan", None)
         if (
@@ -7580,32 +6999,10 @@ class LMCacheConnectorV1Impl:
             chunks = prepare_chunks(plan["tokens"])
             if chunks is not None:
                 plan["chunk_plan"] = chunks
-        if perf_enabled:
-            executor_submit_started = serving_perf_now()
         coordinator.submit_pair(
-            plan, generation, indexer_block_ids, submitted_at, npu_device_id,
+            plan, generation, indexer_block_ids, npu_device_id,
             executor, self._run_dsa_cold_indexer_load, self._run_dsa_cold_compact_load,
         )
-        if perf_enabled:
-            executor_submit_ms = (serving_perf_now() - executor_submit_started) * 1000
-        if perf_enabled:
-            serving_perf_log(
-                logger,
-                "cold_compact_plan_submit",
-                started=plan_started,
-                req_id=request.req_id,
-                tokens=token_count,
-                jobs=2,
-                block_ids_ms=round(block_ids_ms, 3),
-                device_query_ms=round(device_ms, 3),
-                plan_build_ms=round(build_ms, 3),
-                executor_submit_ms=round(executor_submit_ms, 3),
-                thread_cpu_ms=(
-                    round((time.thread_time_ns() - plan_thread_started) / 1e6, 3)
-                    if perf_enabled
-                    else None
-                ),
-            )
 
     def _try_prepare_dsa_live_split(self, request: ReqMeta) -> bool:
         """Reserve cold groups until live import succeeds or falls back."""
@@ -7633,8 +7030,6 @@ class LMCacheConnectorV1Impl:
             return False
         assert request.load_spec is not None
         token_count = request.load_spec.lmcache_cached_tokens
-        perf_enabled = serving_perf_enabled()
-        plan_started = serving_perf_now() if perf_enabled else 0.0
         plan: ColdLoadPlan = {
             "request": request,
             "tokens": request.token_ids[:token_count],
@@ -7643,8 +7038,6 @@ class LMCacheConnectorV1Impl:
             "indexer_slots_cpu": request.indexer_slot_mapping[0],
             "latent_kvcaches": self._kvcaches_for_group(0),
             "indexer_kvcaches": self._kvcaches_for_group(1),
-            "planned_at": serving_perf_now() if perf_enabled else 0.0,
-            "plan_started": plan_started,
             "latent_shared_ready": Future(),
         }
         indexer_completion: Future = Future()
@@ -7696,7 +7089,6 @@ class LMCacheConnectorV1Impl:
             completion,
             request,
             indexer_blocks,
-            serving_perf_now() if perf_enabled else 0.0,
             indexer_completion,
         )
         if pending is None:
@@ -7777,13 +7169,6 @@ class LMCacheConnectorV1Impl:
         self, handled_groups: tuple[int, ...]
     ) -> dict[str, dict[str, Any]]:
         pending = getattr(self, "_dsa_live_split_pending", None)
-        if serving_perf_enabled():
-            serving_perf_log(
-                logger,
-                "live_source_destination_provider_entry",
-                pending_count=len(pending or {}),
-                handled_groups=handled_groups,
-            )
         if not pending:
             return {}
         handled_groups = tuple(handled_groups)
@@ -7847,14 +7232,6 @@ class LMCacheConnectorV1Impl:
 
     def accept_live_split_results(self, results: dict[str, str]) -> None:
         pending = getattr(self, "_dsa_live_split_pending", None)
-        if serving_perf_enabled():
-            serving_perf_log(
-                logger,
-                "live_source_result_accept_entry",
-                pending_count=len(pending or {}),
-                result_ids=sorted(results),
-                statuses=results,
-            )
         if not pending:
             return
         assert self.lmcache_engine is not None
@@ -7907,7 +7284,7 @@ class LMCacheConnectorV1Impl:
                     entry["plan"]["indexer_source_owners"] = tuple(
                         context.get("destination_owners", ())
                     )
-                    completion.set_result((None, readiness, 0.0, 0.0))
+                    completion.set_result((None, readiness))
                     gate = entry["latent_gate"]
                     if not gate.done():
                         gate.set_result(None)
@@ -7928,29 +7305,9 @@ class LMCacheConnectorV1Impl:
         self, plan: ColdLoadPlan, npu_device_id: Optional[int]
     ) -> ColdIndexerResult:
         """Load Group 1 densely after Group 0 shared-CPU publication."""
-        perf_breakdown = {} if serving_perf_enabled() else None
-        thread_started = (
-            time.thread_time_ns() if perf_breakdown is not None else 0
-        )
-        if perf_breakdown is not None:
-            plan["indexer_perf"] = perf_breakdown
-
-        def stage_start() -> float:
-            return serving_perf_now() if perf_breakdown is not None else 0.0
-
-        def finish_stage(name: str, stage_started: float) -> None:
-            if perf_breakdown is not None:
-                perf_breakdown[name] = round(
-                    (serving_perf_now() - stage_started) * 1000, 3
-                )
-
-        producer_setup_started = stage_start()
         if npu_device_id is not None:
             torch.npu.set_device(npu_device_id)
-        finish_stage("producer_setup_ms", producer_setup_started)
         assert self.lmcache_engine is not None
-        started = serving_perf_now() if perf_breakdown is not None else 0.0
-        queue_ms = (started - plan["planned_at"]) * 1000
         request = plan["request"]
         indexer_slots_cpu = plan["indexer_slots_cpu"]
         indexer_kvcaches = plan["indexer_kvcaches"]
@@ -7959,10 +7316,8 @@ class LMCacheConnectorV1Impl:
             "validate_layerwise_slot_mapping",
             None,
         )
-        slot_validate_started = stage_start()
         if callable(validate_slots):
             validate_slots(indexer_slots_cpu, indexer_kvcaches, kv_group=1)
-        finish_stage("slot_validate_ms", slot_validate_started)
         if request.load_spec.dsa_group1_direct_hbm:
             direct_load = getattr(
                 self.lmcache_engine,
@@ -7971,7 +7326,6 @@ class LMCacheConnectorV1Impl:
             )
             if not callable(direct_load):
                 raise RuntimeError("Group-1 direct-HBM loader is unavailable")
-            direct_started = stage_start()
             direct_load(
                 plan["tokens"],
                 indexer_slots_cpu,
@@ -7980,19 +7334,10 @@ class LMCacheConnectorV1Impl:
                 request.req_id,
                 **({"chunk_plan": plan["chunk_plan"]} if "chunk_plan" in plan else {}),
             )
-            finish_stage("direct_page_load_ms", direct_started)
-            if perf_breakdown is not None:
-                perf_breakdown["thread_cpu_ms"] = round(
-                    (time.thread_time_ns() - thread_started) / 1e6, 3
-                )
             return (
                 plan["token_mask"],
                 None,
-                (serving_perf_now() if perf_breakdown is not None else 0.0)
-                - started,
-                queue_ms,
             )
-        slot_submit_started = stage_start()
         stage_tensor = getattr(
             self.lmcache_engine.gpu_connector,
             "stage_dense_load_tensor",
@@ -8007,7 +7352,6 @@ class LMCacheConnectorV1Impl:
                 device=self.device,
                 dtype=torch.long,
             )
-        finish_stage("slot_mapping_submit_ms", slot_submit_started)
         retrieve_state = WorkerRetrieveState(req_id=request.req_id)
         supports_dense_retention = getattr(
             self.lmcache_engine, "supports_dense_sparse_cache_retention", None
@@ -8016,7 +7360,6 @@ class LMCacheConnectorV1Impl:
             raise RuntimeError(
                 "Cold compact indexer load requires dense source retention"
             )
-        retrieve_kwargs_started = stage_start()
         readiness_out: list[Any] = []
         retrieve_kwargs = {
             "kvcaches": indexer_kvcaches,
@@ -8031,7 +7374,6 @@ class LMCacheConnectorV1Impl:
             "_dense_load_readiness_out": readiness_out,
             **retrieve_state.cache_kwargs(1, dsa_two_groups=True),
         }
-        finish_stage("retrieve_kwargs_ms", retrieve_kwargs_started)
         prefetch_owners: tuple[Any, ...] = ()
         if (
             getattr(
@@ -8069,7 +7411,6 @@ class LMCacheConnectorV1Impl:
                         request.req_id,
                         error,
                     )
-        latent_gate_started = stage_start()
         try:
             plan["latent_shared_ready"].result()
         except BaseException:
@@ -8079,8 +7420,6 @@ class LMCacheConnectorV1Impl:
                 synchronize=False,
             )
             raise
-        finish_stage("latent_gate_wait_ms", latent_gate_started)
-        generator_started = stage_start()
         try:
             retriever = self.lmcache_engine.retrieve_layer(
                 plan["tokens"],
@@ -8094,11 +7433,9 @@ class LMCacheConnectorV1Impl:
                 synchronize=False,
             )
             raise
-        finish_stage("generator_create_ms", generator_started)
         result = None
         load_stream_fenced = False
         try:
-            layer_submit_started = stage_start()
             try:
                 try:
                     result = next(retriever)
@@ -8113,8 +7450,6 @@ class LMCacheConnectorV1Impl:
                     raise
             finally:
                 retriever.close()
-            finish_stage("layer_submit_host_ms", layer_submit_started)
-            result_check_started = stage_start()
             if result is None or int(result.sum().item()) != plan["token_count"]:
                 raise RuntimeError("Cold compact indexer retrieve was incomplete")
             if plan["token_count"] and not (
@@ -8124,12 +7459,9 @@ class LMCacheConnectorV1Impl:
                 raise RuntimeError(
                     "Cold compact indexer retrieve did not retain its sources"
                 )
-            finish_stage("result_check_ms", result_check_started)
-            readiness_started = stage_start()
             if len(readiness_out) != 1:
                 raise RuntimeError("Cold compact indexer readiness was not recorded")
             readiness = readiness_out[0]
-            finish_stage("readiness_record_ms", readiness_started)
         except BaseException:
             if not load_stream_fenced:
                 self._synchronize_dsa_cold_dense_load()
@@ -8144,21 +7476,9 @@ class LMCacheConnectorV1Impl:
             self.lmcache_engine,
             synchronize=False,
         )
-        # Do not publish a request while Group 1 can still be writing its
-        # final HBM blocks from this background worker.
-        readiness_wait_started = stage_start()
+        # Complete the indexer write before publishing its resident state.
         self._synchronize_dsa_cold_dense_readiness(readiness)
-        finish_stage("dense_readiness_wait_ms", readiness_wait_started)
-        if perf_breakdown is not None:
-            perf_breakdown["thread_cpu_ms"] = round(
-                (time.thread_time_ns() - thread_started) / 1e6, 3
-            )
-        return (
-            result,
-            readiness,
-            (serving_perf_now() if perf_breakdown is not None else 0.0) - started,
-            queue_ms,
-        )
+        return result, readiness
 
     def synchronize_staged_sfa_capture_unsafe_loads(self) -> None:
         """Finish legacy background NPU loads before serving-time graph capture.
@@ -8262,21 +7582,9 @@ class LMCacheConnectorV1Impl:
         shared_generation = int(
             getattr(self.lmcache_engine, "shared_cpu_cache_generation", 0) or 0
         )
-        perf_enabled = serving_perf_enabled()
-        started = serving_perf_now() if perf_enabled else 0.0
         indexer_readiness = None
-        predecessor_wait_ms = 0.0
-        latent_materialize_ms = 0.0
-        latent_materialize_thread_cpu_ms = 0.0
-        latent_kwargs_ms = latent_generator_create_ms = 0.0
-        latent_first_yield_ms = latent_send_sum_ms = latent_send_max_ms = 0.0
-        latent_result_check_ms = latent_seal_ms = 0.0
-        latent_send_max_layer = -1
         try:
             if previous_latent_future is not None:
-                predecessor_wait_started = (
-                    serving_perf_now() if perf_enabled else 0.0
-                )
                 try:
                     # Only wait for ordering. Re-raising a stored failure would
                     # attach this new request's frame to the predecessor.
@@ -8285,19 +7593,8 @@ class LMCacheConnectorV1Impl:
                     # The predecessor's failure must not reorder or poison this
                     # request's fixed group-0 collective publication slot.
                     pass
-                if perf_enabled:
-                    predecessor_wait_ms = (
-                        serving_perf_now() - predecessor_wait_started
-                    ) * 1000
             retrieve_location = "LocalCPU"
             if live_state is None:
-                latent_materialize_started = (
-                    serving_perf_now() if perf_enabled else 0.0
-                )
-                latent_materialize_thread_cpu_started = (
-                    time.thread_time_ns() if perf_enabled else 0
-                )
-                phase_started = serving_perf_now() if perf_enabled else 0.0
                 empty_slots = torch.empty(0, dtype=torch.long)
                 retrieve_kwargs, _, _ = self._sparse_retrieve_kwargs(
                     request,
@@ -8313,10 +7610,6 @@ class LMCacheConnectorV1Impl:
                     shared_cpu_enabled=True,
                     shared_cpu_preflight_state=None,
                 )
-                if perf_enabled:
-                    latent_kwargs_ms = (
-                        serving_perf_now() - phase_started
-                    ) * 1000
                 resident = getattr(request.load_spec, "dsa_cold_resident_load", False)
                 if resident:
                     readiness_out: list[Any] = []
@@ -8331,40 +7624,17 @@ class LMCacheConnectorV1Impl:
                 retrieve_kwargs["_defer_sparse_pointer_copy"] = True
                 if "chunk_plan" in plan and not resident:
                     retrieve_kwargs["_cold_chunk_plan"] = plan["chunk_plan"]
-                phase_started = serving_perf_now() if perf_enabled else 0.0
                 retrieve = (self.lmcache_engine.retrieve_layer if resident else
                             self.lmcache_engine.retrieve_layer_head_token_wise)
                 latent_retriever = retrieve(
                     tokens, token_mask, **retrieve_kwargs,
                 )
-                if perf_enabled:
-                    latent_generator_create_ms = (
-                        serving_perf_now() - phase_started
-                    ) * 1000
                 try:
-                    phase_started = serving_perf_now() if perf_enabled else 0.0
                     latent_result = next(latent_retriever)
-                    if perf_enabled:
-                        latent_first_yield_ms = (
-                            serving_perf_now() - phase_started
-                        ) * 1000
                     for layer_id in range(latent_layers + int(resident)):
-                        phase_started = (
-                            serving_perf_now() if perf_enabled else 0.0
-                        )
                         latent_result = latent_retriever.send(None)
-                        if perf_enabled:
-                            send_ms = (
-                                serving_perf_now() - phase_started
-                            ) * 1000
-                            latent_send_sum_ms += send_ms
-                            if send_ms > latent_send_max_ms:
-                                latent_send_max_ms = send_ms
-                                latent_send_max_layer = layer_id
                 finally:
                     latent_retriever.close()
-
-                phase_started = serving_perf_now() if perf_enabled else 0.0
                 if (
                     latent_result is None
                     or int(latent_result.sum().item()) != token_count
@@ -8375,41 +7645,18 @@ class LMCacheConnectorV1Impl:
                         raise RuntimeError("Resident latent load did not record readiness")
                     self._synchronize_dsa_cold_dense_readiness(readiness_out[0])
                     state.dense_prefix_resident_tokens = token_count
-                if perf_enabled:
-                    latent_result_check_ms = (
-                        serving_perf_now() - phase_started
-                    ) * 1000
                 retrieve_location = retrieve_kwargs.get(
                     "cached_retrieve_location"
                 )
-                if perf_enabled:
-                    latent_materialize_ms = (
-                        serving_perf_now() - latent_materialize_started
-                    ) * 1000
-                    latent_materialize_thread_cpu_ms = (
-                        time.thread_time_ns()
-                        - latent_materialize_thread_cpu_started
-                    ) / 1_000_000
             latent_shared_ready = plan["latent_shared_ready"]
             if not latent_shared_ready.done():
                 latent_shared_ready.set_result(None)
-            dependency_wait_started = serving_perf_now() if perf_enabled else 0.0
-            (
-                _,
-                indexer_readiness,
-                indexer_remote_s,
-                indexer_queue_ms,
-            ) = indexer_future.result()
-            dependency_wait_ms = (
-                (serving_perf_now() if perf_enabled else 0.0)
-                - dependency_wait_started
-            ) * 1000
+            _, indexer_readiness = indexer_future.result()
             if request.load_spec.dsa_group1_direct_hbm:
                 if indexer_readiness is not None:
                     raise RuntimeError(
                         "Direct Group-1 load returned an unexpected CPU-source fence"
                     )
-            seal_started = serving_perf_now() if perf_enabled else 0.0
             state.indexer_npu_resident = True
             state.location = retrieve_location
             state.metadata_warm = state.has_cache()
@@ -8433,40 +7680,6 @@ class LMCacheConnectorV1Impl:
                 state,
                 additional_owners=tuple(plan.get("indexer_source_owners", ())),
             )
-            completed_at = serving_perf_now() if perf_enabled else 0.0
-            if perf_enabled:
-                latent_seal_ms = (completed_at - seal_started) * 1000
-            state._dsa_cold_load_completed_at = completed_at
-            if perf_enabled:
-                serving_perf_log(
-                    logger,
-                    "cold_compact_retrieve_complete",
-                    started=started,
-                    req_id=request.req_id,
-                    tokens=token_count,
-                    plan_ms=round(
-                        (plan["planned_at"] - plan["plan_started"]) * 1000, 3
-                    ),
-                    remote_ms=round(indexer_remote_s * 1000, 3),
-                    queue_ms=round(indexer_queue_ms, 3),
-                    event_wait_ms=round(dependency_wait_ms, 3),
-                    indexer_wait_ms=round(dependency_wait_ms, 3),
-                    predecessor_wait_ms=round(predecessor_wait_ms, 3),
-                    latent_materialize_ms=round(latent_materialize_ms, 3),
-                    latent_materialize_thread_cpu_ms=round(
-                        latent_materialize_thread_cpu_ms, 3
-                    ),
-                    latent_kwargs_ms=round(latent_kwargs_ms, 3),
-                    latent_generator_create_ms=round(latent_generator_create_ms, 3),
-                    latent_first_yield_ms=round(latent_first_yield_ms, 3),
-                    latent_send_sum_ms=round(latent_send_sum_ms, 3),
-                    latent_send_max_ms=round(latent_send_max_ms, 3),
-                    latent_send_max_layer=latent_send_max_layer,
-                    latent_result_check_ms=round(latent_result_check_ms, 3),
-                    latent_seal_ms=round(latent_seal_ms, 3),
-                    seal_ms=round((completed_at - seal_started) * 1000, 3),
-                    **plan.get("indexer_perf", {}),
-                )
             return state
         except BaseException as exc:
             latent_shared_ready = plan["latent_shared_ready"]
@@ -8477,7 +7690,7 @@ class LMCacheConnectorV1Impl:
             # producer-stream fence; a failed result fenced its stream locally.
             if indexer_readiness is None:
                 try:
-                    _, indexer_readiness, _, _ = indexer_future.result()
+                    _, indexer_readiness = indexer_future.result()
                 except BaseException:
                     pass
             owners_by_id = {
@@ -8532,16 +7745,9 @@ class LMCacheConnectorV1Impl:
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start this step's KV loads and atomically discard partial setup."""
-        started = (
-            time.perf_counter()
-            if self._layerwise_prefill_p_node and prefill_start_timing_enabled()
-            else 0.0
-        )
-        status = "ok"
         try:
             self._start_load_kv(forward_context, **kwargs)
         except BaseException:
-            status = "error"
             metadata = self._parent._get_connector_metadata()
             assert isinstance(metadata, LMCacheConnectorMetadata)
             self._abort_layerwise_retrieve_step(
@@ -8553,11 +7759,6 @@ class LMCacheConnectorV1Impl:
                 )
             )
             raise
-        finally:
-            if started:
-                prefill_start_timing_log(
-                    logger, "start_load_kv_total", started, status=status,
-                )
 
     def _start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -8669,23 +7870,12 @@ class LMCacheConnectorV1Impl:
         if self._layerwise_prefill_p_node and not getattr(
             self, "_layerwise_prefill_dma", False
         ):
-            mapping_started = (
-                time.perf_counter() if prefill_start_timing_enabled() else 0.0
-            )
             for request in metadata.requests:
                 if request.block_allocation_mode == "prefill_child":
                     self._materialize_layerwise_prefill_slot_mappings(
                         request,
                         force=True,
                     )
-            if mapping_started:
-                prefill_start_timing_log(
-                    logger, "materialize_bank_maps", mapping_started,
-                    requests=len(metadata.requests),
-                    max_tokens=max(
-                        (len(r.token_ids) for r in metadata.requests), default=0
-                    ),
-                )
         kvcaches = self._kvcaches_list
 
         assert self.lmcache_engine is not None
@@ -8710,14 +7900,6 @@ class LMCacheConnectorV1Impl:
             self._stats_monitor.update_interval_prompt_tokens(prompt_tokens)
 
         for load_idx, (idx, request) in enumerate(loadable_requests):
-            prefill_request_started = (
-                time.perf_counter()
-                if self._layerwise_prefill_p_node and prefill_start_timing_enabled()
-                else 0.0
-            )
-            request_perf_started = (
-                serving_perf_now() if serving_perf_enabled() else 0.0
-            )
             tokens = request.token_ids
             assert request.load_spec is not None
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
@@ -8810,8 +7992,6 @@ class LMCacheConnectorV1Impl:
                     )
                 elif request.is_sparse_decode:
                     prior_retrieve_state = sparse_bound_state
-                    prior_retrieve_snapshot = None
-                    invalidation_reason = None
                     retrieve_state_invalidated = False
                     if hasattr(self, "_worker_retrieve_state"):
                         if prior_retrieve_state is None:
@@ -8826,50 +8006,6 @@ class LMCacheConnectorV1Impl:
                                 prior_retrieve_state,
                                 token_count,
                             )
-                        if (
-                            _mtp_dw_deep_diag_enabled()
-                            and prior_retrieve_state is not None
-                        ):
-                            prior_retrieve_snapshot = {
-                                "frontier": prior_retrieve_state.token_count,
-                                "kv_group0_cached_ranges": (
-                                    self._deep_retrieve_range_summary(
-                                        prior_retrieve_state.cached_starts,
-                                        prior_retrieve_state.cached_ends,
-                                    )
-                                ),
-                                "kv_group1_cached_ranges": (
-                                    self._deep_retrieve_range_summary(
-                                        prior_retrieve_state.cached_starts_indexer,
-                                        prior_retrieve_state.cached_ends_indexer,
-                                    )
-                                ),
-                                "kv_group0_cache_present": (
-                                    self._deep_retrieve_group_cache_present(
-                                        prior_retrieve_state, 0
-                                    )
-                                ),
-                                "kv_group1_cache_present": (
-                                    self._deep_retrieve_group_cache_present(
-                                        prior_retrieve_state, 1
-                                    )
-                                ),
-                                "scope_token_present": (
-                                    prior_retrieve_state.request_scope_token is not None
-                                ),
-                                "scope_token": (
-                                    prior_retrieve_state.request_scope_token
-                                ),
-                                "shared_request_active": (
-                                    prior_retrieve_state.shared_request_active
-                                ),
-                                "shared_generation": (
-                                    prior_retrieve_state.shared_generation
-                                ),
-                                "pointer_cache_generation": (
-                                    prior_retrieve_state.pointer_cache_generation
-                                ),
-                            }
                         retrieve_state_invalidated = (
                             not request.sparse_warm_ref
                             and self._should_invalidate_worker_retrieve_state(
@@ -8877,16 +8013,6 @@ class LMCacheConnectorV1Impl:
                             )
                         )
                         if retrieve_state_invalidated:
-                            if _mtp_dw_deep_diag_enabled():
-                                invalidation_reason = "resumed_from_preemption"
-                                if prior_retrieve_state is not None:
-                                    invalidation_reason = (
-                                        self._worker_retrieve_state_invalidation_reason(
-                                            request,
-                                            token_count,
-                                            prior_retrieve_state,
-                                        )
-                                    )
                             self._drop_worker_retrieve_state(request.req_id)
                         bound_state = (
                             sparse_bound_state
@@ -8944,41 +8070,6 @@ class LMCacheConnectorV1Impl:
                             f"source: req_id={request.req_id}, "
                             f"tokens={token_count}"
                         )
-                    cold_perf_active = bool(
-                        request_perf_started and latent_prepared is None
-                    )
-                    dense_completed = self._cold_perf_dense_load_completed.pop(
-                        request.req_id,
-                        None,
-                    )
-                    if cold_perf_active:
-                        load_started = serving_perf_now()
-                        self._cold_perf_load_started[request.req_id] = (
-                            request_perf_started,
-                            token_count,
-                        )
-                        serving_perf_log(
-                            logger,
-                            "worker_load_start",
-                            req_id=request.req_id,
-                            tokens=token_count,
-                            layers=getattr(self.lmcache_engine, "num_layers", 0),
-                            dsa_two_groups=dsa_two_groups,
-                            setup_ms=round(
-                                (load_started - request_perf_started) * 1000,
-                                3,
-                            ),
-                            post_dense_gap_ms=(
-                                round((load_started - dense_completed) * 1000, 3)
-                                if dense_completed is not None
-                                else None
-                            ),
-                            rank=getattr(
-                                getattr(self.lmcache_engine, "metadata", None),
-                                "worker_id",
-                                None,
-                            ),
-                        )
 
                     layerwise_retriever = (
                         _defer_prepared_sparse_retrieve(
@@ -9002,22 +8093,7 @@ class LMCacheConnectorV1Impl:
                     self._layerwise_retriever_is_sparse.append(True)
                     self._layerwise_sparse_req_ids.append(request.req_id)
                     self._layerwise_sparse_shared_ordered.append(False)
-                    # NOTE: retrieve layers one by one with cpu prefetch
-                    prime_started = (
-                        serving_perf_now() if cold_perf_active else 0.0
-                    )
                     next(layerwise_retriever)
-                    if prime_started:
-                        serving_perf_log(
-                            logger,
-                            "prime_group",
-                            started=prime_started,
-                            req_id=request.req_id,
-                            kv_group=0,
-                            tokens=token_count,
-                            prepared=False,
-                            scope="blocking_wall",
-                        )
 
                     indexer_retriever = None
                     indexer_skipped = False
@@ -9063,11 +8139,6 @@ class LMCacheConnectorV1Impl:
                                 "requires DSA index kvcaches for kv_group=1."
                             )
                         else:
-                            indexer_setup_started = (
-                                serving_perf_now()
-                                if cold_perf_active
-                                else 0.0
-                            )
                             latent_sparse_slots = (
                                 slot_mapping[0]
                                 if isinstance(slot_mapping, list)
@@ -9162,43 +8233,13 @@ class LMCacheConnectorV1Impl:
                                 retrieve_state.indexer_npu_materialization_pending = (
                                     True
                                 )
-                            prime_started = (
-                                serving_perf_now()
-                                if cold_perf_active
-                                else 0.0
-                            )
                             next(indexer_retriever)
-                            if prime_started:
-                                serving_perf_log(
-                                    logger,
-                                    "prime_group",
-                                    started=prime_started,
-                                    req_id=request.req_id,
-                                    kv_group=1,
-                                    tokens=token_count,
-                                    prepared=False,
-                                    scope="blocking_wall",
-                                    setup_ms=round(
-                                        (prime_started - indexer_setup_started)
-                                        * 1000,
-                                        3,
-                                    ),
-                                )
 
                     if indexer_skipped:
                         request.shared_index_skipped = True
                         retrieve_state.clear_group(1)
                         retrieve_state.indexer_npu_resident = False
                         retrieve_state.indexer_npu_materialization_pending = False
-                        if cold_perf_active:
-                            serving_perf_log(
-                                logger,
-                                "prime_group",
-                                req_id=request.req_id,
-                                kv_group=1,
-                                tokens=token_count,
-                                status="skipped",
-                            )
                     retrieve_location = retrieve_kwargs.get(
                         "cached_retrieve_location"
                     )
@@ -9221,32 +8262,7 @@ class LMCacheConnectorV1Impl:
                             "layer loading completes: req_id=%s",
                             request.req_id,
                         )
-                    post_retrieve_state = (
-                        self._worker_retrieve_state.get(request.req_id)
-                        if hasattr(self, "_worker_retrieve_state")
-                        else None
-                    )
-                    self._trace_deep_retrieve_state(
-                        request,
-                        prior_retrieve_state,
-                        prior_retrieve_snapshot,
-                        invalidated=retrieve_state_invalidated,
-                        invalidation_reason=invalidation_reason,
-                        post_state=post_retrieve_state,
-                        prior_state_rebound=bound_state is prior_retrieve_state,
-                        kv_group0_retriever_present=layerwise_retriever is not None,
-                        kv_group1_retriever_present=indexer_retriever is not None,
-                    )
                 else:
-                    if request_perf_started:
-                        self._cold_perf_dense_load_completed.pop(
-                            request.req_id,
-                            None,
-                        )
-                        self._cold_perf_dense_load_started[request.req_id] = (
-                            request_perf_started,
-                            token_count,
-                        )
                     retrieve_slot_mapping = slot_mapping
                     if lmcache_cached_tokens < len(slot_mapping):
                         retrieve_slot_mapping = slot_mapping[:lmcache_cached_tokens]
@@ -9301,15 +8317,23 @@ class LMCacheConnectorV1Impl:
                     deferred_prefill_kwargs = (
                         {
                             "deferred_layerwise_get": True,
-                            "layerwise_prefill_bank_count": 2,
-                            "layerwise_prefill_bank_offset": (
-                                int(request.layerwise_prefill_bank_offset)
-                                & 1
+                            "layerwise_prefill_bank_count": (
+                                self._layerwise_prefill_bank_count
                             ),
                         }
                         if self._deferred_layerwise_prefill_load_active
                         else {}
                     )
+                    if (
+                        self._layerwise_prefill_p_node
+                        and self._deferred_layerwise_prefill_load_active
+                    ):
+                        deferred_prefill_kwargs[
+                            "_require_complete_prefill_prefix"
+                        ] = True
+                        deferred_prefill_kwargs[
+                            "_prefill_recalculate_last_token"
+                        ] = recalc_last_applied
                     if reuse_dense_prefix:
                         deferred_prefill_kwargs["_reuse_shared_dense_prefix"] = True
                         if retrieve_state.prefill_metadata_cache is not None:
@@ -9425,24 +8449,9 @@ class LMCacheConnectorV1Impl:
                             layerwise_retriever,
                             indexer_retriever,
                         )
-
-                    # The first two generator resumes prepare and submit L0.
-                    # L1 is submitted by the virtual N=-1 callback at the
-                    # first SFA entry, so its DMA can overlap L0 compute.
-                    if prefill_request_started:
-                        prefill_start_timing_log(
-                            logger, "retrieve_setup_before_prime",
-                            prefill_request_started,
-                            req_id=request.req_id,
-                            prefix_tokens=len(retrieve_tokens),
-                        )
                     self._prime_dense_prefix_retrievers(
                         layerwise_retriever,
                         indexer_retriever,
-                        req_id=(
-                            request.req_id if self._layerwise_prefill_p_node else None
-                        ),
-                        prefix_tokens=len(retrieve_tokens),
                     )
                     if retain_dense_seed:
                         retrieve_state.location = "LocalCPUBackend"
@@ -9511,26 +8520,12 @@ class LMCacheConnectorV1Impl:
                     recalc_last_applied=recalc_last_applied,
                 )
 
-        # Submit the second bank's initial layer before model execution.  The
+        # Fill the initial bank window before model execution. The
         # first-SFA callback remains idempotent for older callers, but it must
         # not perform a synchronous retriever advance on the latency path.
         if self._deferred_layerwise_prefill_load_active:
             self._submit_initial_layerwise_prefill_load()
-
-        store_setup_started = (
-            time.perf_counter()
-            if self._layerwise_prefill_p_node and prefill_start_timing_enabled()
-            else 0.0
-        )
         self._prepare_p_node_layerwise_save_storers(metadata)
-        if store_setup_started:
-            prefill_start_timing_log(
-                logger, "prepare_store_all", store_setup_started,
-                requests=len(metadata.requests),
-                max_tokens=max(
-                    (len(r.token_ids) for r in metadata.requests), default=0
-                ),
-            )
 
     def _validate_dense_retrieve_result(
         self,
@@ -9748,34 +8743,34 @@ class LMCacheConnectorV1Impl:
         wait_group: int,
         transfer_layer: int,
     ) -> Optional[torch.Tensor]:
-        """Submit one dense group while preserving its dynamic bank mapping."""
+        """Submit one dense group using the layer's fixed bank slot mapping."""
         layerwise_retriever, indexer_retriever = retriever_pair
         if wait_group == 1:
             if indexer_retriever is not None:
-                dynamic_mapping = self._layerwise_prefill_slot_mapping(
+                layer_mapping = self._layerwise_prefill_slot_mapping(
                     request,
                     1,
                     transfer_layer,
                 )
-                if dynamic_mapping is None:
+                if layer_mapping is None:
                     return next(indexer_retriever)
                 return indexer_retriever.send(
-                    {"slot_mapping": dynamic_mapping}
+                    {"slot_mapping": layer_mapping}
                 )
             raise RuntimeError(
                 "Layerwise prefill Group-1 load is missing its retriever: "
                 f"req_id={request.req_id}"
             )
 
-        dynamic_mapping = self._layerwise_prefill_slot_mapping(
+        layer_mapping = self._layerwise_prefill_slot_mapping(
             request,
             0,
             transfer_layer,
         )
-        if dynamic_mapping is None:
+        if layer_mapping is None:
             return next(layerwise_retriever)
         return layerwise_retriever.send(
-            {"slot_mapping": dynamic_mapping}
+            {"slot_mapping": layer_mapping}
         )
 
     def _complete_layerwise_retrieve_group(
@@ -9790,31 +8785,6 @@ class LMCacheConnectorV1Impl:
             self.current_layer += 1
             if self.current_layer >= self.num_layers:
                 completed_requests = tuple(layerwise_requests)
-                perf_enabled = serving_perf_enabled()
-                dense_perf_states = ()
-                if perf_enabled:
-                    dense_perf_states = [
-                        (
-                            request,
-                            self._cold_perf_dense_load_started.get(
-                                request.req_id,
-                                None,
-                            ),
-                        )
-                        for request in completed_requests
-                    ]
-                finalize_started = (
-                    serving_perf_now()
-                    if perf_enabled
-                    and (
-                        any(
-                            request.req_id in self._cold_perf_load_started
-                            for request in completed_requests
-                        )
-                        or any(state is not None for _, state in dense_perf_states)
-                    )
-                    else 0.0
-                )
                 with self._sparse_retrieve_state_guard(
                     completed_requests
                 ):
@@ -9823,51 +8793,6 @@ class LMCacheConnectorV1Impl:
                         assert isinstance(metadata, LMCacheConnectorMetadata)
                     self._finalize_worker_retrieve_state_from_metadata(metadata)
                     self._drain_layerwise_retrievers()
-                finalize_ms = (
-                    (serving_perf_now() - finalize_started) * 1000
-                    if finalize_started
-                    else 0.0
-                )
-                if perf_enabled:
-                    dense_completed = serving_perf_now()
-                    for request, perf_state in dense_perf_states:
-                        if perf_state is None:
-                            continue
-                        self._cold_perf_dense_load_started.pop(request.req_id, None)
-                        request_started, token_count = perf_state
-                        self._cold_perf_dense_load_completed[request.req_id] = (
-                            dense_completed
-                        )
-                        serving_perf_log(
-                            logger,
-                            "dense_worker_load_complete",
-                            started=request_started,
-                            req_id=request.req_id,
-                            tokens=token_count,
-                            layers=self.num_layers,
-                            finalize_ms=round(finalize_ms, 3),
-                            scope="layerwise_wall",
-                            includes_model_compute=True,
-                        )
-                    for request in completed_requests:
-                        perf_state = self._cold_perf_load_started.pop(
-                            request.req_id,
-                            None,
-                        )
-                        if perf_state is None:
-                            continue
-                        request_started, token_count = perf_state
-                        serving_perf_log(
-                            logger,
-                            "worker_load_complete",
-                            started=request_started,
-                            req_id=request.req_id,
-                            tokens=token_count,
-                            layers=self.num_layers,
-                            finalize_ms=round(finalize_ms, 3),
-                            scope="layerwise_wall",
-                            includes_model_compute=True,
-                        )
 
     def _advance_deferred_layerwise_prefill_load(
         self, layer_name: str, *, finish_current: bool = False
@@ -9924,7 +8849,7 @@ class LMCacheConnectorV1Impl:
             )
         if finish_current and layer_id != last_group_layer:
             raise RuntimeError("Only the last group row may drain its prefill load")
-        transfer_layer = layer_id + 2
+        transfer_layer = layer_id + getattr(self, "_layerwise_prefill_bank_count", 2)
         should_advance_retriever = (
             (finish_current and layer_id == last_group_layer)
             or (not finish_current and transfer_layer <= last_group_layer)
@@ -9979,7 +8904,7 @@ class LMCacheConnectorV1Impl:
         )
 
     def _submit_initial_layerwise_prefill_load(self) -> None:
-        """Submit L1 before model execution without advancing model layers."""
+        """Submit the remaining initial banks without advancing model layers."""
         if self._initial_layerwise_prefill_load_submitted:
             return
         requests = self._layerwise_requests
@@ -9987,41 +8912,26 @@ class LMCacheConnectorV1Impl:
             for request, retriever_pair in zip(
                 requests, self.layerwise_retrievers, strict=True
             ):
-                if len(self._latent_layer_names) > 1:
-                    started = (
-                        time.perf_counter()
-                        if prefill_start_timing_enabled() else 0.0
-                    )
+                for layer_id in range(1, min(
+                    getattr(self, "_layerwise_prefill_bank_count", 2),
+                    len(self._latent_layer_names),
+                )):
                     self._advance_dense_layerwise_retriever(
-                        request, retriever_pair, 0, 1
+                        request, retriever_pair, 0, layer_id
                     )
-                    if started:
-                        prefill_start_timing_log(
-                            logger, "second_bank_submit", started,
-                            req_id=request.req_id, kv_group=0,
-                            prefix_tokens=len(request.token_ids),
-                        )
-                if retriever_pair[1] is not None and len(
-                    self._indexer_layer_names
-                ) > 1:
-                    started = (
-                        time.perf_counter()
-                        if prefill_start_timing_enabled() else 0.0
-                    )
+                for layer_id in range(1, min(
+                    getattr(self, "_layerwise_prefill_bank_count", 2),
+                    len(self._indexer_layer_names)
+                    if retriever_pair[1] is not None else 0,
+                )):
                     self._advance_dense_layerwise_retriever(
-                        request, retriever_pair, 1, 1
+                        request, retriever_pair, 1, layer_id
                     )
-                    if started:
-                        prefill_start_timing_log(
-                            logger, "second_bank_submit", started,
-                            req_id=request.req_id, kv_group=1,
-                            prefix_tokens=len(request.token_ids),
-                        )
         self._initial_layerwise_prefill_load_submitted = True
 
     @_lmcache_nvtx_annotate
     def submit_layerwise_prefill_load(self, layer_name: str | int) -> None:
-        """Submit N+2; N=-1 primes L1 at first-layer SFA entry."""
+        """Submit N+bank_count; N=-1 primes the initial prefetch window."""
         if not self.layerwise_retrievers:
             return
         if not getattr(self, "_deferred_layerwise_prefill_load_active", False):
@@ -10213,6 +9123,8 @@ class LMCacheConnectorV1Impl:
                     sync=True,
                     prepared_sparse_source=source,
                     prepared_start_layer=target_count,
+                    req_id=request.req_id,
+                    lmcache_cached_tokens=source.total_tokens,
                     registered_destination_layout=getattr(
                         self, "_sparse_destination_binding", None
                     ),
@@ -10260,9 +9172,9 @@ class LMCacheConnectorV1Impl:
         wait_group = None
         if self.supports_layerwise_prefill_transfer_window:
             wait_group = self._layerwise_wait_group(layer_name)
-            # This fence is required even on a cache miss. Layer N and N-2 use
-            # the same two-bank slot; N must not overwrite it while save(N-2)
-            # is still reading from that bank.
+            # This fence is required even on a cache miss. Layer N and N-B
+            # share a bank (B is the configured depth). Do not overwrite it
+            # while save(N-B) is still reading.
             self._wait_for_layerwise_prefill_bank(layer_name, wait_group)
 
         if self.layerwise_retrievers and logger.isEnabledFor(10):
@@ -10541,12 +9453,6 @@ class LMCacheConnectorV1Impl:
                             else:
                                 selected_tokens_per_req = selected_tokens_payload
                                 token_start_index_per_req = token_start_payload
-                    if self.current_layer == 0 and wait_group == 0:
-                        self._record_sparse_retrieve_stats(
-                            selected_tokens_per_req,
-                            selected_token_counts_per_req,
-                            row_count,
-                        )
                     sparse_payload = (
                         payload
                         if payload is not None
@@ -10734,10 +9640,9 @@ class LMCacheConnectorV1Impl:
     def _close_layerwise_storer(storer) -> None:
         if storer is None:
             return
-        try:
-            storer.close()
-        except (GeneratorExit, RuntimeError, ValueError):
-            pass
+        # A connector close can be the last fence for outstanding D2H writes.
+        # Propagate failure so request cleanup cannot treat it as completion.
+        storer.close()
 
     def _finalize_layerwise_storer(
         self,
@@ -10789,10 +9694,6 @@ class LMCacheConnectorV1Impl:
             "decode_window_size": getattr(request, "decode_window_size", None),
             "request_configs": request.request_configs,
         }
-        if self._layerwise_prefill_p_node:
-            store_kwargs["layerwise_prefill_bank_offset"] = (
-                int(request.layerwise_prefill_bank_offset) & 1
-            )
         if self._is_dsa_two_groups() and kv_group == 1:
             store_kwargs["kv_group"] = 1
         if self._prefill_metadata_cache_enabled(request, deferred=True):
@@ -11023,7 +9924,7 @@ class LMCacheConnectorV1Impl:
             sync=sync,
             deferred_layerwise_put=True,
             layerwise_prefill_incremental=True,
-            layerwise_prefill_bank_count=2,
+            layerwise_prefill_bank_count=self._layerwise_prefill_bank_count,
             **(
                 {"prefill_dma_block_ids_by_bank":
                  self._layerwise_prefill_dma_block_ids(request, kv_group),
@@ -11033,18 +9934,7 @@ class LMCacheConnectorV1Impl:
             req_id=request.req_id,
             **store_kwargs,
         )
-        # Priming performs token processing, all-layer MemoryObj allocation,
-        # and GPU-consumer setup. Doing it here keeps those CPU-side costs out
-        # of the first post-attention/HCOM window.
-        store_prime_started = (
-            time.perf_counter() if prefill_start_timing_enabled() else 0.0
-        )
         next(storer)
-        if store_prime_started:
-            prefill_start_timing_log(
-                logger, "prime_storer", store_prime_started,
-                req_id=request.req_id, tokens=len(token_ids), kv_group=kv_group,
-            )
         return storer
 
     def _prepare_p_node_layerwise_save_storers(
@@ -11394,7 +10284,8 @@ class LMCacheConnectorV1Impl:
                         self._layerwise_prefill_p_node
                     ),
                     layerwise_prefill_bank_count=(
-                        2 if self._layerwise_prefill_p_node else 1
+                        self._layerwise_prefill_bank_count
+                        if self._layerwise_prefill_p_node else 1
                     ),
                     req_id=request.req_id,
                     **store_kwargs,
@@ -11439,25 +10330,22 @@ class LMCacheConnectorV1Impl:
                             "P-node layerwise save received an unknown layer: "
                             f"layer={layer_name}, kv_group={kv_group}"
                         ) from exc
-                    # The raw-address DMA storer was prepared from the two
-                    # banks' block IDs.  It deliberately has no per-token
-                    # slot mapping to rotate here; the NPU connector selects
-                    # the physical bank from the layer ordinal.  Keep the
-                    # legacy dynamic mapping command only for the non-DMA
-                    # layerwise path.
+                    # Raw-address DMA selects the fixed bank from the layer
+                    # ordinal and its block IDs. Only the non-DMA layerwise
+                    # path needs this bank's per-token slot mapping.
                     if self._layerwise_prefill_dma:
                         layer_command = None
                     else:
-                        dynamic_slot_mapping = (
+                        layer_slot_mapping = (
                             self._layerwise_prefill_slot_mapping(
                                 request,
                                 kv_group,
                                 layer_index,
                             )
                         )
-                        assert dynamic_slot_mapping is not None
+                        assert layer_slot_mapping is not None
                         layer_command = {
-                            "slot_mapping": dynamic_slot_mapping,
+                            "slot_mapping": layer_slot_mapping,
                             "slot_mapping_base": 0,
                         }
                     yielded = self._store_result_from_yield(
@@ -11837,16 +10725,8 @@ class LMCacheConnectorV1Impl:
         entry: ColdLoadEntry,
         state: Any,
         was_aborted: bool,
-        perf_enabled: bool,
     ) -> None:
-        generation, future, request, indexer_block_ids, submitted_at, indexer_future = entry
-        publish_started = serving_perf_now() if perf_enabled else 0.0
-        completed_at = getattr(
-            state,
-            "_dsa_cold_load_completed_at",
-            publish_started,
-        )
-        publish_thread_started = time.thread_time_ns() if perf_enabled else 0
+        generation, future, request, indexer_block_ids, indexer_future = entry
         if was_aborted:
             self._release_unadopted_shared_request_objects(state, request)
             self._release_shared_worker_retrieve_state(state, self.lmcache_engine)
@@ -11868,40 +10748,6 @@ class LMCacheConnectorV1Impl:
             # authoritative cleanup path.
             state._dsa_cold_prune_protected = True
             state.completed_cold_load_generation = generation
-        published_at = serving_perf_now() if perf_enabled else 0.0
-        if perf_enabled:
-            serving_perf_log(
-                logger,
-                "worker_load_complete",
-                started=submitted_at,
-                req_id=req_id,
-                tokens=request.load_spec.lmcache_cached_tokens,
-                mode=("dsa_cold_resident" if getattr(request.load_spec,
-                      "dsa_cold_resident_load", False) else "dsa_cold_compact"),
-                background_ms=round((completed_at - submitted_at) * 1000, 3),
-                scheduler_poll_ms=round((publish_started - completed_at) * 1000, 3),
-                publish_ms=round((published_at - publish_started) * 1000, 3),
-                publish_thread_cpu_ms=(
-                    round(
-                        (time.thread_time_ns() - publish_thread_started) / 1e6,
-                        3,
-                    )
-                    if publish_thread_started
-                    else None
-                ),
-                final_unhidden_ms=round((published_at - completed_at) * 1000, 3),
-            )
-        if perf_enabled:
-            logger.info(
-                "[DSA_COLD_COMPACT] request=%s generation=%d "
-                "status=%s tokens=%d indexer_blocks=%d elapsed_ms=%.3f",
-                req_id,
-                generation,
-                "aborted" if was_aborted else "ready",
-                request.load_spec.lmcache_cached_tokens,
-                len(indexer_block_ids),
-                (serving_perf_now() - submitted_at) * 1000,
-            )
 
     def _cold_requires_paired_restart(self) -> bool:
         check = getattr(self.lmcache_engine, "remote_fill_requires_paired_restart", None)
@@ -11913,9 +10759,8 @@ class LMCacheConnectorV1Impl:
         entry: ColdLoadEntry,
         state: Any,
         exc: BaseException,
-        perf_enabled: bool,
     ) -> bool:
-        generation, future, request, indexer_block_ids, submitted_at, indexer_future = entry
+        generation, future, request, indexer_block_ids, indexer_future = entry
         requires_restart = getattr(
             self.lmcache_engine,
             "remote_fill_requires_paired_restart",
@@ -11972,11 +10817,10 @@ class LMCacheConnectorV1Impl:
         else:
             logger.exception(
                 "[DSA_COLD_COMPACT] request=%s generation=%d "
-                "status=failed indexer_blocks=%d elapsed_ms=%.3f",
+                "status=failed indexer_blocks=%d",
                 req_id,
                 generation,
                 len(indexer_block_ids),
-                ((serving_perf_now() if perf_enabled else 0.0) - submitted_at) * 1000,
             )
         # Both workers are terminal and request owners have either
         # retired or moved to the existing readiness retirement queue.
@@ -12003,9 +10847,6 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        perf_enabled = serving_perf_enabled()
-        finished_started = serving_perf_now() if perf_enabled else 0.0
-        finished_thread_started = time.thread_time_ns() if perf_enabled else 0
         aborted_cold: set[str] = set()
         live_pending = getattr(self, "_dsa_live_split_pending", None)
         if live_pending and finished_req_ids:
@@ -12044,42 +10885,14 @@ class LMCacheConnectorV1Impl:
             if waiting_req_ids:
                 self._finished_req_ids_waiting_for_save.update(waiting_req_ids)
                 releasable_req_ids -= waiting_req_ids
-
-        store_finalize_started = serving_perf_now() if perf_enabled else 0.0
         finished_sending = self._finalize_worker_requests_after_store(
             releasable_req_ids
         )
-        store_finalize_ms = (
-            (serving_perf_now() - store_finalize_started) * 1000
-            if perf_enabled
-            else 0.0
-        )
-        load_drain_started = serving_perf_now() if perf_enabled else 0.0
         finished_recving = self._drain_dsa_cold_load_futures()
         # Cold-load retirement can enqueue its final cleanup acknowledgement.
         # Include it now rather than requiring an otherwise idle extra step.
         finished_sending.update(self._late_finished_sending)
         self._late_finished_sending.clear()
-        if perf_enabled:
-            completed = serving_perf_now()
-            load_drain_ms = (completed - load_drain_started) * 1000
-            elapsed_ms = (completed - finished_started) * 1000
-        else:
-            load_drain_ms = elapsed_ms = 0.0
-        if elapsed_ms >= 100.0:
-            serving_perf_log(
-                logger,
-                "decoder_connector_get_finished_slow",
-                started=finished_started,
-                finished_request_count=len(finished_req_ids),
-                completed_load_count=len(finished_recving or ()),
-                store_finalize_ms=round(store_finalize_ms, 3),
-                load_drain_ms=round(load_drain_ms, 3),
-                thread_cpu_ms=round(
-                    (time.thread_time_ns() - finished_thread_started) / 1e6,
-                    3,
-                ),
-            )
         return finished_sending or None, finished_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -12091,7 +10904,6 @@ class LMCacheConnectorV1Impl:
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
-        self._dsa_kv_policy_states.clear()
         live_pending = getattr(self, "_dsa_live_split_pending", None)
         if live_pending:
             for req_id, entry in list(live_pending.items()):
@@ -12309,11 +11121,6 @@ class LMCacheConnectorV1Impl:
             query_end - getattr(self, "skip_last_n_tokens", 0),
             0,
         )
-        lookup_call_started = (
-            serving_perf_now() if serving_perf_enabled() else 0.0
-        )
-        if lookup_call_started:
-            self._cold_perf_lookup_started.setdefault(req_id, lookup_call_started)
 
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
@@ -12382,32 +11189,6 @@ class LMCacheConnectorV1Impl:
             # the fresh paired frontier as the query result, never the old offer.
             query_end = lookup_query_tokens = num_external_hit_tokens
             self._resume_lookup_queries[req_id] = (query_end, query_scope, decode_committed_end)
-        lookup_started = self._cold_perf_lookup_started.pop(
-            req_id,
-            lookup_call_started,
-        )
-        if lookup_call_started:
-            serving_perf_log(
-                logger,
-                "scheduler_lookup",
-                started=lookup_started or None,
-                req_id=req_id,
-                prompt_tokens=request.num_tokens,
-                request_tokens=request.num_tokens,
-                request_prompt_tokens=request_prompt_tokens,
-                lookup_query_tokens=lookup_query_tokens,
-                query_scope=query_scope,
-                decode_committed_end=decode_committed_end,
-                resumed=resumed,
-                vllm_cached_tokens=num_computed_tokens,
-                lmcache_cached_tokens=num_external_hit_tokens,
-                lookup_call_ms=round(
-                    (serving_perf_now() - lookup_call_started) * 1000,
-                    3,
-                )
-                if lookup_call_started
-                else 0.0,
-            )
 
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.
@@ -12866,94 +11647,6 @@ class LMCacheConnectorV1Impl:
             return "no_decode_tokens"
         return "unknown"
 
-    def _trace_decode_window_decision(
-        self,
-        tracker: RequestTracker,
-        decision: Optional[str] = None,
-        reason: Optional[str] = None,
-    ) -> None:
-        if not _mtp_dw_diag_enabled():
-            return
-        should_save = self._should_decode_window_save(tracker)
-        eligibility_reason = (
-            "eligible"
-            if should_save
-            else self._decode_window_save_skip_reason(tracker)
-        )
-        tracker_len = len(tracker.token_ids)
-        window_size = int(getattr(self, "_decode_window_save_window_size", 0) or 0)
-        next_start = tracker.decode_window_save_next_start
-        next_end = (
-            int(next_start) + window_size
-            if next_start is not None and window_size > 0
-            else None
-        )
-        states = getattr(self, "_mtp_dw_window_decision_states", None)
-        if states is None:
-            states = {}
-            self._mtp_dw_window_decision_states = states
-        state = states.setdefault(
-            tracker.req_id,
-            {
-                "signature": None,
-                "near": set(),
-                "reached": set(),
-                "forced": set(),
-            },
-        )
-        signature = (should_save, eligibility_reason, next_start)
-        if decision is None:
-            if state["signature"] is None:
-                decision = "initial"
-            elif should_save and next_end is not None:
-                if tracker_len >= next_end and next_end not in state["reached"]:
-                    decision = "boundary_reached"
-                    state["reached"].add(next_end)
-                elif (
-                    tracker_len >= next_end - 4
-                    and next_end not in state["near"]
-                ):
-                    decision = "near_boundary"
-                    state["near"].add(next_end)
-                elif state["signature"] != signature:
-                    decision = "eligible"
-            elif state["signature"] != signature:
-                decision = "blocked"
-        state["signature"] = signature
-        if decision is None:
-            return
-        if reason is None:
-            if not should_save:
-                reason = eligibility_reason
-            elif next_end is not None and tracker_len < next_end:
-                reason = "awaiting_frontier"
-            else:
-                reason = "ready"
-        if decision == "blocked":
-            forced_key = (decision, reason, next_start)
-            if forced_key in state["forced"]:
-                return
-            state["forced"].add(forced_key)
-        _mtp_dw_event(
-            "meta",
-            req=str(tracker.req_id),
-            event="window_decision",
-            decision=decision,
-            reason=reason,
-            skip_reason=(
-                reason if not should_save or decision == "blocked" else None
-            ),
-            frontier=tracker_len,
-            tracker_len=tracker_len,
-            prompt_len=tracker.prompt_len,
-            next_start=(int(next_start) if next_start is not None else None),
-            next_end=next_end,
-            committed_end=int(tracker.decode_window_save_committed_end),
-            num_saved_tokens=int(tracker.num_saved_tokens),
-            is_decode_phase=bool(tracker.is_decode_phase),
-            should_save=should_save,
-        )
-
     def _init_decode_window_save_start(self, tracker: RequestTracker) -> int:
         if tracker.decode_window_save_next_start is not None:
             return tracker.decode_window_save_next_start
@@ -12977,36 +11670,6 @@ class LMCacheConnectorV1Impl:
             * self._lmcache_chunk_size,
         )
         return start
-
-    def _log_dsa_kv_policy(
-        self,
-        req_id: str,
-        is_sparse_decode: bool,
-        prompt_len: int,
-        num_computed_tokens: int,
-    ) -> None:
-        """Log the connector KV policy once per request transition.
-
-        ``full_resident`` uses full-prefix loading and keeps the main latent
-        resident. ``sparse_managed`` enables sparse loading/offload lifecycle
-        management. Both policies continue to use sparse attention. Controlled
-        by ``LMCACHE_DSA_KV_POLICY_LOG=1``.
-        """
-        policy = "sparse_managed" if is_sparse_decode else "full_resident"
-        prev = self._dsa_kv_policy_states.get(req_id)
-        if prev == policy:
-            return
-        self._dsa_kv_policy_states[req_id] = policy
-        logger.info(
-            "[DSA_KV_POLICY] req=%s kv_policy=%s%s prompt_len=%d computed=%d "
-            "threshold=%d",
-            req_id,
-            policy,
-            f" (switched from {prev})" if prev is not None else " (first)",
-            prompt_len,
-            num_computed_tokens,
-            getattr(self, "_dsa_kv_policy_threshold", 0),
-        )
 
     def _build_request_meta(
         self,
@@ -13068,12 +11731,10 @@ class LMCacheConnectorV1Impl:
         tracker: RequestTracker,
     ) -> None:
         if not self._should_decode_window_save(tracker):
-            self._trace_decode_window_decision(tracker)
             return
 
         window_size = self._decode_window_save_window_size
         next_start = self._init_decode_window_save_start(tracker)
-        self._trace_decode_window_decision(tracker)
 
         if tracker.decode_window_save_inflight_end is not None:
             return
@@ -13098,57 +11759,7 @@ class LMCacheConnectorV1Impl:
                 ),
             )
             if req_meta is None:
-                self._trace_decode_window_decision(
-                    tracker, decision="blocked", reason="metadata_unavailable"
-                )
                 return
-            if _mtp_dw_diag_enabled():
-                slot_mapping = (
-                    req_meta.slot_mapping[0].detach().cpu().reshape(-1)
-                    if req_meta.slot_mapping
-                    else torch.empty(0, dtype=torch.long)
-                )
-                _mtp_dw_event(
-                    "config",
-                    req=tracker.req_id,
-                    event="decode_window",
-                    frontier=len(tracker.token_ids),
-                    window_start=window_start,
-                    window_end=window_end,
-                    window_size=window_size,
-                    chunk_size=self._lmcache_chunk_size,
-                )
-                _mtp_dw_event(
-                    "meta",
-                    req=tracker.req_id,
-                    frontier=len(tracker.token_ids),
-                    prompt_frontier=tracker.prompt_len,
-                    committed_end=tracker.decode_window_save_committed_end,
-                    window_start=window_start,
-                    window_end=window_end,
-                    window_size=window_size,
-                    slot_count=int(slot_mapping.numel()),
-                    slot_min=(
-                        int(slot_mapping.min()) if slot_mapping.numel() else None
-                    ),
-                    slot_max=(
-                        int(slot_mapping.max()) if slot_mapping.numel() else None
-                    ),
-                    slot_sample=slot_mapping[:8].tolist(),
-                )
-                if (
-                    window_end > len(tracker.token_ids)
-                    or (window_end - tracker.decode_window_save_anchor) % window_size
-                ):
-                    _mtp_dw_event(
-                        "fail",
-                        req=tracker.req_id,
-                        frontier=len(tracker.token_ids),
-                        window_start=window_start,
-                        window_end=window_end,
-                        invariant="synthetic_window_frontier",
-                        window_size=window_size,
-                    )
             if (
                 self._is_dsa_two_groups()
                 and getattr(req_meta.save_spec, "can_save_indexer", False) is False
@@ -13161,63 +11772,7 @@ class LMCacheConnectorV1Impl:
                     window_start,
                     window_end,
                 )
-                self._trace_decode_window_decision(
-                    tracker,
-                    decision="blocked",
-                    reason="missing_indexer_slots",
-                )
                 return
-
-            if _mtp_dw_deep_diag_enabled():
-                planned_reqs = getattr(
-                    self, "_mtp_dw_deep_window_group_planned_reqs", None
-                )
-                if planned_reqs is None:
-                    planned_reqs = set()
-                    self._mtp_dw_deep_window_group_planned_reqs = planned_reqs
-                if tracker.req_id not in planned_reqs:
-                    if len(planned_reqs) >= 256:
-                        planned_reqs.pop()
-                    planned_reqs.add(tracker.req_id)
-                    save_spec = req_meta.save_spec
-                    kv_group0_save = bool(
-                        save_spec is not None and save_spec.can_save_latent
-                    )
-                    kv_group1_save = bool(
-                        save_spec is not None and save_spec.can_save_indexer
-                    )
-                    dsa_two_groups = self._is_dsa_two_groups()
-                    _mtp_dw_event(
-                        "deep",
-                        event="window_group_plan",
-                        req=tracker.req_id,
-                        worker_rank=None,
-                        tp_rank=None,
-                        tp_world=None,
-                        frontier=len(tracker.token_ids),
-                        window_start=window_start,
-                        window_end=window_end,
-                        kv_group=None,
-                        dsa_two_groups=dsa_two_groups,
-                        shared_cpu_enabled=bool(
-                            self._shared_cpu_config_value(
-                                "enable_shared_cpu_cache", False
-                            )
-                        ),
-                        latent_only=(
-                            dsa_two_groups and kv_group0_save and not kv_group1_save
-                        ),
-                        indexer_disabled=dsa_two_groups and not kv_group1_save,
-                        kv_group0_save=kv_group0_save,
-                        kv_group1_save=kv_group1_save,
-                        required_groups=sorted(
-                            self._decode_window_save_required_groups(req_meta)
-                        ),
-                    )
-
-            self._trace_decode_window_decision(
-                tracker, decision="emitted", reason="window_ready"
-            )
             meta.add_request(req_meta)
             tracker.decode_window_save_next_start = window_end
             tracker.decode_window_save_inflight_end = window_end
@@ -13243,31 +11798,11 @@ class LMCacheConnectorV1Impl:
         pending_cold = getattr(self, "_pending_dsa_cold_load_metas", None)
 
         for finished_req_id in scheduler_output.finished_req_ids:
-            tracker = self._request_trackers.pop(finished_req_id, None)
+            self._request_trackers.pop(finished_req_id, None)
             self._resume_lookup_queries.pop(finished_req_id, None)
-            self._dsa_kv_policy_states.pop(finished_req_id, None)
             self._discard_request_set(
                 "_dsa_group1_direct_hbm_deferred_req_ids", finished_req_id
             )
-            if tracker is not None:
-                self._trace_decode_window_decision(
-                    tracker, decision="request_finish", reason="request_finished"
-                )
-            if _mtp_dw_diag_enabled():
-                states = getattr(self, "_mtp_dw_window_decision_states", None)
-                if states is not None:
-                    states.pop(finished_req_id, None)
-            planned_reqs = getattr(
-                self, "_mtp_dw_deep_window_group_planned_reqs", None
-            )
-            if planned_reqs is not None:
-                planned_reqs.discard(finished_req_id)
-            waits = getattr(self, "_mtp_dw_deep_window_group_wait_seen", None)
-            if waits is not None:
-                waits_copy = {
-                    key for key in waits if key[0] != finished_req_id
-                }
-                self._mtp_dw_deep_window_group_wait_seen = waits_copy
             self._unfinished_requests.pop(finished_req_id, None)
             self.load_specs.pop(finished_req_id, None)
             if pending_cold is not None:
@@ -13610,13 +12145,6 @@ class LMCacheConnectorV1Impl:
                     or hasattr(request_tracker, "sparse_remap_frontier")
                 )
             )
-            if self._dsa_kv_policy_log:
-                self._log_dsa_kv_policy(
-                    req_id,
-                    is_sparse_decode,
-                    request_tracker.prompt_len,
-                    request.num_computed_tokens,
-                )
             if is_sparse_decode:
                 # Sparse direct decode should only retrieve the prefix whose
                 # boundary is also used by SFA scratch_remap. Keep the final
@@ -13742,9 +12270,7 @@ class LMCacheConnectorV1Impl:
         checkpoints = getattr(self, "_preemption_checkpoints", None)
         if checkpoints:
             checkpoints.pop(req_id, None)
-        self._cold_perf_lookup_started.pop(request.request_id, None)
         self._resume_lookup_queries.pop(request.request_id, None)
-        self._dsa_kv_policy_states.pop(request.request_id, None)
         pending_cold = getattr(self, "_pending_dsa_cold_load_metas", None)
         pending_meta = (
             pending_cold.pop(req_id, None) if pending_cold is not None else None
@@ -13782,9 +12308,6 @@ class LMCacheConnectorV1Impl:
             self._drop_layerwise_save_storers(request.request_id)
 
         self._drop_worker_retrieve_state(req_id, release_lookup_pins=False)
-        transitions = getattr(self, "_mtp_dw_deep_retrieve_transitions", None)
-        if transitions is not None:
-            transitions.pop(request.request_id, None)
 
         assert self.lookup_client is not None
         # Worker-side lookup ownership remains live for emitted direct loads;
@@ -13856,10 +12379,6 @@ class LMCacheConnectorV1Impl:
         if pending is not None and pending.accept(result):
             if pending.status == "captured" or pending.cancel_pending:
                 self._arm_preemption_controls()
-            if serving_perf_enabled():
-                serving_perf_log(logger, "decoder_preemption_checkpoint", req_id=result.req_id,
-                                 generation=result.generation, status=result.status,
-                                 end=result.end, reason=result.reason, **(result.timings_ms or {}))
             self._resume_lookup_queries.pop(result.req_id, None)
             if self.lookup_client is not None:
                 self.lookup_client.clear_lookup_status(result.req_id)
@@ -14084,29 +12603,6 @@ class LMCacheConnectorV1Impl:
             and state.token_count <= token_count
             and not self._prefill_metadata_scope_changed(request, state)
         )
-        rank = int(
-            getattr(getattr(self.lmcache_engine, "metadata", None), "worker_id", -1)
-        )
-        debug_reuse = prefill_reuse_debug_enabled(rank)
-        action = "new" if state_is_new else "keep"
-        if debug_reuse:
-            old_tokens = state.token_count
-            if preserve:
-                reason = "ok"
-            elif not reuse_prefix:
-                reason = "path"
-            elif state.req_id != request.req_id:
-                reason = "req"
-            elif request.resumed_from_preemption:
-                reason = "preempt"
-            elif state.dense_prefix_generation is None:
-                reason = "new"
-            elif state.dense_prefix_generation != generation:
-                reason = "gen"
-            elif self._prefill_metadata_scope_changed(request, state):
-                reason = "scope"
-            else:
-                reason = "shrink"
         if retain_dense_seed and not preserve and (
             state.shared_request_active
             or state.dense_prefix_seed
@@ -14115,7 +12611,6 @@ class LMCacheConnectorV1Impl:
         ):
             self._release_shared_worker_retrieve_state(state, self.lmcache_engine)
             state = WorkerRetrieveState(req_id=request.req_id)
-            action = "reset"
         if reuse_prefix:
             # The engine still consumes and validates every shared envelope.
             # It preserves unchanged objects and replaces a growing partial
@@ -14128,24 +12623,6 @@ class LMCacheConnectorV1Impl:
             state.prefill_metadata_scope = None
             state.prefill_metadata_step = None
             state.prefill_metadata_frontier = 0
-        if debug_reuse:
-            keep_mapping = bool(
-                getattr(self, "_layerwise_prefill_p_node", False)
-                and getattr(self, "_layerwise_prefill_dma", False)
-                and getattr(self, "_deferred_layerwise_prefill_load_active", False)
-                and not getattr(self, "enable_blending", False)
-            )
-            prefill_reuse_debug_log(
-                rank,
-                "state",
-                req_id=request.req_id,
-                p=token_count,
-                a=action,
-                w=reason,
-                old=old_tokens,
-                map="keep" if keep_mapping else "h2d",
-                e=reuse_prefix,
-            )
         return state, reuse_prefix
 
     def _prefill_metadata_cache_enabled(

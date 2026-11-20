@@ -227,20 +227,19 @@ def test_rpc_server_helper_rejects_malformed_envelope(harness) -> None:
     assert response.code is ResultCode.INVALID_MESSAGE
 
 
-def test_service_diagnostics_disabled_do_not_read_timing_clocks(
+def test_service_does_not_read_diagnostic_timing_clocks(
     harness, monkeypatch
 ) -> None:
-    """Disabled diagnostics add no timing work to the RPC service path."""
-
-    monkeypatch.setattr(service_module, "serving_perf_enabled", lambda: False)
+    """The RPC service runs without the retired diagnostic clock probes."""
 
     def fail_clock() -> None:
-        raise AssertionError("disabled diagnostics read a timing clock")
+        raise AssertionError("RPC service read a diagnostic timing clock")
 
     monkeypatch.setattr(
         service_module,
         "time",
         SimpleNamespace(perf_counter=fail_clock, thread_time_ns=fail_clock),
+        raising=False,
     )
 
     assert harness.client.execute(harness.requests.open()).code is ResultCode.ACCEPTED

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Cold-load records without per-request wrappers or polling allocations.
 
-Plans remain ordinary dictionaries; entries remain the existing six-item tuple.
+Plans are dictionaries; pending entries are five-item tuples.
 This module imports no adapter, Torch or vLLM implementation at runtime.
 """
 
@@ -10,9 +10,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeAlias, TypedDict
 from weakref import WeakMethod
-
-# First Party
-from lmcache.v1.serving_perf import serving_perf_enabled
 
 logger = logging.getLogger("lmcache.integration.vllm.vllm_v1_adapter")
 
@@ -25,7 +22,6 @@ if TYPE_CHECKING:
 
 
 class _ColdLoadOptionalFields(TypedDict, total=False):
-    indexer_perf: dict[str, float]
     indexer_source_owners: tuple[Any, ...]
     chunk_plan: Callable[[], tuple[tuple[int, int, Any], ...]]
 
@@ -33,8 +29,8 @@ class _ColdLoadOptionalFields(TypedDict, total=False):
 class ColdLoadPlan(_ColdLoadOptionalFields):
     """Existing request plan shared by paired background jobs.
 
-    The submitter supplies required fields. The indexer worker optionally fills
-    timing fields; live-split completion and cleanup retain/clear source owners.
+    The submitter supplies required fields. Live-split completion and cleanup
+    retain and release source owners.
     Buffers, cache lists and readiness gates are borrowed without copying.
     """
 
@@ -45,26 +41,22 @@ class ColdLoadPlan(_ColdLoadOptionalFields):
     indexer_slots_cpu: "torch.Tensor"
     latent_kvcaches: "list[torch.Tensor]"
     indexer_kvcaches: "list[torch.Tensor]"
-    planned_at: float
-    plan_started: float
     latent_shared_ready: Future[None]
 
 
-ColdIndexerResult: TypeAlias = tuple["torch.Tensor | None", Any, float, float]
+ColdIndexerResult: TypeAlias = tuple["torch.Tensor | None", Any]
 
 # Tuple fields, in their existing positional order:
 # 0 generation: request-attempt generation checked before publication.
 # 1 latent_future: completed state, including final readiness and retained owners.
 # 2 request: the original request metadata, retained through terminal cleanup.
 # 3 indexer_block_ids: destination blocks held until safe completion/failure.
-# 4 submitted_at: diagnostic submission timestamp (zero when disabled).
-# 5 indexer_future: sibling result, drained before cleanup or publication.
+# 4 indexer_future: sibling result, drained before cleanup or publication.
 ColdLoadEntry: TypeAlias = tuple[
     int,
     Future["WorkerRetrieveState"],
     "ReqMeta",
     set[int],
-    float,
     Future[ColdIndexerResult],
 ]
 
@@ -79,8 +71,8 @@ class ColdLoadCoordinator:
 
     def __init__(
         self,
-        publish: Callable[[str, ColdLoadEntry, Any, bool, bool], None],
-        fail: Callable[[str, ColdLoadEntry, Any, BaseException, bool], bool],
+        publish: Callable[[str, ColdLoadEntry, Any, bool], None],
+        fail: Callable[[str, ColdLoadEntry, Any, BaseException], bool],
         requires_restart: Callable[[], bool],
     ) -> None:
         """Borrow terminal bound methods weakly and initialize empty job state.
@@ -116,7 +108,6 @@ class ColdLoadCoordinator:
         futures = self.futures
         if not futures:
             return None
-        perf_enabled = serving_perf_enabled()
         finished: set[str] = set()
         for req_id, entry in list(futures.items()):
             (
@@ -124,7 +115,6 @@ class ColdLoadCoordinator:
                 future,
                 request,
                 indexer_block_ids,
-                submitted_at,
                 indexer_future,
             ) = entry
             if not future.done() or not indexer_future.done():
@@ -153,14 +143,14 @@ class ColdLoadCoordinator:
                 publish = self._publish()
                 if publish is None:
                     raise RuntimeError("Cold-load publication owner is unavailable")
-                publish(req_id, entry, state, was_aborted, perf_enabled)
+                publish(req_id, entry, state, was_aborted)
             except BaseException as exc:
                 fail = self._fail()
                 if fail is None:
                     raise RuntimeError(
                         "Cold-load cleanup owner is unavailable"
                     ) from exc
-                if not fail(req_id, entry, state, exc, perf_enabled):
+                if not fail(req_id, entry, state, exc):
                     continue
             futures.pop(req_id, None)
             if was_aborted:
@@ -228,7 +218,6 @@ class ColdLoadCoordinator:
         plan: ColdLoadPlan,
         generation: int,
         indexer_block_ids: set[int],
-        submitted_at: float,
         npu_device_id: Optional[int],
         executor: ThreadPoolExecutor,
         indexer_job: Callable[[ColdLoadPlan, Optional[int]], ColdIndexerResult],
@@ -237,7 +226,7 @@ class ColdLoadCoordinator:
         """Submit the existing job pair, opening the sibling gate on failure.
 
         Job callables and the executor are borrowed for submission only. The
-        exact original futures, request, block set and timestamp form the entry.
+        exact original futures, request and block set form the entry.
         """
         indexer_future = executor.submit(
             indexer_job,
@@ -280,6 +269,5 @@ class ColdLoadCoordinator:
             latent_future,
             request,
             indexer_block_ids,
-            submitted_at,
             indexer_future,
         )

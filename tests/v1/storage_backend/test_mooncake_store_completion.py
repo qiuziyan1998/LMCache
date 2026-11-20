@@ -2446,7 +2446,7 @@ def test_mooncake_layer_page_get_allocates_exact_full_and_tail_pages(
             self.submitted = None
             self.metadata = SimpleNamespace(chunk_size=8)
 
-        def batched_allocate_layer_pages(self, *args, **kwargs):
+        async def async_batched_allocate_layer_pages(self, *args, **kwargs):
             return self.allocator.batched_allocate_layer_pages(*args, **kwargs)
 
         def batched_submit_layer_pages(self, keys, pages):
@@ -2978,7 +2978,7 @@ def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
             )
             self.submitted = None
 
-        def batched_allocate_layer_pages(self, *args, **kwargs):
+        async def async_batched_allocate_layer_pages(self, *args, **kwargs):
             return self.allocator.batched_allocate_layer_pages(*args, **kwargs)
 
         def batched_submit_layer_pages(self, keys, pages):
