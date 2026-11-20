@@ -51,6 +51,15 @@ def ascend_modules():
 
 @pytest.fixture
 def setup():
+    yield from runtime_setup()
+
+
+@pytest.fixture
+def fixed_setup():
+    yield from runtime_setup(fixed=True)
+
+
+def runtime_setup(fixed=False):
     factory, module = ascend_modules()
     owner = CPUStorage()
     owner.config.decode_preemption_checkpoint = True
@@ -64,6 +73,12 @@ def setup():
     owner.config.store_async = True
     owner.config.store_async_max_queue_size = 2
     owner.config.extra_config = {"mooncake_dsa_raw_token_dims": {0: 576, 1: 128}}
+    if fixed:
+        from threading import Lock
+
+        owner.local._defer_fixed_slots = True
+        owner.allocator.host_mem_lock = Lock()
+        owner.allocator.align_bytes = 4096
     policy = IndexerC8Layout(c8_layers=(True, False, True))
     owner.layout = LayoutSpec(
         "model",
@@ -108,7 +123,7 @@ def setup():
         owner.config,
         metadata,
         EventManager(),
-        backend_factory=factory(owner.allocator, local_backend=owner.local),
+        backend_factory=factory(owner.allocator, local_backend=owner.local, defer_layout=fixed),
         copy_stream_factory=None,
     )
     runtime = module.AscendCPUCacheRuntime(
@@ -147,6 +162,12 @@ def setup():
         requests.append(request)
         return runtime.handle(request), request
 
+    if fixed:
+        owner.config.remote_url = "mooncakestore://test"
+        owner.config.extra_config.update(
+            enable_shared_cpu_cache=True, save_only_first_rank=True,
+            mooncake_page_first_multi_buffer=True, mooncake_layer_merged_page_objects=True,
+        )
     for rank in range(2):
         session = f"worker-{rank}"
         runtime.register_participant(
@@ -241,6 +262,33 @@ def fill_capture(runtime, reservation_id):
                         group * 20 + layer * 3 + plane + 1
                     )
                     begin = end
+
+
+def test_process_fixed_slots_bind_mixed_layout_and_reclaim_across_chunks(fixed_setup, monkeypatch):
+    owner, runtime, work = fixed_setup
+    pool = owner.local.get_page_slot_pool()
+    assert pool.specs[1].layer_token_bytes == (130, 256, 130)
+    allocate = runtime.allocate_checkpoint_fragment
+    reclaim = runtime.reclaim_checkpoint_capacity
+    attempts, reclaims = [], []
+
+    def pressured(group, tokens, **kwargs):
+        attempts.append((group, tokens))
+        if len(attempts) in (1, 4, 7):
+            raise MemoryError("injected slot pressure")
+        return allocate(group, tokens, **kwargs)
+
+    def recover(tokens, groups, **kwargs):
+        reclaims.append(kwargs["allocation_purpose"])
+        return reclaim(tokens, groups, **kwargs)
+
+    monkeypatch.setattr(runtime, "allocate_checkpoint_fragment", pressured)
+    monkeypatch.setattr(runtime, "reclaim_checkpoint_capacity", recover)
+    result, _ = capture(work, end=12)
+    assert result.status == "COMPLETED", result.error
+    assert result.value["captured_end"] == 8 and reclaims == ["checkpoint"] * 2
+    assert len(attempts) == 7 and all(tokens == 4 for _, tokens in attempts)
+    assert all(row["checkpoint_in_use"] == 2 for row in pool.snapshot().values())
 
 
 def test_registered_mixed_geometry_has_no_engine_or_npu_dependency(setup):

@@ -18,6 +18,7 @@ import torch
 # First Party
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
+from lmcache.v1.page_slot_pool import PageSlotPool, PageSlotSpec
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.pin_monitor import PinMonitor
@@ -1676,6 +1677,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         tensor: torch.Tensor,
         align_bytes: int = AddressManager.ALIGN_BYTES,
         init_address_space: int | None = None,
+        page_slot_specs: Optional[tuple[PageSlotSpec, ...]] = None,
     ):
         """
         Args:
@@ -1683,6 +1685,8 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             align_bytes: The alignment requirement for allocations.
             init_address_space: Initial size of the address space. If None,
                 use the size of the provided tensor.
+            page_slot_specs: Optional two-group fixed-slot layouts and quotas.
+                This mode rejects non-page KV allocations and lazy growth.
 
         Note:
             The `init_address_space` is used for lazy memory allocation.
@@ -1692,7 +1696,14 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         self.buffer = tensor.view(torch.uint8).flatten()
 
         # Use AddressManager for address space management
-        self.address_manager = AddressManager(
+        if page_slot_specs is not None and init_address_space is not None:
+            raise ValueError("Fixed slots do not support lazy address-space growth")
+        self.page_slot_pool = (
+            PageSlotPool(self.buffer.numel(), page_slot_specs)
+            if page_slot_specs is not None
+            else None
+        )
+        self.address_manager = self.page_slot_pool or AddressManager(
             self.buffer.numel() if init_address_space is None else init_address_space,
             align_bytes,
         )
@@ -1806,9 +1817,18 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat,
         valid_tokens: Optional[Union[int, list[int]]] = None,
         full_tokens: Optional[int] = None,
+        allocation_purpose: str = "cache",
     ) -> Optional[List[LayerPageMemoryObj]]:
-        """Allocate one exact-size all-layer object per token chunk."""
-        if num_layers < 1:
+        """Allocate one all-layer owner per chunk, preserving logical lengths.
+
+        With fixed slots, physical size is the full runtime chunk. Purpose is
+        ``cache``, ``checkpoint`` (capture), or ``workspace`` (restore/spill).
+        These labels only track usage; all purposes share the full group quota.
+        Return None on capacity refusal; incompatible layouts raise ValueError.
+        """
+        if batch_size == 0:
+            return []
+        if batch_size < 0 or num_layers < 1:
             raise ValueError("num_layers must be positive")
         shapes, dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
         if len(shapes) not in (1, num_layers) or len(dtypes) != len(shapes):
@@ -1847,23 +1867,29 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                 None
             ] * batch_size
             allocated_pages: list[LayerPageMemoryObj] = []
-            for count, positions in positions_by_count.items():
-                allocated = self.batched_allocate_layer_pages(
-                    full_shapes,
-                    dtypes,
-                    len(positions),
-                    num_layers,
-                    fmt,
-                    count,
-                    full_tokens,
-                )
-                if allocated is None:
-                    for page in allocated_pages:
-                        page.ref_count_down()
-                    return None
-                allocated_pages.extend(allocated)
-                for position, page in zip(positions, allocated, strict=True):
-                    pages_by_position[position] = page
+            try:
+                for count, positions in positions_by_count.items():
+                    allocated = self.batched_allocate_layer_pages(
+                        full_shapes,
+                        dtypes,
+                        len(positions),
+                        num_layers,
+                        fmt,
+                        count,
+                        full_tokens,
+                        allocation_purpose,
+                    )
+                    if allocated is None:
+                        for page in allocated_pages:
+                            page.ref_count_down()
+                        return None
+                    allocated_pages.extend(allocated)
+                    for position, page in zip(positions, allocated, strict=True):
+                        pages_by_position[position] = page
+            except BaseException:
+                for page in allocated_pages:
+                    page.ref_count_down()
+                raise
             return [
                 page
                 for page in pages_by_position
@@ -1887,6 +1913,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             materialize_views=False,
             page_layers=num_layers,
             page_valid_tokens=count,
+            allocation_purpose=allocation_purpose,
         )  # type: ignore[return-value]
 
     def _batched_allocate(
@@ -1899,19 +1926,56 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         materialize_views: bool,
         page_layers: int = 0,
         page_valid_tokens: Optional[int] = None,
+        allocation_purpose: str = "cache",
     ) -> Optional[List[TensorMemoryObj]]:
         shapes, dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
 
         # Calculate the size of the tensor
         unit_raw_size = get_size_bytes(shapes, dtypes)
-        unit_aligned_size = self.address_manager.compute_aligned_size(unit_raw_size)
-
-        try:
-            alloc_results = self.address_manager.batched_allocate(
-                unit_aligned_size, batch_size
-            )
-        except RuntimeError:
-            return None
+        if self.page_slot_pool is not None:
+            group = {
+                MemoryFormat.KV_MLA_LATENT_FMT: 0,
+                MemoryFormat.KV_DSA_INDEX_FMT: 1,
+            }.get(fmt)
+            if not page_layers or group is None or page_valid_tokens is None:
+                raise ValueError("Fixed-slot mode only accepts MLA/DSA all-layer pages")
+            spec = self.page_slot_pool.specs[group]
+            if (
+                page_layers != len(spec.layer_token_bytes)
+                or page_valid_tokens > spec.chunk_tokens
+                or tuple(
+                    shape.numel() * dtype.itemsize
+                    for shape, dtype in zip(shapes, dtypes, strict=True)
+                )
+                != tuple(width * page_valid_tokens for width in spec.layer_token_bytes)
+            ):
+                raise ValueError(
+                    "Layer page disagrees with the fixed-slot runtime layout"
+                )
+            unit_aligned_size = spec.slot_bytes
+            try:
+                alloc_results = self.page_slot_pool.allocate_pages(
+                    group, unit_raw_size, batch_size, allocation_purpose
+                )
+            except MemoryError:
+                logger.warning(
+                    "[CPU_FIXED_SLOTS] allocation refused group=%d purpose=%s "
+                    "count=%d valid_tokens=%d pools=%s",
+                    group,
+                    allocation_purpose,
+                    batch_size,
+                    page_valid_tokens,
+                    self.page_slot_pool.snapshot(),
+                )
+                return None
+        else:
+            unit_aligned_size = self.address_manager.compute_aligned_size(unit_raw_size)
+            try:
+                alloc_results = self.address_manager.batched_allocate(
+                    unit_aligned_size, batch_size
+                )
+            except RuntimeError:
+                return None
         addresses = [addr for addr, _ in alloc_results]
         raw_datas: list[Optional[torch.Tensor]]
         if materialize_views:
@@ -1942,50 +2006,62 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         )
         self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
 
-        group_prefix_sum = _group_prefix_sums(shapes, dtypes, unit_raw_size)
         tensor_mem_objs = []
-        for raw_data, address in zip(raw_datas, addresses, strict=True):
-            cls = LayerPageMemoryObj if page_layers else TensorMemoryObj
-            tensor_mem_objs.append(
-                cls(
-                    raw_data=raw_data,
-                    metadata=MemoryObjMetadata(
-                        shapes[0],
-                        dtypes[0],
-                        address,
-                        unit_aligned_size,
-                        1,
-                        0,
-                        fmt,
-                        shapes=shapes,
-                        dtypes=dtypes,
-                    ),
-                    parent_allocator=self,
-                    group_prefix_sum=group_prefix_sum,
-                    raw_view_size=unit_aligned_size,
-                    **({"num_layers": page_layers} if page_layers else {}),
-                    **(
-                        {"valid_tokens": page_valid_tokens}
-                        if page_layers
-                        else {}
-                    ),
+        try:
+            group_prefix_sum = _group_prefix_sums(shapes, dtypes, unit_raw_size)
+            for raw_data, address in zip(raw_datas, addresses, strict=True):
+                cls = LayerPageMemoryObj if page_layers else TensorMemoryObj
+                tensor_mem_objs.append(
+                    cls(
+                        raw_data=raw_data,
+                        metadata=MemoryObjMetadata(
+                            shapes[0],
+                            dtypes[0],
+                            address,
+                            unit_aligned_size,
+                            1,
+                            0,
+                            fmt,
+                            shapes=shapes,
+                            dtypes=dtypes,
+                        ),
+                        parent_allocator=self,
+                        group_prefix_sum=group_prefix_sum,
+                        raw_view_size=(
+                            unit_raw_size
+                            if self.page_slot_pool is not None
+                            else unit_aligned_size
+                        ),
+                        **({"num_layers": page_layers} if page_layers else {}),
+                        **({"valid_tokens": page_valid_tokens} if page_layers else {}),
+                    )
                 )
+
+            batch = _TensorAllocationBatch(
+                self,
+                int(self.buffer.numel()),
+                dtypes[0],
+                fmt,
+                tuple(addresses),
+                unit_aligned_size,
+                tuple(map(id, tensor_mem_objs)),
             )
+            for index, memory_obj in enumerate(tensor_mem_objs):
+                memory_obj._allocation_batch = batch
+                memory_obj._allocation_batch_index = index
 
-        batch = _TensorAllocationBatch(
-            self,
-            int(self.buffer.numel()),
-            dtypes[0],
-            fmt,
-            tuple(addresses),
-            unit_aligned_size,
-            tuple(map(id, tensor_mem_objs)),
-        )
-        for index, memory_obj in enumerate(tensor_mem_objs):
-            memory_obj._allocation_batch = batch
-            memory_obj._allocation_batch_index = index
-
-        return tensor_mem_objs
+            return tensor_mem_objs
+        except BaseException:
+            for memory_obj in tensor_mem_objs:
+                memory_obj.invalidate()
+            for address, size in alloc_results:
+                self.address_manager.free(address, size)
+            self.num_active_allocations -= batch_size
+            self.stats_monitor.update_local_cache_usage(self.total_allocated_size)
+            self.stats_monitor.update_active_memory_objs_count(
+                self.num_active_allocations
+            )
+            raise
 
     @_lmcache_nvtx_annotate
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):
@@ -2017,6 +2093,12 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         assume that the memory objs are equal-sized.
         """
         if not memory_objs:
+            return
+
+        if self.page_slot_pool is not None:
+            # Each address has one owner; never merge slots across group regions.
+            for memory_obj in memory_objs:
+                self.free(memory_obj)
             return
 
         # Coalesce adjacent memory objects before freeing to reduce
@@ -2676,7 +2758,9 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             )
         else:
             self.pin_allocator = TensorMemoryAllocator(
-                self.buffer, align_bytes=self.align_bytes
+                self.buffer,
+                align_bytes=self.align_bytes,
+                page_slot_specs=kwargs.get("page_slot_specs"),
             )
 
         self.host_mem_lock = threading.Lock() if not use_paging else nullcontext()
@@ -2771,6 +2855,7 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat,
         valid_tokens: Optional[Union[int, list[int]]] = None,
         full_tokens: Optional[int] = None,
+        allocation_purpose: str = "cache",
     ) -> Optional[List[LayerPageMemoryObj]]:
         """Allocate layer pages from the pinned allocator."""
         allocate = getattr(self.pin_allocator, "batched_allocate_layer_pages", None)
@@ -2785,7 +2870,13 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
                 fmt,
                 valid_tokens,
                 full_tokens,
+                allocation_purpose,
             )
+
+    @property
+    def page_slot_pool(self) -> Optional[PageSlotPool]:
+        """Return the fixed-slot manager, or None for the legacy allocator."""
+        return getattr(self.pin_allocator, "page_slot_pool", None)
 
     @_lmcache_nvtx_annotate
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):
