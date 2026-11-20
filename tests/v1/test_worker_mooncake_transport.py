@@ -419,7 +419,10 @@ def test_stale_registration_refused_and_metadata_payload_not_marshaled(tmp_path)
         assert bytes(slab.buf[64:74]) == b"headerdata"
 
 
-def test_metadata_connector_uses_shared_destinations(tmp_path, monkeypatch):
+@pytest.mark.parametrize("file_replay", [False, True])
+def test_metadata_connector_uses_shared_destinations(tmp_path, monkeypatch, file_replay):
+    from unittest.mock import Mock
+
     import torch
     from lmcache.v1.memory_management import TensorMemoryAllocator
     from tests.v1.storage_backend.test_mooncake_store_completion import (
@@ -427,25 +430,29 @@ def test_metadata_connector_uses_shared_destinations(tmp_path, monkeypatch):
         _key,
     )
 
-    with transport(tmp_path) as (remote, worker, slab):
+    with transport(tmp_path, child=True) as (remote, _, slab):
+        submit = Mock(wraps=remote._request)
+        monkeypatch.setattr(remote, "_request", submit)
         allocator = TensorMemoryAllocator(
             torch.frombuffer(slab.buf, dtype=torch.uint8), align_bytes=64
         )
         connector, loop = _make_mooncake_connector(
-            monkeypatch, {}, [], native_io=remote
+            monkeypatch, {"save_chunk_meta": True}, [], native_io=remote,
+            config_overrides=dict(
+                decoder_storage_mode="process", pd_role="receiver", enable_shared_cpu_cache=True,
+                use_layerwise=True, dsa_two_groups=True, file_replay_enabled=file_replay,
+            ),
         )
         connector.local_cpu_backend = SimpleNamespace(allocate=allocator.allocate)
         source = allocator.allocate(
             connector.meta_shapes, connector.meta_dtypes, connector.meta_fmt
         )
         source.tensor.fill_(3)
+        restored = None
         try:
-            loop.run_until_complete(
-                connector._put_with_metadata(_key(1).to_string(), source)
-            )
-            restored = loop.run_until_complete(
-                connector._batch_get_buffer([_key(1), _key(2)])
-            )
+            loop.run_until_complete(connector.put(_key(1), source))
+            restored = loop.run_until_complete(connector.batched_get([_key(1), _key(2)]))
+            assert [call.args[0] for call in submit.call_args_list] == ["native_put", "native_get"]
             assert restored[1] is None
             torch.testing.assert_close(restored[0].tensor, source.tensor)
             restored[0].ref_count_down()

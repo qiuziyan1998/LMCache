@@ -213,6 +213,7 @@ class _PairPageManager:
 
 def _engine(storage_manager):
     engine = object.__new__(LMCacheEngine)
+    engine.storage_process = None
     engine._init_failed = False
     engine._health_monitor = None
     engine.storage_manager = storage_manager

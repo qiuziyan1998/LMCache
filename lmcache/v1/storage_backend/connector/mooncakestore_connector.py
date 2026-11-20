@@ -927,6 +927,11 @@ class MooncakestoreConnector(RemoteConnector):
             raise RuntimeError(
                 "Mooncake close refused because teardown ownership is unknown"
             ) from error
+        error = getattr(self, "_external_native_unknown_error", None)
+        if error is not None:
+            raise RuntimeError(
+                "Mooncake close refused because external DMA completion is unknown"
+            ) from error
 
     def _raise_if_external_close_unknown(self) -> None:
         with self._get_external_close_state_lock():
@@ -1844,10 +1849,10 @@ class MooncakestoreConnector(RemoteConnector):
         for memory_obj in memory_objs:
             memory_obj.ref_count_up()
 
+        remote = getattr(self, "_remote_store", None)
         task = asyncio.create_task(
             asyncio.to_thread(self._call_store, func, *args, owners=tuple(memory_objs))
-            if getattr(self, "_remote_store", None) is not None
-            and getattr(func, "__self__", None) is self.store
+            if remote is not None and getattr(func, "__self__", None) is remote
             else asyncio.to_thread(func, *args)
         )
         self._inflight_put_tasks.add(task)
@@ -2738,17 +2743,14 @@ class MooncakestoreConnector(RemoteConnector):
 
     async def close(self):
         self._raise_if_external_close_unknown()
-        if getattr(self, "_external_native_unknown_error", None) is not None:
-            raise RuntimeError(
-                "Mooncake close refused because external DMA completion is unknown"
-            )
         direct_push_transport = getattr(self, "_direct_push_transport", None)
         if direct_push_transport is not None:
             await direct_push_transport.close()
             self._raise_if_external_close_unknown()
         if self._inflight_put_tasks:
-            await asyncio.gather(
-                *tuple(self._inflight_put_tasks), return_exceptions=True
+            # Native completion tasks must survive cancellation of this close.
+            await asyncio.shield(
+                asyncio.gather(*self._inflight_put_tasks, return_exceptions=True)
             )
             self._raise_if_external_close_unknown()
 

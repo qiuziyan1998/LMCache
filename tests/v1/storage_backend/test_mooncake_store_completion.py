@@ -73,6 +73,7 @@ def _make_mooncake_connector(
     calls: list,
     *,
     remote_fill_enabled: bool = False,
+    config_overrides: dict | None = None,
     external_page_only: bool = False,
     store_cls: type | None = None,
     cpu_buffer: torch.Tensor | None = None,
@@ -127,8 +128,11 @@ def _make_mooncake_connector(
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=8,
         enable_remote_lmcache_store=remote_fill_enabled,
-        use_layerwise=external_page_only,
-        dsa_two_groups=external_page_only,
+        **{
+            "use_layerwise": external_page_only,
+            "dsa_two_groups": external_page_only,
+            **(config_overrides or {}),
+        },
         remote_url=(
             "mooncakestore://127.0.0.1:50051"
             if external_page_only
@@ -2864,6 +2868,68 @@ def test_mooncake_timeout_keeps_source_buffer_until_native_put_exits() -> None:
 
     asyncio.run(run())
     assert memory_obj.ref_count == 1
+
+
+@pytest.mark.parametrize("cancel_close", [True, False], ids=["cancel-close", "unknown-during-close"])
+def test_close_during_native_put_preserves_ownership(monkeypatch, cancel_close):
+    calls = []
+    slab = torch.zeros(64, dtype=torch.uint8)
+    connector, loop = _make_mooncake_connector(
+        monkeypatch, {"save_chunk_meta": False}, calls, cpu_buffer=slab
+    )
+    allocator = TensorMemoryAllocator(slab, align_bytes=64)
+    source = allocator.allocate(connector.meta_shapes, connector.meta_dtypes, connector.meta_fmt)
+    entered, release = threading.Event(), threading.Event()
+    uncertainty = NativeExternalPageTransferUnknownError("put", loop.create_future())
+
+    def native_put(*args):
+        entered.set()
+        assert release.wait(5)
+        if not cancel_close:
+            raise uncertainty
+        return 0
+
+    monkeypatch.setattr(connector.store, "put_from", native_put, raising=False)
+
+    async def exercise():
+        put = asyncio.create_task(connector.put(_key(1), source))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            source.ref_count_down()  # Only the in-flight PUT owns the allocation.
+            closing = asyncio.create_task(connector.close())
+            await asyncio.sleep(0)  # Close is now waiting on the original PUT.
+            assert not closing.done()
+            if cancel_close:
+                closing.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await closing
+                assert allocator.get_capacity_bytes() == (0, 64)
+                assert connector._inflight_put_tasks
+                release.set()
+                await put
+                assert allocator.get_capacity_bytes() == (64, 64)
+                await connector.close()
+                assert [entry[0] for entry in calls].count("unregister") == 1
+            else:
+                release.set()
+                with pytest.raises(NativeExternalPageTransferUnknownError):
+                    await put
+                with pytest.raises(RuntimeError, match="unknown"):
+                    await closing
+                assert allocator.get_capacity_bytes() == (0, 64)
+                assert connector._external_native_unknown_error is uncertainty
+                assert not uncertainty.terminal_future.done()
+                with pytest.raises(RuntimeError, match="unknown"):
+                    await connector.close()
+                assert not any(entry[0] in ("unregister", "close") for entry in calls)
+        finally:
+            release.set()
+            await asyncio.gather(put, return_exceptions=True)
+
+    try:
+        loop.run_until_complete(exercise())
+    finally:
+        loop.close()
 
 
 def _group_manager(*num_layers: int) -> KVLayerGroupsManager:
