@@ -10,7 +10,8 @@ To use a configuration file, you can set the ``LMCACHE_CONFIG_FILE`` environment
 
 .. note::
 
-    The environment variable configurations will be ignored if the configuration file is present.
+    The vLLM integration loads the configuration file first, then applies matching
+    ``LMCACHE_`` environment variables.
 
 
 General Configurations
@@ -242,6 +243,13 @@ Settings for disaggregated prefill functionality. The latest/default PD is imple
    * - pd_role
      - LMCACHE_PD_ROLE
      - PD role. Values: "sender" (prefiller) or "receiver" (decoder).
+   * - decoder_require_kv_prefix
+     - LMCACHE_DECODER_REQUIRE_KV_PREFIX
+     - Off by default so a vLLM receiver can compute missing tokens locally
+       when capacity permits. Set to ``true`` at startup to require verified
+       local or external KV through the penultimate input token. A one-token
+       prompt requires a hit. On resume, an acknowledged checkpoint end sets
+       the required prefix.
    * - pd_buffer_size
      - LMCACHE_PD_BUFFER_SIZE
      - Upper bound of PD transport buffer size (in bytes), aligned to chunk size. Required for both senders and receivers when enable_pd=true

@@ -78,8 +78,9 @@ def scheduler_adapter_class(ascend):
 
 @pytest.mark.parametrize("ascend", [False, True])
 @pytest.mark.parametrize("dispatched", [False, True])
+@pytest.mark.parametrize("required_prefix", [0, 3])
 def test_rejection_or_abort_releases_lookup_ticket_at_its_ownership_boundary(
-    ascend: bool, dispatched: bool,
+    ascend: bool, dispatched: bool, required_prefix: int,
 ) -> None:
     runtime = LookupRuntime()
     work, lifecycle = endpoint(), endpoint()
@@ -145,7 +146,7 @@ def test_rejection_or_abort_releases_lookup_ticket_at_its_ownership_boundary(
             request = NS(
                 request_id=req_id, kv_transfer_params={"ret_first_tok": True},
                 output_token_ids=[], dsa_compact_allocated=dispatched,
-                min_kv_prefix_tokens=3,
+                min_kv_prefix_tokens=required_prefix,
             )
             assert adapter.request_finished(request, []) == (ascend or dispatched, None)
             assert req_id not in adapter._requests_priority
