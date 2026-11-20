@@ -73,8 +73,12 @@ def setup(*, pressure=False, failure=None, timeout=0.3):
         "batched_allocate_layer_pages", "async_batched_allocate_layer_pages",
     }, namespace)
     methods("lmcache/v1/storage_backend/connector/mooncakestore_connector.py", {
-        "batched_get_layer_pages", "_run_blocking_put", "_await_native_task",
+        "batched_get_layer_pages", "_run_blocking_put", "_await_native_task", "_require_layout_bound", "_call_store",
     }, namespace)
+    from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
+
+    namespace["NativeExternalPageTransferUnknownError"] = NativeExternalPageTransferUnknownError
+    namespace["MooncakestoreConnector"] = NS(_require_layout_bound=namespace["_require_layout_bound"])
     retained, page = Page(), Page()
     state = NS(attempts=0, evictions=0, calls=0, published=[],
                native_started=threading.Event(), native_release=threading.Event(),
@@ -124,7 +128,7 @@ def setup(*, pressure=False, failure=None, timeout=0.3):
         config=NS(transfer_timeout=2), local_cpu_backend=backend,
         store=NS(batch_get_into_multi_buffers=get),
     )
-    for name in ("batched_get_layer_pages", "_run_blocking_put"):
+    for name in ("batched_get_layer_pages", "_run_blocking_put", "_call_store"):
         setattr(connector, name, MethodType(namespace[name], connector))
     return connector, state
 

@@ -17,6 +17,7 @@ from lmcache.utils import (
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.exceptions import IrrecoverableException
+from lmcache.v1.lookup_diagnostics import record_lookup_failure
 from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.remote_fill.native import NativeExternalPageTransferUnknownError
@@ -60,6 +61,8 @@ class RemoteBackend(StorageBackendInterface):
         local_cpu_backend: Optional[LocalCPUBackend],
         dst_device: str = "cuda",
         external_page_only: bool = False,
+        defer_layout: bool = False,
+        native_io: Any = None,
     ):
         super().__init__(dst_device=dst_device)
         if external_page_only and local_cpu_backend is not None:
@@ -67,6 +70,10 @@ class RemoteBackend(StorageBackendInterface):
                 "External-page-only RemoteBackend cannot own LocalCPU storage"
             )
         self.external_page_only = external_page_only
+        self.defer_layout = defer_layout
+        self.native_io = native_io
+        if defer_layout and not str(config.remote_url).startswith("mooncakestore://"):
+            raise ValueError("Deferred layout requires the Mooncake storage backend")
         self.put_tasks: Set[CacheEngineKey] = set()
         # Single-key callers must observe the completion of the writer that
         # actually owns a pending key.  ``put_tasks`` remains a set because it
@@ -104,7 +111,7 @@ class RemoteBackend(StorageBackendInterface):
         self.failure_time = -1000000.0
         self.init_connection()
 
-        if not external_page_only:
+        if not external_page_only and not defer_layout:
             assert config.remote_serde is not None
             self.serializer, self.deserializer = CreateSerde(
                 config.remote_serde, metadata, config
@@ -196,6 +203,10 @@ class RemoteBackend(StorageBackendInterface):
                 if getattr(self, "external_page_only", False)
                 else {}
             )
+            if getattr(self, "defer_layout", False):
+                connector_kwargs["defer_layout"] = True
+            if getattr(self, "native_io", None) is not None:
+                connector_kwargs["native_io"] = self.native_io
             self.connection = CreateConnector(
                 self.config.remote_url,
                 self.loop,
@@ -217,6 +228,19 @@ class RemoteBackend(StorageBackendInterface):
                 self.failure_time = time.time()
             logger.warning(f"Failed to initialize/re-establish remote connection: {e}")
             self.connection = None
+
+    def bind_layout(self, metadata: LMCacheMetadata) -> None:
+        """Finalize CPU-only layout metadata without opening another native session."""
+        connection = self._external_page_connector()
+        if connection is None:
+            raise RuntimeError("Cannot bind an unavailable remote transport")
+        connection.bind_layout(metadata)
+        self.metadata = metadata
+        if self.defer_layout and not self.external_page_only:
+            self.serializer, self.deserializer = CreateSerde(
+                self.config.remote_serde, metadata, self.config
+            )
+        self.defer_layout = False
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         if self.connection is None:
@@ -269,15 +293,20 @@ class RemoteBackend(StorageBackendInterface):
     ) -> int:
         """Check Mooncake page keys without accepting legacy layer objects."""
         if self.connection is None:
+            record_lookup_failure("remote_connection_unavailable")
             return 0
         contains = getattr(self.connection, "batched_contains_layer_pages", None)
         if not callable(contains):
+            record_lookup_failure("remote_page_lookup_unsupported")
             return 0
         if self._mla_worker_id_as0_mode:
             keys = [key.with_new_worker_id(0) for key in keys]
         try:
             return contains(keys)
         except Exception as error:
+            record_lookup_failure(
+                "remote_page_lookup_exception", backend_error=str(error)[:256]
+            )
             logger.warning(f"Remote layer-page lookup failed: {error}")
             return 0
 
@@ -1145,6 +1174,8 @@ class RemoteExternalPageReader:
         self,
         config: LMCacheEngineConfig,
         metadata: LMCacheMetadata,
+        *,
+        defer_layout: bool = False,
     ) -> None:
         """Create one allocator-free reader and its storage event loop."""
         if not str(config.remote_url).startswith("mooncakestore://"):
@@ -1183,6 +1214,7 @@ class RemoteExternalPageReader:
                 loop=self._loop,
                 local_cpu_backend=None,
                 external_page_only=True,
+                **({"defer_layout": True} if defer_layout else {}),
             )
         except BaseException:
             try:
@@ -1192,6 +1224,11 @@ class RemoteExternalPageReader:
                     "Failed to stop reader after initialization failure"
                 )
             raise
+
+    def bind_layout(self, metadata: LMCacheMetadata) -> None:
+        """Bind registered geometry after profiling without new native resources."""
+        with self._lock:
+            self._require_open().bind_layout(metadata)
 
     def batched_get_external_pages(
         self,

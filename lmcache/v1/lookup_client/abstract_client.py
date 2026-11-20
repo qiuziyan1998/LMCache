@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Optional, Union
+from typing import Any, Optional, Union
 import abc
 
 # Third Party
@@ -75,6 +75,18 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
             lookup_id: The lookup ID whose status needs to be cleared.
         """
         return
+
+    def peek_ticket(self, lookup_id: str) -> Optional[Any]:
+        """Return a cached source ticket without consuming it or changing holds.
+
+        Args:
+            lookup_id: Request lookup identity.
+
+        Returns:
+            The service client's immutable source ticket, or None for clients
+            without ticket support or without a result for this lookup.
+        """
+        return None
 
     def cleanup_lookup(self, lookup_id: str) -> None:
         """Release worker-side lookup state, if any, and local status."""

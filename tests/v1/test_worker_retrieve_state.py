@@ -53,6 +53,12 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     return impl
 
 
+def _seal_test_latent_source(state, token_count):
+    state.prepared_sparse_sources[0] = SimpleNamespace(
+        total_tokens=token_count, graph_owners=None
+    )
+
+
 @pytest.mark.parametrize("tokens", [0, 1, 4, 5, 8, 10, 12])
 def test_cold_indexer_blocks_match_full_cpu_mapping(
     tokens: int, monkeypatch: pytest.MonkeyPatch
@@ -2128,11 +2134,12 @@ class TestWorkerRetrieveState:
         owner = Owner()
         synchronize = MagicMock()
         impl = _make_impl()
+        impl._refresh_prepared_sparse_sources = _seal_test_latent_source
         impl.num_layers = 1
         impl._num_layers_for_group = lambda _group: 1
         impl.lmcache_engine = SimpleNamespace(
             gpu_connector=SimpleNamespace(
-                synchronize_dense_load_readiness=synchronize,
+                synchronize_dense_load_stream=synchronize,
             )
         )
         impl._record_dsa_cold_dense_load_readiness = MagicMock(
@@ -2143,6 +2150,7 @@ class TestWorkerRetrieveState:
         request = SimpleNamespace(
             req_id="req-1",
             load_spec=SimpleNamespace(
+                dsa_cold_load_generation=1,
                 lmcache_cached_tokens=1, dsa_group1_direct_hbm=False
             ),
         )
@@ -2157,7 +2165,7 @@ class TestWorkerRetrieveState:
             "indexer_source_owners": (owner,),
         }
         dependency = Future()
-        dependency.set_result((None, object(), 0.0, 0.0))
+        dependency.set_result((None, object()))
         state = WorkerRetrieveState(req_id="req-1")
 
         with pytest.raises(RuntimeError, match="record failed"):
@@ -2168,7 +2176,7 @@ class TestWorkerRetrieveState:
                 live_state=state,
             )
 
-        synchronize.assert_called_once_with(dependency.result()[1])
+        synchronize.assert_called_once_with()
         assert owner.unpinned == 1
         assert owner.released == 1
         assert plan["indexer_source_owners"] == ()
@@ -2176,6 +2184,7 @@ class TestWorkerRetrieveState:
 
     def test_direct_cold_record_failure_fences_deferred_pointer_copy(self):
         impl = _make_impl()
+        impl._refresh_prepared_sparse_sources = _seal_test_latent_source
         impl.num_layers = 1
         impl._num_layers_for_group = lambda _group: 1
         impl._record_dsa_cold_dense_load_readiness = MagicMock(
@@ -2188,6 +2197,7 @@ class TestWorkerRetrieveState:
         request = SimpleNamespace(
             req_id="req-1",
             load_spec=SimpleNamespace(
+                dsa_cold_load_generation=1,
                 lmcache_cached_tokens=1,
                 dsa_group1_direct_hbm=True,
             ),
@@ -2202,7 +2212,7 @@ class TestWorkerRetrieveState:
             "latent_shared_ready": Future(),
         }
         dependency = Future()
-        dependency.set_result((None, None, 0.0, 0.0))
+        dependency.set_result((None, None))
 
         with pytest.raises(RuntimeError, match="record failed"):
             impl._run_dsa_cold_compact_load(
@@ -2217,11 +2227,12 @@ class TestWorkerRetrieveState:
     def test_cold_compact_sync_failure_preserves_every_owner_on_error_state(self):
         owner = object()
         impl = _make_impl()
+        impl._refresh_prepared_sparse_sources = _seal_test_latent_source
         impl.num_layers = 1
         impl._num_layers_for_group = lambda _group: 1
         impl.lmcache_engine = SimpleNamespace(
             gpu_connector=SimpleNamespace(
-                synchronize_dense_load_readiness=MagicMock(
+                synchronize_dense_load_stream=MagicMock(
                     side_effect=RuntimeError("sync failed")
                 ),
             )
@@ -2232,6 +2243,7 @@ class TestWorkerRetrieveState:
         request = SimpleNamespace(
             req_id="req-1",
             load_spec=SimpleNamespace(
+                dsa_cold_load_generation=1,
                 lmcache_cached_tokens=1, dsa_group1_direct_hbm=False
             ),
         )
@@ -2246,7 +2258,7 @@ class TestWorkerRetrieveState:
             "indexer_source_owners": (owner,),
         }
         dependency = Future()
-        dependency.set_result((None, object(), 0.0, 0.0))
+        dependency.set_result((None, object()))
         state = WorkerRetrieveState(req_id="req-1")
 
         with pytest.raises(RuntimeError, match="record failed") as raised:
@@ -6880,7 +6892,7 @@ class TestWorkerRetrieveState:
 
         impl.accept_live_split_results({"req-live": "success"})
 
-        assert dependency.result() == (None, readiness, 0.0, 0.0)
+        assert dependency.result() == (None, readiness)
         assert latent_gate.done()
         impl.lmcache_engine.admit_live_split_pages.assert_not_called()
         impl.lmcache_engine._release_live_split_import.assert_not_called()
@@ -7193,18 +7205,14 @@ class TestWorkerRetrieveState:
         )
         assert gate.done()
 
-    def test_live_split_indexer_success_still_loads_persistent_group0(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_live_split_indexer_success_still_loads_persistent_group0(self):
         impl = _make_impl()
         impl.num_layers = 1
         impl.device = "cpu"
         impl._num_layers_for_group = lambda _group: 1
         impl._record_dsa_cold_dense_load_readiness = MagicMock()
         impl._release_unadopted_shared_request_objects = MagicMock()
-        impl._refresh_prepared_sparse_sources = lambda state, _tokens: (
-            state.prepared_sparse_sources.setdefault(0, object())
-        )
+        impl._refresh_prepared_sparse_sources = _seal_test_latent_source
 
         def latent_retriever():
             while True:
@@ -7220,6 +7228,7 @@ class TestWorkerRetrieveState:
         request = SimpleNamespace(
             req_id="req-live",
             load_spec=SimpleNamespace(
+                dsa_cold_load_generation=1,
                 lmcache_cached_tokens=2, dsa_group1_direct_hbm=False
             ),
         )
@@ -7234,28 +7243,17 @@ class TestWorkerRetrieveState:
             "latent_shared_ready": Future(),
         }
         dependency = Future()
-        dependency.set_result((None, None, 0.0, 0.0))
+        dependency.set_result((None, None))
         previous = Future()
         previous.set_result(None)
-        events = []
-        monkeypatch.setattr(adapter_mod, "serving_perf_enabled", lambda: True)
-        monkeypatch.setattr(
-            adapter_mod,
-            "serving_perf_log",
-            lambda _logger, event, **fields: events.append((event, fields)),
-        )
 
-        impl._run_dsa_cold_compact_load(
+        state = impl._run_dsa_cold_compact_load(
             plan, None, dependency, previous_latent_future=previous
         )
 
         retrieve.assert_called_once()
-        event, fields = events[-1]
-        assert event == "cold_compact_retrieve_complete"
-        assert fields["predecessor_wait_ms"] >= 0
-        assert fields["latent_materialize_ms"] >= 0
-        assert fields["latent_materialize_thread_cpu_ms"] >= 0
-        assert fields["indexer_wait_ms"] == fields["event_wait_ms"]
+        assert state.prepared_sparse_sources[0].total_tokens == 2
+        assert impl._sparse_retrieve_kwargs.call_args.kwargs["kv_group"] == 0
 
     def test_live_split_failure_runs_one_persistent_group0_get(self):
         impl = _make_impl()
@@ -7263,9 +7261,7 @@ class TestWorkerRetrieveState:
         impl.device = "cpu"
         impl._num_layers_for_group = lambda _group: 1
         impl._record_dsa_cold_dense_load_readiness = MagicMock()
-        impl._refresh_prepared_sparse_sources = lambda state, _tokens: (
-            state.prepared_sparse_sources.setdefault(0, object())
-        )
+        impl._refresh_prepared_sparse_sources = _seal_test_latent_source
 
         def latent_retriever():
             while True:
@@ -7281,6 +7277,7 @@ class TestWorkerRetrieveState:
         request = SimpleNamespace(
             req_id="req-live",
             load_spec=SimpleNamespace(
+                dsa_cold_load_generation=1,
                 lmcache_cached_tokens=2, dsa_group1_direct_hbm=False
             ),
         )
@@ -7295,7 +7292,7 @@ class TestWorkerRetrieveState:
             "latent_shared_ready": Future(),
         }
         dependency = Future()
-        dependency.set_result((None, None, 0.0, 0.0))
+        dependency.set_result((None, None))
 
         impl._run_dsa_cold_compact_load(plan, None, dependency)
 

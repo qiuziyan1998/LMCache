@@ -5,6 +5,7 @@ from concurrent.futures import Future
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Coroutine,
     Dict,
     Generator,
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+_DEFAULT_CONSTRUCTION = object()
 
 
 # Helper function to get the class name of the backend
@@ -230,9 +232,36 @@ class StorageManager:
         event_manager: EventManager,
         lmcache_worker: Optional["LMCacheWorker"] = None,
         async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None,
-    ):
+        *,
+        backend_factory: Callable[..., Any] | object = _DEFAULT_CONSTRUCTION,
+        copy_stream_factory: Callable[[], Any] | None | object = _DEFAULT_CONSTRUCTION,
+    ) -> None:
+        """Create storage using optional internal backend and stream policies.
+
+        Omitted policies preserve worker behavior. An explicit ``None`` stream
+        factory disables device-copy stream creation for a CPU storage owner.
+        Backend factories receive the existing/skip sets on every invocation;
+        an optional ``validate_recreate(name)`` rejects teardown before close.
+        """
         self.config = config
         self.metadata = metadata
+        self.backend_factory = cast(
+            Callable[..., Any],
+            (
+                CreateStorageBackends
+                if backend_factory is _DEFAULT_CONSTRUCTION
+                else backend_factory
+            ),
+        )
+        if not callable(self.backend_factory):
+            raise TypeError("backend_factory must be callable")
+        if (
+            copy_stream_factory is not _DEFAULT_CONSTRUCTION
+            and copy_stream_factory is not None
+            and not callable(copy_stream_factory)
+        ):
+            raise TypeError("copy_stream_factory must be callable or None")
+        self.copy_stream_factory = copy_stream_factory
         self.loop = asyncio.new_event_loop()
 
         self.thread = threading.Thread(
@@ -272,10 +301,16 @@ class StorageManager:
         self.async_serializer: Optional[AsyncSerializer] = None
 
         # The cuda stream for internal copies during put
-        if is_cuda_worker(metadata):
-            self.internal_copy_stream = torch.cuda.Stream()
+        if self.copy_stream_factory is _DEFAULT_CONSTRUCTION:
+            self.internal_copy_stream = (
+                torch.cuda.Stream() if is_cuda_worker(metadata) else None
+            )
         else:
-            self.internal_copy_stream = None
+            self.internal_copy_stream = (
+                cast(Callable[[], Any], self.copy_stream_factory)()
+                if self.copy_stream_factory is not None
+                else None
+            )
 
         # freeze mode: only use local_cpu backend for retrieval
         self._freeze = False
@@ -571,7 +606,7 @@ class StorageManager:
                     req_id,
                 )
             except Exception as error:
-                if publish_local_early and isinstance(
+                if isinstance(
                     error, NativeExternalPageTransferUnknownError
                 ):
                     error.layerwise_source_pages = (
@@ -598,10 +633,10 @@ class StorageManager:
                 except Exception as caught:
                     error = caught
                 finally:
-                    if publish_local_early and isinstance(
+                    if isinstance(
                         error, NativeExternalPageTransferUnknownError
                     ):
-                        # The P-node's sticky queue will refuse handoff/close.
+                        # The caller's sticky failure refuses handoff/close.
                         # Do not return possibly DMA-owned pages to the pool.
                         error.layerwise_source_pages = (
                             getattr(error, "layerwise_source_pages", ()) + held
@@ -1929,6 +1964,9 @@ class StorageManager:
                 )
                 return False
 
+            validate_close = getattr(self.backend_factory, "validate_close", None)
+            if validate_close is not None:
+                validate_close(backend_name)
             try:
                 logger.info("Closing backend: %s", backend_name)
                 backend.close()
@@ -1963,7 +2001,7 @@ class StorageManager:
         """
         with self.manager_lock:
             existing_names = set(self.storage_backends)
-            new_backends = CreateStorageBackends(
+            new_backends = self.backend_factory(
                 self.config,
                 self.metadata,
                 self.loop,
@@ -2014,6 +2052,9 @@ class StorageManager:
             backend = self.storage_backends.get(backend_name)
             if backend is None:
                 raise KeyError("Backend %s not found" % backend_name)
+            validate_recreate = getattr(self.backend_factory, "validate_recreate", None)
+            if validate_recreate is not None:
+                validate_recreate(backend_name)
 
             # --- close ---
             try:
@@ -2027,7 +2068,7 @@ class StorageManager:
 
             # --- create ---
             existing_names = set(self.storage_backends)
-            new_backends = CreateStorageBackends(
+            new_backends = self.backend_factory(
                 self.config,
                 self.metadata,
                 self.loop,

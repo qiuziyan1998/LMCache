@@ -8,7 +8,7 @@ keeping the LMCacheManager agnostic to the serving engine.
 
 # Standard
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 if TYPE_CHECKING:
     # Third Party
@@ -26,6 +26,7 @@ from lmcache.integration.base_service_factory import BaseServiceFactory
 from lmcache.logging import init_logger
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.control_group import LMCacheControlGroup
 from lmcache.v1.health_monitor.base import HealthMonitor
 from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.internal_api_server.api_server import InternalAPIServer
@@ -57,6 +58,7 @@ class VllmServiceFactory(BaseServiceFactory):
         runtime_kv_group_layer_names: Optional[tuple[tuple[str, ...], ...]] = None,
         indexer_c8_layout: Optional[IndexerC8Layout] = None,
         indexer_hbm_block_map: Optional[tuple[int, ...]] = None,
+        dsa_dcp_size: Optional[int] = None,
     ) -> None:
         self.lmcache_config = lmcache_config
         self.vllm_config = vllm_config
@@ -65,6 +67,7 @@ class VllmServiceFactory(BaseServiceFactory):
         self.runtime_kv_group_layer_names = runtime_kv_group_layer_names
         self.indexer_c8_layout = indexer_c8_layout
         self.indexer_hbm_block_map = indexer_hbm_block_map
+        self.dsa_dcp_size = dsa_dcp_size
         self.metadata: Optional[LMCacheMetadata] = None
         self.lmcache_engine: Optional[LMCacheEngine] = None
 
@@ -152,6 +155,15 @@ class VllmServiceFactory(BaseServiceFactory):
             local_worker_id, local_world_size = calculate_local_rank_and_world_size(
                 self.vllm_config
             )
+        local_mla = (
+            use_mla
+            and num_kv_head == 1
+            and parallel_config.world_size == parallel_config.tensor_parallel_size
+            and getattr(parallel_config, "pipeline_parallel_size", 1) == 1
+            and getattr(parallel_config, "prefill_context_parallel_size", 1) == 1
+            and not getattr(parallel_config, "enable_elastic_ep", False)
+        )
+        dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
         self.metadata = LMCacheMetadata(
             model_name=model_config.model,
             world_size=parallel_config.world_size,
@@ -171,31 +183,32 @@ class VllmServiceFactory(BaseServiceFactory):
             runtime_kv_group_layer_names=self.runtime_kv_group_layer_names,
             indexer_c8_layout=self.indexer_c8_layout,
             indexer_hbm_block_map=self.indexer_hbm_block_map,
-            mla_cache_tp_replicated=(
-                use_mla
-                and num_kv_head == 1
-                and parallel_config.world_size == parallel_config.tensor_parallel_size
-                and all(
-                    getattr(parallel_config, name, 1) == 1
-                    for name in (
-                        "pipeline_parallel_size",
-                        "prefill_context_parallel_size",
-                        "decode_context_parallel_size",
-                    )
-                )
-                and not getattr(parallel_config, "enable_elastic_ep", False)
+            mla_cache_tp_replicated=local_mla and dcp_size == 1,
+            mla_cache_cpu_source_tp_shared=(
+                local_mla
+                and dcp_size > 1
+                and dcp_size == self.dsa_dcp_size
+                and dcp_size == parallel_config.tensor_parallel_size
+                and self.lmcache_config.pd_role == "receiver"
+                and self.lmcache_config.enable_shared_cpu_cache
+                and self.lmcache_config.shared_cpu_cache_strict
+                and self.lmcache_config.local_cpu
             ),
         )
         return self.metadata
 
     def get_or_create_lmcache_engine(self) -> Optional[LMCacheEngine]:
+        """Reuse the engine or create its isolated CPU control group at startup."""
         self._ensure_metadata()
         assert self.metadata is not None
 
         # Scheduler without bypass lookup does not need an engine
         if (
             self.role == "scheduler"
-            and not self.lmcache_config.enable_scheduler_bypass_lookup
+            and (
+                not self.lmcache_config.enable_scheduler_bypass_lookup
+                or self.lmcache_config.decoder_storage_mode == "process"
+            )
         ):
             # Create PrometheusLogger for scheduler without engine
             # First Party
@@ -216,30 +229,17 @@ class VllmServiceFactory(BaseServiceFactory):
             self.lmcache_engine = curr_engine
             return curr_engine
 
+        control_group = None
         if self.role == "scheduler":
             tpg = SimpleNamespace()
             tpg.broadcast = lambda tensor, src: tensor
             tpg.broadcast_object = lambda obj, src: obj
-            collective_all_true = bool
             vllm_gpu_connector = None
         else:
             # Third Party
-            import torch
-            import torch.distributed as dist
             from vllm.distributed.parallel_state import get_tp_group
 
             tpg = get_tp_group()
-
-            def collective_all_true(local_ready: bool) -> bool:
-                flag = torch.tensor(
-                    [int(local_ready)], dtype=torch.int32, device="cpu"
-                )
-                dist.all_reduce(
-                    flag,
-                    op=dist.ReduceOp.MIN,
-                    group=tpg.cpu_group,
-                )
-                return bool(flag.item())
             # First Party
             from lmcache.integration.vllm.utils import vllm_layout_hints
 
@@ -250,15 +250,33 @@ class VllmServiceFactory(BaseServiceFactory):
                 layout_hints=vllm_layout_hints(),
             )
 
-        engine = LMCacheEngineBuilder.get_or_create(
-            ENGINE_NAME,
-            self.lmcache_config,
-            self.metadata,
-            vllm_gpu_connector,
-            tpg.broadcast,
-            tpg.broadcast_object,
-            collective_all_true,
-        )
+        broadcast_object = tpg.broadcast_object
+        collective_all_true: Callable[[bool], bool] = bool
+        if self.role != "scheduler" and tpg.world_size > 1:
+            control_group = LMCacheControlGroup(tpg.ranks)
+            collective_all_true = control_group.collective_all_true
+            # Bind the original callback directly: no extra wrapper, branch or
+            # Gloo broadcast on the normal message-queue path.
+            if getattr(tpg, "mq_broadcaster", None) is None:
+                broadcast_object = control_group.broadcast_object
+        try:
+            engine = LMCacheEngineBuilder.get_or_create(
+                ENGINE_NAME,
+                self.lmcache_config,
+                self.metadata,
+                vllm_gpu_connector,
+                tpg.broadcast,
+                broadcast_object,
+                collective_all_true,
+            )
+        except BaseException:
+            if control_group is not None:
+                try:
+                    control_group.close()
+                except Exception:
+                    logger.exception("Failed to close LMCache startup control group")
+            raise
+        engine.control_group = control_group
         self.lmcache_engine = engine
 
         if (

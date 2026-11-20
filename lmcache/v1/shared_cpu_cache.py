@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional, Union
+from threading import Lock
+from typing import Any, Callable, Iterable, Optional, Union
 from weakref import WeakKeyDictionary
 
 import torch
@@ -36,6 +37,107 @@ class SharedCPUCacheError(RuntimeError):
 
 class SharedCPUCacheValidationError(SharedCPUCacheError):
     """Raised before view creation or pointer install when metadata is unsafe."""
+
+
+@dataclass
+class _LocalLeaseState:
+    lease_id: str
+    mapping: Any
+    retire: Callable[[str, str], None]
+    holds: int = 1
+    imported: bool = False
+    retirement_pending: bool = False
+    lock: Any = field(default_factory=Lock)
+
+
+class LocalLeaseHandle:
+    """One explicit local hold on a service-owned allocation lease.
+
+    ``retain`` returns an independent hold; every hold that submits pointer or
+    device work must call ``mark_imported`` and release with ``proof='fenced'``
+    only after its final local access completes. Unknown completion retains the
+    hold. The final release calls ``retire(lease_id, proof)`` once, outside the
+    lock; that callback must enqueue nonblocking, idempotent lifecycle work and
+    retain it until acknowledgement. No destructor can prove device completion.
+    """
+
+    def __init__(
+        self,
+        *,
+        lease_id: str,
+        mapping: Any,
+        retire: Callable[[str, str], None],
+    ) -> None:
+        if not lease_id or mapping is None or not callable(retire):
+            raise ValueError(
+                "A local lease requires identity, mapping and retire callback"
+            )
+        self._state = _LocalLeaseState(lease_id, mapping, retire)
+        self._released = False
+        self._imported = False
+
+    @property
+    def lease_id(self) -> str:
+        """Return the immutable service lease identity."""
+        return self._state.lease_id
+
+    @property
+    def mapping(self) -> Any:
+        """Return the mapping kept alive by this lease's outstanding holds."""
+        return self._state.mapping
+
+    def is_valid(self) -> bool:
+        """Return whether this hold can still acquire or submit source work."""
+        with self._state.lock:
+            return not self._released and not self._state.retirement_pending
+
+    def retain(self) -> LocalLeaseHandle:
+        """Acquire and return a new hold, raising if this handle was released."""
+        with self._state.lock:
+            if self._released or self._state.retirement_pending:
+                raise SharedCPUCacheError("Cannot retain a released local source lease")
+            retained = object.__new__(type(self))
+            retained._state = self._state
+            retained._released = False
+            retained._imported = False
+            self._state.holds += 1
+        return retained
+
+    def mark_imported(self) -> None:
+        """Require a completion fence before releasing this device-consumer hold."""
+        with self._state.lock:
+            if self._released or self._state.retirement_pending:
+                raise SharedCPUCacheError("Cannot import a released local source lease")
+            self._imported = True
+            self._state.imported = True
+
+    def release(self, proof: Optional[str] = None) -> None:
+        """Release once; imported holds require explicit ``fenced`` proof.
+
+        Invalid proof leaves the hold intact. The callback must not raise after
+        accepting retirement; transport failure is reconciled by its pending map.
+        """
+        if proof not in (None, "never_imported", "fenced"):
+            raise ValueError("Unknown local source retirement proof")
+        state = self._state
+        with state.lock:
+            if self._released:
+                return
+            if self._imported and proof != "fenced":
+                raise SharedCPUCacheError(
+                    "Imported source requires its final-access fence"
+                )
+            self._released = True
+            state.holds -= 1
+            if state.holds:
+                return
+            state.retirement_pending = True
+            final_proof = "fenced" if state.imported else "never_imported"
+        state.retire(state.lease_id, final_proof)
+
+    def close(self, proof: Optional[str] = None) -> None:
+        """Idempotently release this hold using the same proof as ``release``."""
+        self.release(proof)
 
 
 def chunk_hash_to_int(chunk_hash: Union[int, bytes]) -> int:

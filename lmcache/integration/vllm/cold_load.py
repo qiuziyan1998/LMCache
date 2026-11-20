@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 
 class _ColdLoadOptionalFields(TypedDict, total=False):
+    dsa_dcp_rank: int
     indexer_source_owners: tuple[Any, ...]
     chunk_plan: Callable[[], tuple[tuple[int, int, Any], ...]]
 
@@ -160,7 +161,8 @@ class ColdLoadCoordinator:
                     self.aborted = None
             finished.add(req_id)
         if not futures:
-            self.last_latent_future = None
+            if self.last_latent_future is None or self.last_latent_future.done():
+                self.last_latent_future = None
             # Keep the bounded pool across bursts; connector shutdown drains it.
         return finished or None
 
@@ -270,4 +272,29 @@ class ColdLoadCoordinator:
             request,
             indexer_block_ids,
             indexer_future,
+        )
+
+    def submit_ordinary(
+        self,
+        plan: ColdLoadPlan,
+        generation: int,
+        block_ids: set[int],
+        device: int | None,
+        job: Callable[..., Any],
+    ) -> None:
+        """Reuse the publication FIFO for one paired dense background transfer.
+
+        Both groups complete in the single job; the already-terminal sibling
+        preserves the existing completion/retirement entry contract.
+        """
+        sibling: Future[ColdIndexerResult] = Future()
+        sibling.set_result((None, None))
+        future = self.get_executor().submit(job, plan, device, self.last_latent_future)
+        self.last_latent_future = future
+        self.futures[plan["request"].req_id] = (
+            generation,
+            future,
+            plan["request"],
+            block_ids,
+            sibling,
         )

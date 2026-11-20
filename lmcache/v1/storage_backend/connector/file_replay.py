@@ -14,6 +14,7 @@ import os
 import socket
 import threading
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
 TAG = "lmcache.tag.file_replay"
@@ -209,13 +210,15 @@ class FileReplayStore:
     def is_exist(self, key: str) -> int:
         return self.batch_is_exist([key])[0]
 
-    def batch_get_into(self, keys: list, pointers: list, sizes: list) -> list:
+    def batch_get_into(
+        self, keys: list, pointers: list, sizes: list, *, native_get: Callable | None = None
+    ) -> list:
         return self.batch_get_into_multi_buffers(
-            keys, [[p] for p in pointers], [[s] for s in sizes]
+            keys, [[p] for p in pointers], [[s] for s in sizes], native_get=native_get
         )
 
     def batch_get_into_multi_buffers(
-        self, keys: list, pointers: list, sizes: list
+        self, keys: list, pointers: list, sizes: list, *, native_get: Callable | None = None
     ) -> list:
         if not len(keys) == len(pointers) == len(sizes):
             raise ValueError("File replay buffer list lengths differ")
@@ -290,7 +293,8 @@ class FileReplayStore:
                     raise OSError("File replay acknowledgement failed")
             results[i] = expected
         if native_indices:
-            got = self.native.batch_get_into_multi_buffers(
+            get_native = native_get or self.native.batch_get_into_multi_buffers
+            got = get_native(
                 [keys[i] for i in native_indices],
                 [pointers[i] for i in native_indices],
                 [sizes[i] for i in native_indices],

@@ -127,6 +127,7 @@ def test_strict_mooncake_probe_rejects_errors_not_just_missing(statuses):
         dict(
             mooncake_page_key=lambda key, layers: key,
             trace_mooncake_keys=lambda *args, **kwargs: None,
+            MooncakestoreConnector=NS(_require_layout_bound=lambda self: None),
         ),
     )
     connector = NS(

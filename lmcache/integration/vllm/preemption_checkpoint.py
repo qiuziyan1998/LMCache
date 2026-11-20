@@ -29,6 +29,8 @@ class CaptureSpec:
     blocks: tuple[tuple[int, ...], ...]
     request_configs: dict[str, Any] | None = None
     prefix_end: int = 0
+    # Value-only DcpWriteLayout for Group 0; absent for ordinary replicated KV.
+    dcp_write_layout: Any = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,8 @@ class PendingCheckpoint:
     captured_end: int = 0
     restore_retries: int = 0
     restore_miss: CheckpointResult | None = None
+    # The acknowledged end survives a shorter lookup or restore retry.
+    sealed_end: int = 0
 
     def retry_shorter(
         self,
@@ -135,6 +139,7 @@ class PendingCheckpoint:
             ):
                 self.status = "failed"
             else:
+                self.sealed_end = result.end
                 self.status = "ready"
         else:
             return False

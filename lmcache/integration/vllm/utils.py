@@ -31,6 +31,33 @@ _config_instance: Optional[LMCacheEngineConfig] = None
 _config_lock = threading.Lock()
 
 
+def apply_vllm_config_overrides(
+    config: LMCacheEngineConfig, vllm_config: "VllmConfig"
+) -> None:
+    """Apply the same effective serving settings before any cache allocation."""
+    from lmcache.v1.config_base import validate_and_set_config_value
+
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    extra = getattr(transfer, "kv_connector_extra_config", None)
+    if extra:
+        for key, value in extra.items():
+            if key.startswith("lmcache."):
+                config_key = key[8:]
+                if validate_and_set_config_value(config, config_key, value):
+                    logger.info("Updated config %s from vLLM extra config", config_key)
+    if config.extra_config is None:
+        config.extra_config = {}
+    for component, fields in (
+        ("model_config", ("max_model_len",)),
+        ("scheduler_config", ("max_num_seqs", "max_num_batched_tokens")),
+    ):
+        owner = getattr(vllm_config, component, None)
+        for name in fields:
+            value = getattr(owner, name, None)
+            if value is not None:
+                config.extra_config[f"vllm_{name}"] = value
+
+
 def is_false(value: str) -> bool:
     """Check if the given string value is equivalent to 'false'."""
     return value.strip().lower() in ("false", "0", "no", "n", "off")

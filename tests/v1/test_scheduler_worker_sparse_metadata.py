@@ -1735,7 +1735,7 @@ def test_dsa_cold_compact_background_order_retains_sources_without_host_sync(
     readiness = object()
     request = SimpleNamespace(
         req_id="cold-source-lifetime",
-        load_spec=SimpleNamespace(dsa_group1_direct_hbm=False),
+        load_spec=SimpleNamespace(dsa_group1_direct_hbm=False, dsa_cold_load_generation=1),
     )
     state = WorkerRetrieveState(req_id=request.req_id)
     plan = {
@@ -1752,18 +1752,16 @@ def test_dsa_cold_compact_background_order_retains_sources_without_host_sync(
         events.append("predecessor")
         return RuntimeError("prior request failed") if predecessor_failed else None
 
-    def indexer_result() -> tuple[Any, Any, float, float]:
+    def indexer_result() -> tuple[Any, Any]:
         assert plan["latent_shared_ready"].done()
         events.append("indexer")
-        return (None, readiness, 0.0, 0.0)
+        return (None, readiness)
 
     def record_readiness() -> Any:
         events.append("readiness")
         return readiness
 
     def seal(result: WorkerRetrieveState, _count: int) -> None:
-        assert result.dense_load_source_owners == (owner,)
-        assert result.dense_load_readiness is readiness
         events.append("seal")
         result.prepared_sparse_sources[0] = object()
 
@@ -1788,7 +1786,9 @@ def test_dsa_cold_compact_background_order_retains_sources_without_host_sync(
     assert result is state
     assert state.indexer_npu_resident
     assert not state.dense_load_readiness_consumed
-    assert events == ["predecessor", "indexer", "readiness", "seal"]
+    assert state.dense_load_source_owners == (owner,)
+    assert state.dense_load_readiness is readiness
+    assert events == ["predecessor", "indexer", "seal", "readiness"]
     impl._synchronize_dsa_cold_dense_load.assert_not_called()
     impl._synchronize_dsa_cold_dense_readiness.assert_not_called()
 
