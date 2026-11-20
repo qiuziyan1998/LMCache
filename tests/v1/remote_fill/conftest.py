@@ -56,6 +56,7 @@ class FakePageLifecycle:
 
     commit_result: bool = True
     fail_release: bool = False
+    fail_prepare: bool = False
     next_address: int = 0x100000
     prepared_override: tuple[PreparedPage, ...] | None = None
     existing_keys: set[str] = field(default_factory=set)
@@ -79,6 +80,8 @@ class FakePageLifecycle:
 
         del transfer_id, window_id
         self.prepare_calls += 1
+        if self.fail_prepare:
+            raise RuntimeError("injected prepare failure")
         if self.prepared_override is not None:
             return self.prepared_override
         allocations = []

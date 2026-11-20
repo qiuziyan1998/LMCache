@@ -55,6 +55,8 @@ def log_remote_fill_diagnostic(
     req_id: Optional[str] = None,
     transfer_id: Optional[str] = None,
     reason: Optional[str] = None,
+    response_code: Optional[str] = None,
+    response_message: Optional[str] = None,
     error: Optional[BaseException] = None,
     memory_safety_uncertain: bool = False,
     severity: Literal["warning", "error", "critical"] = "error",
@@ -83,6 +85,10 @@ def log_remote_fill_diagnostic(
         fields["transfer_id"] = _bounded_text(transfer_id)
     if reason:
         fields["reason"] = _bounded_text(reason)
+    if response_code:
+        fields["response_code"] = _bounded_text(response_code)
+    if response_message:
+        fields["response_message"] = _bounded_text(response_message)
     if error is not None:
         fields["error_type"] = type(error).__name__
         fields["error"] = _bounded_text(error)

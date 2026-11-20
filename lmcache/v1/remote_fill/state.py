@@ -2,13 +2,15 @@
 """Thread-safe, hardware-independent remote-fill transaction core."""
 
 # Standard
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, fields
 from threading import RLock
 from time import monotonic
 from typing import Any, Protocol
 from uuid import uuid4
+import logging
+import math
 
 # Third Party
 import msgspec
@@ -45,6 +47,8 @@ from .security import (
     seal_descriptor,
     transaction_manifest_digest,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _new_token() -> str:
@@ -212,6 +216,8 @@ class _Transaction:
     d_local_end_open: int
     destination_dp_rank: int
     manifest_digest_seed: str
+    created_at: float
+    last_progress_at: float
     state: TransactionState = TransactionState.ACTIVE
     terminal_outcome: TerminalOutcome | None = None
     source_generation: int | None = None
@@ -256,6 +262,7 @@ class RemoteFillMetricsSnapshot:
     terminal_persistence_failed_total: int
     terminal_cancelled_total: int
     terminal_fatal_restart_total: int
+    expired_transactions_total: int = 0
 
 
 @dataclass
@@ -277,6 +284,7 @@ class _RemoteFillMetricCounters:
     terminal_persistence_failed: int = 0
     terminal_cancelled: int = 0
     terminal_fatal_restart: int = 0
+    expired_transactions: int = 0
 
 
 _TERMINAL_STATES = {
@@ -313,6 +321,7 @@ class RemoteFillStateCore:
         descriptor_ttl_sec: float | None = None,
         native_hard_timeout_sec: float = 300.0,
         terminal_record_ttl_sec: float = 300.0,
+        transaction_idle_timeout_sec: float = 1800.0,
         clock: Callable[[], float] = monotonic,
         token_factory: Callable[[], str] = _new_token,
         tp_independent: bool = False,
@@ -329,6 +338,9 @@ class RemoteFillStateCore:
             group_layer_counts: Trusted runtime physical rows; defaults to equal groups.
             limits: Protocol bounds, or defaults when omitted.
             reservation_ttl_sec: Lifetime of unarmed reservations only.
+            transaction_idle_timeout_sec: Owner progress lease, renewed by a new
+                window, ARM or native completion. STATUS and replay do not renew
+                it. Expiry cancels hidden work but never releases armed memory.
             descriptor_ttl_sec: D-local deadline for accepting ARM. Defaults
                 to the reservation lifetime and is capped by that lifetime.
             native_hard_timeout_sec: Bound after arm before restart is required.
@@ -377,6 +389,13 @@ class RemoteFillStateCore:
         self._group_layer_counts = tuple(counts)
         self._tp_independent = tp_independent
         self._lifecycle = page_lifecycle
+        if (
+            not math.isfinite(transaction_idle_timeout_sec)
+            or transaction_idle_timeout_sec <= 0
+        ):
+            raise ValueError("transaction idle timeout must be finite and positive")
+        self._transaction_idle_timeout_sec = transaction_idle_timeout_sec
+        self._next_capacity_log_at = 0.0
         self._reservation_ttl_sec = reservation_ttl_sec
         self._descriptor_ttl_sec = min(descriptor_ttl, reservation_ttl_sec)
         self._native_hard_timeout_sec = native_hard_timeout_sec
@@ -391,6 +410,7 @@ class RemoteFillStateCore:
         self._operations: OrderedDict[str, _OperationRecord] = OrderedDict()
         self._expired_reservation_operations: set[str] = set()
         self._metrics = _RemoteFillMetricCounters()
+        self._quarantined_prepared: tuple[PreparedPage, ...] = ()
         self._closed = False
 
     @property
@@ -460,6 +480,15 @@ class RemoteFillStateCore:
 
         with self._lock:
             if self._closed:
+                transaction = self._transactions.get(request.common.transfer_id)
+                if (
+                    transaction is not None
+                    and transaction.state is TransactionState.FATAL_RESTART
+                    and transaction.request_attempt == request.common.request_attempt
+                    and request.common.destination_engine_epoch == self.destination_engine_epoch
+                    and request.common.shared_cache_generation == self.shared_cache_generation
+                ):
+                    return self._fatal_response(request, transaction)
                 return self._response(
                     request,
                     ResultCode.TERMINAL,
@@ -651,6 +680,7 @@ class RemoteFillStateCore:
             counters = self._metrics
             return RemoteFillMetricsSnapshot(
                 active_transactions=counters.active_transactions,
+                expired_transactions_total=counters.expired_transactions,
                 active_windows=counters.active_windows,
                 active_bytes=counters.active_bytes,
                 reserved_bytes_total=counters.reserved_bytes,
@@ -672,7 +702,7 @@ class RemoteFillStateCore:
             )
 
     def run_maintenance(self) -> tuple[str, ...]:
-        """Expire safe reservations and identify fatal armed attempts.
+        """Expire idle transactions/safe reservations and identify fatal attempts.
 
         Returns:
             Transfer IDs newly or already requiring a paired P+D restart.
@@ -710,6 +740,9 @@ class RemoteFillStateCore:
             for transaction in self._transactions.values():
                 if transaction.state is TransactionState.FATAL_RESTART:
                     fatal.add(transaction.transfer_id)
+                    # Publication or release may have transferred only part of the
+                    # ownership. Shutdown cannot safely repeat either operation.
+                    continue
                 for window in transaction.windows.values():
                     if window.native_state in (
                         DestinationNativeState.ARMED,
@@ -881,6 +914,23 @@ class RemoteFillStateCore:
                 d_local_end_open=existing.d_local_end_open,
             )
         if self._metrics.active_transactions >= self.limits.max_active_transactions:
+            now = self._clock()
+            if now >= self._next_capacity_log_at:
+                self._next_capacity_log_at = now + 10.0
+                logger.warning(
+                    "remote_fill_active_capacity_exhausted epoch=%s generation=%s "
+                    "active_transactions=%s limit=%s active_bytes=%s owners=%s",
+                    self.destination_engine_epoch,
+                    self.shared_cache_generation,
+                    self._metrics.active_transactions,
+                    self.limits.max_active_transactions,
+                    self._metrics.active_bytes,
+                    [
+                        self._transaction_summary_locked(item, now)
+                        for item in self._transactions.values()
+                        if item.state not in _TERMINAL_STATES
+                    ],
+                )
             return self._response(
                 request,
                 ResultCode.RESOURCE_EXHAUSTED,
@@ -889,6 +939,7 @@ class RemoteFillStateCore:
         # OPEN is intentionally keyless and therefore cannot prove a local
         # prefix. Exact pages arrive in bounded RESERVE_WINDOW manifests.
         d_local_end_open = 0
+        now = self._clock()
         transaction = _Transaction(
             transfer_id=request.common.transfer_id,
             request_attempt=request.common.request_attempt,
@@ -900,6 +951,8 @@ class RemoteFillStateCore:
             d_local_end_open=d_local_end_open,
             destination_dp_rank=request.destination_dp_rank,
             manifest_digest_seed=request.manifest_digest_seed,
+            created_at=now,
+            last_progress_at=now,
         )
         self._transactions[request.common.transfer_id] = transaction
         self._metrics.active_transactions += 1
@@ -916,6 +969,13 @@ class RemoteFillStateCore:
         request: ReserveWindowRequest,
         transaction: _Transaction,
     ) -> RemoteFillResponse:
+        if transaction.state is TransactionState.ABORT_REQUESTED:
+            return self._response(
+                request,
+                ResultCode.TERMINAL,
+                "transaction cancellation is draining native work",
+                transaction_state=transaction.state,
+            )
         if transaction.publication_ineligible and request.reserve_missing:
             return self._response(
                 request,
@@ -932,27 +992,17 @@ class RemoteFillStateCore:
                 "source generation changed within transaction",
             )
         existing = transaction.windows.get(request.window_id)
-        if existing is not None:
-            if existing.expired_unarmed:
-                transaction.windows.pop(request.window_id)
-                transaction.registered_selectors.difference_update(
-                    (page.kv_group, page.chunk_index)
-                    for page in existing.control_pages
-                )
-                transaction.registered_keys.difference_update(
-                    page.canonical_key for page in existing.control_pages
-                )
-                transaction.coverage_missing = any(
-                    window.coverage_missing for window in transaction.windows.values()
-                )
-            else:
-                return self._response(
-                    request,
-                    ResultCode.WINDOW_CONFLICT,
-                    "window already has a reservation attempt",
-                    transaction_state=transaction.state,
-                )
-        if len(transaction.windows) >= self.limits.max_windows_per_transaction:
+        if existing is not None and not existing.expired_unarmed:
+            return self._response(
+                request,
+                ResultCode.WINDOW_CONFLICT,
+                "window already has a reservation attempt",
+                transaction_state=transaction.state,
+            )
+        if (
+            existing is None
+            and len(transaction.windows) >= self.limits.max_windows_per_transaction
+        ):
             if request.reserve_missing:
                 self._mark_direct_abandoned_locked(transaction)
             return self._response(
@@ -964,14 +1014,24 @@ class RemoteFillStateCore:
         requested_selectors = {
             (page.kv_group, page.chunk_index) for page in request.control_pages
         }
-        if transaction.registered_selectors & requested_selectors:
+        selector_conflicts = transaction.registered_selectors & requested_selectors
+        if existing is not None:
+            selector_conflicts.difference_update(
+                (p.kv_group, p.chunk_index) for p in existing.control_pages
+            )
+        if selector_conflicts:
             return self._response(
                 request,
                 ResultCode.WINDOW_CONFLICT,
                 "group/chunk page was already registered in another window",
             )
         requested_keys = {page.canonical_key for page in request.control_pages}
-        if transaction.registered_keys & requested_keys:
+        key_conflicts = transaction.registered_keys & requested_keys
+        if existing is not None:
+            key_conflicts.difference_update(
+                p.canonical_key for p in existing.control_pages
+            )
+        if key_conflicts:
             return self._response(
                 request,
                 ResultCode.WINDOW_CONFLICT,
@@ -1051,6 +1111,9 @@ class RemoteFillStateCore:
                     request.reserve_missing,
                 )
             )
+        except UnsafePageLifecycleError:
+            self._mark_fatal_locked(transaction)
+            return self._fatal_response(request, transaction)
         except Exception:
             if request.reserve_missing:
                 self._mark_direct_abandoned_locked(transaction)
@@ -1216,9 +1279,7 @@ class RemoteFillStateCore:
             descriptors=descriptor_tuple if not has_missing else (),
             reservations=tuple(reservations),
             page_results=page_result_tuple,
-            descriptor_expires_at=(
-                descriptor_expires_at if has_allocated else 0.0
-            ),
+            descriptor_expires_at=(descriptor_expires_at if has_allocated else 0.0),
             state=(
                 WindowState.RELEASED
                 if has_missing
@@ -1238,6 +1299,18 @@ class RemoteFillStateCore:
             coverage_missing=has_missing,
         )
         transaction.windows[request.window_id] = window
+        if existing is not None:
+            # Replace the acknowledged manifest only when its successor exists.
+            transaction.registered_selectors.difference_update(
+                (p.kv_group, p.chunk_index) for p in existing.control_pages
+            )
+            transaction.registered_keys.difference_update(
+                p.canonical_key for p in existing.control_pages
+            )
+            transaction.coverage_missing = any(
+                w.coverage_missing for w in transaction.windows.values()
+            )
+        transaction.last_progress_at = self._clock()
         transaction.registered_selectors.update(requested_selectors)
         transaction.registered_keys.update(requested_keys)
         if window.state not in (WindowState.RELEASED, WindowState.COMMITTED):
@@ -1366,6 +1439,7 @@ class RemoteFillStateCore:
         self._set_window_state_locked(window, WindowState.ARMED)
         window.native_state = DestinationNativeState.ARMED
         window.armed_at = now
+        transaction.last_progress_at = now
         for reservation in window.reservations:
             if reservation.prepared.disposition is PageDisposition.ALLOCATED:
                 reservation.state = WindowState.ARMED
@@ -1428,6 +1502,7 @@ class RemoteFillStateCore:
             )
         window.native_return_code = request.native_return_code
         window.completed_bytes = request.completed_bytes
+        transaction.last_progress_at = self._clock()
         transfer_ok = (
             request.native_return_code == 0
             and request.completed_bytes == window.total_bytes
@@ -1507,6 +1582,7 @@ class RemoteFillStateCore:
                 "final transaction manifest digest mismatch",
                 transaction_state=transaction.state,
             )
+        unarmed = None
         for window in transaction.windows.values():
             if window.native_state is DestinationNativeState.ARMED:
                 return self._response(
@@ -1519,15 +1595,17 @@ class RemoteFillStateCore:
                 window.native_state is DestinationNativeState.NOT_ARMED
                 and window.state is WindowState.RESERVED
             ):
-                if not self._release_window_locked(
-                    transaction,
-                    window,
-                    "finish before arm",
-                ):
-                    return self._fatal_response(request, transaction)
-                self._set_window_state_locked(window, WindowState.RELEASED)
-                window.coverage_missing = True
-                transaction.coverage_missing = True
+                if unarmed is None:
+                    unarmed = []
+                unarmed.append(window)
+        # A refused FINISH must leave every reservation usable. Only settle
+        # unarmed windows once all native writers have been ruled out.
+        for window in unarmed or ():
+            if not self._release_window_locked(transaction, window, "finish before arm"):
+                return self._fatal_response(request, transaction)
+            self._set_window_state_locked(window, WindowState.RELEASED)
+            window.coverage_missing = True
+            transaction.coverage_missing = True
 
         # Persistent durability is mandatory. Direct placement accelerates
         # decoder handoff but must never become the only discoverable copy.
@@ -1648,19 +1726,9 @@ class RemoteFillStateCore:
         request: AbortRequest,
         transaction: _Transaction,
     ) -> RemoteFillResponse:
-        transaction.publication_ineligible = True
-        transaction.state = TransactionState.ABORT_REQUESTED
-        for window in transaction.windows.values():
-            if window.native_state is DestinationNativeState.ARMED:
-                self._set_window_state_locked(window, WindowState.ABORT_REQUESTED)
-                for reservation in window.reservations:
-                    reservation.state = WindowState.ABORT_REQUESTED
-                continue
-            if window.state not in (WindowState.COMMITTED, WindowState.RELEASED):
-                if not self._release_window_locked(transaction, window, "abort"):
-                    return self._fatal_response(request, transaction)
-                self._set_window_state_locked(window, WindowState.RELEASED)
-        self._finish_abort_if_drained_locked(transaction)
+        self._cancel_transaction_locked(transaction, "abort")
+        if transaction.state is TransactionState.FATAL_RESTART:
+            return self._fatal_response(request, transaction)
         code = (
             ResultCode.TERMINAL
             if transaction.state is TransactionState.CANCELLED
@@ -1672,6 +1740,29 @@ class RemoteFillStateCore:
             transaction_state=transaction.state,
             terminal_outcome=transaction.terminal_outcome,
         )
+
+    def _cancel_transaction_locked(
+        self, transaction: _Transaction, reason: str
+    ) -> None:
+        """Cancel safe pages while keeping armed destinations until a report."""
+
+        transaction.publication_ineligible = True
+        transaction.state = TransactionState.ABORT_REQUESTED
+        for window in transaction.windows.values():
+            if window.native_state is DestinationNativeState.ARMED:
+                self._set_window_state_locked(window, WindowState.ABORT_REQUESTED)
+                for reservation in window.reservations:
+                    reservation.state = WindowState.ABORT_REQUESTED
+                continue
+            if window.state not in (WindowState.COMMITTED, WindowState.RELEASED):
+                if not self._release_window_locked(transaction, window, reason):
+                    return
+                self._set_window_state_locked(window, WindowState.RELEASED)
+                if window.native_state is DestinationNativeState.NOT_ARMED:
+                    # A different window can still be draining native work.
+                    # Invalidate this window's replayable address capability now.
+                    window.expired_unarmed = True
+        self._finish_abort_if_drained_locked(transaction)
 
     def _status_locked(
         self,
@@ -1723,9 +1814,47 @@ class RemoteFillStateCore:
                     self._mark_fatal_locked(transaction)
             if transaction.state is TransactionState.ABORT_REQUESTED:
                 self._finish_abort_if_drained_locked(transaction)
+            elif (
+                transaction.state not in _TERMINAL_STATES
+                and now - transaction.last_progress_at
+                >= self._transaction_idle_timeout_sec
+            ):
+                logger.warning(
+                    "remote_fill_transaction_expired epoch=%s generation=%s owner=%s",
+                    self.destination_engine_epoch,
+                    self.shared_cache_generation,
+                    self._transaction_summary_locked(transaction, now),
+                )
+                self._metrics.expired_transactions += 1
+                self._cancel_transaction_locked(transaction, "transaction idle expiry")
         if now >= self._next_terminal_prune_at:
             self._next_terminal_prune_at = now + self._terminal_prune_interval_sec
             self._prune_terminal_records_locked(now)
+
+    @staticmethod
+    def _transaction_summary_locked(
+        transaction: _Transaction, now: float
+    ) -> dict[str, Any]:
+        """Summarize ownership without addresses or unbounded window lists."""
+
+        return {
+            "transfer_id": transaction.transfer_id,
+            "request_id": transaction.request_id,
+            "request_attempt": transaction.request_attempt,
+            "source_engine_id": transaction.source_engine_id,
+            "state": transaction.state.value,
+            "created_at": transaction.created_at,
+            "last_progress_at": transaction.last_progress_at,
+            "age_sec": round(now - transaction.created_at, 3),
+            "idle_sec": round(now - transaction.last_progress_at, 3),
+            "reserved_bytes": transaction.reserved_bytes,
+            "windows": dict(
+                Counter(
+                    f"{window.state.value}/{window.native_state.value}"
+                    for window in transaction.windows.values()
+                )
+            ),
+        }
 
     def _expire_unarmed_window_locked(
         self,
@@ -1811,6 +1940,9 @@ class RemoteFillStateCore:
         try:
             self._lifecycle.release_prepared_pages(pages, reason)
         except Exception:
+            # These handles have not yet been installed in a window. Retain
+            # them across shutdown so a finalizer cannot free uncertain pages.
+            self._quarantined_prepared = pages
             self._mark_fatal_locked(transaction)
             return
         self._metrics.discarded_bytes += sum(page.destination_length for page in pages)
@@ -1821,7 +1953,7 @@ class RemoteFillStateCore:
 
         transaction.coverage_missing = True
         transaction.publication_ineligible = True
-        if transaction.state not in _TERMINAL_STATES:
+        if transaction.state is TransactionState.ACTIVE:
             transaction.state = TransactionState.DIRECT_ABANDONED
 
     def _prepared_pages_valid(
@@ -1855,7 +1987,8 @@ class RemoteFillStateCore:
             if not reserve_missing or prepared.handle is None:
                 return False
             if (
-                prepared.reservation_base < 0
+                prepared.destination_ptr <= 0
+                or prepared.reservation_base < 0
                 or prepared.destination_ptr < prepared.reservation_base
                 or prepared.destination_length != page.expected_bytes
                 or prepared.reservation_length < prepared.destination_length
@@ -2158,7 +2291,8 @@ class RemoteFillStateCore:
             live_capability = (
                 window is not None
                 and window.native_state is DestinationNativeState.NOT_ARMED
-                and bool(window.descriptors)
+                and bool(record.response.descriptors)
+                and record.response.native_transfer_attempt_id == window.native_transfer_attempt_id
                 and not window.expired_unarmed
             )
             if not live_capability:
@@ -2174,6 +2308,10 @@ class RemoteFillStateCore:
         record = self._operations.get(request.common.operation_id)
         if record is None:
             return None
+        if isinstance(request, StatusRequest):
+            # Recovery uses this read as present-tense evidence for ARM/REPORT.
+            # Its original snapshot may predate cancellation or a hard timeout.
+            return self._dispatch_locked(request)
         if request.common.operation_id in self._expired_reservation_operations:
             return msgspec.structs.replace(
                 record.response,
@@ -2182,20 +2320,48 @@ class RemoteFillStateCore:
                 descriptors=(),
                 destination_descriptor_digest="",
             )
-        if record.kind is OperationKind.RESERVE_WINDOW and record.window_id is not None:
+        if record.window_id is not None and record.kind in (
+            OperationKind.RESERVE_WINDOW,
+            OperationKind.ARM_WINDOW,
+        ):
             transaction = self._transactions.get(record.transfer_id)
             window = (
                 transaction.windows.get(record.window_id)
                 if transaction is not None
                 else None
             )
-            if window is not None and window.expired_unarmed:
+            if (
+                record.kind is OperationKind.RESERVE_WINDOW
+                and window is not None
+                and window.expired_unarmed
+            ):
                 return msgspec.structs.replace(
                     record.response,
                     code=ResultCode.RESERVATION_EXPIRED,
                     message="unarmed reservation expired",
                     descriptors=(),
                     destination_descriptor_digest="",
+                )
+            if (
+                window is not None
+                and window.native_state
+                in (
+                    DestinationNativeState.TERMINAL_SUCCESS,
+                    DestinationNativeState.TERMINAL_FAILURE,
+                )
+                and (
+                    record.response.descriptors
+                    or (
+                        record.kind is OperationKind.ARM_WINDOW
+                        and record.response.code is ResultCode.OK
+                    )
+                )
+            ):
+                # Replaying a control operation must not reissue an address or
+                # permission to write once the native attempt has ended.
+                return self._response(
+                    request, ResultCode.TERMINAL, "native attempt is already terminal",
+                    transaction_state=transaction.state,
                 )
         return record.response
 
@@ -2208,6 +2374,20 @@ class RemoteFillStateCore:
         transaction = self._transactions.get(request.common.transfer_id)
         if transaction is None or transaction.state not in _TERMINAL_STATES:
             return None
+        common = request.common
+        if (
+            common.request_attempt != transaction.request_attempt
+            or common.destination_engine_epoch != self.destination_engine_epoch
+            or common.shared_cache_generation != self.shared_cache_generation
+        ):
+            # Route a stale owner through ordinary identity rejection before it
+            # can observe this transfer's terminal publication.
+            return self._dispatch_locked(request)
+        if isinstance(request, OpenRequest):
+            # OPEN also binds the source, request, manifest seed and layout.
+            opened = self._open_locked(request)
+            if opened.code is not ResultCode.ALREADY_EXISTS:
+                return opened
         return self._response(
             request,
             ResultCode.TERMINAL,

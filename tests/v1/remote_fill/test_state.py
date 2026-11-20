@@ -5,6 +5,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from unittest.mock import Mock
+import weakref
 
 # Third Party
 import msgspec
@@ -732,6 +733,9 @@ def test_unsafe_commit_exception_requires_paired_restart(harness) -> None:
     assert finished.terminal_outcome is TerminalOutcome.FATAL_RESTART
     assert finished.fatal_restart_required is True
     assert harness.lifecycle.released == []
+    for _ in range(2):
+        assert harness.service.shutdown() == ("transfer-1",)
+        assert harness.lifecycle.released == []
 
 
 def test_partial_final_page_uses_authoritative_valid_token_count(harness) -> None:
@@ -1234,3 +1238,196 @@ def test_state_requires_positive_engine_epoch_and_limits(harness) -> None:
             ),
             **kwargs,
         )
+
+
+@pytest.mark.parametrize(("field", "expected"), [
+    ("request_attempt", ResultCode.WINDOW_CONFLICT),
+    ("destination_engine_epoch", ResultCode.STALE_ENGINE_EPOCH),
+    ("shared_cache_generation", ResultCode.STALE_CACHE_GENERATION),
+])
+def test_late_abort_cannot_claim_foreign_terminal_result(harness, field, expected):
+    _, reserve, response = _open_and_reserve(harness)
+    _arm_and_report(harness, reserve, response)
+    assert harness.client.execute(harness.requests.finish()).terminal_outcome is TerminalOutcome.LOCAL_FULL
+    common = harness.requests.common()
+    stale = msgspec.structs.replace(common, **{field: getattr(common, field) + 1})
+    reply = harness.client.execute(AbortRequest(common=stale, reason="late retirement"))
+    assert reply.code is expected and reply.terminal_outcome is None
+    own = harness.client.execute(AbortRequest(common=harness.requests.common(), reason="owner retirement"))
+    assert own.terminal_outcome is TerminalOutcome.LOCAL_FULL
+
+@pytest.mark.parametrize(
+    "field", ["source_engine_id", "request_id", "manifest_digest_seed"]
+)
+def test_terminal_open_still_validates_original_owner(harness, field):
+    _, reserve, response = _open_and_reserve(harness)
+    _arm_and_report(harness, reserve, response)
+    assert (
+        harness.client.execute(harness.requests.finish()).terminal_outcome
+        is TerminalOutcome.LOCAL_FULL
+    )
+    fresh = harness.requests.open()
+    changed = msgspec.structs.replace(fresh, **{field: "e" * 64})
+    rejected = harness.client.execute(changed)
+    assert rejected.code is ResultCode.WINDOW_CONFLICT
+    assert rejected.terminal_outcome is None
+    assert (
+        harness.client.execute(harness.requests.open()).terminal_outcome
+        is TerminalOutcome.LOCAL_FULL
+    )
+
+
+@pytest.mark.parametrize("armed_index", [0, 1])
+def test_refused_finish_preserves_all_windows_for_later_completion(
+    harness, armed_index
+):
+    harness.client.execute(harness.requests.open())
+    windows = []
+    for i in range(2):
+        reserve = harness.requests.reserve(
+            harness.requests.pages(start_chunk=i), window_id=i
+        )
+        windows.append((reserve, harness.client.execute(reserve)))
+    harness.client.execute(harness.requests.arm(*windows[armed_index]))
+    assert (
+        harness.client.execute(harness.requests.finish(required_store_end=2048)).code
+        is ResultCode.WINDOW_NOT_TERMINAL
+    )
+    assert not harness.lifecycle.released
+    assert (
+        harness.client.execute(harness.requests.arm(*windows[1 - armed_index])).code
+        is ResultCode.OK
+    )
+    for window in windows:
+        harness.client.execute(harness.requests.report(*window))
+    assert (
+        harness.client.execute(
+            harness.requests.finish(required_store_end=2048)
+        ).terminal_outcome
+        is TerminalOutcome.LOCAL_FULL
+    )
+
+
+def test_delayed_reserve_and_arm_retry_cannot_revive_a_released_window(harness):
+    _, reserve, response = _open_and_reserve(harness)
+    arm = harness.requests.arm(reserve, response)
+    assert harness.client.execute(arm).code is ResultCode.OK
+    failed = harness.client.execute(
+        harness.requests.report(reserve, response, return_code=1)
+    )
+    assert failed.transaction_state is TransactionState.DIRECT_ABANDONED
+    assert harness.lifecycle.released
+    replay = harness.client.execute(reserve)
+    assert not replay.descriptors and replay.code is not ResultCode.OK
+    assert harness.client.execute(arm).code is not ResultCode.OK
+    assert len(harness.lifecycle.released) == 1
+
+
+def test_lost_armed_status_cannot_outlive_native_hard_deadline(harness):
+    _, reserve, response = _open_and_reserve(harness)
+    harness.client.execute(harness.requests.arm(reserve, response))
+    status = harness.requests.status(window_id=0)
+    harness.transport.drop_next_reply(OperationKind.STATUS)
+    with pytest.raises(ReplyLostError):
+        harness.client.execute(status)
+    harness.clock.advance(21)
+    retried = harness.client.execute(status)
+    assert retried.fatal_restart_required
+    assert retried.windows[0].native_state is DestinationNativeState.FATAL_UNKNOWN
+    assert harness.lifecycle.released == []
+
+
+def test_refusal_record_does_not_pin_another_requests_admission(harness):
+    harness.state.limits = msgspec.structs.replace(
+        harness.state.limits, max_operation_records=2
+    )
+    _, reserve, grant = _open_and_reserve(harness)
+    duplicate = harness.requests.reserve(window_id=0)
+    assert harness.client.execute(duplicate).code is ResultCode.WINDOW_CONFLICT
+    other = type(harness.requests)("other-transfer")
+    assert (
+        harness.client.execute(other.open(operation_id="other-open")).code
+        is ResultCode.ACCEPTED
+    )
+    assert harness.client.execute(reserve).descriptors == grant.descriptors
+    assert harness.lifecycle.prepare_calls == 1
+    second = other.reserve(operation_id="other-reserve")
+    second_grant = harness.client.execute(second)
+    assert second_grant.descriptors
+    third = type(harness.requests)("third-transfer")
+    assert (
+        harness.client.execute(third.open(operation_id="third-open")).code
+        is ResultCode.RESOURCE_EXHAUSTED
+    )
+    assert harness.client.execute(second).descriptors == second_grant.descriptors
+    assert harness.client.execute(reserve).descriptors == grant.descriptors
+    assert harness.lifecycle.prepare_calls == 2
+
+
+def test_null_allocator_destination_is_rolled_back_before_registration(harness):
+    pages = harness.requests.pages()
+    harness.lifecycle.prepared_override = tuple(
+        PreparedPage(
+            handle=i,
+            destination_ptr=i * 0x10000,
+            reservation_base=i * 0x10000,
+            destination_length=page.expected_bytes,
+            reservation_length=page.expected_bytes,
+        )
+        for i, page in enumerate(pages)
+    )
+    _, _, reply = _open_and_reserve(harness, pages=pages)
+    assert reply.code is ResultCode.RESERVATION_REJECTED
+    assert harness.lifecycle.raw_released[0][0] == (0, 1)
+    assert not harness.client.execute(harness.requests.status()).windows
+    assert harness.state.metrics_snapshot().active_bytes == 0
+
+
+def test_refused_replacement_keeps_acknowledged_expired_manifest(harness):
+    _, original, _ = _open_and_reserve(harness)
+    finish = harness.requests.finish()
+    harness.clock.advance(6)
+    bad = tuple(
+        msgspec.structs.replace(page, layout_tag="wrong")
+        for page in original.control_pages
+    )
+    rejected = harness.client.execute(
+        harness.requests.reserve(bad, window_id=original.window_id)
+    )
+    assert rejected.code is ResultCode.RESERVATION_REJECTED
+    result = harness.client.execute(finish)
+    assert result.terminal_outcome is TerminalOutcome.PERSISTENT_ONLY
+    assert harness.state.metrics_snapshot().active_transactions == 0
+    assert len(harness.lifecycle.released) == 1
+
+
+def test_unregistered_pages_survive_uncertain_raw_rollback(harness):
+    class Owner:
+        pass
+
+    refs = []
+
+    def prepare(*args):
+        owner = Owner()
+        refs.append(weakref.ref(owner))
+        return (PreparedPage(handle=owner),)  # Incomplete batch triggers rollback.
+
+    harness.lifecycle.prepare_pages = prepare
+    harness.lifecycle.fail_release = True
+    _, _, result = _open_and_reserve(harness)
+    assert result.fatal_restart_required
+    assert harness.service.shutdown() == ("transfer-1",)
+    assert refs[0]() is not None
+
+
+def test_uncertain_prepare_cleanup_prevents_admission_of_peer(harness):
+    def unsafe_prepare(*args):
+        raise UnsafePageLifecycleError("injected partial allocation rollback failure")
+
+    harness.lifecycle.prepare_pages = unsafe_prepare
+    _, _, result = _open_and_reserve(harness)
+    assert result.code is ResultCode.FATAL_RESTART_REQUIRED
+    other = type(harness.requests)("other-transfer")
+    assert harness.client.execute(
+        other.open(operation_id="other-open")
+    ).fatal_restart_required

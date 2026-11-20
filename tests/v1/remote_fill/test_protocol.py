@@ -7,6 +7,8 @@ import pytest
 
 # First Party
 from lmcache.v1.remote_fill import (
+    AbortRequest,
+    TransactionState,
     ProtocolLimits,
     ProtocolValidationError,
     RemoteFillService,
@@ -342,3 +344,38 @@ def test_nonbuiltin_hash_rejects_python_seed(harness) -> None:
     )
     with pytest.raises(ProtocolValidationError, match="only for builtin"):
         encode_request(request, ProtocolLimits())
+
+
+def test_oversized_reserve_cannot_reverse_abort_in_progress(harness):
+    harness.client.execute(harness.requests.open())
+    first = harness.requests.reserve()
+    reserved = harness.client.execute(first)
+    harness.client.execute(harness.requests.arm(first, reserved))
+    abort = AbortRequest(common=harness.requests.common(), reason="cancel")
+    assert (
+        harness.client.execute(abort).transaction_state
+        is TransactionState.ABORT_REQUESTED
+    )
+
+    request = seal_request(
+        harness.requests.reserve(harness.requests.pages(start_chunk=1), window_id=1)
+    )
+    encoded = encode_request(request, harness.service.limits)
+    limits = msgspec.structs.replace(
+        harness.service.limits, max_rpc_message_bytes=len(encoded) + 64
+    )
+    rejected = decode_response(
+        RemoteFillService(harness.state, limits).handle_bytes(encoded), limits
+    )
+    assert rejected.code is ResultCode.RESOURCE_EXHAUSTED
+    assert (
+        harness.client.execute(harness.requests.status()).transaction_state
+        is TransactionState.ABORT_REQUESTED
+    )
+    assert (
+        harness.client.execute(
+            harness.requests.report(first, reserved)
+        ).transaction_state
+        is TransactionState.CANCELLED
+    )
+    assert harness.state.metrics_snapshot().active_transactions == 0
