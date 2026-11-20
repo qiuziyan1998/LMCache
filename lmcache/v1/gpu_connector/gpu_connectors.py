@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 import abc
 
 # Third Party
@@ -997,45 +997,82 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         assert tmp_gpu_buffer_obj.tensor is not None
 
         current_stream = torch.cuda.current_stream()
-
-        for layer_id in range(self.num_layers):
-            memory_objs_layer = memory_objs[layer_id]
-            # kvcaches -> gpu_buffer -> memobj
-            with torch.cuda.stream(self.store_stream):
-                self.store_stream.wait_stream(current_stream)
-                lmc_ops.single_layer_kv_transfer(
-                    tmp_gpu_buffer_obj.tensor,
-                    self.kvcaches[layer_id],
-                    slot_mapping_full,
-                    lmc_ops.TransferDirection.D2H,
-                    self.gpu_kv_format,
-                    token_major=False,  # shape is [2, num_tokens, hidden_dim]
-                )
-                for (buf_start, buf_end), memory_obj, old_positions in zip(
-                    buf_starts_ends,
-                    memory_objs_layer,
-                    old_positions_chunks,
-                    strict=False,
-                ):
-                    assert memory_obj.tensor is not None
-                    memory_obj.tensor[0].copy_(
-                        tmp_gpu_buffer_obj.tensor[0][buf_start:buf_end],
-                        non_blocking=True,
+        store_transfer_pending = False
+        try:
+            for layer_id in range(self.num_layers):
+                memory_objs_layer = memory_objs[layer_id]
+                # kvcaches -> gpu_buffer -> memobj
+                with torch.cuda.stream(self.store_stream):
+                    self.store_stream.wait_stream(current_stream)
+                    lmc_ops.single_layer_kv_transfer(
+                        tmp_gpu_buffer_obj.tensor,
+                        self.kvcaches[layer_id],
+                        slot_mapping_full,
+                        lmc_ops.TransferDirection.D2H,
+                        self.gpu_kv_format,
+                        token_major=False,  # shape is [2, num_tokens, hidden_dim]
                     )
-                    memory_obj.tensor[1].copy_(
-                        tmp_gpu_buffer_obj.tensor[1][buf_start:buf_end],
-                        non_blocking=True,
-                    )
-                    if self.cache_positions:
-                        memory_obj.metadata.cached_positions = old_positions
+                    for (buf_start, buf_end), memory_obj, old_positions in zip(
+                        buf_starts_ends,
+                        memory_objs_layer,
+                        old_positions_chunks,
+                        strict=False,
+                    ):
+                        assert memory_obj.tensor is not None
+                        memory_obj.tensor[0].copy_(
+                            tmp_gpu_buffer_obj.tensor[0][buf_start:buf_end],
+                            non_blocking=True,
+                        )
+                        memory_obj.tensor[1].copy_(
+                            tmp_gpu_buffer_obj.tensor[1][buf_start:buf_end],
+                            non_blocking=True,
+                        )
+                        if self.cache_positions:
+                            memory_obj.metadata.cached_positions = old_positions
+                    store_transfer_pending = True
 
+                yield
+                self.store_stream.synchronize()
+                store_transfer_pending = False
+                logger.debug(f"Finished offloading layer {layer_id}")
+
+            # free the buffer memory
+            tmp_gpu_buffer_obj.ref_count_down()
+            tmp_gpu_buffer_obj = None
             yield
-            self.store_stream.synchronize()
-            logger.debug(f"Finished offloading layer {layer_id}")
-
-        # free the buffer memory
-        tmp_gpu_buffer_obj.ref_count_down()
-        yield
+        finally:
+            try:
+                if store_transfer_pending:
+                    self.store_stream.synchronize()
+            except BaseException:
+                self_any: Any = self
+                unfenced: Optional[list[Any]] = getattr(
+                    self, "_layerwise_prefill_unfenced_stores", None
+                )
+                if unfenced is None:
+                    unfenced = []
+                    self_any._layerwise_prefill_unfenced_stores = unfenced
+                retained: list[Any] = []
+                for layer_objs in memory_objs:
+                    for obj in layer_objs:
+                        ref_up = getattr(obj, "ref_count_up", None)
+                        if callable(ref_up):
+                            ref_up()
+                        retained.append(obj)
+                if tmp_gpu_buffer_obj is not None:
+                    ref_up = getattr(tmp_gpu_buffer_obj, "ref_count_up", None)
+                    if callable(ref_up):
+                        ref_up()
+                    retained.append(tmp_gpu_buffer_obj)
+                    tmp_gpu_buffer_obj = None
+                unfenced.append((self.store_stream, tuple(retained)))
+                raise
+            finally:
+                if (
+                    tmp_gpu_buffer_obj is not None
+                    and tmp_gpu_buffer_obj.is_valid()
+                ):
+                    tmp_gpu_buffer_obj.ref_count_down()
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         return torch.Size([2, num_tokens, self.hidden_dim_size])
@@ -1355,53 +1392,96 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         offset = starts[0]
         current_stream = torch.cuda.current_stream()
-
-        for layer_id in range(self.num_layers):
-            memory_objs_layer = memory_objs[layer_id]
-            # kvcaches -> gpu_buffer -> memobj
-            with torch.cuda.stream(self.store_stream):
-                self.store_stream.wait_stream(current_stream)
-                if self.use_gpu:
-                    lmc_ops.single_layer_kv_transfer(
-                        tmp_gpu_buffer_obj.tensor,
-                        self.kvcaches[layer_id],
-                        slot_mapping_full,
-                        lmc_ops.TransferDirection.D2H,
-                        self.gpu_kv_format,
-                        token_major=True,
-                    )
-                for start, end, memory_obj in zip(
-                    starts, ends, memory_objs_layer, strict=False
-                ):
-                    assert memory_obj.tensor is not None
+        store_transfer_pending = False
+        try:
+            for layer_id in range(self.num_layers):
+                memory_objs_layer = memory_objs[layer_id]
+                # kvcaches -> gpu_buffer -> memobj
+                with torch.cuda.stream(self.store_stream):
+                    self.store_stream.wait_stream(current_stream)
                     if self.use_gpu:
-                        memory_obj.tensor.copy_(
-                            tmp_gpu_buffer_obj.tensor[start - offset : end - offset],
-                            non_blocking=True,
-                        )
-                    else:
                         lmc_ops.single_layer_kv_transfer(
-                            memory_obj.tensor,
+                            tmp_gpu_buffer_obj.tensor,
                             self.kvcaches[layer_id],
-                            slot_mapping[start:end],
+                            slot_mapping_full,
                             lmc_ops.TransferDirection.D2H,
                             self.gpu_kv_format,
                             token_major=True,
                         )
-                    # Set metadata format
-                    if self.use_mla:
-                        memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+                    for start, end, memory_obj in zip(
+                        starts, ends, memory_objs_layer, strict=False
+                    ):
+                        assert memory_obj.tensor is not None
+                        if self.use_gpu:
+                            memory_obj.tensor.copy_(
+                                tmp_gpu_buffer_obj.tensor[
+                                    start - offset : end - offset
+                                ],
+                                non_blocking=True,
+                            )
+                        else:
+                            lmc_ops.single_layer_kv_transfer(
+                                memory_obj.tensor,
+                                self.kvcaches[layer_id],
+                                slot_mapping[start:end],
+                                lmc_ops.TransferDirection.D2H,
+                                self.gpu_kv_format,
+                                token_major=True,
+                            )
+                        # Set metadata format
+                        if self.use_mla:
+                            memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+                    store_transfer_pending = True
+
+                yield
+                if sync:
+                    self.store_stream.synchronize()
+                    store_transfer_pending = False
+                logger.debug(f"Finished offloading layer {layer_id}")
+
+            if store_transfer_pending:
+                self.store_stream.synchronize()
+                store_transfer_pending = False
+
+            # free the buffer memory
+            if tmp_gpu_buffer_obj is not None:
+                tmp_gpu_buffer_obj.ref_count_down()
+                tmp_gpu_buffer_obj = None
 
             yield
-            if sync:
-                self.store_stream.synchronize()
-            logger.debug(f"Finished offloading layer {layer_id}")
-
-        # free the buffer memory
-        if tmp_gpu_buffer_obj is not None:
-            tmp_gpu_buffer_obj.ref_count_down()
-
-        yield
+        finally:
+            try:
+                if store_transfer_pending:
+                    self.store_stream.synchronize()
+            except BaseException:
+                self_any: Any = self
+                unfenced: Optional[list[Any]] = getattr(
+                    self, "_layerwise_prefill_unfenced_stores", None
+                )
+                if unfenced is None:
+                    unfenced = []
+                    self_any._layerwise_prefill_unfenced_stores = unfenced
+                retained: list[Any] = []
+                for layer_objs in memory_objs:
+                    for obj in layer_objs:
+                        ref_up = getattr(obj, "ref_count_up", None)
+                        if callable(ref_up):
+                            ref_up()
+                        retained.append(obj)
+                if tmp_gpu_buffer_obj is not None:
+                    ref_up = getattr(tmp_gpu_buffer_obj, "ref_count_up", None)
+                    if callable(ref_up):
+                        ref_up()
+                    retained.append(tmp_gpu_buffer_obj)
+                    tmp_gpu_buffer_obj = None
+                unfenced.append((self.store_stream, tuple(retained)))
+                raise
+            finally:
+                if (
+                    tmp_gpu_buffer_obj is not None
+                    and tmp_gpu_buffer_obj.is_valid()
+                ):
+                    tmp_gpu_buffer_obj.ref_count_down()
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         if self.use_mla:

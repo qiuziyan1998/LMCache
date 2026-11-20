@@ -2053,6 +2053,7 @@ class PreemptionConnectorMetadata(LMCacheConnectorMetadata):
 class LMCacheConnectorV1Impl:
     supports_preemption_checkpoint = False
     _defer_prepared_sparse_setup = False
+    _supports_selected_group0_omit_skip = True
 
     def __init__(
         self,
@@ -2288,6 +2289,7 @@ class LMCacheConnectorV1Impl:
         self._deferred_layerwise_prefill_load_active = False
         self._initial_layerwise_prefill_load_submitted = False
         self._deferred_layerwise_prefill_drained_groups: set[int] = set()
+        self._layerwise_group0_dma_skipped: set[str] = set()
         self._layerwise_save_storers: dict[
             LayerwiseSaveKey, Generator[Optional[LayerwiseStoreResult], None, None]
         ] = {}
@@ -3967,9 +3969,11 @@ class LMCacheConnectorV1Impl:
             if hasattr(self, "_layerwise_sparse_indexer_sent_layers"):
                 self._layerwise_sparse_indexer_sent_layers.clear()
             self._layerwise_required_wait_groups_cache = None
+            self._sync_recompute_fallback_from_engine(clear_engine=True)
             self._deferred_layerwise_prefill_load_active = False
             self._initial_layerwise_prefill_load_submitted = False
             self._deferred_layerwise_prefill_drained_groups = set()
+            self._layerwise_group0_dma_skipped = set()
 
     @staticmethod
     def _close_layerwise_retriever(
@@ -4004,6 +4008,17 @@ class LMCacheConnectorV1Impl:
             # two-bank state before closing generators and releasing those
             # references.
             reset_transfer_state(synchronize=True)
+            if getattr(self, "_layerwise_group0_dma_skipped", None):
+                sync_skip = getattr(
+                    gpu_connector,
+                    "synchronize_selected_group0_skip",
+                    None,
+                )
+                if not callable(sync_skip):
+                    raise RuntimeError(
+                        "GPU connector missing synchronize_selected_group0_skip"
+                    )
+                sync_skip()
         for request in requests:
             state = self._worker_retrieve_state.get(request.req_id)
             if state is not None:
@@ -4303,14 +4318,50 @@ class LMCacheConnectorV1Impl:
             if pending_key[0] == req_id:
                 self._deferred_latent_pending.discard(pending_key)
 
+    def _sync_recompute_fallback_from_engine(
+        self, *, clear_engine: bool = False
+    ) -> set[str]:
+        step_fb = getattr(self, "_step_recompute_fallback_req_ids", None)
+        if not isinstance(step_fb, set):
+            step_fb = set()
+            self._step_recompute_fallback_req_ids = step_fb
+        eng_fb = getattr(
+            getattr(self, "lmcache_engine", None),
+            "_recompute_fallback_req_ids",
+            None,
+        )
+        if eng_fb:
+            step_fb.update(eng_fb)
+        if clear_engine and isinstance(eng_fb, set):
+            eng_fb.clear()
+        return step_fb
+
+    def _is_recompute_fallback_request(self, req_id: str) -> bool:
+        return req_id in (
+            getattr(self, "_step_recompute_fallback_req_ids", None) or ()
+        ) or req_id in (
+            getattr(
+                getattr(self, "lmcache_engine", None),
+                "_recompute_fallback_req_ids",
+                None,
+            )
+            or ()
+        )
+
     def _abort_save_step(self, requests: Iterable[ReqMeta]) -> None:
         """Discard partial stores without advancing decode-window progress."""
+        omit_map = getattr(self, "_selected_group0_omit_end_tokens", None)
+        if isinstance(omit_map, dict):
+            omit_map.clear()
         expected = getattr(self, "_decode_window_save_expected_start", None)
         saved_expected = dict(expected or {})
         for request in requests:
             self._drop_layerwise_save_storers(request.req_id)
         if expected is not None:
             expected.update(saved_expected)
+        step_fb = getattr(self, "_step_recompute_fallback_req_ids", None)
+        if isinstance(step_fb, set):
+            step_fb.clear()
 
     def _release_request_lookup_pins(self, req_id: str) -> None:
         manager = getattr(self, "_manager", None)
@@ -7773,9 +7824,18 @@ class LMCacheConnectorV1Impl:
             the same.
         """
         self.current_layer = 0
+        self._step_recompute_fallback_req_ids = set()
+        recompute_ids = getattr(
+            getattr(self, "lmcache_engine", None),
+            "_recompute_fallback_req_ids",
+            None,
+        )
+        if isinstance(recompute_ids, set):
+            recompute_ids.clear()
         self._wait_for_save_done = False
         self._deferred_layerwise_prefill_load_active = False
         self._initial_layerwise_prefill_load_submitted = False
+        self._layerwise_group0_dma_skipped = set()
 
         attn_metadata = forward_context.attn_metadata
         metadata = self._parent._get_connector_metadata()
@@ -8347,6 +8407,11 @@ class LMCacheConnectorV1Impl:
                                     self._lmcache_chunk_size,
                                 )
                             )
+                    skip_group0_dma = self._should_skip_group0_prefill_dma(
+                        request.req_id, gpu_connector, request=request
+                    )
+                    if skip_group0_dma:
+                        self._layerwise_group0_dma_skipped.add(request.req_id)
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         retrieve_tokens,
                         token_mask,
@@ -8361,6 +8426,11 @@ class LMCacheConnectorV1Impl:
                         shared_cpu_request_preflight_state=dense_preflight_state,
                         _retain_shared_dense_cache=retain_dense_seed,
                         **deferred_prefill_kwargs,
+                        **(
+                            {"_selected_skip_group0_dma": True}
+                            if skip_group0_dma
+                            else {}
+                        ),
                         **(
                             {"prefill_dma_block_ids_by_bank":
                              self._layerwise_prefill_dma_block_ids(request, 0),
@@ -8525,6 +8595,7 @@ class LMCacheConnectorV1Impl:
         # not perform a synchronous retriever advance on the latency path.
         if self._deferred_layerwise_prefill_load_active:
             self._submit_initial_layerwise_prefill_load()
+        self._sync_recompute_fallback_from_engine()
         self._prepare_p_node_layerwise_save_storers(metadata)
 
     def _validate_dense_retrieve_result(
@@ -8651,6 +8722,7 @@ class LMCacheConnectorV1Impl:
                 f"expected={num_expected_tokens}"
             )
         self._invalid_block_ids.update(missing_blocks)
+        self._sync_recompute_fallback_from_engine().add(request.req_id)
 
     def record_failed_blocks(
         self,
@@ -8872,7 +8944,17 @@ class LMCacheConnectorV1Impl:
                         "non-PREFILL_CHILD request: "
                         f"req_id={request.req_id}"
                     )
-                if wait_group not in drained_groups and should_advance_retriever:
+                skip_group0_advance = (
+                    wait_group == 0
+                    and not finish_current
+                    and request.req_id
+                    in getattr(self, "_layerwise_group0_dma_skipped", ())
+                )
+                if (
+                    wait_group not in drained_groups
+                    and should_advance_retriever
+                    and not skip_group0_advance
+                ):
                     ret_token_mask = self._advance_dense_layerwise_retriever(
                         request,
                         self.layerwise_retrievers[idx],
@@ -8903,6 +8985,67 @@ class LMCacheConnectorV1Impl:
             metadata,
         )
 
+    def _should_skip_group0_prefill_dma(
+        self,
+        req_id: str,
+        gpu_connector: Any,
+        request: Optional[Any] = None,
+    ) -> bool:
+        """Return whether Selected-KV prefill owns Group-0 HBM materialization."""
+        if getattr(self, "kv_role", None) == "kv_both":
+            if not getattr(self, "enable_sparse_attention", False):
+                return False
+            if request is not None:
+                if not getattr(request, "is_last_prefill", True):
+                    return False
+                cs = int(getattr(self, "_lmcache_chunk_size", 256) or 256)
+                cached_toks = int(
+                    getattr(
+                        getattr(request, "load_spec", None),
+                        "lmcache_cached_tokens",
+                        0,
+                    )
+                    or 0
+                )
+                committed_end = (
+                    (cached_toks // cs) * cs if cs > 0 else cached_toks
+                )
+                release_gate = max(
+                    int(getattr(self, "_dsa_scratch_capacity", 0) or 0),
+                    int(getattr(self, "_dsa_kv_policy_threshold", 0) or 0),
+                )
+                if committed_end <= release_gate:
+                    return False
+        shared_pred = getattr(
+            self.lmcache_engine, "_should_use_shared_layerwise_retrieve", None
+        )
+        return bool(
+            getattr(self, "_deferred_layerwise_prefill_load_active", False)
+            and getattr(self, "_layerwise_prefill_dma", False)
+            and not getattr(self, "enable_blending", False)
+            and callable(shared_pred)
+            and bool(shared_pred(0))
+            and callable(
+                getattr(
+                    gpu_connector,
+                    "prepare_layerwise_prefill_group0_skip",
+                    None,
+                )
+            )
+            and callable(
+                getattr(
+                    gpu_connector,
+                    "synchronize_selected_group0_skip",
+                    None,
+                )
+            )
+            and getattr(gpu_connector, "fence_debug", None) is None
+            and not hasattr(gpu_connector, "kv_trace")
+            and not hasattr(gpu_connector, "prefill_audit")
+            and req_id
+            in getattr(self, "_selected_skip_group0_dma_req_ids", ())
+        )
+
     def _submit_initial_layerwise_prefill_load(self) -> None:
         """Submit the remaining initial banks without advancing model layers."""
         if self._initial_layerwise_prefill_load_submitted:
@@ -8912,13 +9055,19 @@ class LMCacheConnectorV1Impl:
             for request, retriever_pair in zip(
                 requests, self.layerwise_retrievers, strict=True
             ):
-                for layer_id in range(1, min(
-                    getattr(self, "_layerwise_prefill_bank_count", 2),
-                    len(self._latent_layer_names),
-                )):
-                    self._advance_dense_layerwise_retriever(
-                        request, retriever_pair, 0, layer_id
-                    )
+                if request.req_id not in getattr(
+                    self, "_layerwise_group0_dma_skipped", ()
+                ):
+                    for layer_id in range(
+                        1,
+                        min(
+                            getattr(self, "_layerwise_prefill_bank_count", 2),
+                            len(self._latent_layer_names),
+                        ),
+                    ):
+                        self._advance_dense_layerwise_retriever(
+                            request, retriever_pair, 0, layer_id
+                        )
                 for layer_id in range(1, min(
                     getattr(self, "_layerwise_prefill_bank_count", 2),
                     len(self._indexer_layer_names)
@@ -9747,10 +9896,11 @@ class LMCacheConnectorV1Impl:
                     device=self.device, dtype=torch.long
                 )
 
-        if (
+        producer_prefill_save = (
             self.kv_role == "kv_producer"
             and not self._is_decode_window_save_request(request)
-        ):
+        )
+        if producer_prefill_save:
             skip_leading_tokens = 0
         else:
             assert save_spec is not None
@@ -9763,11 +9913,24 @@ class LMCacheConnectorV1Impl:
                 * self._lmcache_chunk_size
             )
 
+        unverified_prefix_skip = 0
+        if kv_group == 0:
+            omit_skip = self._selected_group0_omit_skip_tokens(request)
+            if omit_skip > skip_leading_tokens:
+                if omit_skip >= len(token_ids):
+                    return None
+                skip_leading_tokens = omit_skip
+                if producer_prefill_save:
+                    unverified_prefix_skip = omit_skip
+
+        mapping_expected_base = (
+            0 if producer_prefill_save else skip_leading_tokens
+        )
         windowed_slot_mapping = (
             self._windowed_sparse_save_mapping(
                 request,
                 kv_group=kv_group,
-                expected_base=skip_leading_tokens,
+                expected_base=mapping_expected_base,
             )
             if slot_mapping is not None
             else None
@@ -9784,8 +9947,12 @@ class LMCacheConnectorV1Impl:
         store_kwargs = self._layerwise_store_kwargs(request, kv_group)
         if "_prefill_metadata_cache" in store_kwargs:
             store_kwargs["_prefill_skip_tokens"] = skip_leading_tokens
+        if unverified_prefix_skip > 0:
+            store_kwargs["_unverified_prefix_skip_tokens"] = (
+                unverified_prefix_skip
+            )
         if windowed_sparse_save:
-            store_kwargs["slot_mapping_base"] = skip_leading_tokens
+            store_kwargs["slot_mapping_base"] = mapping_expected_base
             store_kwargs["windowed_sparse_save"] = True
 
         return (
@@ -9795,6 +9962,25 @@ class LMCacheConnectorV1Impl:
             skip_leading_tokens,
             store_kwargs,
             windowed_sparse_save,
+        )
+
+    def _selected_group0_omit_skip_tokens(self, request: ReqMeta) -> int:
+        if (
+            getattr(request, "is_sparse_decode", False)
+            or self._is_decode_window_save_request(request)
+            or self._is_recompute_fallback_request(request.req_id)
+        ):
+            return 0
+        omit_map = getattr(self, "_selected_group0_omit_end_tokens", None)
+        if not isinstance(omit_map, dict):
+            return 0
+        omit_end = int(omit_map.get(request.req_id, 0) or 0)
+        if omit_end <= 0:
+            return 0
+        return (
+            omit_end
+            // self._lmcache_chunk_size
+            * self._lmcache_chunk_size
         )
 
     def _flush_deferred_latent_store(
@@ -9957,8 +10143,12 @@ class LMCacheConnectorV1Impl:
             prepared_keys = set()
             self._layerwise_prefill_prepared_storer_keys = prepared_keys
         dsa_two_groups = self._is_dsa_two_groups()
+        self._sync_recompute_fallback_from_engine()
         try:
             for request in connector_metadata.requests:
+                if self._is_recompute_fallback_request(request.req_id):
+                    self._drop_layerwise_save_storers(request.req_id)
+                    continue
                 save_spec = request.save_spec
                 if (
                     save_spec is None or not save_spec.can_save
@@ -10077,7 +10267,11 @@ class LMCacheConnectorV1Impl:
                 )
             return
 
+        self._sync_recompute_fallback_from_engine()
         for request in connector_metadata.requests:
+            if self._is_recompute_fallback_request(request.req_id):
+                self._drop_layerwise_save_storers(request.req_id)
+                continue
             save_spec = request.save_spec
             if (
                 save_spec is None or not save_spec.can_save
@@ -10421,7 +10615,11 @@ class LMCacheConnectorV1Impl:
             "_layerwise_prefill_pending_store_finishes",
             {},
         )
+        self._sync_recompute_fallback_from_engine()
         for request in connector_metadata.requests:
+            if self._is_recompute_fallback_request(request.req_id):
+                self._drop_layerwise_save_storers(request.req_id)
+                continue
             storer_key = self._layerwise_save_storer_key(request, kv_group)
             pending_layer = pending_finishes.get(storer_key)
             if pending_layer is None:
@@ -10514,8 +10712,15 @@ class LMCacheConnectorV1Impl:
             try:
                 self._wait_for_save_impl(save_context)
             finally:
-                self._finish_save_batch(save_context)
-                save_fence_complete = True
+                try:
+                    self._finish_save_batch(save_context)
+                    save_fence_complete = True
+                finally:
+                    omit_map = getattr(
+                        self, "_selected_group0_omit_end_tokens", None
+                    )
+                    if isinstance(omit_map, dict):
+                        omit_map.clear()
         except BaseException:
             metadata = self._parent._get_connector_metadata()
             assert isinstance(metadata, LMCacheConnectorMetadata)
@@ -10527,6 +10732,10 @@ class LMCacheConnectorV1Impl:
             for request in save_context.get("decode_window_saves", ()):
                 self._mark_decode_window_save_completed(request)
             self._complete_worker_save_step()
+        finally:
+            step_fb = getattr(self, "_step_recompute_fallback_req_ids", None)
+            if isinstance(step_fb, set):
+                step_fb.clear()
 
     def _wait_for_save_impl(self, save_context: dict[str, Any]) -> None:
         connector_metadata = self._parent._get_connector_metadata()
@@ -10540,9 +10749,15 @@ class LMCacheConnectorV1Impl:
                 self._maybe_lookup_unpin_for_request(request)
             return
 
+        self._sync_recompute_fallback_from_engine()
         if self.use_layerwise:
             if self._should_defer_latent_save_under_tp():
                 for request in connector_metadata.requests:
+                    if self._is_recompute_fallback_request(request.req_id):
+                        self._deferred_latent_pending.discard(
+                            self._layerwise_save_storer_key(request, 0)
+                        )
+                        continue
                     if (
                         self._layerwise_save_storer_key(request, 0)
                         in self._deferred_latent_pending
@@ -10552,6 +10767,10 @@ class LMCacheConnectorV1Impl:
                             request.save_spec,
                         )
             for request in connector_metadata.requests:
+                if self._is_recompute_fallback_request(request.req_id):
+                    self._drop_layerwise_save_storers(request.req_id)
+                    self._maybe_lookup_unpin_for_request(request)
+                    continue
                 for kv_group in (0, 1):
                     storer_key = self._layerwise_save_storer_key(
                         request,
@@ -10594,7 +10813,16 @@ class LMCacheConnectorV1Impl:
                     save_context.setdefault("decode_window_saves", []).append(
                         request
                     )
-                self._mark_prefill_committed(request)
+                if (
+                    self.kv_role == "kv_producer"
+                    and not self._is_decode_window_save_request(request)
+                    and len(request.token_ids) > 0
+                    and self._selected_group0_omit_skip_tokens(request)
+                    >= len(request.token_ids)
+                ):
+                    self._clear_prefill_save_groups_for_req(request.req_id)
+                else:
+                    self._mark_prefill_committed(request)
                 self._mark_initial_sparse_release_ready(request)
                 self._maybe_lookup_unpin_for_request(request)
             return
@@ -10605,6 +10833,8 @@ class LMCacheConnectorV1Impl:
 
         for request in connector_metadata.requests:
             self._maybe_lookup_unpin_for_request(request)
+            if self._is_recompute_fallback_request(request.req_id):
+                continue
             self._mark_initial_sparse_release_ready(request)
 
             try:
