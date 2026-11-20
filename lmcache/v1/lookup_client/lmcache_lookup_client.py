@@ -67,6 +67,8 @@ class LMCacheLookupClient(LookupClientInterface):
         # looked up, the following lookups of the same
         # request must have the same result.
         self.reqs_status: dict[str, int] = {}
+        self._lookup_chunk_hashes: dict[str, tuple] = {}
+        self.lock = self._get_lookup_stash_lock()
 
         # First Party
         from lmcache.v1.token_database import (
@@ -88,7 +90,8 @@ class LMCacheLookupClient(LookupClientInterface):
         None means ongoing; (not supported in sync client)
         int >= 0 means number of hit tokens
         """
-        return self.reqs_status.get(lookup_id, -1)
+        with self._get_lookup_stash_lock():
+            return self.reqs_status.get(lookup_id, -1)
 
     def lookup(
         self,
@@ -106,6 +109,9 @@ class LMCacheLookupClient(LookupClientInterface):
         if not self.enable_blending:
             hashes = []
             offsets = []
+            chunk_end_tokens: list[int] = []
+            tok_len = len(token_ids)
+            stash_ok = True
 
             for (
                 start,
@@ -114,11 +120,23 @@ class LMCacheLookupClient(LookupClientInterface):
             ) in self.token_database.process_tokens(token_ids, make_key=False):
                 hashes.append(key)
                 offsets.append(end - start)
+                if stash_ok and 0 < end <= tok_len:
+                    chunk_end_tokens.append(int(token_ids[end - 1]))
+                else:
+                    stash_ok = False
 
             # if the token database returns no hashes,
             # return 0
             if not hashes:
+                self._drop_lookup_chunk_hashes(lookup_id)
                 return 0
+
+            if stash_ok:
+                self._stash_lookup_chunk_hashes(
+                    lookup_id, token_ids, hashes, offsets, chunk_end_tokens
+                )
+            else:
+                self._drop_lookup_chunk_hashes(lookup_id)
 
             msg_buf = [
                 hashes,
@@ -129,6 +147,7 @@ class LMCacheLookupClient(LookupClientInterface):
             lookup_mode = "hashes"
             lookup_input_count = len(hashes)
         else:
+            self._drop_lookup_chunk_hashes(lookup_id)
             msg_buf = [
                 token_ids,
                 lookup_id,
@@ -137,28 +156,33 @@ class LMCacheLookupClient(LookupClientInterface):
             lookup_mode = "tokens"
             lookup_input_count = len(token_ids)
 
-        responses = self.transport.send_and_recv_all(msg_buf)
+        try:
+            responses = self.transport.send_and_recv_all(msg_buf)
 
-        # Transport returns empty list on failure
-        if not responses:
-            logger.error(
-                "Lookup RPC returned no responses: failed_at=%s "
-                "caller=LMCacheLookupClient.lookup "
-                "lookup_id=%s mode=%s input_count=%s token_count=%s "
-                "transport=%s timeout_ms=%s",
-                _utc_timestamp(),
-                lookup_id,
-                lookup_mode,
-                lookup_input_count,
-                len(token_ids),
-                type(self.transport).__name__,
-                self.config.lookup_timeout_ms,
-            )
-            return 0
+            # Transport returns empty list on failure
+            if not responses:
+                self._drop_lookup_chunk_hashes(lookup_id)
+                logger.error(
+                    "Lookup RPC returned no responses: failed_at=%s "
+                    "caller=LMCacheLookupClient.lookup "
+                    "lookup_id=%s mode=%s input_count=%s token_count=%s "
+                    "transport=%s timeout_ms=%s",
+                    _utc_timestamp(),
+                    lookup_id,
+                    lookup_mode,
+                    lookup_input_count,
+                    len(token_ids),
+                    type(self.transport).__name__,
+                    self.config.lookup_timeout_ms,
+                )
+                return 0
 
-        results = [int.from_bytes(resp, "big") for resp in responses]
+            results = [int.from_bytes(resp, "big") for resp in responses]
 
-        assert len(results) == self.transport.world_size
+            assert len(results) == self.transport.world_size
+        except BaseException:
+            self._drop_lookup_chunk_hashes(lookup_id)
+            raise
         if len(set(results)) > 1:
             logger.warning(
                 "Lookup results (number of hit tokens) "
@@ -169,12 +193,15 @@ class LMCacheLookupClient(LookupClientInterface):
         # tokens is different across (TP and PP) ranks,
         # so we can use the minimum value.
         num_hit_toks = min(results)
-        self.reqs_status[lookup_id] = num_hit_toks
+        with self._get_lookup_stash_lock():
+            self.reqs_status[lookup_id] = num_hit_toks
 
         return num_hit_toks
 
     def clear_lookup_status(self, lookup_id: str) -> None:
-        self.reqs_status.pop(lookup_id, None)
+        with self._get_lookup_stash_lock():
+            self.reqs_status.pop(lookup_id, None)
+            self._drop_lookup_chunk_hashes(lookup_id)
 
     def cleanup_lookup(self, lookup_id: str) -> None:
         """Release lookup pins on every worker before forgetting local state."""
@@ -202,7 +229,14 @@ class LMCacheLookupClient(LookupClientInterface):
         return False
 
     def close(self):
-        self.transport.close()
+        try:
+            self.transport.close()
+        finally:
+            with self._get_lookup_stash_lock():
+                reqs = getattr(self, "reqs_status", None)
+                if reqs is not None:
+                    reqs.clear()
+                self._clear_all_lookup_stashes()
 
 
 class LMCacheLookupServer:

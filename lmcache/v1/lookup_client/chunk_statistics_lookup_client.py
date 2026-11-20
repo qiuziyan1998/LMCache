@@ -152,6 +152,14 @@ class ChunkStatisticsLookupClient(LookupClientInterface):
 
         return result
 
+    def pop_lookup_chunk_hashes(self, lookup_id: str) -> Optional[tuple]:
+        return self.actual_lookup_client.pop_lookup_chunk_hashes(lookup_id)
+
+    def pop_lookup_chunk_digests(
+        self, lookup_id: str
+    ) -> Optional[tuple[int, tuple[int, ...]]]:
+        return self.actual_lookup_client.pop_lookup_chunk_digests(lookup_id)
+
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.actual_lookup_client.clear_lookup_status(lookup_id)
 

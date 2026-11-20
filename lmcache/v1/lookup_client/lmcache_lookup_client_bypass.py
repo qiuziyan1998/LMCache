@@ -56,17 +56,36 @@ class LMCacheBypassLookupClient(LookupClientInterface):
         request_configs: Optional[dict] = None,
     ) -> Optional[int]:
         try:
-            if not self.enable_blending:
+            if not getattr(self, "enable_blending", False):
                 # Process tokens to get hashes and offsets
                 hashes = []
                 offsets = []
+                chunk_end_tokens: list[int] = []
+                tok_len = len(token_ids)
+                stash_ok = True
                 for start, end, key in self.token_database.process_tokens(
                     token_ids, make_key=False
                 ):
                     hashes.append(key)
                     offsets.append(end - start)
+                    if stash_ok and 0 < end <= tok_len:
+                        chunk_end_tokens.append(int(token_ids[end - 1]))
+                    else:
+                        stash_ok = False
                 if not hashes:
+                    self._drop_lookup_chunk_hashes(lookup_id)
                     return 0
+
+                if stash_ok:
+                    self._stash_lookup_chunk_hashes(
+                        lookup_id,
+                        token_ids,
+                        hashes,
+                        offsets,
+                        chunk_end_tokens,
+                    )
+                else:
+                    self._drop_lookup_chunk_hashes(lookup_id)
 
                 # Call LMCacheEngine lookup with hashes and offsets
                 result = self.lmcache_engine.lookup(
@@ -77,6 +96,7 @@ class LMCacheBypassLookupClient(LookupClientInterface):
                     request_configs=request_configs,
                 )
             else:
+                self._drop_lookup_chunk_hashes(lookup_id)
                 # For blending mode, pass tokens directly
                 result = self.lmcache_engine.lookup(
                     tokens=token_ids,
@@ -88,6 +108,7 @@ class LMCacheBypassLookupClient(LookupClientInterface):
             return result
 
         except Exception as e:
+            self._drop_lookup_chunk_hashes(lookup_id)
             logger.error(f"Error in bypass lookup: {e}")
             return 0
 
@@ -95,8 +116,11 @@ class LMCacheBypassLookupClient(LookupClientInterface):
         return True
 
     def cleanup_lookup(self, lookup_id: str) -> None:
-        self.lmcache_engine.cleanup_memory_objs(lookup_id)
+        try:
+            self.lmcache_engine.cleanup_memory_objs(lookup_id)
+        finally:
+            self.clear_lookup_status(lookup_id)
 
     def close(self):
-        # No resources to clean up for bypass client
+        self._clear_all_lookup_stashes()
         logger.info("LMCacheBypassLookupClient closed")

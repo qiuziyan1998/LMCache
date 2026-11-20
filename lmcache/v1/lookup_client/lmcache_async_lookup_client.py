@@ -136,6 +136,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         # None indicates ongoing.
         # int indicates number of hit tokens.
         self.reqs_status: dict[str, Optional[int]] = {}
+        self._lookup_chunk_hashes: dict[str, tuple] = {}
 
         # map from lookup_id (i.e., req_id) to number of hit tokens for each worker
         self.res_for_each_worker: dict[str, list[int]] = {}
@@ -216,11 +217,27 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
     ) -> Optional[int]:
         hashes: list[int | bytes] = []
         offsets = []
+        chunk_end_tokens: list[int] = []
+        tok_len = len(token_ids)
+        stash_ok = not bool(
+            getattr(getattr(self, "config", None), "enable_blending", False)
+        )
         for start, end, hash_val in self.token_database.process_tokens(
             token_ids, make_key=False
         ):
             hashes.append(hash_val)  # type: ignore[arg-type]
             offsets.append(end - start)
+            if stash_ok and 0 < end <= tok_len:
+                chunk_end_tokens.append(int(token_ids[end - 1]))
+            else:
+                stash_ok = False
+
+        if stash_ok and hashes:
+            self._stash_lookup_chunk_hashes(
+                lookup_id, token_ids, hashes, offsets, chunk_end_tokens
+            )
+        else:
+            self._drop_lookup_chunk_hashes(lookup_id)
 
         # Create structured message
         msg = LookupRequestMsg(
@@ -233,8 +250,12 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         # Serialize message using msgspec
         msg_buf = msgspec.msgpack.encode(msg)
 
-        for i in range(self.world_size):
-            self.push_sockets[i].send(msg_buf, copy=False)
+        try:
+            for i in range(self.world_size):
+                self.push_sockets[i].send(msg_buf, copy=False)
+        except BaseException:
+            self._drop_lookup_chunk_hashes(lookup_id)
+            raise
         if not self.prefill_cpu_prefetch:
             time.sleep(self.lookup_backoff_time)
         return None
@@ -277,6 +298,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                             self.cleanup_res_for_each_worker.pop(lookup_id, None)
                             self.res_for_each_worker.pop(lookup_id, None)
                             self.reqs_status.pop(lookup_id, None)
+                            self._drop_lookup_chunk_hashes(lookup_id)
                             self.first_lookup_time.pop(lookup_id, None)
                             self.aborted_lookups.discard(lookup_id)
                             if lookup_id in getattr(self, "prefetch_timeouts", ()):
@@ -324,6 +346,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
     def clear_lookup_status(self, lookup_id: str) -> None:
         with self.lock:
             self.reqs_status.pop(lookup_id, None)
+            self._drop_lookup_chunk_hashes(lookup_id)
             self.first_lookup_time.pop(lookup_id, None)
             getattr(self, "lookup_complete_workers", {}).pop(lookup_id, None)
 
@@ -336,6 +359,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             already_pending = lookup_id in self.aborted_lookups
             self.aborted_lookups.add(lookup_id)
             self.reqs_status.pop(lookup_id, None)
+            self._drop_lookup_chunk_hashes(lookup_id)
             self.first_lookup_time.pop(lookup_id, None)
         if not already_pending:
             self._send_cleanup_message(lookup_id)
@@ -368,6 +392,8 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             self.ctx.term()
         except Exception as e:
             logger.warning("Failed to join thread during close: %s", e)
+        finally:
+            self._clear_all_lookup_stashes()
 
 
 class LMCacheAsyncLookupServer:
