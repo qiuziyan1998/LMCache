@@ -5,6 +5,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from random import Random
 from types import SimpleNamespace
+import logging
 
 # Third Party
 import pytest
@@ -284,6 +285,48 @@ def test_reclaim_targets_missing_group_and_preserves_borrowed_and_pinned_owners(
     pages[1].unpin()
     pages[2].ref_count_down()
     backend.clear()
+    assert owner.total_allocated_size == 0 and owner.memcheck()
+
+
+def test_checkpoint_reclaim_reports_entries_checked_and_stops_at_first_match(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = make_allocator(slots=2)
+    backend = LocalCPUBackend(
+        LMCacheEngineConfig.from_defaults(local_cpu=True), memory_allocator=owner
+    )
+    logger = logging.getLogger("lmcache.v1.storage_backend.local_cpu_backend")
+    monkeypatch.setattr(logger, "handlers", [caplog.handler])
+    caplog.set_level(logging.INFO, logger=logger.name)
+    keys = [
+        CacheEngineKey("test", 1, 0, 0, torch.bfloat16, kv_group=0),
+        CacheEngineKey("test", 1, 0, 1, torch.uint8, kv_group=1),
+        CacheEngineKey("test", 1, 0, 2, torch.uint8, kv_group=1),
+    ]
+    latent = allocate(owner, 0, [1])
+    index = allocate(owner, 1, [1, 1])
+    assert latent is not None and index is not None
+    pages = latent + index
+    backend.batched_submit_layer_pages(keys, pages)
+    try:
+        for page in pages:
+            page.ref_count_down()
+        assert not backend.reclaim_layer_page_slots(
+            {1: 1}, allocation_purpose="checkpoint", max_scan_entries=1
+        )
+        assert all(backend.contains(key) for key in keys)
+        assert backend.reclaim_layer_page_slots(
+            {1: 1}, allocation_purpose="checkpoint", max_scan_entries=3
+        )
+        assert [backend.contains(key) for key in keys] == [True, False, True]
+        logs = [
+            line for line in caplog.messages if "reclaim purpose=checkpoint" in line
+        ]
+        assert len(logs) == 2
+        assert "scanned=1 scan_ms=" in logs[0]
+        assert "scanned=2 scan_ms=" in logs[1]
+    finally:
+        backend.clear()
     assert owner.total_allocated_size == 0 and owner.memcheck()
 
 
