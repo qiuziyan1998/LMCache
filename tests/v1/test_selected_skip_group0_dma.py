@@ -256,11 +256,15 @@ class TestSelectedSkipGroup0DMA(unittest.TestCase):
             eng.gpu_connector.reset_layerwise_prefill_transfer_state = reset
             impl = _impl(
                 use_layerwise=True,
-                lmcache_engine=eng,
                 layerwise_retrievers=[(gen, None)],
                 _layerwise_retriever_is_sparse=[False],
                 _worker_retrieve_state={},
             )
+            # The adapter property stores its engine on the manager; updating
+            # __dict__ through _impl kwargs would bypass that setter.
+            impl.lmcache_engine = eng
+            self.assertIs(impl.lmcache_engine, eng)
+            self.assertTrue(impl.supports_layerwise_prefill_transfer_window)
             impl._abort_layerwise_retrieve_step([])
             reset.assert_called_once_with(synchronize=True)
             self.assertEqual(impl.layerwise_retrievers, [])
