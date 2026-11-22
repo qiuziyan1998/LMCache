@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for selected-KV Group-0 prefill DMA skipping."""
+"""Unit tests for ondemand-selected Group-0 prefill DMA skipping."""
 
 # Standard
 from types import SimpleNamespace as _NS
@@ -49,15 +49,6 @@ def _env(req: str, grp: int, b: SharedHandleBatch) -> SharedHandleEnvelope:
     return SharedHandleEnvelope(req, "dense_prefix", 0, 0, grp, "ok", 1, [], batch=b)
 
 
-def _rel_once(objs: Any, *, unpin: bool = False, kwargs: Any = None) -> None:
-    del kwargs
-    for obj in list(objs):
-        if unpin and getattr(obj, "is_pinned", False):
-            obj.unpin()
-        if obj.is_valid():
-            obj.ref_count_down()
-
-
 def _eng(
     *, nl: int = 3, r0: bool = True, abort: bool = False, rf: bool = False, **ex: Any
 ) -> Any:
@@ -97,11 +88,17 @@ def _eng(
             prepare_layerwise_prefill_group0_skip=_nop,
         )
     if abort:
-        eng._unsafe_layerwise_retrieve_sources = []
         eng._prepare_shared_prefill_sources = eng._broadcast_shared_envelope = _nop
         eng._adopt_dense_shared_retrieve_cache = lambda *_a, **_k: False
-        eng._release_retained_dense_retrieve_objs = _rel_once
-        eng._release_shared_retrieve_objs = _rel_once
+        # Exercise production ownership cleanup, including its unsafe-retention
+        # fallback, instead of a replacement that can hide leaked references.
+        eng._release_shared_retrieve_objs = LMCacheEngine._release_shared_retrieve_objs
+        for name in (
+            "_release_retained_dense_retrieve_objs",
+            "_retain_unsafe_layerwise_retrieve_objs",
+            "_close_shared_retrieve_consumer",
+        ):
+            eng.__dict__.pop(name, None)
     if rf:
         eng.is_healthy = lambda: True
         eng._num_transfer_layers_for_call = lambda _g, _k: nl
@@ -185,11 +182,21 @@ def _impl(
     return impl
 
 
-def _r0_gen(eng: Any, nl: int, nc: int, rid: str, mid: int, hit: bool) -> Any:
+def _r0_gen(
+    eng: Any,
+    nl: int,
+    nc: int,
+    rid: str,
+    mid: int,
+    hit: bool,
+    *,
+    skip_dma: bool = True,
+) -> Any:
     keys: Any = [[f"k{i}_{j}" for j in range(nc)] for i in range(nl)] if nc else []
     locs = [["LocalCPUBackend"] * nc for _ in range(nl)] if nc else []
     rm = (torch.ones if hit else torch.zeros)(max(nc, 1) * 128, dtype=torch.bool)
     kw = {**_KW, "kvcaches": ["k0"]} if nc else dict(_KW)
+    kw["_selected_skip_group0_dma"] = skip_dma
     st, en = [i * 128 for i in range(nc)], [(i + 1) * 128 for i in range(nc)]
     return rm, eng._retrieve_layer_shared_rank0(
         starts=st,
@@ -225,16 +232,47 @@ class TestSelectedSkipGroup0DMA(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def _abort_ok(self, eng: Any, ab_g: Any, ok_g: Any, objs: list[_Obj]) -> None:
-        next(ab_g)
-        next(ab_g)
-        ab_g.close()
-        self.assertEqual(len(eng.unsafe), 2)
-        self.assertEqual((objs[0].ref_downs, objs[1].ref_downs), (0, 0))
-        eng.unsafe.clear()
-        list(ok_g)
-        self.assertEqual(eng.unsafe, [])
-        self.assertEqual((objs[0].ref_downs, objs[1].ref_downs), (1, 1))
+    def _abort_ok(
+        self,
+        eng: Any,
+        gen: Any,
+        objs: list[_Obj],
+        *,
+        boundary: int,
+        via_adapter: bool,
+        rank0: bool,
+    ) -> None:
+        for _ in range(boundary):
+            next(gen)
+        self.assertEqual([obj.ref_downs for obj in objs], [0] * len(objs))
+        if via_adapter:
+
+            def assert_sources_live(**kwargs: Any) -> None:
+                self.assertEqual(kwargs, {"synchronize": True})
+                self.assertTrue(all(obj.is_valid() for obj in objs))
+
+            reset = MagicMock(side_effect=assert_sources_live)
+            eng.gpu_connector.supports_layerwise_prefill_transfer_window = True
+            eng.gpu_connector.reset_layerwise_prefill_transfer_state = reset
+            impl = _impl(
+                use_layerwise=True,
+                lmcache_engine=eng,
+                layerwise_retrievers=[(gen, None)],
+                _layerwise_retriever_is_sparse=[False],
+                _worker_retrieve_state={},
+            )
+            impl._abort_layerwise_retrieve_step([])
+            reset.assert_called_once_with(synchronize=True)
+            self.assertEqual(impl.layerwise_retrievers, [])
+        else:
+            gen.close()
+        self.assertEqual([obj.ref_downs for obj in objs], [1] * len(objs))
+        if rank0:
+            self.assertTrue(all(not obj.is_pinned for obj in objs))
+        self.assertEqual(getattr(eng, "_unsafe_layerwise_retrieve_sources", []), [])
+        # Closing again must not release the same ownership twice.
+        gen.close()
+        self.assertEqual([obj.ref_downs for obj in objs], [1] * len(objs))
 
     def test_rank0_hit_miss_and_retains_sources_during_skip(self) -> None:
         c: dict[str, list[Any]] = {k: [] for k in "btg skip srcs bcast rel".split()}
@@ -379,28 +417,124 @@ class TestSelectedSkipGroup0DMA(unittest.TestCase):
         self.assertIsNotNone(g1_last)
         self.assertTrue(bool(g1_last.all()))
 
-    def test_abort_after_two_primes_and_missing_hook_fails_closed(self) -> None:
-        batch, owned = _batch(2, 1), [[_Obj(0)], [_Obj(1)]]
+    def test_rank0_abort_releases_sources_at_each_skip_yield(self) -> None:
+        for boundary in (1, 2):
+            for via_adapter in (False, True):
+                with self.subTest(boundary=boundary, via_adapter=via_adapter):
+                    batch, owned = _batch(2, 1), [[_Obj(0)], [_Obj(1)]]
+                    eng = _eng(nl=2, r0=True, abort=True)
+                    eng._make_shared_handle_batch = lambda *a, b=batch, **k: b
+                    eng._resolve_shared_rank0_layer_mem_objs = (
+                        lambda o=owned, **k: o[k["layer_id"]]
+                    )
+                    gen = _r0_gen(eng, 2, 1, "r-ab", 3, False)[1]
+                    self._abort_ok(
+                        eng,
+                        gen,
+                        [owned[0][0], owned[1][0]],
+                        boundary=boundary,
+                        via_adapter=via_adapter,
+                        rank0=True,
+                    )
+
+    def test_missing_skip_hook_fails_closed(self) -> None:
         eng = _eng(nl=2, r0=True, abort=True)
-        eng._make_shared_handle_batch = lambda *a, **k: batch
-        eng._resolve_shared_rank0_layer_mem_objs = lambda **k: owned[k["layer_id"]]
-        ab_g = _r0_gen(eng, 2, 1, "r-ab", 3, False)[1]
-        ok_g = _r0_gen(eng, 2, 1, "r-ok", 30, True)[1]
-        self._abort_ok(eng, ab_g, ok_g, [owned[0][0], owned[1][0]])
         eng.gpu_connector = _NS()
         err = "prepare_layerwise_prefill_group0_skip"
         g_bad = _r0_gen(eng, 2, 1, "r-bad", 4, False)[1]
         self.assertRaisesRegex(RuntimeError, err, next, g_bad)
 
-    def test_passive_abort_after_two_primes_retains_unsafe_and_completes(self) -> None:
-        batch, owned = _batch(2, 2, compact=True), (_Obj(0), _Obj(1))
-        eng = _eng(nl=2, r0=False, abort=True)
-        eng._make_passive_layer_page_views = lambda *a, **k: owned
-        recv = lambda *a, **k: _env(k.get("req_id", "p-ab"), 0, batch)
-        eng._receive_matching_shared_envelope = recv
-        ab_g = _p_gen(eng, "p-ab", 31, 0)[1]
-        ok_g = _p_gen(eng, "p-ok", 32, 0)[1]
-        self._abort_ok(eng, ab_g, ok_g, list(owned))
+    def test_passive_abort_releases_views_at_each_skip_yield(self) -> None:
+        for boundary in (1, 2):
+            for via_adapter in (False, True):
+                with self.subTest(boundary=boundary, via_adapter=via_adapter):
+                    batch = _batch(2, 2, compact=True)
+                    owned = (_Obj(0), _Obj(1))
+                    for obj in owned:
+                        obj.is_pinned = False
+                    eng = _eng(nl=2, r0=False, abort=True)
+                    eng._make_passive_layer_page_views = lambda *a, o=owned, **k: o
+                    eng._receive_matching_shared_envelope = (
+                        lambda *a, b=batch, **k: _env(k["req_id"], 0, b)
+                    )
+                    gen = _p_gen(eng, "p-ab", 31, 0)[1]
+                    self._abort_ok(
+                        eng,
+                        gen,
+                        list(owned),
+                        boundary=boundary,
+                        via_adapter=via_adapter,
+                        rank0=False,
+                    )
+
+    def test_failed_dma_retains_sources_until_completion_is_proven(self) -> None:
+        for rank0 in (True, False):
+            for failure_phase in ("submit", "synchronize", "close"):
+                with self.subTest(rank0=rank0, failure_phase=failure_phase):
+                    enqueued: list[Any] = []
+
+                    def failing_dma(
+                        *args: Any,
+                        enqueued: list[Any] = enqueued,
+                        failure_phase: str = failure_phase,
+                        **kwargs: Any,
+                    ) -> Any:
+                        try:
+                            for _ in range(2):
+                                source = yield None
+                                enqueued.append(source)
+                                if failure_phase == "submit":
+                                    raise RuntimeError("DMA completion unknown")
+                            # Both layers were submitted. The next resume is
+                            # the consumer's final synchronization boundary.
+                            yield None
+                            raise RuntimeError("DMA completion unknown")
+                        finally:
+                            if failure_phase == "close":
+                                raise RuntimeError("DMA completion unknown")
+
+                    eng = _eng(nl=2, r0=rank0, abort=True)
+                    eng.gpu_connector.batched_to_gpu = failing_dma
+                    if rank0:
+                        owned = [[_Obj(0)], [_Obj(1)]]
+                        batch = _batch(2, 1)
+                        eng._make_shared_handle_batch = lambda *a, b=batch, **k: b
+                        eng._resolve_shared_rank0_layer_mem_objs = (
+                            lambda o=owned, **k: o[k["layer_id"]]
+                        )
+                        objs = [owned[0][0], owned[1][0]]
+                        gen = _r0_gen(
+                            eng, 2, 1, "r-dma", 40, True, skip_dma=False
+                        )[1]
+                    else:
+                        objs = [_Obj(0), _Obj(1)]
+                        for obj in objs:
+                            obj.is_pinned = False
+                        batch = _batch(2, 2, compact=True)
+                        eng._make_passive_layer_page_views = (
+                            lambda *a, o=objs, **k: tuple(o)
+                        )
+                        eng._receive_matching_shared_envelope = (
+                            lambda *a, b=batch, **k: _env(k["req_id"], 1, b)
+                        )
+                        gen = _p_gen(eng, "p-dma", 41, 1)[1]
+                    with self.assertRaisesRegex(
+                        RuntimeError, "DMA completion unknown"
+                    ):
+                        if failure_phase == "close":
+                            next(gen)
+                            next(gen)
+                            self.assertEqual(len(enqueued), 1)
+                            gen.close()
+                        else:
+                            list(gen)
+                    self.assertEqual(
+                        len(enqueued), 2 if failure_phase == "synchronize" else 1
+                    )
+                    self.assertEqual([obj.ref_downs for obj in objs], [0, 0])
+                    self.assertEqual(eng._unsafe_layerwise_retrieve_sources, objs)
+                    if rank0:
+                        self.assertTrue(all(obj.is_pinned for obj in objs))
 
     def test_should_skip_group0_dma_kv_both_full_resident_guard(self) -> None:
         fn = "prepare_layerwise_prefill_group0_skip"

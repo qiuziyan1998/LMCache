@@ -6055,12 +6055,13 @@ class LMCacheEngine:
                 self._prepare_shared_prefill_sources(
                     prepared_sources, kv_group, kwargs
                 )
-                sources_safe_to_release = False
                 if skip_group0_dma:
+                    # No consumer can enqueue H2D for this group. Keep sources
+                    # releasable if either protocol yield is closed on abort.
                     yield torch.sum(ret_mask)
                     yield None
-                    sources_safe_to_release = True
                 else:
+                    sources_safe_to_release = False
                     try:
                         yield from (
                             self._submit_prepared_shared_prefill_layers(
@@ -6614,12 +6615,14 @@ class LMCacheEngine:
                         self._prepare_shared_prefill_sources(
                             prepared_sources, kv_group, kwargs
                         )
-                    sources_safe_to_release = False
                 if skip_group0_dma:
+                    # No consumer can enqueue H2D for this group. Keep sources
+                    # releasable if either protocol yield is closed on abort.
                     yield torch.sum(ret_mask)
                     yield None
-                    sources_safe_to_release = True
                 else:
+                    if resolved_layers:
+                        sources_safe_to_release = False
                     try:
                         yield from (
                             self._submit_prepared_shared_prefill_layers(
