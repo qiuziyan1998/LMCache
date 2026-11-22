@@ -2205,6 +2205,7 @@ class PreemptionConnectorMetadata(LMCacheConnectorMetadata):
 class LMCacheConnectorV1Impl:
     supports_preemption_checkpoint = False
     _defer_prepared_sparse_setup = False
+    _supports_selected_group0_omit_skip = True
 
     def __init__(
         self,
@@ -2440,6 +2441,7 @@ class LMCacheConnectorV1Impl:
         self._deferred_layerwise_prefill_load_active = False
         self._initial_layerwise_prefill_load_submitted = False
         self._deferred_layerwise_prefill_drained_groups: set[int] = set()
+        self._layerwise_group0_dma_skipped: set[str] = set()
         self._layerwise_save_storers: dict[
             LayerwiseSaveKey, Generator[Optional[LayerwiseStoreResult], None, None]
         ] = {}
@@ -4189,6 +4191,7 @@ class LMCacheConnectorV1Impl:
             self._deferred_layerwise_prefill_load_active = False
             self._initial_layerwise_prefill_load_submitted = False
             self._deferred_layerwise_prefill_drained_groups = set()
+            self._layerwise_group0_dma_skipped = set()
 
     @staticmethod
     def _close_layerwise_retriever(
@@ -4223,6 +4226,17 @@ class LMCacheConnectorV1Impl:
             # two-bank state before closing generators and releasing those
             # references.
             reset_transfer_state(synchronize=True)
+            if getattr(self, "_layerwise_group0_dma_skipped", None):
+                sync_skip = getattr(
+                    gpu_connector,
+                    "synchronize_selected_group0_skip",
+                    None,
+                )
+                if not callable(sync_skip):
+                    raise RuntimeError(
+                        "GPU connector missing synchronize_selected_group0_skip"
+                    )
+                sync_skip()
         for request in requests:
             state = self._worker_retrieve_state.get(request.req_id)
             if state is not None:
@@ -4557,6 +4571,9 @@ class LMCacheConnectorV1Impl:
 
     def _abort_save_step(self, requests: Iterable[ReqMeta]) -> None:
         """Discard partial stores without advancing decode-window progress."""
+        omit_map = getattr(self, "_selected_group0_omit_end_tokens", None)
+        if isinstance(omit_map, dict):
+            omit_map.clear()
         expected = getattr(self, "_decode_window_save_expected_start", None)
         saved_expected = dict(expected or {})
         for request in requests:
@@ -8070,6 +8087,7 @@ class LMCacheConnectorV1Impl:
         self._wait_for_save_done = False
         self._deferred_layerwise_prefill_load_active = False
         self._initial_layerwise_prefill_load_submitted = False
+        self._layerwise_group0_dma_skipped = set()
 
         attn_metadata = forward_context.attn_metadata
         metadata = self._parent._get_connector_metadata()
@@ -8697,6 +8715,11 @@ class LMCacheConnectorV1Impl:
                                     self._lmcache_chunk_size,
                                 )
                             )
+                    skip_group0_dma = self._should_skip_group0_prefill_dma(
+                        request.req_id, gpu_connector, request=request
+                    )
+                    if skip_group0_dma:
+                        self._layerwise_group0_dma_skipped.add(request.req_id)
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         retrieve_tokens,
                         token_mask,
@@ -8711,6 +8734,11 @@ class LMCacheConnectorV1Impl:
                         shared_cpu_request_preflight_state=dense_preflight_state,
                         _retain_shared_dense_cache=retain_dense_seed,
                         **deferred_prefill_kwargs,
+                        **(
+                            {"_selected_skip_group0_dma": True}
+                            if skip_group0_dma
+                            else {}
+                        ),
                         **(
                             {"prefill_dma_block_ids_by_bank":
                              self._layerwise_prefill_dma_block_ids(request, 0),
@@ -9245,7 +9273,17 @@ class LMCacheConnectorV1Impl:
                         "non-PREFILL_CHILD request: "
                         f"req_id={request.req_id}"
                     )
-                if wait_group not in drained_groups and should_advance_retriever:
+                skip_group0_advance = (
+                    wait_group == 0
+                    and not finish_current
+                    and request.req_id
+                    in getattr(self, "_layerwise_group0_dma_skipped", ())
+                )
+                if (
+                    wait_group not in drained_groups
+                    and should_advance_retriever
+                    and not skip_group0_advance
+                ):
                     ret_token_mask = self._advance_dense_layerwise_retriever(
                         request,
                         self.layerwise_retrievers[idx],
@@ -9276,6 +9314,67 @@ class LMCacheConnectorV1Impl:
             metadata,
         )
 
+    def _should_skip_group0_prefill_dma(
+        self,
+        req_id: str,
+        gpu_connector: Any,
+        request: Optional[Any] = None,
+    ) -> bool:
+        """Return whether Selected-KV prefill owns Group-0 HBM materialization."""
+        if getattr(self, "kv_role", None) == "kv_both":
+            if not getattr(self, "enable_sparse_attention", False):
+                return False
+            if request is not None:
+                if not getattr(request, "is_last_prefill", True):
+                    return False
+                cs = int(getattr(self, "_lmcache_chunk_size", 256) or 256)
+                cached_toks = int(
+                    getattr(
+                        getattr(request, "load_spec", None),
+                        "lmcache_cached_tokens",
+                        0,
+                    )
+                    or 0
+                )
+                committed_end = (
+                    (cached_toks // cs) * cs if cs > 0 else cached_toks
+                )
+                release_gate = max(
+                    int(getattr(self, "_dsa_scratch_capacity", 0) or 0),
+                    int(getattr(self, "_dsa_kv_policy_threshold", 0) or 0),
+                )
+                if committed_end <= release_gate:
+                    return False
+        shared_pred = getattr(
+            self.lmcache_engine, "_should_use_shared_layerwise_retrieve", None
+        )
+        return bool(
+            getattr(self, "_deferred_layerwise_prefill_load_active", False)
+            and getattr(self, "_layerwise_prefill_dma", False)
+            and not getattr(self, "enable_blending", False)
+            and callable(shared_pred)
+            and bool(shared_pred(0))
+            and callable(
+                getattr(
+                    gpu_connector,
+                    "prepare_layerwise_prefill_group0_skip",
+                    None,
+                )
+            )
+            and callable(
+                getattr(
+                    gpu_connector,
+                    "synchronize_selected_group0_skip",
+                    None,
+                )
+            )
+            and getattr(gpu_connector, "fence_debug", None) is None
+            and not hasattr(gpu_connector, "kv_trace")
+            and not hasattr(gpu_connector, "prefill_audit")
+            and req_id
+            in getattr(self, "_selected_skip_group0_dma_req_ids", ())
+        )
+
     def _submit_initial_layerwise_prefill_load(self) -> None:
         """Submit the remaining initial banks without advancing model layers."""
         if self._initial_layerwise_prefill_load_submitted:
@@ -9285,13 +9384,19 @@ class LMCacheConnectorV1Impl:
             for request, retriever_pair in zip(
                 requests, self.layerwise_retrievers, strict=True
             ):
-                for layer_id in range(1, min(
-                    getattr(self, "_layerwise_prefill_bank_count", 2),
-                    len(self._latent_layer_names),
-                )):
-                    self._advance_dense_layerwise_retriever(
-                        request, retriever_pair, 0, layer_id
-                    )
+                if request.req_id not in getattr(
+                    self, "_layerwise_group0_dma_skipped", ()
+                ):
+                    for layer_id in range(
+                        1,
+                        min(
+                            getattr(self, "_layerwise_prefill_bank_count", 2),
+                            len(self._latent_layer_names),
+                        ),
+                    ):
+                        self._advance_dense_layerwise_retriever(
+                            request, retriever_pair, 0, layer_id
+                        )
                 for layer_id in range(1, min(
                     getattr(self, "_layerwise_prefill_bank_count", 2),
                     len(self._indexer_layer_names)
@@ -10127,10 +10232,11 @@ class LMCacheConnectorV1Impl:
                     device=self.device, dtype=torch.long
                 )
 
-        if (
+        producer_prefill_save = (
             self.kv_role == "kv_producer"
             and not self._is_decode_window_save_request(request)
-        ):
+        )
+        if producer_prefill_save:
             skip_leading_tokens = 0
         else:
             assert save_spec is not None
@@ -10143,11 +10249,24 @@ class LMCacheConnectorV1Impl:
                 * self._lmcache_chunk_size
             )
 
+        unverified_prefix_skip = 0
+        if kv_group == 0:
+            omit_skip = self._selected_group0_omit_skip_tokens(request)
+            if omit_skip > skip_leading_tokens:
+                if omit_skip >= len(token_ids):
+                    return None
+                skip_leading_tokens = omit_skip
+                if producer_prefill_save:
+                    unverified_prefix_skip = omit_skip
+
+        mapping_expected_base = (
+            0 if producer_prefill_save else skip_leading_tokens
+        )
         windowed_slot_mapping = (
             self._windowed_sparse_save_mapping(
                 request,
                 kv_group=kv_group,
-                expected_base=skip_leading_tokens,
+                expected_base=mapping_expected_base,
             )
             if slot_mapping is not None
             else None
@@ -10164,8 +10283,12 @@ class LMCacheConnectorV1Impl:
         store_kwargs = self._layerwise_store_kwargs(request, kv_group)
         if "_prefill_metadata_cache" in store_kwargs:
             store_kwargs["_prefill_skip_tokens"] = skip_leading_tokens
+        if unverified_prefix_skip > 0:
+            store_kwargs["_unverified_prefix_skip_tokens"] = (
+                unverified_prefix_skip
+            )
         if windowed_sparse_save:
-            store_kwargs["slot_mapping_base"] = skip_leading_tokens
+            store_kwargs["slot_mapping_base"] = mapping_expected_base
             store_kwargs["windowed_sparse_save"] = True
 
         return (
@@ -10175,6 +10298,25 @@ class LMCacheConnectorV1Impl:
             skip_leading_tokens,
             store_kwargs,
             windowed_sparse_save,
+        )
+
+    def _selected_group0_omit_skip_tokens(self, request: ReqMeta) -> int:
+        if (
+            getattr(request, "is_sparse_decode", False)
+            or self._is_decode_window_save_request(request)
+            or self._is_recompute_fallback_request(request.req_id)
+        ):
+            return 0
+        omit_map = getattr(self, "_selected_group0_omit_end_tokens", None)
+        if not isinstance(omit_map, dict):
+            return 0
+        omit_end = int(omit_map.get(request.req_id, 0) or 0)
+        if omit_end <= 0:
+            return 0
+        return (
+            omit_end
+            // self._lmcache_chunk_size
+            * self._lmcache_chunk_size
         )
 
     def _flush_deferred_latent_store(
@@ -10906,8 +11048,15 @@ class LMCacheConnectorV1Impl:
             try:
                 self._wait_for_save_impl(save_context)
             finally:
-                self._finish_save_batch(save_context)
-                save_fence_complete = True
+                try:
+                    self._finish_save_batch(save_context)
+                    save_fence_complete = True
+                finally:
+                    omit_map = getattr(
+                        self, "_selected_group0_omit_end_tokens", None
+                    )
+                    if isinstance(omit_map, dict):
+                        omit_map.clear()
         except BaseException:
             metadata = self._parent._get_connector_metadata()
             assert isinstance(metadata, LMCacheConnectorMetadata)
@@ -11000,7 +11149,16 @@ class LMCacheConnectorV1Impl:
                     save_context.setdefault("decode_window_saves", []).append(
                         request
                     )
-                self._mark_prefill_committed(request)
+                if (
+                    self.kv_role == "kv_producer"
+                    and not self._is_decode_window_save_request(request)
+                    and len(request.token_ids) > 0
+                    and self._selected_group0_omit_skip_tokens(request)
+                    >= len(request.token_ids)
+                ):
+                    self._clear_prefill_save_groups_for_req(request.req_id)
+                else:
+                    self._mark_prefill_committed(request)
                 self._mark_initial_sparse_release_ready(request)
                 self._maybe_lookup_unpin_for_request(request)
             return

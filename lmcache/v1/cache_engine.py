@@ -154,6 +154,7 @@ class LayerwiseStoreResult:
     # successfully stored for every layer. Zero means the store was skipped or
     # incomplete and must not be used to release serving-engine KV blocks.
     committed_end: int = 0
+    unverified_prefix_end: int = 0
 
     def has_cache(self) -> bool:
         """Return whether the completed store produced reusable cache data."""
@@ -2763,6 +2764,8 @@ class LMCacheEngine:
         monitor_req_id: int,
         yielded_steps: int,
         kv_group: int = 0,
+        skip_group0_dma: bool = False,
+        req_id: Optional[str] = None,
     ) -> Generator[Optional[torch.Tensor], None, None]:
         """Complete a failed layerwise load with the ordinary recompute signal.
 
@@ -2771,9 +2774,13 @@ class LMCacheEngine:
         an empty mask lets the existing vLLM invalid-block policy roll the
         request back to recomputation instead of failing the worker.
         """
+        self._record_recompute_fallback_req(req_id)
         ret_mask.zero_()
+        total_non_result_steps = (
+            2 if skip_group0_dma else self.num_layers_for_group(kv_group) + 1
+        )
         remaining_non_result_steps = max(
-            self.num_layers_for_group(kv_group) + 1 - yielded_steps,
+            total_non_result_steps - yielded_steps,
             0,
         )
         for _ in range(remaining_non_result_steps):
@@ -4749,6 +4756,20 @@ class LMCacheEngine:
         if consumer is not None:
             consumer.close()
 
+    def _prepare_group0_skip_consumer(self, kwargs: dict[str, Any]) -> None:
+        prepare_skip = getattr(
+            self.gpu_connector, "prepare_layerwise_prefill_group0_skip", None
+        )
+        sync_skip = getattr(
+            self.gpu_connector, "synchronize_selected_group0_skip", None
+        )
+        if not callable(prepare_skip) or not callable(sync_skip):
+            raise RuntimeError(
+                "GPU connector missing prepare_layerwise_prefill_group0_skip "
+                "or synchronize_selected_group0_skip"
+            )
+        prepare_skip(**kwargs)
+
     @staticmethod
     def _release_shared_retrieve_objs(
         memory_objs: list[MemoryObj], *, unpin: bool
@@ -5587,6 +5608,11 @@ class LMCacheEngine:
             )
             is not None
         )
+        skip_group0_dma = bool(
+            deferred_layerwise_get
+            and kv_group == 0
+            and kwargs.get("_selected_skip_group0_dma")
+        )
         if not keys_layer_major:
             for layer_id in range(self.num_layers_for_group(kv_group)):
                 self._broadcast_shared_envelope(
@@ -5604,10 +5630,15 @@ class LMCacheEngine:
                 )
                 if not deferred_layerwise_get:
                     yield None
-            if deferred_layerwise_get:
-                for _ in range(self.num_layers_for_group(kv_group)):
-                    yield None
-            yield None
+            if skip_group0_dma:
+                self._record_recompute_fallback_req(req_id)
+                yield torch.sum(ret_mask)
+                yield None
+            else:
+                if deferred_layerwise_get:
+                    for _ in range(self.num_layers_for_group(kv_group)):
+                        yield None
+                yield None
             self.stats_monitor.on_retrieve_finished(monitor_req_id, 0)
             yield ret_mask
             return
@@ -5663,10 +5694,13 @@ class LMCacheEngine:
         mem_obj_consumer = None
         if not prepare_c8_packets:
             try:
-                mem_obj_consumer = self.gpu_connector.batched_to_gpu(
-                    starts, ends, **kwargs
-                )
-                next(mem_obj_consumer)
+                if skip_group0_dma:
+                    self._prepare_group0_skip_consumer(kwargs)
+                else:
+                    mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                        starts, ends, **kwargs
+                    )
+                    next(mem_obj_consumer)
             except Exception as exc:
                 message = "Shared CPU cache rank0 consumer preparation failed."
                 self._broadcast_shared_envelope(
@@ -6043,31 +6077,42 @@ class LMCacheEngine:
                         starts, ends, prefill_c8_memory_objs=resolved_layers, **kwargs
                     )
                     next(mem_obj_consumer)
+                kwargs["_shared_prefill_starts"] = starts
+                kwargs["_shared_prefill_ends"] = ends
                 self._prepare_shared_prefill_sources(
                     prepared_sources, kv_group, kwargs
                 )
                 sources_safe_to_release = False
-                try:
-                    yield from (
-                        self._submit_prepared_shared_prefill_layers(
-                            mem_obj_consumer, prepared_sources, ret_mask
+                if skip_group0_dma:
+                    if not resolved_layers:
+                        self._record_recompute_fallback_req(req_id)
+                    yield torch.sum(ret_mask)
+                    yield None
+                    sources_safe_to_release = True
+                else:
+                    try:
+                        yield from (
+                            self._submit_prepared_shared_prefill_layers(
+                                mem_obj_consumer, prepared_sources, ret_mask
+                            )
                         )
-                    )
-                except Exception:
-                    consumer_failed = True
+                    except Exception:
+                        consumer_failed = True
+                        raise
+                    # N-1 returns immediately after the final H2D enqueue. The
+                    # last-layer entry resumes this generator to synchronize the
+                    # consumer and release shared-source ownership.
+                    yield None
+            if not skip_group0_dma:
+                assert mem_obj_consumer is not None
+                try:
+                    next(mem_obj_consumer)
+                except BaseException:
+                    consumer_failed = deferred_layerwise_get
                     raise
-                # N-1 returns immediately after the final H2D enqueue. The
-                # last-layer entry resumes this generator to synchronize the
-                # consumer and release shared-source ownership.
-                yield None
-            try:
-                next(mem_obj_consumer)
-            except BaseException:
-                consumer_failed = deferred_layerwise_get
-                raise
-            sources_safe_to_release = True
-            self._close_shared_retrieve_consumer(mem_obj_consumer)
-            mem_obj_consumer = None
+                sources_safe_to_release = True
+                self._close_shared_retrieve_consumer(mem_obj_consumer)
+                mem_obj_consumer = None
             adoption_keys = keys_layer_major
             preplanned_keys = kwargs.get("_prefill_layer_keys")
             if preplanned_keys is not None:
@@ -6146,6 +6191,22 @@ class LMCacheEngine:
                     self._close_shared_retrieve_consumer(mem_obj_consumer)
                     if not consumer_failed:
                         sources_safe_to_release = True
+                elif (
+                    skip_group0_dma
+                    and not sources_safe_to_release
+                    and not consumer_failed
+                ):
+                    sync_skip = getattr(
+                        self.gpu_connector,
+                        "synchronize_selected_group0_skip",
+                        None,
+                    )
+                    if not callable(sync_skip):
+                        raise RuntimeError(
+                            "GPU connector missing synchronize_selected_group0_skip"
+                        )
+                    sync_skip()
+                    sources_safe_to_release = True
             finally:
                 if sources_safe_to_release:
                     self._release_retained_dense_retrieve_objs(
@@ -6190,6 +6251,11 @@ class LMCacheEngine:
         assert_layerwise_gpu_connector(self.gpu_connector)
         deferred_layerwise_get = bool(
             kwargs.get("deferred_layerwise_get", False)
+        )
+        skip_group0_dma = bool(
+            deferred_layerwise_get
+            and kv_group == 0
+            and kwargs.get("_selected_skip_group0_dma")
         )
         prepare_c8_packets = bool(
             deferred_layerwise_get and kv_group == 1
@@ -6280,10 +6346,13 @@ class LMCacheEngine:
                     for start, end in zip(starts, ends, strict=False):
                         ret_mask[start:end] = True
                     if not prepare_c8_packets:
-                        mem_obj_consumer = self.gpu_connector.batched_to_gpu(
-                            starts, ends, **kwargs
-                        )
-                        next(mem_obj_consumer)
+                        if skip_group0_dma:
+                            self._prepare_group0_skip_consumer(kwargs)
+                        else:
+                            mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                                starts, ends, **kwargs
+                            )
+                            next(mem_obj_consumer)
                     if compact_batch is not None:
                         if kwargs.get("_reuse_shared_dense_prefix"):
                             kwargs["_shared_prefill_reuse_count"] = 0
@@ -6594,23 +6663,33 @@ class LMCacheEngine:
                                 prefill_c8_memory_objs=resolved_layers, **kwargs
                             )
                             next(mem_obj_consumer)
+                        kwargs["_shared_prefill_starts"] = starts
+                        kwargs["_shared_prefill_ends"] = ends
                         self._prepare_shared_prefill_sources(
                             prepared_sources, kv_group, kwargs
                         )
                     sources_safe_to_release = False
-                try:
-                    yield from (
-                        self._submit_prepared_shared_prefill_layers(
-                            mem_obj_consumer, prepared_sources, ret_mask
+                if skip_group0_dma:
+                    if not resolved_layers:
+                        self._record_recompute_fallback_req(req_id)
+                    yield torch.sum(ret_mask)
+                    yield None
+                    sources_safe_to_release = True
+                else:
+                    try:
+                        yield from (
+                            self._submit_prepared_shared_prefill_layers(
+                                mem_obj_consumer, prepared_sources, ret_mask
+                            )
                         )
-                    )
-                except Exception:
-                    consumer_failed = True
-                    raise
+                    except Exception:
+                        consumer_failed = True
+                        raise
             deferred_cleanup_gate_used = bool(
-                deferred_layerwise_get and mem_obj_consumer is not None
+                deferred_layerwise_get
+                and (mem_obj_consumer is not None or skip_group0_dma)
             )
-            if deferred_cleanup_gate_used:
+            if deferred_cleanup_gate_used and not skip_group0_dma:
                 yield None
             if mem_obj_consumer is not None:
                 try:
@@ -6684,6 +6763,22 @@ class LMCacheEngine:
                     self._close_shared_retrieve_consumer(mem_obj_consumer)
                     if not consumer_failed:
                         sources_safe_to_release = True
+                elif (
+                    skip_group0_dma
+                    and not sources_safe_to_release
+                    and not consumer_failed
+                ):
+                    sync_skip = getattr(
+                        self.gpu_connector,
+                        "synchronize_selected_group0_skip",
+                        None,
+                    )
+                    if not callable(sync_skip):
+                        raise RuntimeError(
+                            "GPU connector missing synchronize_selected_group0_skip"
+                        )
+                    sync_skip()
+                    sources_safe_to_release = True
             finally:
                 if sources_safe_to_release:
                     self._release_retained_dense_retrieve_objs(
@@ -7501,6 +7596,12 @@ class LMCacheEngine:
                     yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
+        unverified_prefix_skip = int(
+            kwargs.get("_unverified_prefix_skip_tokens", 0) or 0
+        )
+        if unverified_prefix_skip > 0:
+            requested_end = max(requested_end, unverified_prefix_skip)
+            store_result.unverified_prefix_end = unverified_prefix_skip
         if store_complete:
             store_result.committed_end = requested_end
         yield store_result
@@ -7829,8 +7930,13 @@ class LMCacheEngine:
                         # Keep inner source/bank cleanup deterministic on abort.
                         passive_retriever.close()
             except _RemoteFillMaterializationError as exc:
+                skip_g0 = bool(
+                    deferred_layerwise_get
+                    and kv_group == 0
+                    and kwargs.get("_selected_skip_group0_dma")
+                )
                 if (
-                    yielded_steps >= num_layers + 2
+                    yielded_steps >= (3 if skip_g0 else num_layers + 2)
                     or not self._remote_fill_pair_lookup_enabled()
                     or self._remote_fill_local_full_hint(request_configs) is None
                 ):
@@ -7851,6 +7957,8 @@ class LMCacheEngine:
                     monitor_req_id=monitor_req_id,
                     yielded_steps=yielded_steps,
                     kv_group=kv_group,
+                    skip_group0_dma=skip_g0,
+                    req_id=req_id,
                 )
             return
 
@@ -7906,6 +8014,13 @@ class LMCacheEngine:
                     ret_mask=ret_mask,
                     monitor_req_id=monitor_req_id,
                     yielded_steps=0,
+                    kv_group=kv_group,
+                    skip_group0_dma=bool(
+                        deferred_layerwise_get
+                        and kv_group == 0
+                        and kwargs.get("_selected_skip_group0_dma")
+                    ),
+                    req_id=req_id,
                 )
                 return
             location_cache = None
@@ -8216,9 +8331,14 @@ class LMCacheEngine:
                     finally:
                         rank0_retriever.close()
             except _RemoteFillMaterializationError as exc:
+                skip_g0 = bool(
+                    deferred_layerwise_get
+                    and kv_group == 0
+                    and kwargs.get("_selected_skip_group0_dma")
+                )
                 if (
                     remote_fill_plan is None
-                    or yielded_steps >= num_layers + 2
+                    or yielded_steps >= (3 if skip_g0 else num_layers + 2)
                     # Match passive recovery: a retained P lookup plan alone
                     # does not authorize the decoder's LOCAL_FULL fallback.
                     or not self._remote_fill_pair_lookup_enabled()
@@ -8242,6 +8362,8 @@ class LMCacheEngine:
                     monitor_req_id=monitor_req_id,
                     yielded_steps=yielded_steps,
                     kv_group=kv_group,
+                    skip_group0_dma=skip_g0,
+                    req_id=req_id,
                 )
             return
         for start, end, key in self._dense_retrieve_token_results(
