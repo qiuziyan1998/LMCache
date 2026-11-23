@@ -29,6 +29,7 @@ def definitions() -> dict[str, Any]:
     names = {
         "_apply_mm_hashes",
         "_build_slot_mapping",
+        "_copy_block_ids_by_bank",
         "LoadSpec",
         "SaveSpec",
         "RequestTracker",
@@ -212,3 +213,38 @@ def test_non_dcp_handoff_keeps_existing_dense_source_mapping(
         metadata.live_source_indexer_slot_mapping[0], torch.arange(2560, 2817)
     )
     assert metadata.dcp_write_layout is None
+
+
+@pytest.mark.parametrize("mode", ["persistent_direct_hbm", "p2p_preferred"])
+@pytest.mark.parametrize("skip_save", [False, True])
+def test_four_bank_sender_keeps_persistent_handoff_without_dense_source(
+    definitions: dict[str, Any], mode: str, skip_save: bool
+) -> None:
+    adapter = make_adapter(definitions, None, mode)
+    adapter._layerwise_prefill_p_node = adapter._layerwise_prefill_dma = True
+    adapter._unfinished_requests["r"].num_computed_tokens = 0
+    banks = tuple(
+        ([1 + b, 5 + b, 9 + b], [21 + b, 25 + b, 29 + b]) for b in range(4)
+    )
+    tokens = list(range(257))
+    tracker = definitions["RequestTracker"](
+        req_id="r",
+        prompt_len=len(tokens),
+        token_ids=tokens,
+        allocated_block_ids=banks[0][0],
+        allocated_block_ids_indexer=banks[0][1],
+        allocated_block_ids_by_bank=banks,
+        block_allocation_mode="prefill_child",
+        skip_save=skip_save,
+    )
+    metadata = adapter._build_request_meta(tracker, None)
+    assert metadata.is_last_prefill and metadata.token_ids == tokens
+    assert metadata.block_ids_by_bank == banks
+    assert metadata.save_spec.can_save == (not skip_save)
+    assert adapter._unfinished_requests["r"].kv_transfer_params["do_remote_decode"]
+    assert not metadata.live_source_requested
+    assert metadata.live_source_token_ids == []
+    assert metadata.live_source_slot_mapping == []
+    assert metadata.live_source_indexer_slot_mapping == []
+    assert not adapter.supports_dsa_live_split()
+    assert not adapter.supports_dsa_live_latent_source()

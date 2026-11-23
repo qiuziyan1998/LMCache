@@ -2009,7 +2009,10 @@ class ReqMeta:
         live_source_token_ids: list[int] = []
         live_source_slot_mapping: list[torch.Tensor] = []
         live_source_indexer_slot_mapping: list[torch.Tensor] = []
-        if live_source_requested and not is_sparse_decode:
+        # Banked P still needs the complete handoff above for persistent saves.
+        # Its rotating HBM pages cannot serve as a dense, all-layer source.
+        export_live_source = live_source_requested and not layerwise_prefill_dma
+        if export_live_source and not is_sparse_decode:
             live_source_token_ids = _apply_mm_hashes(
                 input_token_ids,
                 tracker.mm_hashes,
@@ -2062,7 +2065,7 @@ class ReqMeta:
                 tuple((p.offset, p.length) for p in tracker.mm_positions or ()),
             ),
             decode_ret_mask=decode_ret_mask,
-            live_source_requested=live_source_requested,
+            live_source_requested=export_live_source,
             live_source_token_ids=live_source_token_ids,
             live_source_slot_mapping=live_source_slot_mapping,
             live_source_indexer_slot_mapping=live_source_indexer_slot_mapping,
@@ -11354,6 +11357,7 @@ class LMCacheConnectorV1Impl:
         """Whether this node can export a dense live HBM source."""
         return bool(
             getattr(self, "_dsa_dcp_size", None) is None
+            and not getattr(self, "_layerwise_prefill_dma", False)
             and self._group1_p2p_preferred()
             and self.config.get_extra_config_value(
                 "mooncake_direct_npu_prefill_store", False
