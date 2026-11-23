@@ -1759,6 +1759,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         ):
             return False
         removed: list[MemoryObj] = []
+        scanned = 0
         try:
             missing = pool.shortages(counts, allocation_purpose)
             candidates: list[tuple[CacheEngineKey, MemoryObj]] = []
@@ -1766,9 +1767,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
             entries = self.hot_cache.items()
             if max_scan_entries is not None:
                 entries = islice(entries, max_scan_entries)
+            scan_started = time.monotonic()
             for key, obj in entries:
                 if not any(missing.values()):
                     break
+                scanned += 1
                 group = key.kv_group
                 if missing.get(group, 0) and obj.can_evict and id(obj) not in seen:
                     if not isinstance(obj, LayerPageMemoryObj):
@@ -1776,6 +1779,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     seen.add(id(obj))
                     candidates.append((key, obj))
                     missing[group] -= 1
+            scan_ms = (time.monotonic() - scan_started) * 1000
             if not any(missing.values()):
                 for key, obj in candidates:
                     _, owners = self._pop_layer_page_evict_candidate_locked(
@@ -1794,11 +1798,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
             self.stats_monitor.update_local_cpu_evict_failed_count(1)
         logger.info(
             "[CPU_FIXED_SLOTS] reclaim purpose=%s counts=%s released=%d "
-            "success=%s pools=%s",
+            "success=%s scanned=%d scan_ms=%.3f pools=%s",
             allocation_purpose,
             dict(counts),
             len(removed),
             sufficient,
+            scanned,
+            scan_ms,
             pool.snapshot(),
         )
         return sufficient
