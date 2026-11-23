@@ -78,7 +78,10 @@ from lmcache.v1.mooncake_layout import (
 )
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.prefill_locations import PrefillLocationPlan
-from lmcache.v1.prefill_metadata import PrefillSequenceView, split_layers_cached
+from lmcache.v1.prefill_metadata import (
+    PrefillSequenceView,  # noqa: F401
+    split_layers_cached,  # noqa: F401
+)
 from lmcache.v1.prefill_sources import SharedPrefillSources, same_chunk_key
 from lmcache.v1.remote_fill.security import content_digest
 from lmcache.v1.remote_fill_diagnostics import log_remote_fill_diagnostic
@@ -91,7 +94,7 @@ from lmcache.v1.sampled_lookup import (
     first_last_layer_keys,
 )
 from lmcache.v1.shared_cpu_cache import (
-    PassiveSharedViewAllocator,
+    PassiveSharedViewAllocator,  # noqa: F401
     SharedChunkHandle,
     SharedCPURequestLease,
     SharedHandleBatch,
@@ -6115,9 +6118,13 @@ class LMCacheEngine:
                 mem_obj_consumer = None
             adoption_keys = keys_layer_major
             preplanned_keys = kwargs.get("_prefill_layer_keys")
+            _view_cls = globals().get("PrefillSequenceView")
+            _split_fn = globals().get("split_layers_cached")
             if preplanned_keys is not None:
                 adoption_keys = tuple(
-                    PrefillSequenceView(row, 0, len(starts))
+                    _view_cls(row, 0, len(starts))
+                    if _view_cls is not None
+                    else row[: len(starts)]
                     for row in preplanned_keys
                 )
             elif (
@@ -6127,7 +6134,9 @@ class LMCacheEngine:
             ):
                 num_group_layers = self.num_layers_for_group(kv_group)
                 page_layers = [
-                    split_layers_cached(key, num_group_layers)
+                    _split_fn(key, num_group_layers)
+                    if _split_fn is not None
+                    else key.split_layers(num_group_layers)
                     for key in keys_layer_major[0][source_prefix:planned_page_chunks]
                 ]
                 adoption_keys = [
@@ -6457,8 +6466,12 @@ class LMCacheEngine:
                     and batch_tail_start < expected_handle_count
                 ):
                     alloc = self.shared_cpu_cache_passive_allocator
+                    _passive_alloc_cls = globals().get(
+                        "PassiveSharedViewAllocator"
+                    )
                     if (
-                        type(alloc) is PassiveSharedViewAllocator
+                        _passive_alloc_cls is not None
+                        and type(alloc) is _passive_alloc_cls
                         and "create_batch_view" not in alloc.__dict__
                     ):
                         policy = getattr(
@@ -6557,8 +6570,17 @@ class LMCacheEngine:
                             else:
                                 split_keys = lazy_split_chunks.get(chunk_index)
                                 if split_keys is None:
-                                    split_keys = split_layers_cached(
-                                        raw_expected_key, num_group_layers
+                                    _split_fn = globals().get(
+                                        "split_layers_cached"
+                                    )
+                                    split_keys = (
+                                        _split_fn(
+                                            raw_expected_key, num_group_layers
+                                        )
+                                        if _split_fn is not None
+                                        else raw_expected_key.split_layers(
+                                            num_group_layers
+                                        )
                                     )
                                     lazy_split_chunks[chunk_index] = split_keys
                                 expected_key = split_keys[layer_id]
@@ -6701,9 +6723,12 @@ class LMCacheEngine:
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
                 mem_obj_consumer = None
             if resolved_layers:
+                _view_cls = globals().get("PrefillSequenceView")
                 adoption_keys: Any = (
                     tuple(
-                        PrefillSequenceView(row, 0, len(starts))
+                        _view_cls(row, 0, len(starts))
+                        if _view_cls is not None
+                        else row[: len(starts)]
                         for row in keys_layer_major
                     )
                     if keys_layer_major
@@ -7392,13 +7417,18 @@ class LMCacheEngine:
                     kv_group=kv_group,
                 )
             )
+        _split_fn = globals().get("split_layers_cached")
         for candidate_index, (start, end, key) in enumerate(store_candidates):
             assert isinstance(key, CacheEngineKey)
             requested_end = end
             keys_multi_layer = (
                 list(store_plan.keys_chunk_major[candidate_index])
                 if store_plan is not None
-                else list(split_layers_cached(key, num_layers))
+                else (
+                    list(_split_fn(key, num_layers))
+                    if _split_fn is not None
+                    else key.split_layers(num_layers)
+                )
             )
             fully_stored = self._layerwise_chunk_fully_stored(
                 keys_multi_layer,
@@ -7883,13 +7913,18 @@ class LMCacheEngine:
                     metadata_plan.keys_layer_major if starts else []
                 )
             else:
+                _split_fn = globals().get("split_layers_cached")
                 for start, end, key in self._dense_retrieve_token_results(
                     tokens, mask, request_configs, kv_group, kwargs,
                 ):
                     assert isinstance(key, CacheEngineKey)
                     starts.append(start)
                     ends.append(end)
-                    keys.append(list(split_layers_cached(key, num_layers)))
+                    keys.append(
+                        list(_split_fn(key, num_layers))
+                        if _split_fn is not None
+                        else key.split_layers(num_layers)
+                    )
                 keys_layer_major = (
                     [list(row) for row in zip(*keys, strict=False)] if keys else []
                 )
@@ -8063,6 +8098,7 @@ class LMCacheEngine:
                 chunk_locations = location_cache.locations
                 if retained_chunks:
                     ret_mask[starts[0]:ends[-1]] = True
+            _split_fn = globals().get("split_layers_cached")
             batch_plan = None
             tail_plan: Optional[list[str]] = None
             layer_pages = False
@@ -8079,7 +8115,11 @@ class LMCacheEngine:
                             else (
                                 list(metadata_plan.keys_chunk_major[index])
                                 if metadata_plan is not None
-                                else list(split_layers_cached(item[2], num_layers))
+                                else list(
+                                    _split_fn(item[2], num_layers)
+                                    if _split_fn is not None
+                                    else item[2].split_layers(num_layers)
+                                )
                             )
                             for index, item in enumerate(
                                 page_candidates[retained_chunks:], retained_chunks
@@ -8101,10 +8141,11 @@ class LMCacheEngine:
                     batch_plan is not None
                     and len(page_candidates) < len(candidates)
                 ):
+                    tail_cand_key = candidates[len(page_candidates)][2]
                     tail_keys = list(
-                        split_layers_cached(
-                            candidates[len(page_candidates)][2], num_layers
-                        )
+                        _split_fn(tail_cand_key, num_layers)
+                        if _split_fn is not None
+                        else tail_cand_key.split_layers(num_layers)
                     )
                     hits, mapping = self.storage_manager.batched_contains(
                         tail_keys, self.retrieve_locations
@@ -8124,16 +8165,22 @@ class LMCacheEngine:
                         else:
                             tail_plan = tail_locations
             local_batch_chunks = 0
+            _local_prefix_fn = getattr(
+                self, "_shared_local_prefix_chunk_count", None
+            )
             if (
-                remote_fill_plan is None
+                callable(_local_prefix_fn)
+                and remote_fill_plan is None
                 and batch_plan is None
                 and len(candidates) > retained_chunks
             ):
-                local_batch_chunks = self._shared_local_prefix_chunk_count(
+                local_batch_chunks = _local_prefix_fn(
                     metadata_plan.keys_chunk_major[retained_chunks:]
                     if metadata_plan is not None
                     else (
-                        split_layers_cached(item[2], num_layers)
+                        _split_fn(item[2], num_layers)
+                        if _split_fn is not None
+                        else item[2].split_layers(num_layers)
                         for item in candidates[retained_chunks:]
                     )
                 )
@@ -8160,7 +8207,11 @@ class LMCacheEngine:
                     or (ordinary_page_planned and layer_pages)
                     else metadata_plan.keys_chunk_major[candidate_index]
                     if metadata_plan is not None
-                    else list(split_layers_cached(key, num_layers))
+                    else list(
+                        _split_fn(key, num_layers)
+                        if _split_fn is not None
+                        else key.split_layers(num_layers)
+                    )
                 )
                 planned_location = (
                     remote_fill_chunk[0]
@@ -8366,6 +8417,7 @@ class LMCacheEngine:
                     req_id=req_id,
                 )
             return
+        _split_fn = globals().get("split_layers_cached")
         for start, end, key in self._dense_retrieve_token_results(
             tokens,
             mask,
@@ -8375,7 +8427,11 @@ class LMCacheEngine:
         ):
             assert isinstance(key, CacheEngineKey)
 
-            keys_multi_layer = list(split_layers_cached(key, num_layers))
+            keys_multi_layer = (
+                list(_split_fn(key, num_layers))
+                if _split_fn is not None
+                else key.split_layers(num_layers)
+            )
 
             # NOTE: Only check the first layer
             if current_location := self.storage_manager.contains(
@@ -8878,8 +8934,11 @@ class LMCacheEngine:
                                 chunk_objs.append(page_obj)
                                 chunk_keys.append(page_key)
                                 continue
-                        group_keys = split_layers_cached(
-                            group_key, group_num_layers
+                        _split_fn = globals().get("split_layers_cached")
+                        group_keys = (
+                            _split_fn(group_key, group_num_layers)
+                            if _split_fn is not None
+                            else group_key.split_layers(group_num_layers)
                         )
                         group_objs: list[MemoryObj] = []
                         for gk in group_keys:
@@ -9128,6 +9187,7 @@ class LMCacheEngine:
                         keys, search_range, do_pin
                     )
 
+                _split_fn = globals().get("split_layers_cached")
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
                     chunk_groups: list[tuple[list[CacheEngineKey], bool]] = []
@@ -9139,20 +9199,21 @@ class LMCacheEngine:
                         )
                         page = page_lookup
                         group_num_layers = self.num_layers_for_group(kv_group)
-                        group_keys: list[CacheEngineKey] = list(
-                            split_layers_cached(
-                                group_key, 1 if page else group_num_layers
-                            )
+                        _cnt = 1 if page else group_num_layers
+                        group_keys: list[CacheEngineKey] = (
+                            list(_split_fn(group_key, _cnt))
+                            if _split_fn is not None
+                            else group_key.split_layers(_cnt)
                         )
                         hit_chunks, block_mapping = contains_group(
                             group_keys, page, False
                         )
                         if page and (hit_chunks != 1 or len(block_mapping) != 1):
                             page = False
-                            group_keys = list(
-                                split_layers_cached(
-                                    group_key, group_num_layers
-                                )
+                            group_keys = (
+                                list(_split_fn(group_key, group_num_layers))
+                                if _split_fn is not None
+                                else group_key.split_layers(group_num_layers)
                             )
                             hit_chunks, block_mapping = contains_group(
                                 group_keys, page, False
@@ -9852,6 +9913,17 @@ class LMCacheEngine:
         assert self.storage_manager is not None
         return 0 if self.storage_manager.memcheck() else -1
 
+    @staticmethod
+    def _has_unfenced_dma_quarantine(engine: Any) -> bool:
+        """Return True if unfenced external/layerwise DMA sources remain active."""
+        gpu_conn = getattr(engine, "gpu_connector", None)
+        return bool(
+            getattr(engine, "_retain_unfenced_external_dma", False)
+            or getattr(engine, "_unsafe_layerwise_retrieve_sources", None)
+            or getattr(gpu_conn, "_layerwise_prefill_unfenced_stores", None)
+            or getattr(gpu_conn, "_layerwise_prefill_unfenced_loads", None)
+        )
+
     def close(self) -> None:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
@@ -9864,20 +9936,10 @@ class LMCacheEngine:
             except Exception as e:
                 logger.error(f"Error closing lmcache_worker: {e}")
 
-        if (
-            getattr(self, "_retain_unfenced_external_dma", False)
-            or getattr(self, "_unsafe_layerwise_retrieve_sources", None)
-            or getattr(
-                getattr(self, "gpu_connector", None),
-                "_layerwise_prefill_unfenced_stores",
-                None,
-            )
-            or getattr(
-                getattr(self, "gpu_connector", None),
-                "_layerwise_prefill_unfenced_loads",
-                None,
-            )
-        ):
+        _quarantine_fn = getattr(
+            LMCacheEngine, "_has_unfenced_dma_quarantine", None
+        )
+        if callable(_quarantine_fn) and _quarantine_fn(self):
             logger.warning(
                 "Retaining storage_manager and shared CPU slab mapping during "
                 "close() because unfenced external NPU DMA may still be active."
@@ -10431,20 +10493,7 @@ class LMCacheEngineBuilder:
                 # same-ID replacement cannot reuse that memory in-process.
                 raise
 
-            if (
-                getattr(engine, "_retain_unfenced_external_dma", False)
-                or getattr(engine, "_unsafe_layerwise_retrieve_sources", None)
-                or getattr(
-                    getattr(engine, "gpu_connector", None),
-                    "_layerwise_prefill_unfenced_stores",
-                    None,
-                )
-                or getattr(
-                    getattr(engine, "gpu_connector", None),
-                    "_layerwise_prefill_unfenced_loads",
-                    None,
-                )
-            ):
+            if LMCacheEngine._has_unfenced_dma_quarantine(engine):
                 logger.warning(
                     "Retaining LMCacheEngineBuilder entry for %s because "
                     "unfenced H2D/external DMA ranges remain quarantined.",

@@ -107,36 +107,11 @@ class LMCacheLookupClient(LookupClientInterface):
         # blending enabled because the blender need the
         # input embedding.
         if not self.enable_blending:
-            hashes = []
-            offsets = []
-            chunk_end_tokens: list[int] = []
-            tok_len = len(token_ids)
-            stash_ok = True
-
-            for (
-                start,
-                end,
-                key,
-            ) in self.token_database.process_tokens(token_ids, make_key=False):
-                hashes.append(key)
-                offsets.append(end - start)
-                if stash_ok and 0 < end <= tok_len:
-                    chunk_end_tokens.append(int(token_ids[end - 1]))
-                else:
-                    stash_ok = False
-
-            # if the token database returns no hashes,
-            # return 0
+            hashes, offsets = self._extract_and_stash_lookup_hashes(
+                token_ids, lookup_id
+            )
             if not hashes:
-                self._drop_lookup_chunk_hashes(lookup_id)
                 return 0
-
-            if stash_ok:
-                self._stash_lookup_chunk_hashes(
-                    lookup_id, token_ids, hashes, offsets, chunk_end_tokens
-                )
-            else:
-                self._drop_lookup_chunk_hashes(lookup_id)
 
             msg_buf = [
                 hashes,

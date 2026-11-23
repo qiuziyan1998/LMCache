@@ -84,7 +84,10 @@ from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.kv_layer_groups import validate_two_group_layer_counts
 from lmcache.v1.manager import LMCacheManager
 from lmcache.v1.memory_management import TensorMemoryObj
-from lmcache.v1.prefill_metadata import PrefillMetadataCache, split_layers_cached
+from lmcache.v1.prefill_metadata import (
+    PrefillMetadataCache,
+    split_layers_cached,  # noqa: F401
+)
 
 if TYPE_CHECKING:
     # Third Party
@@ -2206,6 +2209,9 @@ class LMCacheConnectorV1Impl:
     supports_preemption_checkpoint = False
     _defer_prepared_sparse_setup = False
     _supports_selected_group0_omit_skip = True
+    _layerwise_prefill_p_node = False
+    _layerwise_prefill_dma = False
+    _layerwise_prefill_bank_count = 2
 
     def __init__(
         self,
@@ -3019,7 +3025,7 @@ class LMCacheConnectorV1Impl:
             latent_caches = self._latent_kvcaches
         self._latent_layer_names = latent_names
         self._indexer_layer_names = indexer_names
-        if self._layerwise_prefill_p_node:
+        if getattr(self, "_layerwise_prefill_p_node", False):
             self._layerwise_group_ordinals = (
                 {name: ordinal for ordinal, name in enumerate(latent_names)},
                 {name: ordinal for ordinal, name in enumerate(indexer_names)},
@@ -3958,13 +3964,16 @@ class LMCacheConnectorV1Impl:
         # two-group store, not only decode-window stores. Attention metadata
         # is a compatibility source because single-object metadata also has a
         # generic Group-0 slot_mapping that must never address Group 1.
+        indexer_slots = getattr(request, "indexer_slot_mapping", None)
         if (
-            not request.indexer_slot_mapping
-            and request.prefill_dma_indexer_block_ids is not None
+            not indexer_slots
+            and getattr(request, "prefill_dma_indexer_block_ids", None)
+            is not None
         ):
             request.materialize_omitted_slot_mappings(self._block_size)
-        if request.indexer_slot_mapping:
-            return request.indexer_slot_mapping[0]
+            indexer_slots = getattr(request, "indexer_slot_mapping", None)
+        if indexer_slots:
+            return indexer_slots[0]
         _ = token_count
         return self._indexer_slot_mapping_from_attn_metadata(
             attn_metadata, layer_name
@@ -4187,7 +4196,11 @@ class LMCacheConnectorV1Impl:
             if hasattr(self, "_layerwise_sparse_indexer_sent_layers"):
                 self._layerwise_sparse_indexer_sent_layers.clear()
             self._layerwise_required_wait_groups_cache = None
-            self._sync_recompute_fallback_from_engine(clear_engine=True)
+            _sync_fb = getattr(
+                self, "_sync_recompute_fallback_from_engine", None
+            )
+            if callable(_sync_fb):
+                _sync_fb(clear_engine=True)
             self._deferred_layerwise_prefill_load_active = False
             self._initial_layerwise_prefill_load_submitted = False
             self._deferred_layerwise_prefill_drained_groups = set()
@@ -4237,10 +4250,13 @@ class LMCacheConnectorV1Impl:
                         "GPU connector missing synchronize_selected_group0_skip"
                     )
                 sync_skip()
+        _rel_fn = getattr(
+            self, "_release_unadopted_shared_request_objects", None
+        )
         for request in requests:
             state = self._worker_retrieve_state.get(request.req_id)
-            if state is not None:
-                self._release_unadopted_shared_request_objects(state, request)
+            if state is not None and callable(_rel_fn):
+                _rel_fn(state, request)
             self._drop_worker_retrieve_state(request.req_id)
         self._drain_layerwise_retrievers(finish_dense=False)
 
@@ -6518,7 +6534,12 @@ class LMCacheConnectorV1Impl:
     ) -> tuple[Optional[str], bool]:
         if not getattr(self, "enable_sparse_attention", False):
             return None, False
-        if isinstance(tokens, _OmittedPrefixTokens) and tokens.prefix_len > 0:
+        _omit_cls = globals().get("_OmittedPrefixTokens")
+        if (
+            _omit_cls is not None
+            and isinstance(tokens, _omit_cls)
+            and tokens.prefix_len > 0
+        ):
             return None, False
         engine = self.lmcache_engine
         if (
@@ -6924,15 +6945,23 @@ class LMCacheConnectorV1Impl:
                 previous_token_count,
                 validated_latent=validated_latent,
             )
+            _omit_cls = globals().get("_OmittedPrefixTokens")
             if (
                 not reuse_prepared_sources
                 and not request.sparse_warm_ref
-                and not isinstance(request.token_ids, _OmittedPrefixTokens)
+                and (
+                    _omit_cls is None
+                    or not isinstance(request.token_ids, _omit_cls)
+                )
                 and len(request.token_ids) >= token_count
             ):
                 state.metadata_token_ids = request.token_ids[:token_count]
         except Exception:
-            self._release_unadopted_shared_request_objects(state, request)
+            _rel_fn = getattr(
+                self, "_release_unadopted_shared_request_objects", None
+            )
+            if callable(_rel_fn):
+                _rel_fn(state, request)
             preserve_previous_lease = (
                 previous_state is not None
                 and previous_state is not state
@@ -6971,10 +7000,14 @@ class LMCacheConnectorV1Impl:
                 # Do not shrink state while consuming an async reference that
                 # predates a worker-side decode-save promotion.
                 token_count = max(token_count, int(state.token_count))
+            _omit_cls = globals().get("_OmittedPrefixTokens")
             if (
                 not state.metadata_token_ids
                 and not request.sparse_warm_ref
-                and not isinstance(request.token_ids, _OmittedPrefixTokens)
+                and (
+                    _omit_cls is None
+                    or not isinstance(request.token_ids, _omit_cls)
+                )
                 and len(request.token_ids) >= token_count
             ):
                 state.metadata_token_ids = request.token_ids[:token_count]
@@ -8039,7 +8072,11 @@ class LMCacheConnectorV1Impl:
                 )
                 state.dense_load_source_owners = ()
                 plan["indexer_source_owners"] = ()
-                self._release_unadopted_shared_request_objects(state, request)
+                _rel_fn = getattr(
+                    self, "_release_unadopted_shared_request_objects", None
+                )
+                if callable(_rel_fn):
+                    _rel_fn(state, request)
                 self._release_shared_worker_retrieve_state(
                     state, self.lmcache_engine
                 )
@@ -8915,7 +8952,11 @@ class LMCacheConnectorV1Impl:
         # not perform a synchronous retriever advance on the latency path.
         if self._deferred_layerwise_prefill_load_active:
             self._submit_initial_layerwise_prefill_load()
-        self._sync_recompute_fallback_from_engine()
+        _sync_fb = getattr(
+            self, "_sync_recompute_fallback_from_engine", None
+        )
+        if callable(_sync_fb):
+            _sync_fb()
         self._prepare_p_node_layerwise_save_storers(metadata)
 
     def _validate_dense_retrieve_result(
@@ -9051,7 +9092,15 @@ class LMCacheConnectorV1Impl:
                 f"expected={num_expected_tokens}"
             )
         self._invalid_block_ids.update(missing_blocks)
-        self._sync_recompute_fallback_from_engine().add(request.req_id)
+        _sync_fb = getattr(
+            self, "_sync_recompute_fallback_from_engine", None
+        )
+        if callable(_sync_fb):
+            _sync_fb().add(request.req_id)
+        elif isinstance(
+            getattr(self, "_step_recompute_fallback_req_ids", None), set
+        ):
+            self._step_recompute_fallback_req_ids.add(request.req_id)
 
     def record_failed_blocks(
         self,
@@ -10211,7 +10260,10 @@ class LMCacheConnectorV1Impl:
         ]
     ]:
         token_ids = request.token_ids
-        assert isinstance(token_ids, (list, _OmittedPrefixTokens))
+        _omit_cls = globals().get("_OmittedPrefixTokens")
+        assert isinstance(
+            token_ids, (list, _omit_cls) if _omit_cls is not None else list
+        )
         slot_mapping: Optional[torch.Tensor] = None
         if request.is_sparse_decode or materialize_device_slot_mapping:
             if not request.slot_mapping:
@@ -10459,6 +10511,40 @@ class LMCacheConnectorV1Impl:
         next(storer)
         return storer
 
+    def _finalize_stale_layerwise_storers(
+        self,
+        request: ReqMeta,
+        active_requests: Sequence[ReqMeta],
+        kv_group: int,
+        storer_key: LayerwiseSaveKey,
+        *,
+        prepared_keys: Optional[set[LayerwiseSaveKey]] = None,
+    ) -> bool:
+        """Drain and consume stale layerwise storers for a request/group."""
+        active_keys = {
+            self._layerwise_save_storer_key(active, kv_group)
+            for active in active_requests
+        }
+        stale_keys = [
+            key
+            for key in list(self._layerwise_save_storers)
+            if key[0] == request.req_id
+            and key[2] == kv_group
+            and (key == storer_key or key not in active_keys)
+        ]
+        for stale_key in stale_keys:
+            stale_storer = self._layerwise_save_storers.pop(stale_key)
+            if prepared_keys is not None:
+                prepared_keys.discard(stale_key)
+            completed, store_result = self._finalize_layerwise_storer(
+                stale_storer
+            )
+            if stale_key == storer_key:
+                self._consume_completed_layerwise_store(
+                    request, kv_group, completed, store_result
+                )
+        return bool(stale_keys)
+
     def _prepare_p_node_layerwise_save_storers(
         self,
         connector_metadata: LMCacheConnectorMetadata,
@@ -10479,7 +10565,11 @@ class LMCacheConnectorV1Impl:
             prepared_keys = set()
             self._layerwise_prefill_prepared_storer_keys = prepared_keys
         dsa_two_groups = self._is_dsa_two_groups()
-        self._sync_recompute_fallback_from_engine()
+        _sync_fb = getattr(
+            self, "_sync_recompute_fallback_from_engine", None
+        )
+        if callable(_sync_fb):
+            _sync_fb()
         try:
             for request in connector_metadata.requests:
                 if self._is_recompute_fallback_request(request.req_id):
@@ -10509,32 +10599,13 @@ class LMCacheConnectorV1Impl:
                         request,
                         kv_group,
                     )
-                    active_keys = {
-                        self._layerwise_save_storer_key(active, kv_group)
-                        for active in connector_metadata.requests
-                    }
-                    stale_keys = [
-                        key
-                        for key in list(self._layerwise_save_storers)
-                        if key[0] == request.req_id
-                        and key[2] == kv_group
-                        and (key == storer_key or key not in active_keys)
-                    ]
-                    for stale_key in stale_keys:
-                        stale_storer = self._layerwise_save_storers.pop(
-                            stale_key
-                        )
-                        prepared_keys.discard(stale_key)
-                        completed, store_result = (
-                            self._finalize_layerwise_storer(stale_storer)
-                        )
-                        if stale_key == storer_key:
-                            self._consume_completed_layerwise_store(
-                                request,
-                                kv_group,
-                                completed,
-                                store_result,
-                            )
+                    self._finalize_stale_layerwise_storers(
+                        request,
+                        connector_metadata.requests,
+                        kv_group,
+                        storer_key,
+                        prepared_keys=prepared_keys,
+                    )
                     storer = self._create_p_node_layerwise_save_storer(
                         request,
                         save_spec,
@@ -10603,7 +10674,11 @@ class LMCacheConnectorV1Impl:
                 )
             return
 
-        self._sync_recompute_fallback_from_engine()
+        _sync_fb = getattr(
+            self, "_sync_recompute_fallback_from_engine", None
+        )
+        if callable(_sync_fb):
+            _sync_fb()
         for request in connector_metadata.requests:
             if self._is_recompute_fallback_request(request.req_id):
                 self._drop_layerwise_save_storers(request.req_id)
@@ -10663,34 +10738,13 @@ class LMCacheConnectorV1Impl:
             if _first_layer is not None and layer_name == _first_layer:
                 if prepared_for_this_forward:
                     prepared_storer_keys.discard(storer_key)
-                else:
-                    active_keys = {
-                        self._layerwise_save_storer_key(req, kv_group)
-                        for req in connector_metadata.requests
-                    }
-                    stale_keys = [
-                        key
-                        for key in list(self._layerwise_save_storers)
-                        if key[0] == request.req_id
-                        and key[2] == kv_group
-                        and (key == storer_key or key not in active_keys)
-                    ]
-                    for stale_key in stale_keys:
-                        stale_storer = self._layerwise_save_storers.pop(
-                            stale_key
-                        )
-                        completed, store_result = (
-                            self._finalize_layerwise_storer(stale_storer)
-                        )
-                        if stale_key == storer_key:
-                            self._consume_completed_layerwise_store(
-                                request,
-                                kv_group,
-                                completed,
-                                store_result,
-                            )
-                    if stale_keys:
-                        layerwise_storer = None
+                elif self._finalize_stale_layerwise_storers(
+                    request,
+                    connector_metadata.requests,
+                    kv_group,
+                    storer_key,
+                ):
+                    layerwise_storer = None
             if (
                 layerwise_storer is None
                 and self._layerwise_prefill_p_node
@@ -10951,7 +11005,11 @@ class LMCacheConnectorV1Impl:
             "_layerwise_prefill_pending_store_finishes",
             {},
         )
-        self._sync_recompute_fallback_from_engine()
+        _sync_fb = getattr(
+            self, "_sync_recompute_fallback_from_engine", None
+        )
+        if callable(_sync_fb):
+            _sync_fb()
         for request in connector_metadata.requests:
             if self._is_recompute_fallback_request(request.req_id):
                 self._drop_layerwise_save_storers(request.req_id)
@@ -11085,7 +11143,11 @@ class LMCacheConnectorV1Impl:
                 self._maybe_lookup_unpin_for_request(request)
             return
 
-        self._sync_recompute_fallback_from_engine()
+        _sync_fb = getattr(
+            self, "_sync_recompute_fallback_from_engine", None
+        )
+        if callable(_sync_fb):
+            _sync_fb()
         if self.use_layerwise:
             if self._should_defer_latent_save_under_tp():
                 for request in connector_metadata.requests:
@@ -11296,7 +11358,11 @@ class LMCacheConnectorV1Impl:
     ) -> None:
         generation, future, request, indexer_block_ids, indexer_future = entry
         if was_aborted:
-            self._release_unadopted_shared_request_objects(state, request)
+            _rel_fn = getattr(
+                self, "_release_unadopted_shared_request_objects", None
+            )
+            if callable(_rel_fn):
+                _rel_fn(state, request)
             self._release_shared_worker_retrieve_state(state, self.lmcache_engine)
             self._release_request_lookup_pins(req_id)
             self._finish_aborted_cold_load(req_id)
@@ -11368,7 +11434,11 @@ class LMCacheConnectorV1Impl:
         ):
             failed_state = state
         if failed_state is not None:
-            self._release_unadopted_shared_request_objects(failed_state, request)
+            _rel_fn = getattr(
+                self, "_release_unadopted_shared_request_objects", None
+            )
+            if callable(_rel_fn):
+                _rel_fn(failed_state, request)
             self._release_shared_worker_retrieve_state(failed_state, self.lmcache_engine)
         if not retry:
             self._invalid_block_ids.update(indexer_block_ids)
@@ -12119,9 +12189,9 @@ class LMCacheConnectorV1Impl:
             )
             else None
         )
-        prior_stashed = getattr(self, "_stashed_lookup_hashes", None)
-        if prior_stashed is not None:
-            prior_stashed.pop(request.request_id, None)
+        (getattr(self, "_stashed_lookup_hashes", None) or {}).pop(
+            request.request_id, None
+        )
         if (
             isinstance(popped_hashes, tuple)
             and len(popped_hashes) == 6
@@ -12232,10 +12302,9 @@ class LMCacheConnectorV1Impl:
                 self._release_request_lookup_pins(request.request_id)
                 self.load_specs.pop(request.request_id, None)
                 self._unfinished_requests.pop(request.request_id, None)
-                if (
-                    stashed_err := getattr(self, "_stashed_lookup_hashes", None)
-                ) is not None:
-                    stashed_err.pop(request.request_id, None)
+                (getattr(self, "_stashed_lookup_hashes", None) or {}).pop(
+                    request.request_id, None
+                )
                 raise
             pending = getattr(self, "_pending_dsa_cold_load_metas", None)
             if pending is None:
@@ -12666,10 +12735,9 @@ class LMCacheConnectorV1Impl:
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
             self._resume_lookup_queries.pop(finished_req_id, None)
-            if (
-                stashed_map := getattr(self, "_stashed_lookup_hashes", None)
-            ) is not None:
-                stashed_map.pop(finished_req_id, None)
+            (getattr(self, "_stashed_lookup_hashes", None) or {}).pop(
+                finished_req_id, None
+            )
             self._discard_request_set(
                 "_dsa_group1_direct_hbm_deferred_req_ids", finished_req_id
             )
@@ -12814,12 +12882,9 @@ class LMCacheConnectorV1Impl:
                 # token_ids correctly for chunk key computation
                 all_token_ids = None
                 if req.resumed_from_preemption:
-                    if (
-                        stashed_map := getattr(
-                            self, "_stashed_lookup_hashes", None
-                        )
-                    ) is not None:
-                        stashed_map.pop(req.req_id, None)
+                    (getattr(self, "_stashed_lookup_hashes", None) or {}).pop(
+                        req.req_id, None
+                    )
                     vllm_request = self._unfinished_requests.get(req.req_id)
                     assert vllm_request is not None, (
                         f"Preempted request {req.req_id} not found "
@@ -12904,12 +12969,9 @@ class LMCacheConnectorV1Impl:
                     f"This might be due to an unsupported vLLM version."
                 )
             if preempted:
-                if (
-                    stashed_preempt := getattr(
-                        self, "_stashed_lookup_hashes", None
-                    )
-                ) is not None:
-                    stashed_preempt.pop(req_id, None)
+                (getattr(self, "_stashed_lookup_hashes", None) or {}).pop(
+                    req_id, None
+                )
                 assert load_spec is not None, (
                     f"Request {req_id} is preempted but was not given a load spec"
                 )
@@ -12946,12 +13008,9 @@ class LMCacheConnectorV1Impl:
             # reset request.num_computed_tokens, this will lead to
             # request_tracker.token_ids being not matched with vllm
             if num_current_tokens < len(request_tracker.token_ids):
-                if (
-                    stashed_map := getattr(
-                        self, "_stashed_lookup_hashes", None
-                    )
-                ) is not None:
-                    stashed_map.pop(req_id, None)
+                (getattr(self, "_stashed_lookup_hashes", None) or {}).pop(
+                    req_id, None
+                )
                 logger.warning(
                     "Request %s rolled back from %d to %d tokens; "
                     "truncating tracker state.",
@@ -13159,10 +13218,9 @@ class LMCacheConnectorV1Impl:
         if checkpoints:
             checkpoints.pop(req_id, None)
         self._resume_lookup_queries.pop(request.request_id, None)
-        if (
-            stashed_map := getattr(self, "_stashed_lookup_hashes", None)
-        ) is not None:
-            stashed_map.pop(request.request_id, None)
+        (getattr(self, "_stashed_lookup_hashes", None) or {}).pop(
+            request.request_id, None
+        )
         pending_cold = getattr(self, "_pending_dsa_cold_load_metas", None)
         pending_meta = (
             pending_cold.pop(req_id, None) if pending_cold is not None else None
@@ -13272,10 +13330,9 @@ class LMCacheConnectorV1Impl:
             if pending.status == "captured" or pending.cancel_pending:
                 self._arm_preemption_controls()
             self._resume_lookup_queries.pop(result.req_id, None)
-            if (
-                stashed_map := getattr(self, "_stashed_lookup_hashes", None)
-            ) is not None:
-                stashed_map.pop(result.req_id, None)
+            (getattr(self, "_stashed_lookup_hashes", None) or {}).pop(
+                result.req_id, None
+            )
             if self.lookup_client is not None:
                 self.lookup_client.clear_lookup_status(result.req_id)
 
@@ -13305,10 +13362,7 @@ class LMCacheConnectorV1Impl:
         request.kv_resume_checkpoint = None
         request.kv_resume_checkpoint_retry = attempt
         self._resume_lookup_queries.pop(req_id, None)
-        if (
-            stashed_map := getattr(self, "_stashed_lookup_hashes", None)
-        ) is not None:
-            stashed_map.pop(req_id, None)
+        (getattr(self, "_stashed_lookup_hashes", None) or {}).pop(req_id, None)
         if self.lookup_client is not None:
             self.lookup_client.clear_lookup_status(req_id)
 
@@ -13663,7 +13717,12 @@ class LMCacheConnectorV1Impl:
             split_fn = getattr(base_key, "split_layers", None)
             if not callable(split_fn):
                 continue
-            split = split_layers_cached(base_key, num_layers)
+            _split_cached = globals().get("split_layers_cached")
+            split = (
+                _split_cached(base_key, num_layers)
+                if _split_cached is not None
+                else split_fn(num_layers)
+            )
             for layer_id in range(num_layers):
                 cached_keys[layer_id][chunk_idx] = split[layer_id]
 

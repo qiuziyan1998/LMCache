@@ -215,29 +215,12 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         lookup_id: str,
         request_configs: Optional[dict] = None,
     ) -> Optional[int]:
-        hashes: list[int | bytes] = []
-        offsets = []
-        chunk_end_tokens: list[int] = []
-        tok_len = len(token_ids)
-        stash_ok = not bool(
+        allow_stash = not bool(
             getattr(getattr(self, "config", None), "enable_blending", False)
         )
-        for start, end, hash_val in self.token_database.process_tokens(
-            token_ids, make_key=False
-        ):
-            hashes.append(hash_val)  # type: ignore[arg-type]
-            offsets.append(end - start)
-            if stash_ok and 0 < end <= tok_len:
-                chunk_end_tokens.append(int(token_ids[end - 1]))
-            else:
-                stash_ok = False
-
-        if stash_ok and hashes:
-            self._stash_lookup_chunk_hashes(
-                lookup_id, token_ids, hashes, offsets, chunk_end_tokens
-            )
-        else:
-            self._drop_lookup_chunk_hashes(lookup_id)
+        hashes, offsets = self._extract_and_stash_lookup_hashes(
+            token_ids, lookup_id, allow_stash=allow_stash
+        )
 
         # Create structured message
         msg = LookupRequestMsg(

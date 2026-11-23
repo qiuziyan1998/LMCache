@@ -50,6 +50,7 @@ LookupChunkHashesEntry = tuple[
 class LookupClientInterface(metaclass=abc.ABCMeta):
     """Abstract interface for lookup clients."""
 
+    token_database: Any
     _lookup_chunk_hashes: Optional[dict[str, LookupChunkHashesEntry]] = None
 
     def lookup_cache(self, lookup_id: str) -> Optional[int]:
@@ -127,6 +128,40 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
                     stash_lock = threading.RLock()
                     self._stash_lock = stash_lock
         return stash_lock
+
+    def _extract_and_stash_lookup_hashes(
+        self,
+        token_ids: Union[torch.Tensor, list[int]],
+        lookup_id: Optional[str],
+        *,
+        allow_stash: bool = True,
+    ) -> tuple[list[Any], list[int]]:
+        """Hash tokens via ``token_database`` and stash verified prefix metadata."""
+        hashes: list[Any] = []
+        offsets: list[int] = []
+        chunk_end_tokens: list[int] = []
+        tok_len = len(token_ids)
+        stash_ok = allow_stash
+        token_db = getattr(self, "token_database", None) or getattr(
+            getattr(self, "lmcache_engine", None), "token_database", None
+        )
+        assert token_db is not None
+        for start, end, hash_val in token_db.process_tokens(
+            token_ids, make_key=False
+        ):
+            hashes.append(hash_val)
+            offsets.append(end - start)
+            if stash_ok and 0 < end <= tok_len:
+                chunk_end_tokens.append(int(token_ids[end - 1]))
+            else:
+                stash_ok = False
+        if stash_ok and hashes:
+            self._stash_lookup_chunk_hashes(
+                lookup_id, token_ids, hashes, offsets, chunk_end_tokens
+            )
+        else:
+            self._drop_lookup_chunk_hashes(lookup_id)
+        return hashes, offsets
 
     def _stash_lookup_chunk_hashes(
         self,

@@ -1041,41 +1041,61 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             tmp_gpu_buffer_obj = None
             yield
         finally:
-            try:
-                if store_transfer_pending:
-                    self.store_stream.synchronize()
-            except BaseException:
-                self_any: Any = self
-                unfenced: Optional[list[Any]] = getattr(
-                    self, "_layerwise_prefill_unfenced_stores", None
-                )
-                if unfenced is None:
-                    unfenced = []
-                    self_any._layerwise_prefill_unfenced_stores = unfenced
-                retained: list[Any] = []
-                for layer_objs in memory_objs:
-                    for obj in layer_objs:
-                        ref_up = getattr(obj, "ref_count_up", None)
-                        if callable(ref_up):
-                            ref_up()
-                        retained.append(obj)
-                if tmp_gpu_buffer_obj is not None:
-                    ref_up = getattr(tmp_gpu_buffer_obj, "ref_count_up", None)
-                    if callable(ref_up):
-                        ref_up()
-                    retained.append(tmp_gpu_buffer_obj)
-                    tmp_gpu_buffer_obj = None
-                unfenced.append((self.store_stream, tuple(retained)))
-                raise
-            finally:
-                if (
-                    tmp_gpu_buffer_obj is not None
-                    and tmp_gpu_buffer_obj.is_valid()
-                ):
-                    tmp_gpu_buffer_obj.ref_count_down()
+            _finalize_or_quarantine_layerwise_store(
+                self,
+                store_transfer_pending=store_transfer_pending,
+                memory_objs=memory_objs,
+                tmp_gpu_buffer_obj=tmp_gpu_buffer_obj,
+            )
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         return torch.Size([2, num_tokens, self.hidden_dim_size])
+
+
+def _finalize_or_quarantine_layerwise_store(
+    connector: Any,
+    *,
+    store_transfer_pending: bool,
+    memory_objs: Any,
+    tmp_gpu_buffer_obj: Optional[MemoryObj],
+) -> None:
+    """Fence aborted layerwise D2H stores or quarantine backing buffers."""
+    sync_failed = False
+    try:
+        if store_transfer_pending:
+            connector.store_stream.synchronize()
+    except BaseException:
+        sync_failed = True
+        unfenced: Optional[list[Any]] = getattr(
+            connector, "_layerwise_prefill_unfenced_stores", None
+        )
+        if unfenced is None:
+            unfenced = []
+            connector._layerwise_prefill_unfenced_stores = unfenced
+        retained: list[Any] = []
+        unfenced.append((connector.store_stream, retained))
+        if tmp_gpu_buffer_obj is not None:
+            ref_up = getattr(tmp_gpu_buffer_obj, "ref_count_up", None)
+            if callable(ref_up):
+                ref_up()
+        for layer_objs in memory_objs:
+            for obj in layer_objs:
+                ref_up = getattr(obj, "ref_count_up", None)
+                if callable(ref_up):
+                    ref_up()
+                retained.append(obj)
+        if tmp_gpu_buffer_obj is not None:
+            retained.append(tmp_gpu_buffer_obj)
+            tmp_gpu_buffer_obj = None
+        unfenced[-1] = (connector.store_stream, tuple(retained))
+        raise
+    finally:
+        if (
+            not sync_failed
+            and tmp_gpu_buffer_obj is not None
+            and tmp_gpu_buffer_obj.is_valid()
+        ):
+            tmp_gpu_buffer_obj.ref_count_down()
 
 
 class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
@@ -1450,38 +1470,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
             yield
         finally:
-            try:
-                if store_transfer_pending:
-                    self.store_stream.synchronize()
-            except BaseException:
-                self_any: Any = self
-                unfenced: Optional[list[Any]] = getattr(
-                    self, "_layerwise_prefill_unfenced_stores", None
-                )
-                if unfenced is None:
-                    unfenced = []
-                    self_any._layerwise_prefill_unfenced_stores = unfenced
-                retained: list[Any] = []
-                for layer_objs in memory_objs:
-                    for obj in layer_objs:
-                        ref_up = getattr(obj, "ref_count_up", None)
-                        if callable(ref_up):
-                            ref_up()
-                        retained.append(obj)
-                if tmp_gpu_buffer_obj is not None:
-                    ref_up = getattr(tmp_gpu_buffer_obj, "ref_count_up", None)
-                    if callable(ref_up):
-                        ref_up()
-                    retained.append(tmp_gpu_buffer_obj)
-                    tmp_gpu_buffer_obj = None
-                unfenced.append((self.store_stream, tuple(retained)))
-                raise
-            finally:
-                if (
-                    tmp_gpu_buffer_obj is not None
-                    and tmp_gpu_buffer_obj.is_valid()
-                ):
-                    tmp_gpu_buffer_obj.ref_count_down()
+            _finalize_or_quarantine_layerwise_store(
+                self,
+                store_transfer_pending=store_transfer_pending,
+                memory_objs=memory_objs,
+                tmp_gpu_buffer_obj=tmp_gpu_buffer_obj,
+            )
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         if self.use_mla:
