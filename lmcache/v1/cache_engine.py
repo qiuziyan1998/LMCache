@@ -3056,6 +3056,28 @@ class LMCacheEngine:
             groups={0: [unowned_objects]},
         ).close()
 
+    def detach_shared_cpu_sparse_request(
+        self, req_id: Optional[str]
+    ) -> Optional[Callable[[], None]]:
+        """Detach a request lease under a unique retiring key for deferred close."""
+        if not req_id:
+            return None
+        lease = self._shared_cpu_request_leases.pop(req_id, None)
+        if lease is None:
+            return None
+        lease.active = False
+        seq = getattr(self, "_detached_shared_lease_seq", 0) + 1
+        self._detached_shared_lease_seq = seq
+        detached_key = f"{req_id}#detached#{seq}"
+        self._shared_cpu_request_leases[detached_key] = lease
+
+        def _close_detached() -> None:
+            leased = self._shared_cpu_request_leases.pop(detached_key, None)
+            if leased is not None:
+                leased.close()
+
+        return _close_detached
+
     def release_shared_cpu_sparse_request(self, req_id: Optional[str]) -> None:
         if not req_id:
             return
@@ -4993,6 +5015,10 @@ class LMCacheEngine:
         if usable_complete <= 0:
             return None
         covered_tokens = usable_complete * chunk_size
+        if int(getattr(tokens, "prefix_len", 0) or 0) > covered_tokens:
+            raise ValueError(
+                "Omitted prefix exceeds precomputed complete chunk coverage"
+            )
         skip_chunks = num_falses // chunk_size
         prefix_gen: Iterable[tuple[int, int, CacheEngineKey]] = ()
         if skip_chunks < usable_complete:

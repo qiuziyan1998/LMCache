@@ -1924,6 +1924,66 @@ class TestSharedPrefillOptimizations(unittest.TestCase):
                 if name == "sync":
                     self.assertEqual(lc.reqs_status, {})
 
+    def test_detach_shared_cpu_sparse_request_and_omitted_prefix_overflow(
+        self,
+    ) -> None:
+        # First Party
+        from lmcache.integration.vllm import vllm_v1_adapter as va
+        from lmcache.v1.cache_engine import LMCacheEngine
+        from lmcache.v1.config import LMCacheEngineConfig
+        from lmcache.v1.token_database import ChunkedTokenDatabase
+
+        eng: Any = LMCacheEngine.__new__(LMCacheEngine)
+        eng._shared_cpu_request_leases = {}
+
+        def _mk_lease() -> Any:
+            lease: Any = _N(active=True, closed=0)
+            lease.close = lambda: setattr(lease, "closed", lease.closed + 1)
+            return lease
+
+        l1, l2, l3 = _mk_lease(), _mk_lease(), _mk_lease()
+        eng._shared_cpu_request_leases["r1"] = l1
+        cb1 = eng.detach_shared_cpu_sparse_request("r1")
+        assert callable(cb1)
+        self.assertIsNone(eng.detach_shared_cpu_sparse_request("missing"))
+        self.assertEqual((l1.active, l1.closed), (False, 0))
+        self.assertNotIn("r1", eng._shared_cpu_request_leases)
+        self.assertEqual(len(eng._shared_cpu_request_leases), 1)
+        eng._shared_cpu_request_leases["r1"] = l2
+        cb1()
+        self.assertEqual((l1.closed, l2.closed), (1, 0))
+        self.assertIs(eng._shared_cpu_request_leases["r1"], l2)
+
+        cb2 = eng.detach_shared_cpu_sparse_request("r1")
+        assert callable(cb2)
+        eng._shared_cpu_request_leases["r1"] = l3
+        eng._release_all_shared_cpu_request_leases()
+        self.assertEqual((l2.closed, l3.closed), (1, 1))
+        self.assertEqual(eng._shared_cpu_request_leases, {})
+        cb2()
+        self.assertEqual(l2.closed, 1)
+
+        cfg = LMCacheEngineConfig.from_defaults(
+            chunk_size=256, enable_blending=False, save_unfull_chunk=True
+        )
+        meta = _meta()
+        db = ChunkedTokenDatabase(cfg, meta)
+        eng_tok: Any = LMCacheEngine.__new__(LMCacheEngine)
+        eng_tok.token_database, eng_tok.config, eng_tok.metadata = db, cfg, meta
+        toks = list(range(300))
+        pre = list(db.process_tokens(tokens=toks, make_key=False))
+        ph = tuple(h for _, _, h in pre[:1])
+        po = tuple(e - s for s, e, _ in pre[:1])
+        om_bad = va._OmittedPrefixTokens(257, tuple(toks[257:]))
+        with self.assertRaisesRegex(ValueError, "Omitted prefix"):
+            eng_tok._process_tokens_with_precomputed_hashes(
+                om_bad,
+                None,
+                None,
+                0,
+                {"prefill_chunk_hashes": ph, "prefill_chunk_offsets": po},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

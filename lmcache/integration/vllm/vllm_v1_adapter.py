@@ -4192,7 +4192,6 @@ class LMCacheConnectorV1Impl:
             self._layerwise_sparse_row_groups = None
             if hasattr(self, "_layerwise_waited_groups"):
                 self._layerwise_waited_groups.clear()
-            self._layerwise_required_wait_groups_cache = None
             if hasattr(self, "_layerwise_sparse_indexer_sent_layers"):
                 self._layerwise_sparse_indexer_sent_layers.clear()
             self._layerwise_required_wait_groups_cache = None

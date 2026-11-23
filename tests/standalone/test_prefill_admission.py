@@ -135,3 +135,20 @@ def test_capacity_counts_only_free_and_evictable_unique_owners(use_hot):
         hot_cache={"a": evictable, "alias": evictable, "pin": pinned, "dma": inflight},
     )
     assert ns[fn.name](backend) == dict(capacity=1000, available=150 if use_hot else 50)
+
+
+def test_retiring_request_is_not_readmitted_until_all_workers_retire():
+    budget = Budget(4)
+    budget.update(reports())
+    assert budget.admit("a", 2048)[0]
+    budget.finish("a")
+    assert "a" in budget.retiring
+    assert budget.admit("a", 2048) == (False, None, {})
+    assert "a" in budget.waiting
+    budget.update(reports(retired=("a",))[:3])
+    assert budget.admit("a", 2048) == (False, None, {})
+    budget.update(reports(retired=("a",))[3:])
+    assert "a" not in budget.retiring
+    assert "a" not in budget.reservations
+    assert budget.admit("a", 2048)[0]
+    assert "a" not in budget.waiting

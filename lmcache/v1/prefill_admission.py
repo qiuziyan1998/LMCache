@@ -65,6 +65,9 @@ class PrefillAdmissionBudget:
 
     def admit(self, req_id: str, tokens: int) -> tuple[bool, Optional[str], dict]:
         """Return (admitted, permanent error, diagnostic byte counts)."""
+        if req_id in self.retiring:
+            self.waiting.add(req_id)
+            return False, None, {}
         if req_id in self.reservations:
             return True, None, {}
         self.waiting.add(req_id)
