@@ -75,6 +75,22 @@ class TestSparseDecodePinLifecycle:
         connector.wait_for_save()
         assert engine.unpinned == ["req-done"]
 
+    def test_only_managed_lane_keeps_pins_and_can_release_kv(self) -> None:
+        """Stale load and release fields cannot evict a full-resident prefix."""
+        resident = make_sparse_req_meta("resident")
+        managed = make_sparse_req_meta("managed")
+        for req in (resident, managed):
+            assert req.load_spec is not None
+            req.load_spec.dsa_full_resident = req is resident
+            req.load_spec.dsa_release_frontier = req.load_spec.lmcache_cached_tokens
+        connector, _, engine = make_worker_connector([resident, managed])
+        connector._completed_decode_window_saves = {}
+
+        connector.wait_for_save()
+
+        assert engine.unpinned == ["resident"]
+        assert connector.get_completed_decode_window_saves() == {"managed": 4}
+
     def test_decode_window_save_metadata_does_not_unpin(self) -> None:
         window_save = make_non_sparse_req_meta("req-window")
         window_save.is_decode_window_save = True

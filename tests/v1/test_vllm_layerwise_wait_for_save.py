@@ -716,9 +716,13 @@ def test_layerwise_prefill_does_not_publish_incomplete_store() -> None:
     assert connector.get_completed_decode_window_saves() == {}
 
 
-def test_layerwise_prefill_waits_for_both_kv_groups() -> None:
+@pytest.mark.parametrize("full_resident", [False, True])
+def test_layerwise_prefill_waits_for_both_kv_groups(full_resident: bool) -> None:
     request = _make_req("req-1")
     request.is_last_prefill = True
+    if full_resident:
+        request.is_sparse_decode = True
+        request.load_spec = LoadSpec(0, 0, False, dsa_full_resident=True)
     request.token_ids = list(range(16))
     request.save_spec.can_save_indexer = True
     connector, _, _ = _make_connector([request])

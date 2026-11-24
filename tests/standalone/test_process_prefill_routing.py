@@ -16,13 +16,18 @@ import torch
 
 # First Party
 from lmcache.integration.vllm import storage_process as bridge
+from lmcache.integration.vllm.kv_policy import load_spec_requires_retrieve
 from lmcache.v1.cache_engine import LayerwiseStoreResult
 from lmcache.v1.rpc.storage_import import CompactSourceImporter
 from lmcache.v1.rpc.storage_lifetime import NativeSourceLifetime
 
 # Local
 from test_process_store_worker import engine, setup as process_setup
-from test_storage_process_worker import definitions as worker_definitions, loaded
+from test_storage_process_worker import (
+    definitions as worker_definitions,
+    loaded,
+    scheduler_metadata_api as scheduler_definitions,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +38,11 @@ ASCEND = ROOT.parent / "LMCache-Ascend/lmcache_ascend"
 @pytest.fixture
 def setup() -> Iterator[Any]:
     yield from process_setup.__wrapped__()
+
+
+@pytest.fixture(scope="module")
+def policy_scheduler() -> dict[str, Any]:
+    return scheduler_definitions.__wrapped__()[1]
 
 
 def source_class(
@@ -58,6 +68,7 @@ def adapter_class(monkeypatch: pytest.MonkeyPatch) -> type:
     definitions = worker_definitions.__wrapped__(monkeypatch)
     ns = dict(
         torch=torch,
+        load_spec_requires_retrieve=load_spec_requires_retrieve,
         WorkerRetrieveState=definitions[0],
         LayerwiseStoreResult=LayerwiseStoreResult,
         LMCacheConnectorMetadata=NS,
@@ -65,6 +76,9 @@ def adapter_class(monkeypatch: pytest.MonkeyPatch) -> type:
         serving_perf_enabled=lambda: False,
         _lmcache_nvtx_annotate=lambda fn: fn,
         Mapping=Mapping,
+        INDEXER_RETRIEVE_RESIDENT_SKIP="resident_skip",
+        INDEXER_RETRIEVE_FULL="full_materialize",
+        INDEXER_RETRIEVE_METADATA_ONLY="metadata_only",
     )
     source_class(
         BASE,
@@ -73,18 +87,23 @@ def adapter_class(monkeypatch: pytest.MonkeyPatch) -> type:
             "save_kv_layer",
             "wait_for_save",
             "_wait_for_save_impl",
+            "_sync_recompute_fallback_from_engine",
+            "_is_recompute_fallback_request",
             "_should_defer_latent_save_under_tp",
             "_layerwise_store_kwargs",
             "_prepare_layerwise_store_inputs",
+            "_selected_group0_omit_skip_tokens",
             "_flush_deferred_latent_store",
             "_store_result_from_yield",
             "_layerwise_storer_drain_limit",
             "_drain_layerwise_storer_fully",
             "_close_layerwise_storer",
             "_finalize_layerwise_storer",
+            "_finalize_stale_layerwise_storers",
             "_consume_completed_layerwise_store",
             "_promote_layerwise_store_result",
             "_prepared_sparse_source",
+            "_validated_source_extent",
             "_layerwise_save_storer_key",
             "_layerwise_save_range",
             "_is_dsa_two_groups",
@@ -96,6 +115,15 @@ def adapter_class(monkeypatch: pytest.MonkeyPatch) -> type:
             "_materialize_dense_prefix_for_sparse",
             "_validate_shared_worker_retrieve_state",
             "_shared_retrieve_token_count_for_request",
+            "_start_load_kv",
+            "_load_tokens_for_retrieve",
+            "_load_token_mask_for_retrieve",
+            "_full_hit_recalc_last_token",
+            "_sparse_retrieve_kwargs",
+            "_shared_sparse_decode_indexer_retrieve_mode",
+            "_consume_dsa_cold_dense_load_readiness",
+            "_finalize_worker_retrieve_state_from_metadata",
+            "_prepared_sparse_sources_current",
         ),
         ns,
     )
@@ -107,6 +135,7 @@ def adapter_class(monkeypatch: pytest.MonkeyPatch) -> type:
             "save_kv_layer",
             "_wait_for_save_impl",
             "_finish_save_batch",
+            "_is_fallback_req_id",
             "_consume_completed_layerwise_store",
             "_source_ready_event",
             "_preflight_direct_store",
@@ -207,6 +236,7 @@ def test_receiver_direct_option_keeps_local_prefill_source(
     setup: Any,
     adapter_class: type,
     tail: bool,
+    policy_scheduler: dict[str, Any],
 ) -> None:
     _, worker, runtime, _ = engine(setup)
     worker.config.pd_role = "receiver"
@@ -329,6 +359,7 @@ def test_receiver_direct_option_keeps_local_prefill_source(
     assert len(worker.storage_process.client.operations) == operations
     assert len(worker.gpu_connector.transfers) == transfers
     assert obj._worker_retrieve_state_for_warm_ref(req) is state
+    exercise_process_threshold_crossing(obj, state, policy_scheduler, end)
     worker.store_direct_prefill.assert_not_called()
     assert len(
         [
@@ -339,6 +370,94 @@ def test_receiver_direct_option_keeps_local_prefill_source(
     ) == 2 * len(ends)
     bridge.release_sources(state, worker)
     assert worker.compact_source_importer.sources_drained()
+
+
+def exercise_process_threshold_crossing(
+    obj: Any, state: Any, ns: dict[str, Any], end: int,
+) -> None:
+    """Use real scheduler rows and a promoted CPU service lease across the threshold."""
+    logical = 5  # Unaligned, strictly inside both the 8- and 11-token sources.
+    history = list(range(end))
+    track = ns["RequestTracker"](
+        "request", logical, history[:-1], list(range(end)), list(range(end)),
+        num_saved_tokens=end, is_decode_phase=True,
+    )
+    req = NS(num_computed_tokens=end - 1, all_token_ids=history)
+    scheduler = NS(
+        config=NS(
+            dsa_two_groups=True, save_decode_cache=False, decoder_storage_mode="process"
+        ),
+        kv_role="kv_both", force_skip_save=False, enable_sparse_attention=True,
+        _dsa_kv_policy_threshold=end, _dsa_scratch_capacity=4,
+        _decode_window_save_window_size=0,
+        _block_size=4, _lmcache_chunk_size=4, _discard_partial_chunks=False,
+        _request_trackers={"request": track}, _unfinished_requests={"request": req},
+        load_specs={}, _add_decode_window_save_metas=lambda *args: None,
+        _windowed_sparse_layerwise_save_enabled=lambda: True,
+    )
+    scheduler._build_request_meta = MethodType(ns["_build_request_meta"], scheduler)
+    cached = NS(req_ids=["request"], new_block_ids=[None], resumed_req_ids=set())
+    step = NS(
+        finished_req_ids=set(), scheduled_new_reqs=[], scheduled_cached_reqs=cached,
+        num_scheduled_tokens={"request": 1},
+    )
+
+    def schedule() -> Any:
+        return ns["build_connector_meta"](scheduler, step).requests[0]
+
+    assert schedule().load_spec.dsa_full_resident
+    for name in (
+        "_layerwise_requests", "layerwise_retrievers", "_layerwise_sparse_req_ids",
+        "_layerwise_retriever_is_sparse", "_layerwise_sparse_shared_ordered",
+    ):
+        setattr(obj, name, [])
+    obj._prune_worker_retrieve_state = lambda *a: None
+    obj._drain_layerwise_retrievers = lambda: None
+    obj._is_deferred_layerwise_prefill_load_step = lambda _: False
+    obj._prepare_p_node_layerwise_save_storers = lambda _: None
+    obj._sparse_decode_requires_index_materialization = lambda *a: True
+    obj._stats_monitor = Mock()
+    obj.enable_blending = obj._defer_prepared_sparse_setup = False
+    observed = []
+    waits: list[object] = []
+    ready = state.dense_load_readiness = object()
+    obj.lmcache_engine.gpu_connector.consume_dense_load_readiness = waits.append
+
+    def consume(tokens: list[int], mask: Any, **kwargs: Any) -> Iterator[None]:
+        assert waits == [ready]
+        assert kwargs["kv_group"] == 0 and kwargs["lmcache_cached_tokens"] == logical
+        observed.append(kwargs["prepared_sparse_source"])
+        yield
+
+    obj.lmcache_engine.retrieve_layer_head_token_wise = consume
+    ops = len(obj.lmcache_engine.storage_process.client.operations)
+    source = state.prepared_sparse_sources[0]
+    for warm in (False, True):
+        req.num_computed_tokens += 1
+        req.all_token_ids.append(req.num_computed_tokens)
+        row = schedule()
+        assert row.sparse_warm_ref is warm and row.load_spec.cpu_source_ticket is None
+        assert row.load_spec.lmcache_cached_tokens == logical
+        assert row.load_spec.dsa_remap_frontier == 0
+        metadata = NS(requests=[row])
+        obj._parent._get_connector_metadata = lambda metadata=metadata: metadata
+        ctx = NS(attn_metadata={})
+        if not warm:
+            row.token_ids[0] = -1
+            with pytest.raises(RuntimeError, match="request history"):
+                obj._start_load_kv(ctx)
+            row.token_ids[0] = 0
+            state.process_load_generation += 1
+            with pytest.raises(RuntimeError, match="covering live source"):
+                obj._start_load_kv(ctx)
+            state.process_load_generation -= 1
+        obj._start_load_kv(ctx)
+        obj._finalize_worker_retrieve_state_from_metadata(metadata)
+        assert obj.layerwise_retrievers.pop()[1] is None
+        assert obj._worker_retrieve_state[row.req_id] is state
+        assert source.total_tokens == end
+    assert len(observed) == 2 and all(item is source for item in observed)
+    assert len(obj.lmcache_engine.storage_process.client.operations) == ops
 
 
 @pytest.mark.parametrize(

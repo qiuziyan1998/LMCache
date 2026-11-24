@@ -4,6 +4,8 @@
 # Standard
 from concurrent.futures import Future, TimeoutError
 from dataclasses import replace
+from itertools import islice
+from operator import eq
 from typing import Any, Generator
 import time
 
@@ -12,6 +14,7 @@ import msgspec
 import torch
 
 # First Party
+from lmcache.integration.vllm.kv_policy import load_spec_requires_retrieve
 from lmcache.logging import init_logger
 from lmcache.v1.rpc.storage_protocol import (
     PrepareSpec,
@@ -395,6 +398,8 @@ def ordinary_layerwise_load(
         readiness = state.dense_load_readiness
         state.slot_mapping, state.indexer_slot_mapping = slot_mapping, indexer_slots
         state.dense_prefix_seed = not request.is_sparse_decode
+        if request.is_sparse_decode:
+            state.process_sparse_binding_tokens = count
         completed = set()
 
         def retrieve(group: int, mapping: torch.Tensor) -> Generator[Any, Any, None]:
@@ -877,6 +882,77 @@ def run_cold(
             )
 
 
+def _same_token_prefix(left: list[int], right: list[int], end: int) -> bool:
+    """Compare accepted history without allocating two context-sized slices."""
+    return min(len(left), len(right)) >= end and all(islice(map(eq, left, right), end))
+
+
+def _certified_packet(
+    engine: Any, source: Any, request_id: str, generation: int, extent: int
+) -> bool:
+    """The published packet must still have this exact length and live lease."""
+    return (
+        source is not None
+        and source.total_tokens == extent
+        and engine.compact_source_importer.is_certified_source(
+            source, request_id, generation
+        )
+    )
+
+
+def validate_covering_sparse_prefix(
+    engine: Any, state: Any, request: Any, required: int
+) -> None:
+    """Check a ticketless decode against a longer, already published process source.
+
+    ``required`` is the scheduler's logical prefix, not the physical packet
+    length. A full row proves its token history; a warm row refers to the
+    previously bound scratch slots for that same prefix. Raise RuntimeError
+    rather than reacquiring a source without a lookup ticket.
+    """
+    spec = request.load_spec
+    source = state.prepared_sparse_sources.get(0)
+    if (
+        not request.is_sparse_decode
+        or request.resumed_from_preemption
+        or not load_spec_requires_retrieve(spec)
+        or spec.cpu_source_ticket is not None
+        or getattr(spec, "dsa_cold_compact_resume", False)
+        or getattr(spec, "process_ordinary_resume", False)
+        or required != spec.lmcache_cached_tokens
+        or not 0 < required < state.token_count
+        or not 0 <= (spec.dsa_remap_frontier or 0) <= required
+        or state.req_id != request.req_id
+        or not state.shared_request_active
+        or state.shared_latent_status != "present"
+        or state.shared_index_status != "present"
+        or state.shared_generation != engine.shared_cpu_cache_generation
+        or state.pointer_cache_generation != state.shared_generation
+        or not state.indexer_npu_resident
+        or state.indexer_npu_materialization_pending
+        or not _certified_packet(
+            engine, source, request.req_id,
+            getattr(state, "process_load_generation", -1), state.token_count,
+        )
+    ):
+        raise RuntimeError(
+            f"Process sparse prefix lacks a covering live source: {request.req_id}"
+        )
+    if request.sparse_warm_ref:
+        matches = (
+            state.process_sparse_binding_tokens == required
+            and state.slot_mapping is not None
+        )
+    else:
+        matches = len(state.metadata_token_ids) == state.token_count and (
+            _same_token_prefix(state.metadata_token_ids, request.token_ids, required)
+        )
+    if not matches:
+        raise RuntimeError(
+            f"Process sparse prefix does not match request history: {request.req_id}"
+        )
+
+
 def record_state(adapter: Any, state: Any, request: Any) -> None:
     """Adopt only importer-certified ownership; no allocator proxy registration."""
     engine = adapter.lmcache_engine
@@ -886,10 +962,9 @@ def record_state(adapter: Any, state: Any, request: Any) -> None:
         0 not in sources
         or not state.indexer_npu_resident
         or any(
-            not engine.compact_source_importer.is_certified_source(
-                source, request.req_id, generation
+            not _certified_packet(
+                engine, source, request.req_id, generation, state.token_count
             )
-            or source.total_tokens != state.token_count
             or len(source.layers) != adapter._num_layers_for_group(group)
             for group, source in sources.items()
         )
@@ -1112,8 +1187,14 @@ def promote_store(adapter: Any, request: Any, result: Any) -> None:
         state.process_source_plan = job["storage_source_plan"]
         state.indexer_npu_resident = True
         if old is not None:
-            state.slot_mapping = old.slot_mapping
-            state.indexer_slot_mapping = old.indexer_slot_mapping
+            bound = old.process_sparse_binding_tokens
+            if not bound or _same_token_prefix(
+                old.metadata_token_ids, state.metadata_token_ids, bound
+            ):
+                state.slot_mapping = old.slot_mapping
+                state.indexer_slot_mapping = old.indexer_slot_mapping
+                state.decode_ret_mask = old.decode_ret_mask
+                state.process_sparse_binding_tokens = bound
         adapter._record_dsa_cold_dense_load_readiness(state)
         record_state(adapter, state, request)
     except BaseException as exc:

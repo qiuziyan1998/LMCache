@@ -4796,6 +4796,9 @@ class TestWorkerRetrieveState:
         )
         impl, _, _ = make_worker_connector([req], use_layerwise=True)
         impl.config.dsa_two_groups = False
+        # A single 512-token source chunk covers this shorter warm reference.
+        impl._lmcache_chunk_size = 512
+        impl._layerwise_prefill_p_node = False
         impl.num_layers = 1
         impl._refresh_kvcaches_list()
         impl.layerwise_retrievers = []

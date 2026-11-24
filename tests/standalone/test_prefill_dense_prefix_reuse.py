@@ -12,6 +12,9 @@ from typing import Any
 import pytest
 import torch
 
+# First Party
+from lmcache.integration.vllm.kv_policy import load_spec_requires_retrieve
+
 SOURCE = (
     Path(__file__).resolve().parents[2] / "lmcache/integration/vllm/vllm_v1_adapter.py"
 )
@@ -35,6 +38,7 @@ def adapter_types() -> tuple[type, type]:
         "_materialize_dense_prefix_for_sparse",
         "_worker_retrieve_state_for_request",
         "_worker_retrieve_state_for_warm_ref",
+        "_validated_source_extent",
         "_should_invalidate_worker_retrieve_state",
         "_trim_dense_prefix_seed_for_sparse",
     }
@@ -51,6 +55,7 @@ def adapter_types() -> tuple[type, type]:
         dataclass=dataclass,
         field=field,
         torch=torch,
+        load_spec_requires_retrieve=load_spec_requires_retrieve,
         prefill_reuse_debug_enabled=lambda rank: False,
         prefill_reuse_debug_log=lambda *args, **kwargs: None,
     )

@@ -9,6 +9,9 @@ from types import SimpleNamespace as NS
 
 import pytest
 
+# First Party
+from lmcache.integration.vllm.kv_policy import sparse_kv_managed
+
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "lmcache/integration/vllm/vllm_v1_adapter.py"
 spec = importlib.util.spec_from_file_location(
@@ -473,7 +476,8 @@ def test_checkpoint_release_waits_for_resumed_tracker_history() -> None:
     assert worker._completed_decode_window_saves == {"r": 7168}
     scheduler._dsa_scratch_capacity = 4096
     scheduler._eligible_dsa_release_frontier = MethodType(
-        method("_eligible_dsa_release_frontier"), scheduler
+        method("_eligible_dsa_release_frontier", sparse_kv_managed=sparse_kv_managed),
+        scheduler,
     )
     consume(
         scheduler,

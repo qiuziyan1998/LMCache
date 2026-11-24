@@ -16,6 +16,10 @@ from lmcache.integration.vllm.dcp import DcpColdLoadGeometry
 @pytest.mark.parametrize(
     "length,world,model_limit,max_output,output,resumable,threshold,hit_delta,expected",
     [
+        (9000, 4, 20000, 2000, 0, False, 0, 0, True),
+        (9000, 4, 20000, 2000, 0, False, 10000, 0, True),
+        (9000, 4, 20000, 7383, 0, False, 10000, 0, True),
+        (9000, 4, 20000, 7384, 0, False, 10000, 0, False),
         (16464, 8, 20000, None, 0, False, 0, 0, True),
         (20000, 8, 20000, None, 0, False, 0, 0, True),
         (18433, 8, 20000, None, 0, False, 0, 0, True),
@@ -30,7 +34,7 @@ from lmcache.integration.vllm.dcp import DcpColdLoadGeometry
         (16464, 8, 1000000, 1, 0, True, 0, 0, False),
         (16464, 8, 20000, None, 0, True, 0, 0, True),
         (16464, 8, 16000, None, 0, False, 0, 0, False),
-        (16464, 8, 20000, None, 0, False, 16464, 0, False),
+        (16464, 8, 20000, None, 0, False, 16464, 0, True),
         (16464, 8, 20000, None, 0, False, 0, 128, False),
     ],
 )
@@ -51,10 +55,13 @@ def test_dcp_resident_admission_bounds_growth_and_preserves_policy(
             DcpColdLoadGeometry(32 * 128 * world, model_limit, 1)
             if world > 1 else None
         ),
-        lookup_client=NS(lookup_cache=lambda **kw: length - hit_delta),
+        lookup_client=NS(
+            lookup_cache=lambda **kw: length - hit_delta, peek_ticket=lambda _: object()
+        ),
         _cold_perf_lookup_started={}, _lmcache_chunk_size=1024, _block_size=128,
         _dsa_scratch_capacity=4096, _dsa_kv_policy_threshold=threshold,
         config=NS(pd_role="receiver", min_retrieve_tokens=0,
+                  decoder_storage_mode="process", enable_async_loading=True,
                   dsa_group1_load_mode="p2p_preferred"),
         enable_sparse_attention=True, supports_dsa_cold_compact_load=lambda: True,
         load_specs={}, _requests_priority={},
@@ -66,6 +73,8 @@ def test_dcp_resident_admission_bounds_growth_and_preserves_policy(
     assert matched == length - (hit_delta or 1)
     resident = expected and capable
     assert getattr(spec, "dsa_cold_resident_load", False) == resident
+    if length - hit_delta <= threshold:
+        assert spec.process_ordinary_load == (not resident)
     if resident:
         assert spec.dsa_cold_compact_load
         assert spec.dsa_committed_end == length

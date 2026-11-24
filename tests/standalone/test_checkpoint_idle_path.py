@@ -7,6 +7,10 @@ import gc
 from types import SimpleNamespace as NS
 import weakref
 
+# First Party
+from lmcache.integration.vllm.kv_policy import load_spec_requires_retrieve
+
+# Local
 from test_checkpoint_adapter import SOURCE, control, method, request
 
 
@@ -170,6 +174,7 @@ def test_checkpoint_controls_preserve_simultaneous_cold_load_trigger(monkeypatch
     )
     ns = {
         "LMCacheConnectorMetadata": plain,
+        "load_spec_requires_retrieve": load_spec_requires_retrieve,
         "logger": NS(debug=lambda *a: None),
         "kv_hash_enabled": lambda: False,
         "audit_enabled": lambda: False,

@@ -19,13 +19,15 @@ from lmcache.integration.vllm import vllm_v1_adapter as adapter_module
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
     LoadSpec,
+    ReqMeta,
     RequestTracker,
     WorkerRetrieveState,
     _has_live_group1_source_for_dp,
     _has_live_latent_source_for_dp,
     _live_split_source_dp_rank,
 )
-from tests.v1.connector_test_utils import make_worker_impl
+from lmcache.v1.cache_engine import LayerwiseStoreResult
+from tests.v1.connector_test_utils import make_worker_connector, make_worker_impl
 
 
 @dataclass
@@ -476,6 +478,7 @@ def test_cold_compact_nonresident_frontier_survives_threshold_rollback(
     assert rollback_meta.dsa_nonresident_frontier == remap_frontier
     assert rollback_meta.load_spec is not None
     assert rollback_meta.load_spec.can_load
+    assert not rollback_meta.load_spec.dsa_full_resident
     assert rollback_meta.load_spec.dsa_committed_end >= remap_frontier
     assert rollback_meta.load_spec.lmcache_cached_tokens >= remap_frontier
 
@@ -2379,24 +2382,23 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
     def test_cold_compact_resume_marker_is_one_shot(self) -> None:
         impl = _make_scheduler_impl()
         impl._manager = SimpleNamespace(lookup_client=MagicMock())
+        impl.config.dsa_two_groups = True
+        impl._vllm_config = SimpleNamespace(parallel_config=SimpleNamespace())
         req_id = "cold-resume"
         prompt_len = 8193
+        num_blocks = (prompt_len + impl._block_size - 1) // impl._block_size
         request = SimpleNamespace(
             request_id=req_id,
             req_id=req_id,
             prompt_token_ids=list(range(prompt_len)),
-            block_ids=list(range(513)),
+            all_token_ids=list(range(prompt_len)),
+            block_ids=(
+                list(range(num_blocks)), list(range(num_blocks, 2 * num_blocks))
+            ),
             num_tokens=prompt_len,
             num_computed_tokens=prompt_len - 1,
             sampling_params=SimpleNamespace(extra_args=None),
         )
-        impl._unfinished_requests[req_id] = _make_vllm_request(
-            req_id,
-            prompt_len,
-            prompt_len - 1,
-            prompt_len,
-        )
-        impl._dsa_cold_loaded_req_ids = {req_id}
         impl.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=0,
             lmcache_cached_tokens=prompt_len,
@@ -2405,12 +2407,10 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             dsa_remap_frontier=prompt_len - 1,
         )
         impl.load_specs[req_id].dsa_cold_compact_load = True
-        cold_meta = SimpleNamespace(req_id=req_id)
-        impl._build_dsa_cold_compact_meta = MagicMock(return_value=cold_meta)
 
         # The first allocation callback admits the asynchronous full-prefix
         # load and emits its no-forward worker metadata.
-        impl.update_state_after_alloc(request, prompt_len - 1, object())
+        impl.update_state_after_alloc(request, prompt_len - 1, request.block_ids)
         assert impl.load_specs[req_id].can_load is True
         initial = impl.build_connector_meta(
             StubSchedulerOutput(
@@ -2421,14 +2421,15 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             )
         )
         assert initial.dsa_cold_compact_load_pending is True
-        assert initial.requests == [cold_meta]
+        assert len(initial.requests) == 1
+        assert initial.requests[0].load_spec is impl.load_specs[req_id]
 
         # A completed async load is scheduled a second time with no newly
-        # allocated external tokens. This is the real transition that used to
-        # clear can_load immediately before the first sparse resume.
-        impl._dsa_cold_loaded_req_ids = {req_id}
+        # allocated external tokens. The completed source must remain loadable
+        # until the first sparse resume consumes its one-shot marker.
+        impl.update_connector_output(SimpleNamespace(finished_recving={req_id}))
         impl.update_state_after_alloc(request, 0)
-        assert impl.load_specs[req_id].can_load is False
+        assert impl.load_specs[req_id].can_load is True
 
         first = impl.build_connector_meta(
             StubSchedulerOutput(
@@ -2441,12 +2442,15 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
 
         assert first.is_sparse_decode
         assert first.load_spec.can_load is True
+        assert not first.load_spec.dsa_full_resident
         assert first.load_spec.dsa_committed_end == prompt_len
         assert first.load_spec.dsa_remap_frontier == prompt_len - 1
         assert first.dsa_nonresident_frontier == prompt_len - 1
         assert first.load_spec.dsa_cold_compact_resume is True
         assert not hasattr(first.load_spec, "dsa_cold_compact_load")
 
+        request.num_computed_tokens = prompt_len
+        request.all_token_ids.append(prompt_len)
         second = impl.build_connector_meta(
             StubSchedulerOutput(
                 finished_req_ids=set(),
@@ -2502,18 +2506,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
     def test_short_prompt_within_kv_policy_threshold_is_full_resident(
         self,
     ) -> None:
-        """方案 A: requests within the KV-policy threshold use the
-        full-resident policy (is_sparse_decode=False).
-
-        Regression: 0806-4. The FIRST compute step (token_ids == prompt_len,
-        is_decode_phase still False, e.g. right after a cold-compact load) must
-        also stay in the connector metadata (is_sparse_decode=False,
-        load_spec=None). Otherwise the step classifies as
-        MISSING_CONNECTOR_METADATA, falls back to the eager path, and the
-        torch_npu fx compiler captures ACL graphs at serving time — which is
-        illegal to overlap with the async cold-compact load thread's
-        synchronized device copies (device error 507057). Keeping every
-        full-resident step staged prevents serving-time graph capture."""
+        """After prefill the resident prefix needs a staged row, but no retrieve."""
         impl = _make_scheduler_impl()
         impl._dsa_kv_policy_threshold = 2048
         req_id = "short-prompt"
@@ -2547,8 +2540,14 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
 
         assert len(meta.requests) == 1
         req_meta = meta.requests[0]
-        assert not req_meta.is_sparse_decode
-        assert req_meta.load_spec is None
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.dsa_full_resident
+        assert not req_meta.load_spec.can_load
+        assert req_meta.load_spec.lmcache_cached_tokens == 0
+        assert req_meta.load_spec.dsa_committed_end == 0
+        assert req_meta.load_spec.dsa_remap_frontier == 0
+        assert req_meta.load_spec.dsa_release_frontier is None
         assert req_meta.save_spec is not None
         assert not req_meta.save_spec.can_save
 
@@ -2639,6 +2638,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.is_sparse_decode
         assert req_meta.load_spec is not None
         assert not req_meta.load_spec.can_load
+        assert not req_meta.load_spec.dsa_full_resident
         assert req_meta.load_spec.dsa_committed_end == 0
 
     def test_first_decode_step_keeps_short_prompt_resident(self) -> None:
@@ -3416,6 +3416,110 @@ class TestZombieRequestInMetadata:
         assert req_id not in impl._request_trackers
         assert req_id not in impl._unfinished_requests
         assert req_id not in impl._dsa_kv_policy_states
+
+
+@pytest.mark.parametrize("accepted_output", [False, True])
+def test_ordinary_resume_validates_last_required_token(accepted_output: bool) -> None:
+    scheduler = _make_scheduler_impl()
+    scheduler.config.dsa_two_groups = True
+    scheduler.config.decoder_storage_mode = "local"
+    scheduler._dsa_kv_policy_threshold = 300
+    scheduler._block_size, scheduler._lmcache_chunk_size = 128, 512
+    prompt = list(range(300))
+    scheduler._request_trackers["r"] = RequestTracker("r", 300, prompt.copy(), [])
+    scheduler._unfinished_requests["r"] = SimpleNamespace(
+        num_computed_tokens=300 if accepted_output else 299,
+        all_token_ids=prompt + ([999] if accepted_output else []),
+    )
+    spec = scheduler.load_specs["r"] = LoadSpec(0, 300, True)
+    blocks = ([1, 2, 3], [21, 22, 23])
+    cached = StubCachedRequestData(["r"], [[]], [blocks], {"r"})
+    (row,) = scheduler.build_connector_meta(
+        StubSchedulerOutput(set(), [], cached, {"r": 1})
+    ).requests
+    assert row.load_spec is spec and not row.is_sparse_decode
+    worker, _, _ = make_worker_connector([row])
+    worker._invalid_block_ids = set()
+    worker._block_size, worker._lmcache_chunk_size = 128, 512
+    mask = torch.ones(300, dtype=torch.bool)
+    mask[-1] = False
+    worker._validate_dense_retrieve_result(row, mask, kv_group=1)
+    expected = {23} if accepted_output else set()
+    assert worker.get_block_ids_with_load_errors() == expected
+
+
+@pytest.mark.parametrize("window", [0, 256, 512])
+def test_ordinary_decode_save_and_window_ack_are_independent(window: int) -> None:
+    scheduler = _make_scheduler_impl()
+    scheduler.config.dsa_two_groups = scheduler.config.save_decode_cache = True
+    scheduler._dsa_kv_policy_threshold = 2048
+    scheduler._decode_window_save_window_size = window
+    scheduler._block_size = 128
+    tracker = RequestTracker(
+        "r", 511, list(range(511)), list(range(12)), list(range(12, 24)),
+        num_saved_tokens=511, decode_window_save_committed_end=511,
+    )
+    req = SimpleNamespace(num_computed_tokens=511, all_token_ids=[])
+    scheduler._request_trackers["r"] = tracker
+    scheduler._unfinished_requests["r"] = req
+    output = StubSchedulerOutput(
+        set(), [], StubCachedRequestData(["r"], [[]], [[]]), {}
+    )
+    worker, _, _ = make_worker_connector([], use_layerwise=True)
+    worker.config.dsa_two_groups = True
+    worker._prefill_save_completed_groups = {}
+    worker._completed_decode_window_saves = {}
+    worker._decode_window_save_completed_groups = set()
+
+    def schedule_writes(end: int) -> list[ReqMeta]:
+        req.num_computed_tokens = len(tracker.token_ids)
+        req.all_token_ids = list(range(end))
+        output.num_scheduled_tokens["r"] = end - req.num_computed_tokens
+        rows = scheduler.build_connector_meta(output).requests
+        main = next(row for row in rows if not row.is_decode_window_save)
+        assert main.load_spec.dsa_full_resident
+        return [row for row in rows if row.save_spec.can_save]
+
+    def complete(write: ReqMeta) -> dict[str, int]:
+        for group in (0, 1):
+            result = LayerwiseStoreResult(
+                "r", group, committed_end=len(write.token_ids)
+            )
+            worker._record_prefill_save_group_completed(write, group, result)
+            worker._record_decode_window_save_group_completed(write, group, result)
+            worker._mark_prefill_committed(write)
+            worker._mark_decode_window_save_completed(write)
+            if group == 0:
+                assert worker.get_completed_decode_window_saves() == {}
+        return worker.get_completed_decode_window_saves()
+
+    if window != 256:
+        (ordinary,) = schedule_writes(512)
+        assert not ordinary.is_decode_window_save
+        assert ordinary.save_slot_mapping_base == 256
+        assert complete(ordinary) == {}
+        assert tracker.num_saved_tokens == 512
+        if window == 0:
+            assert tracker.decode_window_save_next_start is None
+            return
+        assert tracker.decode_window_save_committed_end == 256
+    first_end = 256 + window
+    (first,) = schedule_writes(first_end)
+    assert first.is_decode_window_save and first.decode_window_start == 256
+    # The next full window becomes due while the first acknowledgement is
+    # still in flight. Its ordinary writer must not race ahead of it.
+    second_end = first_end + window
+    assert schedule_writes(second_end) == []
+    ack = complete(first)
+    assert ack == {"r": first_end}
+    scheduler.update_connector_output(SimpleNamespace(completed_decode_window_saves=ack))
+    assert not ack and tracker.decode_window_save_committed_end == first_end
+    (second,) = schedule_writes(second_end + 1)
+    assert (second.decode_window_start, second.decode_window_end) == (
+        first_end, second_end
+    )
+    assert complete(second) == {"r": second_end}
+    assert tracker.dsa_current_released_frontier == 0
 
 
 class TestDecodeWindowSaveMetadata:

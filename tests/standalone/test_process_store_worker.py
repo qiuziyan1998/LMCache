@@ -503,24 +503,27 @@ def test_paired_growth_reprepares_exact_partial_successor_with_actual_cpu_proof(
         assert worker.compact_source_importer.is_certified_source(
             state.prepared_sparse_sources[0], "request", state.process_load_generation
         )
-        # Sparse decode must retain this complete extent, including the tail.
-        # A rounded extent misses the exact source and enters a ticket-based
-        # reload, but local-prefill synthetic loads have no lookup ticket.
+        # The raw selector remains exact. A shorter synthetic decode can use
+        # this same physical source only with the separate lifetime/history proof.
         from test_storage_process_worker import loaded
 
         select = loaded(path, "_prepared_sparse_source", {}, "LMCacheConnectorV1Impl")
         assert select(adapter, state, 0, end) is state.prepared_sparse_sources[0]
         rounded = end // 4 * 4
         assert select(adapter, state, 0, rounded) is None
-        with pytest.raises(msgspec.ValidationError, match="null"):
-            bridge.ordinary_layerwise_load(
-                adapter, request, request.token_ids[:rounded],
-                torch.ones(rounded, dtype=torch.bool), torch.arange(rounded),
-                torch.arange(rounded), request_ordinal=0,
-            )
+        row = NS(
+            req_id="request", is_sparse_decode=True, sparse_warm_ref=False,
+            resumed_from_preemption=False, token_ids=request.token_ids[:rounded],
+            load_spec=NS(cpu_source_ticket=None, can_load=True,
+                         lmcache_cached_tokens=rounded, dsa_remap_frontier=rounded),
+        )
+        bridge.validate_covering_sparse_prefix(worker, state, row, rounded)
         assert state.prepared_sparse_sources[0].owner_lease.is_valid()
         if previous is not None:
             assert not previous.prepared_sparse_sources[0].owner_lease.is_valid()
+            row.load_spec.lmcache_cached_tokens = row.load_spec.dsa_remap_frontier = 4
+            with pytest.raises(RuntimeError, match="covering live source"):
+                bridge.validate_covering_sparse_prefix(worker, previous, row, 4)
     bridge.release_sources(states["request"], worker)
     assert worker.compact_source_importer.sources_drained()
     assert completed == [(0, 5), (1, 5), (0, 9), (1, 9)]

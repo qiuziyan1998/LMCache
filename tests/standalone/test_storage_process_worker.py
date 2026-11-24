@@ -11,6 +11,7 @@ from pathlib import Path
 from queue import Queue
 from threading import Barrier
 from types import MethodType, ModuleType, SimpleNamespace as NS
+from typing import Any
 import sys
 
 import msgspec
@@ -21,6 +22,11 @@ import torch
 from lmcache.integration.vllm import storage_process as worker
 from lmcache.integration.vllm.decode_window_commit import (
     publish_delayed_decode_window_commit,
+)
+from lmcache.integration.vllm.kv_policy import (
+    is_prefill_commit,
+    load_spec_requires_retrieve,
+    sparse_kv_managed,
 )
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.rpc.storage_lifetime import NativeSourceLifetime
@@ -92,22 +98,12 @@ def complete(value=None):
     return future
 
 
-@pytest.mark.parametrize(
-    "world,phase,compact",
-    [(4, "miss", False), (8, "resume", False), (4, "resident_resume", False),
-     (4, "decode", False), (8, "long_decode", False), (4, "decode", True),
-     (1, "decode", False), (8, "persisted_decode", False),
-     (4, "persisted_decode", False), (8, "persisted_long_decode", False),
-     (8, "persisted_decode", True), (1, "persisted_decode", False),
-     (1, "persisted_logged_decode", False), (1, "persisted_aligned_decode", False)],
-)
-@pytest.mark.parametrize("storage_mode", ["local", "process"])
-def test_dcp_scheduler_metadata_follows_the_allocated_layout(
-    world, phase, compact, storage_mode,
-):
+@pytest.fixture(scope="module")
+def scheduler_metadata_api() -> tuple[Path, dict[str, Any]]:
+    """Load the production scheduler methods without vLLM's native runtime."""
     path = Path(__file__).resolve().parents[2] / "lmcache/integration/vllm/vllm_v1_adapter.py"
 
-    def cdiv(n, d):
+    def cdiv(n: int, d: int) -> int:
         return (n + d - 1) // d
 
     ns = dict(
@@ -119,6 +115,9 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(
         logger=NS(debug=lambda *a: None, error=lambda *a: None),
         _mtp_dw_event=lambda *a, **kw: None,
         publish_delayed_decode_window_commit=publish_delayed_decode_window_commit,
+        is_prefill_commit=is_prefill_commit,
+        load_spec_requires_retrieve=load_spec_requires_retrieve,
+        sparse_kv_managed=sparse_kv_managed,
     )
     for name in (
         "_flatten_block_ids", "_split_kv_group_block_ids", "_copy_block_ids_by_bank",
@@ -127,9 +126,35 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(
         "RequestTracker", "ReqMeta", "LMCacheConnectorMetadata",
     ):
         loaded(path, name, ns)
+    for name in (
+        "_take_completed_cold_load", "_build_request_meta", "_dcp_write_layout",
+        "build_connector_meta",
+    ):
+        loaded(path, name, ns, "LMCacheConnectorV1Impl")
+    return path, ns
 
+
+@pytest.mark.parametrize(
+    "world,phase,compact",
+    [(4, "miss", False), (8, "resume", False), (4, "resident_resume", False),
+     (4, "decode", False), (8, "long_decode", False), (4, "decode", True),
+     (1, "decode", False), (8, "persisted_decode", False),
+     (4, "persisted_decode", False), (8, "persisted_long_decode", False),
+     (8, "persisted_decode", True), (1, "persisted_decode", False),
+     (1, "persisted_logged_decode", False), (1, "persisted_aligned_decode", False),
+     (1, "persisted_resident_decode", False), (4, "persisted_resident_decode", False),
+     (4, "compact_below_threshold", True)],
+)
+@pytest.mark.parametrize("storage_mode", ["local", "process"])
+def test_dcp_scheduler_metadata_follows_the_allocated_layout(
+    world: int, phase: str, compact: bool, storage_mode: str,
+    scheduler_metadata_api: tuple[Path, dict[str, Any]],
+) -> None:
+    path, ns = scheduler_metadata_api
+    cdiv = ns["cdiv"]
     resident = phase == "resident_resume"
     persisted = phase.startswith("persisted_")
+    at_threshold = phase == "persisted_resident_decode"
     prompt_len = {
         "resident_resume": 257, "long_decode": 16385,
         "persisted_decode": 16385, "persisted_long_decode": 49153,
@@ -163,7 +188,10 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(
                   decoder_storage_mode=storage_mode),
         kv_role="kv_both" if persisted else "kv_consumer", force_skip_save=False,
         enable_sparse_attention=True, _dsa_dcp_size=world if world > 1 else None,
-        _dsa_scratch_capacity=4096, _dsa_kv_policy_threshold=0, _dsa_kv_policy_log=False,
+        _dsa_scratch_capacity=4096,
+        _dsa_kv_policy_threshold=(
+            end if at_threshold or phase == "compact_below_threshold" else 0
+        ),
         _dsa_dcp_live_origin=32,
         _block_size=128, _lmcache_chunk_size=1024, _discard_partial_chunks=True,
         _decode_window_save_window_size=0, _requests_priority={}, _request_trackers={},
@@ -181,7 +209,7 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(
             tracker.dsa_nonresident_frontier = tracker.sparse_remap_frontier = len(prompt) - 1
         adapter._request_trackers["r"] = tracker
     for name in ("_take_completed_cold_load", "_build_request_meta", "_dcp_write_layout"):
-        setattr(adapter, name, MethodType(loaded(path, name, ns, "LMCacheConnectorV1Impl"), adapter))
+        setattr(adapter, name, MethodType(ns[name], adapter))
     if persisted:
         # Actual final-prefill completion followed by scheduler reconciliation.
         # Saving the prompt also reports completion when decode-window size is 0.
@@ -203,7 +231,7 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(
             adapter,
             NS(completed_decode_window_saves=saved._completed_decode_window_saves),
         )
-    build = loaded(path, "build_connector_meta", ns, "LMCacheConnectorV1Impl")
+    build = ns["build_connector_meta"]
     result = build(adapter, NS(
         finished_req_ids=set(), scheduled_new_reqs=[request] if first else [],
         scheduled_cached_reqs=NS(
@@ -268,7 +296,10 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(
                 route_ns["StagedSFAQueryProfile"].DECODE_BOUNDED if query_width == 1
                 else route_ns["StagedSFAQueryProfile"].SPEC_FIXED
             )
-        release_expected = prompt_len // 1024 * 1024 if compact or world == 1 else 0
+        release_expected = (
+            prompt_len // 1024 * 1024 if (compact or world == 1) and not at_threshold
+            else 0
+        )
         assert tracker.dsa_current_released_frontier == release_expected
         assert tracker.dsa_nonresident_frontier == release_expected
         assert tracker.decode_window_save_committed_end == prompt_len // 1024 * 1024
@@ -276,7 +307,34 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(
             {"r": release_expected} if release_expected else {}
         )
         assert decision.frontiers == (release_expected,)
-    if compact or world == 1:
+    if world == 1 and at_threshold:
+        assert decision.reason == route_ns["StagedSFARouteReason"].ELIGIBLE
+        assert result.is_sparse_decode and result.load_spec.dsa_full_resident
+        assert not result.load_spec.can_load
+        assert result.load_spec.lmcache_cached_tokens == 0
+        assert result.load_spec.dsa_committed_end == 0
+        assert result.load_spec.dsa_remap_frontier == 0
+        assert result.load_spec.dsa_release_frontier is None
+        assert not result.token_ids
+        assert not result.slot_mapping and not result.indexer_slot_mapping
+        assert result.decode_ret_mask is None and not result.sparse_warm_ref
+        # Crossing the policy threshold must use the target branch's exact
+        # source extent (including the process store's partial prompt chunk).
+        request.num_computed_tokens = end
+        request.all_token_ids.append(9998)
+        following = build(adapter, NS(
+            finished_req_ids=set(), scheduled_new_reqs=[],
+            scheduled_cached_reqs=NS(
+                req_ids=["r"], resumed_req_ids=set(), new_block_ids=[None]
+            ),
+            num_scheduled_tokens={"r": 1},
+        )).requests[0]
+        assert following.is_sparse_decode and following.load_spec.can_load
+        assert not following.load_spec.dsa_full_resident
+        assert following.retrieve_token_count() == (
+            prompt_len if storage_mode == "process" else prompt_len // 1024 * 1024
+        )
+    elif compact or world == 1:
         assert result.is_sparse_decode and result.load_spec.can_load
         assert result.load_spec.dsa_remap_frontier == (
             len(prompt) - 1 if compact else len(prompt) // 1024 * 1024
@@ -334,6 +392,63 @@ def test_dcp_scheduler_metadata_follows_the_allocated_layout(
             assert spec.process_ordinary_resume and spec.dsa_cold_load_generation == 3
 
 
+@pytest.mark.parametrize("restore", ["local", "ticket", "completed"])
+@pytest.mark.parametrize("threshold", [1024, 300, 0])
+def test_short_cached_resume_preserves_the_ordinary_restore(
+    scheduler_metadata_api: tuple[Path, dict[str, Any]], restore: str, threshold: int,
+) -> None:
+    """A preempted request cannot claim residency before its ordinary restore."""
+    _, ns = scheduler_metadata_api
+    prompt = list(range(300))
+    blocks = ([1, 2, 3], [21, 22, 23])
+    spec = ns["LoadSpec"](
+        0, len(prompt), True, process_ordinary_load=restore == "completed"
+    )
+    if restore != "local":
+        spec.cpu_source_ticket = object()
+    tracker = ns["RequestTracker"]("r", len(prompt), prompt.copy(), [], skip_save=True)
+    request = NS(num_computed_tokens=len(prompt), all_token_ids=prompt + [999])
+    adapter = NS(
+        kv_role="kv_consumer", enable_sparse_attention=True,
+        config=NS(dsa_two_groups=True, save_decode_cache=False),
+        _dsa_kv_policy_threshold=threshold, _dsa_scratch_capacity=128,
+        _block_size=128, _lmcache_chunk_size=256, _discard_partial_chunks=False,
+        _decode_window_save_window_size=0,
+        _request_trackers={"r": tracker}, _unfinished_requests={"r": request},
+        load_specs={"r": spec},
+        _dsa_cold_loaded_req_ids={"r"} if restore == "completed" else set(),
+        _add_decode_window_save_metas=lambda *args: None,
+        _windowed_sparse_layerwise_save_enabled=lambda: False,
+    )
+    for name in ("_take_completed_cold_load", "_build_request_meta"):
+        setattr(adapter, name, MethodType(ns[name], adapter))
+    output = NS(
+        finished_req_ids=set(), scheduled_new_reqs=[], num_scheduled_tokens={"r": 1},
+        scheduled_cached_reqs=NS(
+            req_ids=["r"], resumed_req_ids={"r"}, new_block_ids=[blocks]
+        ),
+    )
+    resumed = ns["build_connector_meta"](adapter, output).requests[0]
+    assert resumed.resumed_from_preemption and not resumed.is_sparse_decode
+    assert resumed.load_spec is spec and not spec.dsa_full_resident
+    assert spec.can_load == (restore != "completed")
+    if restore == "completed":
+        assert spec.process_ordinary_resume
+    else:
+        assert len(resumed.slot_mapping[0]) >= len(prompt)
+        assert len(resumed.indexer_slot_mapping[0]) >= len(prompt)
+
+    request.num_computed_tokens += 1
+    request.all_token_ids.append(1000)
+    output.scheduled_cached_reqs.resumed_req_ids.clear()
+    output.scheduled_cached_reqs.new_block_ids = [None]
+    following = ns["build_connector_meta"](adapter, output).requests[0]
+    assert following.is_sparse_decode
+    within_threshold = len(request.all_token_ids) <= threshold
+    assert following.load_spec.dsa_full_resident == within_threshold
+    assert following.load_spec.can_load != following.load_spec.dsa_full_resident
+
+
 @pytest.mark.parametrize("stale", [False, True])
 def test_dcp_resident_resume_consumes_readiness_without_a_layer_load(stale):
     path = Path(__file__).resolve().parents[2] / "lmcache/integration/vllm/vllm_v1_adapter.py"
@@ -352,8 +467,15 @@ def test_dcp_resident_resume_consumes_readiness_without_a_layer_load(stale):
         dense_load_readiness_consumed=False,
     )
     waits = []
+    # A stale can_load on a neighboring resident lane must not start another
+    # retrieve or interfere with the cold lane's one-shot readiness fence.
+    resident = NS(
+        req_id="local", resumed_from_preemption=False, is_sparse_decode=True,
+        load_spec=NS(can_load=True, dsa_full_resident=True, vllm_cached_tokens=0),
+        retrieve_token_count=lambda: 0,
+    )
     adapter = NS(
-        _parent=NS(_get_connector_metadata=lambda: NS(requests=[request])),
+        _parent=NS(_get_connector_metadata=lambda: NS(requests=[resident, request])),
         kv_caches={"latent": object()}, _kvcaches_list=[object()],
         lmcache_engine=NS(gpu_connector=NS(consume_dense_load_readiness=waits.append)),
         _worker_retrieve_state={"r": state}, _layerwise_prefill_p_node=False, use_layerwise=True,
@@ -369,7 +491,10 @@ def test_dcp_resident_resume_consumes_readiness_without_a_layer_load(stale):
         return False
 
     adapter._is_deferred_layerwise_prefill_load_step = check_loads
-    scope = dict(LMCacheConnectorMetadata=NS)
+    scope = dict(
+        LMCacheConnectorMetadata=NS,
+        load_spec_requires_retrieve=load_spec_requires_retrieve,
+    )
     completed = loaded(path, "completed_cold_resume_state", scope)
     adapter._completed_cold_resume = lambda req: completed(req, state)
     adapter._consume_dsa_cold_dense_load_readiness = MethodType(

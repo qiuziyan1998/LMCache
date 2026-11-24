@@ -15,6 +15,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.integration.vllm.kv_policy import load_spec_requires_retrieve
 from lmcache.v1.gpu_connector.sparse import build_prepared_sparse_source
 
 
@@ -53,6 +54,7 @@ def load_prepare_method(name: str = "prepare_sparse_graph_step") -> Any:
         "kv_hash_enabled": lambda: False,
         "dataclass": dataclass,
         "LMCacheConnectorMetadata": SimpleNamespace,
+        "load_spec_requires_retrieve": load_spec_requires_retrieve,
     }
     helper = next(
         node
@@ -1039,7 +1041,10 @@ def test_warm_graph_preview_adopts_or_discards_without_bootstrap(discard):
 
 @pytest.mark.parametrize(
     "reason",
-    ["load", "save", "checkpoint", "generation", "resident", "blending", "producer"],
+    [
+        "load", "save", "checkpoint", "generation", "resident",
+        "full_resident", "blending", "producer",
+    ],
 )
 def test_warm_graph_preview_keeps_nonwarm_steps_on_ordinary_path(reason):
     adapter = FakeAdapter(warm=True, draft=True)
@@ -1062,6 +1067,8 @@ def test_warm_graph_preview_keeps_nonwarm_steps_on_ordinary_path(reason):
         metadata.preemption_seals = (object(),)
     elif reason == "generation":
         request.resumed_from_preemption = True
+    elif reason == "full_resident":
+        request.load_spec.dsa_full_resident = True
     elif reason == "blending":
         adapter.enable_blending = True
     elif reason == "producer":
