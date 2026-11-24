@@ -291,6 +291,7 @@ def test_reclaim_targets_missing_group_and_preserves_borrowed_and_pinned_owners(
 def test_checkpoint_reclaim_reports_entries_checked_and_stops_at_first_match(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "detail")
     owner = make_allocator(slots=2)
     backend = LocalCPUBackend(
         LMCacheEngineConfig.from_defaults(local_cpu=True), memory_allocator=owner

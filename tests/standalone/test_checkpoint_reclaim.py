@@ -361,6 +361,7 @@ def test_perf_log_distinguishes_selected_bytes_from_total_cache(monkeypatch):
     scope = obj.reclaim_evictable_capacity.__func__.__globals__
     logs = []
     monkeypatch.setitem(scope, "serving_perf_enabled", lambda: True)
+    monkeypatch.setitem(scope, "serving_perf_detailed_enabled", lambda: True)
     monkeypatch.setitem(scope, "time", NS(perf_counter=lambda: 1.0))
     monkeypatch.setitem(scope, "logger", object())
     monkeypatch.setitem(scope, "serving_perf_log", lambda *args, **kw: logs.append(kw))

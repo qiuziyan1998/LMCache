@@ -74,8 +74,10 @@ from lmcache.v1.serving_perf import (
     prefill_reuse_debug_log,
     prefill_start_timing_enabled,
     prefill_start_timing_log,
+    serving_perf_detailed_enabled,
     serving_perf_enabled,
     serving_perf_log,
+    serving_perf_report_due,
     serving_perf_now,
 )
 from lmcache.v1.compute.blend import LMCBlenderBuilder
@@ -12359,13 +12361,21 @@ class LMCacheConnectorV1Impl:
                 str(exc),
             )
         else:
-            logger.exception(
+            trace = serving_perf_detailed_enabled() or serving_perf_report_due(
+                f"cold_load_error:{type(exc).__name__}"
+            )
+            logger.error(
                 "[DSA_COLD_COMPACT] request=%s generation=%d "
-                "status=failed indexer_blocks=%d elapsed_ms=%.3f",
+                "status=failed indexer_blocks=%d elapsed_ms=%s error_type=%s reason=%s",
                 req_id,
                 generation,
                 len(indexer_block_ids),
-                ((serving_perf_now() if perf_enabled else 0.0) - submitted_at) * 1000,
+                round((serving_perf_now() - submitted_at) * 1000, 3)
+                if perf_enabled
+                else None,
+                type(exc).__name__,
+                str(exc).replace("\n", " ")[:256],
+                exc_info=(type(exc), exc, exc.__traceback__) if trace else None,
             )
         # Both workers are terminal and request owners have either
         # retired or moved to the existing readiness retirement queue.
@@ -12809,10 +12819,38 @@ class LMCacheConnectorV1Impl:
             req_id,
             lookup_call_started,
         )
+        require_prefix = getattr(self.config, "decoder_require_kv_prefix", False)
+        # P and D may both use kv_both. Compare against the same prefix that
+        # admission would require, even when the operator permits local prefill.
+        required = None
+        if (
+            (require_prefix or lookup_call_started)
+            and not getattr(self, "_layerwise_prefill_p_node", False)
+            and getattr(self.config, "pd_role", None) == "receiver"
+            and self.kv_role != "kv_producer"
+        ):
+            required = max(request.num_tokens - 1, int(num_external_hit_tokens == 0))
+            if resumed and checkpoint is not None and checkpoint.sealed_end:
+                required = checkpoint.sealed_end
+        short = (
+            required is not None
+            and max(num_computed_tokens, num_external_hit_tokens) < required
+        )
         if lookup_call_started:
             serving_perf_log(
                 logger,
                 "scheduler_lookup",
+                production=(
+                    not serving_perf_detailed_enabled()
+                    and (
+                        short
+                        or serving_perf_now() - (lookup_started or lookup_call_started)
+                        >= 0.1
+                    )
+                    and serving_perf_report_due(f"lookup:{req_id}:{resumed}:{short}")
+                ),
+                reason="insufficient_kv_prefix" if short else None,
+                required_kv_tokens=required,
                 started=lookup_started or None,
                 req_id=req_id,
                 prompt_tokens=request.num_tokens,
@@ -12832,21 +12870,9 @@ class LMCacheConnectorV1Impl:
                 else 0.0,
             )
 
-        # The P and D launchers can both use kv_both. An explicit layerwise
-        # prefiller must be able to compute a prompt even on a complete miss.
-        if (
-            getattr(self.config, "decoder_require_kv_prefix", False)
-            and not getattr(self, "_layerwise_prefill_p_node", False)
-            and getattr(self.config, "pd_role", None) == "receiver"
-            and self.kv_role != "kv_producer"
-        ):
-            # Even a full hit runs the last input for logits. A one-token
-            # request with zero hits still needs a source on a dedicated decoder.
-            required = max(request.num_tokens - 1, int(num_external_hit_tokens == 0))
-            if resumed and checkpoint is not None and checkpoint.sealed_end:
-                required = checkpoint.sealed_end
+        if require_prefix and required is not None:
             request.min_kv_prefix_tokens = required
-            if resumed and max(num_computed_tokens, num_external_hit_tokens) < required:
+            if resumed and short:
                 # Withdraw the short offer before waiting for an HBM slot or
                 # dispatching another restore. The scheduler checks all sources.
                 self.load_specs.pop(req_id, None)
@@ -14401,10 +14427,40 @@ class LMCacheConnectorV1Impl:
         if pending is not None and pending.accept(result):
             if pending.status == "captured" or pending.cancel_pending:
                 self._arm_preemption_controls()
-            if serving_perf_enabled():
-                serving_perf_log(logger, "decoder_preemption_checkpoint", req_id=result.req_id,
-                                 generation=result.generation, status=result.status,
-                                 end=result.end, reason=result.reason, **(result.timings_ms or {}))
+            if pending.status == "failed":
+                logger.error(
+                    "[CHECKPOINT_FAILED] req=%s generation=%d ack=%s requested_end=%d "
+                    "seal_target=%d end=%d reason=%s",
+                    result.req_id,
+                    result.generation,
+                    result.status,
+                    pending.capture.end,
+                    pending.end,
+                    result.end,
+                    result.reason
+                    or (
+                        "invalid_ack_frontier"
+                        if result.status != "failed"
+                        else "unspecified"
+                    ),
+                )
+            if serving_perf_enabled() and (
+                pending.status != "failed" or serving_perf_detailed_enabled()
+            ):
+                serving_perf_log(
+                    logger,
+                    "decoder_preemption_checkpoint",
+                    production=True,
+                    req_id=result.req_id,
+                    generation=result.generation,
+                    status=result.status,
+                    checkpoint_state=pending.status,
+                    requested_end=pending.capture.end,
+                    end=result.end,
+                    sealed_end=pending.sealed_end,
+                    reason=result.reason,
+                    **(result.timings_ms or {}),
+                )
             self._resume_lookup_queries.pop(result.req_id, None)
             if self.lookup_client is not None:
                 self.lookup_client.clear_lookup_status(result.req_id)

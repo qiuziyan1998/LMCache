@@ -9,6 +9,7 @@ import threading
 
 # Third Party
 import msgspec
+import pytest
 import zmq
 
 # First Party
@@ -64,7 +65,7 @@ def test_zmq_timeout_log_contains_transport_and_caller_context(monkeypatch) -> N
     assert "endpoint=/tmp/lookup-rank-7" in message
     assert "timeout_ms=3000" in message
     assert "sent=1 received=0" in message
-    assert "started_at=" in message and "failed_at=" in message
+    assert "failed_at=" in message
     assert "caller=" in message and "_call_transport" in message
     assert kwargs["stack_info"] is True
     transport._recreate_all_sockets.assert_called_once_with()
@@ -241,7 +242,7 @@ def test_lookup_failure_log_contains_request_context(monkeypatch) -> None:
     assert "lookup_id=request-42" in message
     assert "mode=hashes input_count=1 token_count=512" in message
     assert "transport=_FailedTransport timeout_ms=3000" in message
-    assert "started_at=" in message and "failed_at=" in message
+    assert "failed_at=" in message
 
 
 def test_sync_lookup_cleanup_releases_every_worker_before_local_clear() -> None:
@@ -287,12 +288,21 @@ class _LookupEngine:
     cleanup_memory_objs = MagicMock()
 
 
-def test_lookup_server_logs_start_and_slow_completion(monkeypatch) -> None:
+@pytest.mark.parametrize("mode", ["0", "1", "detail"])
+@pytest.mark.parametrize("client_timeout", [0, 30000])
+def test_lookup_server_reports_slow_calls_without_routine_production_logs(
+    monkeypatch, mode, client_timeout
+) -> None:
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", mode)
     logger = MagicMock()
     monkeypatch.setattr(lmcache_lookup_client, "logger", logger)
     transport = _ServerTransport()
+    engine = _LookupEngine()
+    engine.config = SimpleNamespace(
+        enable_blending=False, lookup_timeout_ms=client_timeout
+    )
     server = lmcache_lookup_client.LMCacheLookupServer(
-        _LookupEngine(), SimpleNamespace(), transport
+        engine, SimpleNamespace(), transport
     )
     try:
         assert transport.response_sent.wait(timeout=1)
@@ -305,13 +315,20 @@ def test_lookup_server_logs_start_and_slow_completion(monkeypatch) -> None:
     warning_messages = [
         call.args[0] % call.args[1:] for call in logger.warning.call_args_list
     ]
-    started = next(msg for msg in info_messages if "processing started" in msg)
-    completed = next(msg for msg in warning_messages if "processing completed" in msg)
-
-    assert "lookup_id=request-7 mode=hashes input_count=1" in started
-    assert "client_timeout_ms=0" in started
-    assert "lookup_id=request-7 mode=hashes input_count=1" in completed
-    assert "result_tokens=256 client_timeout_ms=0" in completed
+    starts = [msg for msg in info_messages if "processing started" in msg]
+    completions = [msg for msg in warning_messages if "processing completed" in msg]
+    assert len(starts) == int(mode == "detail")
+    assert len(completions) == int(client_timeout == 0 and mode != "0")
+    for message in starts + completions:
+        assert "lookup_id=request-7 mode=hashes input_count=1" in message
+        assert f"client_timeout_ms={client_timeout}" in message
+    if completions:
+        assert "started_at=" in completions[0] and "result_tokens=256" in completions[0]
+    if mode != "detail":
+        assert not any(
+            "processing completed" in str(call.args[0])
+            for call in logger.debug.call_args_list
+        )
 
 
 def test_lookup_server_handles_cleanup_without_running_lookup() -> None:

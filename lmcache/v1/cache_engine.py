@@ -59,6 +59,7 @@ from lmcache.v1.serving_perf import (
     prefill_reuse_debug_log,
     prefill_start_timing_enabled,
     prefill_start_timing_log,
+    serving_perf_detailed_enabled,
     serving_perf_enabled,
     serving_perf_log,
     serving_perf_now,
@@ -1251,7 +1252,7 @@ class LMCacheEngine(CPUCacheOperations):
         )
 
     def _broadcast_shared_envelope(self, envelope: SharedHandleEnvelope) -> None:
-        perf_enabled = serving_perf_enabled()
+        perf_enabled = serving_perf_detailed_enabled()
         started = serving_perf_now() if perf_enabled else None
         thread_started = time.thread_time_ns() if perf_enabled else 0
         condition, _, _ = self._shared_envelope_mailbox()
@@ -1276,7 +1277,7 @@ class LMCacheEngine(CPUCacheOperations):
             )
 
     def _receive_shared_envelope(self) -> SharedHandleEnvelope:
-        perf_enabled = serving_perf_enabled()
+        perf_enabled = serving_perf_detailed_enabled()
         started = serving_perf_now() if perf_enabled else None
         thread_started = time.thread_time_ns() if perf_enabled else 0
         raw = self.broadcast_object_fn(None, self.metadata.first_rank)
@@ -1599,7 +1600,7 @@ class LMCacheEngine(CPUCacheOperations):
         chunk_index_base: int = 0,
         validate_memory_objs: bool = True,
     ) -> list[SharedChunkHandle]:
-        perf_enabled = serving_perf_enabled()
+        perf_enabled = serving_perf_detailed_enabled()
         started = serving_perf_now() if perf_enabled else None
         if self.shared_cpu_cache_name is None:
             raise ValueError("Shared CPU cache name is not initialized")
@@ -1663,7 +1664,7 @@ class LMCacheEngine(CPUCacheOperations):
         reuse_chunks: int = 0,
     ) -> Optional[SharedHandleBatch]:
         """Compact a homogeneous all-layer page-first result."""
-        started = serving_perf_now() if serving_perf_enabled() else None
+        started = serving_perf_now() if serving_perf_detailed_enabled() else None
         num_layers = self.num_layers_for_group(kv_group)
         if (
             getattr(self, "shared_cpu_cache_name", None) is None
@@ -2068,7 +2069,7 @@ class LMCacheEngine(CPUCacheOperations):
         if not chunks:
             return 0
         assert self.storage_manager is not None
-        perf_enabled = serving_perf_enabled()
+        perf_enabled = serving_perf_detailed_enabled()
 
         def tiered_locations(
             base_keys: list[CacheEngineKey],
@@ -4161,7 +4162,7 @@ class LMCacheEngine(CPUCacheOperations):
             and mooncake_layer_pages_enabled(self.config)
         ):
             page_first_resolve = True
-        perf_enabled = serving_perf_enabled()
+        perf_enabled = serving_perf_detailed_enabled()
         consume_started = consumer_send_s = consumer_finish_s = 0.0
         try:
             for layer_id in range(self.num_layers_for_group(kv_group)):
@@ -4549,12 +4550,13 @@ class LMCacheEngine(CPUCacheOperations):
                 monitor_req_id,
                 retrieved_tokens,
             )
-            logger.info(
-                "[req_id=%s kv_group=%s] Shared CPU rank0 retrieved %d tokens",
-                req_id,
-                kv_group,
-                retrieved_tokens,
-            )
+            if serving_perf_detailed_enabled():
+                logger.info(
+                    "[req_id=%s kv_group=%s] Shared CPU rank0 retrieved %d tokens",
+                    req_id,
+                    kv_group,
+                    retrieved_tokens,
+                )
             if consume_started:
                 elapsed_s = serving_perf_now() - consume_started
                 serving_perf_log(
@@ -4661,7 +4663,7 @@ class LMCacheEngine(CPUCacheOperations):
         sources_safe_to_release = True
         prepared_sources: list[Any] = []
         consumer_failed = False
-        perf_enabled = serving_perf_enabled()
+        perf_enabled = serving_perf_detailed_enabled()
         consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
         retained_lease = (
             self.get_shared_cpu_request_lease(req_id)
@@ -5059,12 +5061,13 @@ class LMCacheEngine(CPUCacheOperations):
 
             retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
-            logger.info(
-                "[req_id=%s kv_group=%s] Shared CPU passive retrieved %d tokens",
-                req_id,
-                kv_group,
-                retrieved_tokens,
-            )
+            if serving_perf_detailed_enabled():
+                logger.info(
+                    "[req_id=%s kv_group=%s] Shared CPU passive retrieved %d tokens",
+                    req_id,
+                    kv_group,
+                    retrieved_tokens,
+                )
             if consume_started and resolved_layers:
                 elapsed_s = serving_perf_now() - consume_started
                 active_s = view_build_s + consumer_send_s + consumer_finish_s

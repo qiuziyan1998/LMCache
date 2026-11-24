@@ -24,7 +24,12 @@ from lmcache.v1.rpc.storage_protocol import (
     restore_hash,
 )
 from lmcache.integration.vllm.preemption_checkpoint import CheckpointRestoreMiss
-from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
+from lmcache.v1.serving_perf import (
+    SLOW_OPERATION_MS,
+    serving_perf_detailed_enabled,
+    serving_perf_enabled,
+    serving_perf_log,
+)
 
 logger = init_logger(__name__)
 
@@ -715,14 +720,16 @@ def run_cold(
     started = last = time.perf_counter() if perf else 0.0
     phases = {}
     status = "error"
+    failure = None
+    phase = "predecessor_wait"
     result = None
 
-    def mark(name: str) -> None:
-        nonlocal last
+    def mark(name: str, next_phase: str) -> None:
+        nonlocal last, phase
         if perf:
             now = time.perf_counter()
             phases[name] = round((now - last) * 1000, 3)
-            last = now
+            last, phase = now, next_phase
 
     try:
         if previous is not None:
@@ -730,9 +737,9 @@ def run_cold(
                 previous.exception()
             except BaseException:
                 pass
-        mark("predecessor_wait_ms")
+        mark("predecessor_wait_ms", "prepare_reply_exchange")
         result = _exchange_reply(adapter, plan)
-        mark("reply_exchange_ms")
+        mark("reply_exchange_ms", "source_import")
         if result is None:
             raise RuntimeError("Cold CPU preparation cannot skip publication")
         reply = msgspec.convert(result.value, type=PreparedReply)
@@ -767,7 +774,7 @@ def run_cold(
             )
         except BaseException as exc:
             error = exc
-        mark("import_ms")
+        mark("import_ms", "tp_readiness")
         state.prepared_sparse_sources = sources
         ready = engine._ordered_checkpoint_agreement(
             request.req_id,
@@ -776,19 +783,21 @@ def run_cold(
             0,
             error is None,
         )
-        mark("tp_agreement_ms")
+        mark("tp_agreement_ms", "resident_load")
         if error is not None:
+            phase = "source_import"
             raise error
         if not ready:
+            phase = "tp_readiness"
             raise RuntimeError("CPU source import failed on another TP rank")
         plan["storage_sources"] = sources
         plan["latent_shared_ready"].set_result(None)
         if getattr(request.load_spec, "dsa_cold_resident_load", False):
             load_prepared_dense_source(adapter, sources[0], plan, 0)
             state.dense_prefix_resident_tokens = plan["token_count"]
-        mark("resident_load_ms")
+        mark("resident_load_ms", "indexer_wait")
         indexer.result()
-        mark("indexer_remaining_wait_ms")
+        mark("indexer_remaining_wait_ms", "state_publication")
         state.indexer_npu_resident = True
         state.location = "LocalCPU"
         state.metadata_warm = True
@@ -809,10 +818,12 @@ def run_cold(
         )
         adapter._record_dsa_cold_dense_load_readiness(state)
         state._dsa_cold_load_completed_at = time.perf_counter()
-        mark("state_ready_ms")
+        mark("state_ready_ms", "complete")
         status = "ok"
         return state
     except BaseException as error:
+        if perf:
+            failure = f"{type(error).__name__}: {error}"[:256]
         gate = plan["latent_shared_ready"]
         if not gate.done():
             gate.set_exception(error)
@@ -828,23 +839,34 @@ def run_cold(
             engine.__dict__.setdefault("_failed_process_source_reads", []).append(state)
         raise
     finally:
-        if perf:
+        if perf and (
+            status != "ok"
+            or serving_perf_detailed_enabled()
+            or (time.perf_counter() - started) * 1000 >= SLOW_OPERATION_MS
+        ):
+            identity = (
+                result.identity
+                if result is not None
+                else getattr(plan.get("storage_prepare"), "identity", None)
+            )
             serving_perf_log(
                 logger,
                 "storage_worker_load",
+                production=True,
+                error=failure,
+                failure_phase=phase if failure is not None else None,
+                longest_completed_phase=max(
+                    phases, key=phases.__getitem__
+                ).removesuffix("_ms")
+                if phases
+                else None,
                 started=started,
                 req_id=request.req_id,
                 generation=request.load_spec.dsa_cold_load_generation,
                 rank=getattr(getattr(engine, "metadata", None), "worker_id", None),
-                prepare_operation_id=result.identity.operation_id
-                if result is not None
-                else None,
-                service_epoch=result.identity.service_epoch
-                if result is not None
-                else None,
-                client_session=result.identity.client_session
-                if result is not None
-                else None,
+                prepare_operation_id=getattr(identity, "operation_id", None),
+                service_epoch=getattr(identity, "service_epoch", None),
+                client_session=getattr(identity, "client_session", None),
                 status=status,
                 tokens=plan["token_count"],
                 plan_to_worker_ms=round((started - plan["planned_at"]) * 1000, 3)

@@ -406,6 +406,7 @@ class RemoteMooncakeStore:
                         serving_perf_log(
                             logger,
                             "storage_native_transfer",
+                            production=True,
                             started=started,
                             api=api,
                             status=status,

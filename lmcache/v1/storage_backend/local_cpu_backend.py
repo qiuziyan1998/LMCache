@@ -28,7 +28,13 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
-from lmcache.v1.serving_perf import serving_perf_enabled, serving_perf_log
+from lmcache.v1.serving_perf import (
+    SLOW_OPERATION_MS,
+    serving_perf_detailed_enabled,
+    serving_perf_enabled,
+    serving_perf_log,
+    serving_perf_report_due,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     LayerPageMemoryObj,
@@ -723,7 +729,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             required_keys,
             ready_reservations,
             context="External two-group commit",
-            arm_retention_trace=serving_perf_enabled(),
+            arm_retention_trace=serving_perf_detailed_enabled(),
         )
 
     def commit_external_group0_prefix_if_absent(
@@ -1620,6 +1626,20 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 pages = allocate(
                     *allocation_args, valid_tokens, full_tokens, allocation_purpose
                 )
+            if (
+                pages is None
+                and eviction
+                and not serving_perf_detailed_enabled()
+                and serving_perf_report_due(
+                    f"slots_unavailable:{group}:{allocation_purpose}"
+                )
+            ):
+                logger.warning(
+                    "[CPU_FIXED_SLOTS] allocation unavailable after reclaim group=%d purpose=%s count=%d",
+                    group,
+                    allocation_purpose,
+                    batch_size,
+                )
             return pages
         pages = allocate(
             *allocation_args,
@@ -1699,6 +1719,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         """
         if max_scan_entries is not None and max_scan_entries <= 0:
             raise ValueError("Slot reclaim scan limit must be positive")
+        started = time.monotonic() if serving_perf_enabled() else None
         pool = self.get_page_slot_pool()
         missing = pool.shortages(counts, allocation_purpose)
         if not any(missing.values()):
@@ -1706,6 +1727,15 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if not self.use_hot or not self.cpu_lock.acquire(
             blocking=max_scan_entries is None
         ):
+            if started is not None and serving_perf_report_due(
+                f"reclaim_unavailable:{allocation_purpose}"
+            ):
+                logger.warning(
+                    "[CPU_FIXED_SLOTS] reclaim unavailable purpose=%s counts=%s reason=%s",
+                    allocation_purpose,
+                    dict(counts),
+                    "cache_lock_busy" if self.use_hot else "hot_cache_disabled",
+                )
             return False
         removed: list[MemoryObj] = []
         scanned = 0
@@ -1716,7 +1746,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             entries = self.hot_cache.items()
             if max_scan_entries is not None:
                 entries = islice(entries, max_scan_entries)
-            scan_started = time.monotonic()
+            scan_started = time.monotonic() if started is not None else None
             for key, obj in entries:
                 if not any(missing.values()):
                     break
@@ -1728,7 +1758,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     seen.add(id(obj))
                     candidates.append((key, obj))
                     missing[group] -= 1
-            scan_ms = (time.monotonic() - scan_started) * 1000
+            scan_ms = (
+                (time.monotonic() - scan_started) * 1000
+                if scan_started is not None
+                else None
+            )
             if not any(missing.values()):
                 for key, obj in candidates:
                     _, owners = self._pop_layer_page_evict_candidate_locked(
@@ -1745,17 +1779,34 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.stats_monitor.update_local_cpu_evict_metrics(len(removed))
         if not sufficient:
             self.stats_monitor.update_local_cpu_evict_failed_count(1)
-        logger.info(
-            "[CPU_FIXED_SLOTS] reclaim purpose=%s counts=%s released=%d "
-            "success=%s scanned=%d scan_ms=%.3f pools=%s",
-            allocation_purpose,
-            dict(counts),
-            len(removed),
-            sufficient,
-            scanned,
-            scan_ms,
-            pool.snapshot(),
-        )
+        if serving_perf_detailed_enabled():
+            logger.info(
+                "[CPU_FIXED_SLOTS] reclaim purpose=%s counts=%s released=%d "
+                "success=%s scanned=%d scan_ms=%.3f pools=%s",
+                allocation_purpose,
+                dict(counts),
+                len(removed),
+                sufficient,
+                scanned,
+                scan_ms,
+                pool.snapshot(),
+            )
+        elif started is not None:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            if (
+                not sufficient or elapsed_ms >= SLOW_OPERATION_MS
+            ) and serving_perf_report_due(f"reclaim:{allocation_purpose}:{sufficient}"):
+                logger.warning(
+                    "[CPU_FIXED_SLOTS] reclaim purpose=%s counts=%s success=%s released=%d "
+                    "scanned=%d scan_ms=%.3f elapsed_ms=%.3f",
+                    allocation_purpose,
+                    dict(counts),
+                    sufficient,
+                    len(removed),
+                    scanned,
+                    scan_ms,
+                    elapsed_ms,
+                )
         return sufficient
 
     def get_full_chunk_size_bytes(self) -> int:
@@ -1986,6 +2037,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
             serving_perf_log(
                 logger,
                 cause,
+                production=not serving_perf_detailed_enabled()
+                and (
+                    not sufficient
+                    or (time.perf_counter() - started) * 1000 >= SLOW_OPERATION_MS
+                )
+                and serving_perf_report_due(f"capacity:{cause}:{sufficient}"),
                 started=started,
                 target_free_bytes=target_free_bytes,
                 free_before=free_before,

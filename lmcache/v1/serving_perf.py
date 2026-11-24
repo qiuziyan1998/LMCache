@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in PD serving timing, configured once before worker startup.
 
-Use PD_SERVING_PERF=1 for host timing, detail for additional host detail, or
+Use PD_SERVING_PERF=1 for production anomalies, detail for full host tracing, or
 device for explicit device timing in supported components. Content diagnostics
 and operational failures have separate controls. Log schemas remain stable.
 """
 
 # Standard
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import lru_cache
 from itertools import count
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from zlib import crc32
 import json
@@ -35,6 +37,25 @@ _REUSE_RANK_TEXT = os.environ.get(PREFILL_REUSE_DEBUG_RANK_ENV, "").strip()
 _PREFILL_REUSE_RANK = int(_REUSE_RANK_TEXT) if _REUSE_RANK_TEXT.isdigit() else -1
 _PREFILL_REUSE_FILE = os.environ.get(PREFILL_REUSE_DEBUG_FILE_ENV, "")
 _PREFILL_REUSE_LINES = count()
+# Bound recent request/transfer IDs even when every read is slow.
+_REPORT_TIMES: OrderedDict[str, float] = OrderedDict()
+_REPORT_LOCK = Lock()
+SLOW_OPERATION_MS = 100.0
+
+
+def serving_perf_report_due(key: str) -> bool:
+    """Allow the first and one subsequent summary per minute for this event or transfer."""
+    now = time.monotonic()
+    with _REPORT_LOCK:
+        if now - _REPORT_TIMES.get(key, -float("inf")) < 60:
+            return False
+        _REPORT_TIMES[key] = now
+        _REPORT_TIMES.move_to_end(key)
+        if len(_REPORT_TIMES) > 256:
+            _REPORT_TIMES.popitem(last=False)
+        return True
+
+
 _PERF_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
     "lmcache_serving_perf_context", default=None
 )
@@ -237,12 +258,49 @@ def serving_perf_log(
     event: str,
     *,
     started: float | None = None,
+    production: bool = False,
     **fields: Any,
 ) -> None:
     if not serving_perf_enabled():
         return
+    detailed = serving_perf_detailed_enabled()
+    transfer = event in (
+        "mooncake_page_lookup",
+        "mooncake_page_get",
+        "mooncake_page_put",
+        "mooncake_legacy_get",
+        "direct_npu_page_get",
+        "direct_npu_page_put",
+        "remote_resolver",
+    )
+    if not detailed and not production and not transfer:
+        anomaly = event.endswith(
+            ("_slow", "_failure", "_abort", "_fallback")
+        ) or event in (
+            "sparse_h2d_python_stall",
+            "remote_fill_fatal_restart",
+            "remote_fill_direct_abandoned",
+            "remote_fill_local_prefix_missing_at_load",
+            "live_source_missing_producer_event",
+        )
+        if not anomaly or not serving_perf_report_due(event):
+            return
     if started is not None:
         fields["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)
+    if not detailed and not production and transfer:
+        duration = fields.get("elapsed_ms")
+        if fields.get("status") not in (
+            "error",
+            "failed",
+            "timeout",
+            "allocation_failed",
+            "no_buffers",
+        ) and (
+            type(duration) not in (float, int)
+            or duration < SLOW_OPERATION_MS
+            or not serving_perf_report_due(event)
+        ):
+            return
     payload = {
         "schema": 1,
         "event": event,

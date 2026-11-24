@@ -47,8 +47,8 @@ def test_perf_serialization_does_not_stringify_caller_objects(monkeypatch):
 
         __repr__ = __str__
 
-    monkeypatch.setenv(SERVING_PERF_ENV, "1")
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
+    monkeypatch.setenv(SERVING_PERF_ENV, "detail")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "detail")
     logger = _Logger()
     serving_perf_log(logger, "safe", values=[NoReadback()])
     payload = json.loads(logger.records[0][1])
@@ -74,8 +74,8 @@ def test_serving_perf_disabled(monkeypatch):
 
 
 def test_serving_perf_structured_log(monkeypatch):
-    monkeypatch.setenv(SERVING_PERF_ENV, "1")
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
+    monkeypatch.setenv(SERVING_PERF_ENV, "detail")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "detail")
     logger = _Logger()
 
     serving_perf_log(
@@ -98,8 +98,8 @@ def test_serving_perf_structured_log(monkeypatch):
 
 
 def test_serving_perf_scope_correlates_and_restores(monkeypatch):
-    monkeypatch.setenv(SERVING_PERF_ENV, "1")
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
+    monkeypatch.setenv(SERVING_PERF_ENV, "detail")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "detail")
     logger = _Logger()
 
     with serving_perf_scope(req_id="request-1", rank=3, resolver_call_id="c1"):
@@ -116,8 +116,8 @@ def test_serving_perf_scope_correlates_and_restores(monkeypatch):
 
 
 def test_serving_perf_preserves_aggregate_page_diagnostics(monkeypatch):
-    monkeypatch.setenv(SERVING_PERF_ENV, "1")
-    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
+    monkeypatch.setenv(SERVING_PERF_ENV, "detail")
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "detail")
     logger = _Logger()
 
     with serving_perf_scope(req_id="request-1", rank=2):
@@ -140,3 +140,28 @@ def test_serving_perf_preserves_aggregate_page_diagnostics(monkeypatch):
     assert payload["pointer_seal_ms"] == 12.5
     assert payload["passive_wait_ms"] is None
     assert payload["passive_wait_status"] == "unavailable"
+
+
+def test_production_only_emits_actionable_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routine events are detail-only; repeated timing outliers are bounded."""
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", "1")
+    log = _Logger()
+    for _ in range(3):
+        serving_perf_log(log, "worker_load_start")
+        serving_perf_log(log, "test_phase_slow", elapsed_ms=600)
+    serving_perf_log(
+        log,
+        "storage_worker_load",
+        production=True,
+        status="error",
+        error="generation mismatch",
+        req_id="req",
+    )
+    events = [json.loads(raw) for _, raw in log.records]
+    assert [item["event"] for item in events] == [
+        "test_phase_slow",
+        "storage_worker_load",
+    ]
+    assert events[-1]["error"] == "generation mismatch"
