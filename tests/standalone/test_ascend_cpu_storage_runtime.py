@@ -264,31 +264,69 @@ def fill_capture(runtime, reservation_id):
                     begin = end
 
 
-def test_process_fixed_slots_bind_mixed_layout_and_reclaim_across_chunks(fixed_setup, monkeypatch):
+@pytest.mark.parametrize("pressured_groups", [(), (0,), (1,), (0, 1)])
+def test_process_fixed_slots_bind_mixed_layout_and_reclaim_across_chunks(
+    fixed_setup, monkeypatch, pressured_groups
+):
     owner, runtime, work = fixed_setup
     pool = owner.local.get_page_slot_pool()
     assert pool.specs[1].layer_token_bytes == (130, 256, 130)
-    allocate = runtime.allocate_checkpoint_fragment
-    reclaim = runtime.reclaim_checkpoint_capacity
-    attempts, reclaims = [], []
+    for group in pressured_groups:
+        for index in range(pool.specs[group].slots):
+            page, _ = runtime.allocate_checkpoint_fragment(
+                group, 4, allocation_purpose="cache"
+            )
+            owner.local.batched_submit_layer_pages([owner.key(index, group, 4)], [page])
+            page.ref_count_down()
 
-    def pressured(group, tokens, **kwargs):
-        attempts.append((group, tokens))
-        if len(attempts) in (1, 4, 7):
-            raise MemoryError("injected slot pressure")
-        return allocate(group, tokens, **kwargs)
+    reclaim = runtime.reclaim_checkpoint_capacity
+    reclaims = []
 
     def recover(tokens, groups, **kwargs):
-        reclaims.append(kwargs["allocation_purpose"])
+        reclaims.append((tokens, tuple(groups), kwargs["allocation_purpose"]))
         return reclaim(tokens, groups, **kwargs)
 
-    monkeypatch.setattr(runtime, "allocate_checkpoint_fragment", pressured)
     monkeypatch.setattr(runtime, "reclaim_checkpoint_capacity", recover)
-    result, _ = capture(work, end=12)
+    result, _ = capture(work, end=11, resident=2, prefix=2)
     assert result.status == "COMPLETED", result.error
-    assert result.value["captured_end"] == 8 and reclaims == ["checkpoint"] * 2
-    assert len(attempts) == 7 and all(tokens == 4 for _, tokens in attempts)
-    assert all(row["checkpoint_in_use"] == 2 for row in pool.snapshot().values())
+    assert result.value["captured_end"] == 11
+    assert reclaims == [
+        (lengths[group], (group,), "checkpoint")
+        for lengths in ((2, 4), (4, 4), (3, 3))
+        for group in pressured_groups
+    ]
+    assert all(row["checkpoint_in_use"] == 3 for row in pool.snapshot().values())
+
+
+def test_fixed_slot_checkpoint_keeps_only_paired_fragments_under_pressure(fixed_setup):
+    owner, runtime, work = fixed_setup
+    pool = owner.local.get_page_slot_pool()
+    # Leave one indexer slot free and retain all others outside the hot cache.
+    held = [
+        runtime.allocate_checkpoint_fragment(1, 4)[0]
+        for _ in range(pool.specs[1].slots - 1)
+    ]
+    try:
+        reserved, original = capture(work, end=11)
+        assert reserved.status == "COMPLETED", reserved.error
+        assert reserved.value["captured_end"] == 4
+        assert all(row["checkpoint_in_use"] == 1 for row in pool.snapshot().values())
+        cancelled, _ = work(
+            "worker-0",
+            "cancel_write",
+            {
+                "reservation_id": reserved.value["reservation_id"],
+                "proof": "never_imported",
+            },
+        )
+        assert cancelled.value["status"] == "CANCELLED"
+        for group in reserved.value["groups"]:
+            retire(runtime, original, group["lease_id"])
+        assert all(row["checkpoint_in_use"] == 0 for row in pool.snapshot().values())
+        assert all(page.is_valid() for page in held)
+    finally:
+        for page in held:
+            page.ref_count_down()
 
 
 def test_registered_mixed_geometry_has_no_engine_or_npu_dependency(setup):
