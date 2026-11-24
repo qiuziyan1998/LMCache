@@ -32,12 +32,21 @@ from lmcache.v1.storage_service import StorageService
 NONCE = b"native-test"
 
 
-def test_perf_correlates_split_gets_without_per_page_summary(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode,worker_count", [("1", 1), ("detail", 2)])
+def test_perf_correlates_split_gets_without_per_page_summary(
+    tmp_path, monkeypatch, mode, worker_count
+):
     import time
-    from lmcache.v1.rpc import storage_timing as perf
+    from lmcache.v1 import serving_perf as perf
     from lmcache.v1 import storage_service
 
-    monkeypatch.setattr(perf, "_MODE", "detail")
+    monkeypatch.setattr(perf, "_MODE", mode)
+    # Restricted hosts can deny caller counters. A successful read must still complete.
+    def denied(_who):
+        raise PermissionError
+
+    monkeypatch.setattr(storage_service, "RUSAGE_THREAD", 1, raising=False)
+    monkeypatch.setattr(storage_service, "getrusage", denied)
     records = []
 
     def record(logger, event, **fields):
@@ -67,15 +76,50 @@ def test_perf_correlates_split_gets_without_per_page_summary(tmp_path, monkeypat
         assert bytes(slab.buf[:8]) == b"12345678"
         summaries = [v for e, v in records if e == "storage_native_transfer"]
         workers = [v for e, v in records if e == "storage_service_timing"]
-        assert len(summaries) == 1 and len(workers) == 2
+        assert len(summaries) == 1 and len(workers) == worker_count
         assert summaries[0]["batches"] == 2
         assert summaries[0]["ack_completed_batches"] == 2
         assert parent["remote_get_batches"] == 2
         assert parent["remote_get_reply_wait_ms"] >= 200
         assert all(v["native_call_ms"] >= 100 for v in workers)
+        assert all(v["dominant_phase"] == "native_call" and v["elapsed_ms"] >= 100 for v in workers)
         assert all(v["source_req_id"] == "real-request" for _, v in records)
         assert all(v["prepare_operation_id"] == 7 for _, v in records)
         assert all(v["transfer_id"] == summaries[0]["transfer_id"] for v in workers)
+
+
+@pytest.mark.parametrize("mode", ["0", "1"])
+def test_pending_read_reports_before_completion(tmp_path, monkeypatch, mode):
+    from lmcache.v1 import serving_perf, storage_service
+
+    monkeypatch.setattr(serving_perf, "_MODE", mode)
+    monkeypatch.setattr(storage_service, "_PENDING_READ_SECONDS", 0.05)
+    reported = threading.Event()
+    records = []
+
+    def capture(logger, event, **fields):
+        if event == "storage_operation_pending":
+            records.append(fields)
+            reported.set()
+
+    monkeypatch.setattr(storage_service, "serving_perf_log", capture)
+    with transport(tmp_path) as (remote, worker, slab), ThreadPoolExecutor(1) as pool:
+        worker.store.values["blocked"] = b"x"
+        future = pool.submit(
+            remote.batch_get_into_multi_buffers, ["blocked"], [[remote.base]], [[1]]
+        )
+        try:
+            assert worker.store.entered.wait(2)
+            if mode == "1":
+                assert reported.wait(2)
+                assert len(records) == 1 and records[0]["method"] == "native_get"
+                assert records[0]["state"] == "executing" and records[0]["pending_count"] == 1
+            else:
+                assert not reported.wait(0.15)
+            assert not future.done()
+        finally:
+            worker.store.release.set()
+        assert future.result(2) == [1] and bytes(slab.buf[:1]) == b"x"
 
 
 def endpoint():

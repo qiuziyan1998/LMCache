@@ -51,7 +51,10 @@ def records(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
 
 @pytest.fixture
 def make_client(monkeypatch: pytest.MonkeyPatch) -> Any:
-    monkeypatch.setenv("PD_SERVING_PERF", "0")
+    from lmcache.v1 import lookup_diagnostics, serving_perf
+
+    monkeypatch.setattr(serving_perf, "_MODE", "1")
+    monkeypatch.setattr(lookup_diagnostics.logger, "propagate", True)
     clients = []
 
     def make(
@@ -127,7 +130,7 @@ def make_client(monkeypatch: pytest.MonkeyPatch) -> Any:
     ],
 )
 @pytest.mark.parametrize("async_loading", [False, True])
-def test_terminal_zero_logs_once_without_perf_logs(
+def test_terminal_zero_logs_once_in_production(
     make_client: Any,
     caplog: pytest.LogCaptureFixture,
     status: str,
@@ -198,6 +201,18 @@ def test_unsubmitted_zero_reports_local_cause(
     )
     assert "operation_id" not in record
     assert transport.request.call_count == (0 if empty else 1)
+
+
+def test_quiet_miss_stays_silent_and_fatal_lookup_still_raises(make_client, caplog, monkeypatch):
+    from lmcache.v1 import serving_perf
+
+    monkeypatch.setattr(serving_perf, "_MODE", "0")
+    client, _ = make_client(async_loading=False)
+    assert client.lookup([1, 2, 3, 4], "miss") == 0
+    assert not records(caplog)
+    failed, _ = make_client("FATAL", async_loading=False)
+    with pytest.raises(RuntimeError, match="FATAL"):
+        failed.lookup([1, 2, 3, 4], "fatal")
 
 
 def test_hits_remain_silent(make_client: Any, caplog: pytest.LogCaptureFixture) -> None:

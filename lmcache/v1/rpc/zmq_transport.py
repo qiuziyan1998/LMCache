@@ -19,6 +19,7 @@ import zmq
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.serving_perf import serving_perf_detailed_enabled
 from lmcache.v1.rpc.transport import (
     RpcClientTransport,
     RpcServerTransport,
@@ -66,11 +67,12 @@ class ZmqReqRepClientTransport(RpcClientTransport):
 
         self.sockets: list[zmq.Socket] = []
         for params in self.socket_params:
-            logger.info(
-                "Transport connecting to rank %s with socket path %s",
-                params.rank,
-                params.socket_path,
-            )
+            if serving_perf_detailed_enabled():
+                logger.info(
+                    "Transport connecting to rank %s with socket path %s",
+                    params.rank,
+                    params.socket_path,
+                )
             socket = self._create_socket(params)
             self.sockets.append(socket)
 

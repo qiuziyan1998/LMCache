@@ -53,6 +53,11 @@ from lmcache.utils import (
     compress_slot_mapping,
     convert_tokens_to_list,
 )
+from lmcache.v1.serving_perf import (
+    serving_perf_detailed_enabled,
+    serving_perf_log,
+    serving_perf_now,
+)
 from lmcache.v1.config import LMCacheEngineConfig, prefill_cpu_prefetch_enabled
 from lmcache.v1.cpu_cache_operations import (
     CPUCacheOperations,
@@ -1185,11 +1190,34 @@ class LMCacheEngine(CPUCacheOperations):
         )
 
     def _broadcast_shared_envelope(self, envelope: SharedHandleEnvelope) -> None:
+        perf_enabled = serving_perf_detailed_enabled()
+        started = serving_perf_now() if perf_enabled else None
+        thread_started = time.thread_time_ns() if perf_enabled else 0
         condition, _, _ = self._shared_envelope_mailbox()
         with condition:
             self.broadcast_object_fn(envelope.to_dict(), self.metadata.first_rank)
+        if perf_enabled:
+            serving_perf_log(
+                logger,
+                "shared_handle_broadcast",
+                started=started,
+                req_id=envelope.request_id,
+                phase=envelope.phase,
+                kv_group=envelope.kv_group,
+                layer=envelope.layer_id,
+                handles=len(envelope.handles),
+                batch_offsets=len(envelope.batch.offsets) if envelope.batch else 0,
+                status=envelope.status,
+                rank=self.metadata.worker_id,
+                thread_cpu_ms=round(
+                    (time.thread_time_ns() - thread_started) / 1e6, 3
+                ),
+            )
 
     def _receive_shared_envelope(self) -> SharedHandleEnvelope:
+        perf_enabled = serving_perf_detailed_enabled()
+        started = serving_perf_now() if perf_enabled else None
+        thread_started = time.thread_time_ns() if perf_enabled else 0
         raw = self.broadcast_object_fn(None, self.metadata.first_rank)
         if not isinstance(raw, dict):
             raise ValueError(
@@ -1203,6 +1231,23 @@ class LMCacheEngine(CPUCacheOperations):
                 "Shared CPU cache received corrupt envelope before view "
                 f"creation: error={exc}, raw={raw!r}"
             ) from exc
+        if perf_enabled:
+            serving_perf_log(
+                logger,
+                "shared_handle_receive",
+                started=started,
+                req_id=envelope.request_id,
+                phase=envelope.phase,
+                kv_group=envelope.kv_group,
+                layer=envelope.layer_id,
+                handles=len(envelope.handles),
+                batch_offsets=len(envelope.batch.offsets) if envelope.batch else 0,
+                status=envelope.status,
+                rank=self.metadata.worker_id,
+                thread_cpu_ms=round(
+                    (time.thread_time_ns() - thread_started) / 1e6, 3
+                ),
+            )
         return envelope
 
     @staticmethod
@@ -1431,6 +1476,8 @@ class LMCacheEngine(CPUCacheOperations):
         chunk_index_base: int = 0,
         validate_memory_objs: bool = True,
     ) -> list[SharedChunkHandle]:
+        perf_enabled = serving_perf_detailed_enabled()
+        started = serving_perf_now() if perf_enabled else None
         if self.shared_cpu_cache_name is None:
             raise ValueError("Shared CPU cache name is not initialized")
         if len(keys_layer) != len(mem_objs_layer):
@@ -1468,6 +1515,19 @@ class LMCacheEngine(CPUCacheOperations):
                     producer_rank=self.metadata.worker_id,
                 )
             )
+        if perf_enabled:
+            serving_perf_log(
+                logger,
+                "shared_handle_build",
+                started=started,
+                req_id=req_id,
+                phase=phase,
+                kv_group=kv_group,
+                layer=layer_id,
+                handles=len(handles),
+                validate=validate_memory_objs,
+                rank=self.metadata.worker_id,
+            )
         return handles
 
     def _make_shared_handle_batch(
@@ -1480,6 +1540,7 @@ class LMCacheEngine(CPUCacheOperations):
         reuse_chunks: int = 0,
     ) -> Optional[SharedHandleBatch]:
         """Compact a homogeneous all-layer page-first result."""
+        started = serving_perf_now() if serving_perf_detailed_enabled() else None
         num_layers = self.num_layers_for_group(kv_group)
         if (
             getattr(self, "shared_cpu_cache_name", None) is None
@@ -1567,6 +1628,17 @@ class LMCacheEngine(CPUCacheOperations):
                 for chunk in range(reuse_chunks, page_chunks)
             ],
         )
+        if started is not None:
+            serving_perf_log(
+                logger,
+                "shared_handle_batch_build",
+                started=started,
+                layers=num_layers,
+                chunks=chunks,
+                offsets=len(batch.offsets),
+                pages=page_chunks,
+                rank=self.metadata.worker_id,
+            )
         return batch
 
     def _make_passive_layer_page_views(
@@ -1873,6 +1945,7 @@ class LMCacheEngine(CPUCacheOperations):
         if not chunks:
             return 0
         assert self.storage_manager is not None
+        perf_enabled = serving_perf_detailed_enabled()
 
         def tiered_locations(
             base_keys: list[CacheEngineKey],
@@ -2125,6 +2198,26 @@ class LMCacheEngine(CPUCacheOperations):
 
         def chunk_exists(index: int) -> bool:
             locations = tiered_locations([chunks[index][1]])
+            if perf_enabled and index == 0:
+                try:
+                    details = diagnose(chunks[index][1])
+                    diagnostic_error = None
+                except Exception as error:
+                    details = []
+                    diagnostic_error = f"{type(error).__name__}: {error}"
+                serving_perf_log(
+                    logger,
+                    "scheduler_sample_probe",
+                    lookup_id=lookup_id,
+                    chunk_index=index,
+                    chunk_end=chunks[index][0],
+                    chunk_hash=chunks[index][1].chunk_hash_hex,
+                    sample_count=len(chunks),
+                    found=locations is not None,
+                    diagnostic_extra_probes=True,
+                    diagnostic_error=diagnostic_error,
+                    groups=details,
+                )
             if locations is None:
                 return False
             local_groups_by_chunk[index] = {
@@ -3595,16 +3688,22 @@ class LMCacheEngine(CPUCacheOperations):
         consumer: Any,
         sources: list[Any],
         ret_mask: torch.Tensor,
-    ) -> Generator[Optional[torch.Tensor], Any, None]:
+        perf_enabled: bool = False,
+    ) -> Generator[Optional[torch.Tensor], Any, float]:
         """Relay bank commands; no storage lookup, TP broadcast or pointer upload."""
+        send_s = 0.0
         for layer_id, source in enumerate(sources):
             command = yield torch.sum(ret_mask) if layer_id == 0 else None
             if source is not None:
+                started = serving_perf_now() if perf_enabled else 0.0
                 consumer.send(
                     source
                     if command is None
                     else {"memory_objs": source, "layer_request": command}
                 )
+                if started:
+                    send_s += serving_perf_now() - started
+        return send_s
 
     def _resolve_shared_rank0_prefill_suffix(
         self, *, req_id: str, phase: str, kv_group: int,
@@ -3878,6 +3977,8 @@ class LMCacheEngine(CPUCacheOperations):
             and mooncake_layer_pages_enabled(self.config)
         ):
             page_first_resolve = True
+        perf_enabled = serving_perf_detailed_enabled()
+        consume_started = consumer_send_s = consumer_finish_s = 0.0
         try:
             for layer_id in range(self.num_layers_for_group(kv_group)):
                 envelope_required = compact_batch is None
@@ -4124,10 +4225,15 @@ class LMCacheEngine(CPUCacheOperations):
                         else mem_objs_layer
                     )
                     continue
+
+                if perf_enabled and not consume_started:
+                    consume_started = serving_perf_now()
                 if layer_id == 0:
                     layer_request = yield torch.sum(ret_mask)
                 else:
                     layer_request = yield None
+
+                send_started = serving_perf_now() if perf_enabled else 0.0
                 try:
                     memory_objs_layer = (
                         LayerPageSource(
@@ -4149,6 +4255,8 @@ class LMCacheEngine(CPUCacheOperations):
                 except BaseException:
                     consumer_failed = deferred_layerwise_get
                     raise
+                if send_started:
+                    consumer_send_s += serving_perf_now() - send_started
 
             if deferred_layerwise_get:
                 if prepare_c8_packets:
@@ -4162,10 +4270,12 @@ class LMCacheEngine(CPUCacheOperations):
                     prepared_sources, kv_group, kwargs
                 )
                 sources_safe_to_release = False
+                if perf_enabled:
+                    consume_started = serving_perf_now()
                 try:
-                    yield from (
+                    consumer_send_s = yield from (
                         self._submit_prepared_shared_prefill_layers(
-                            mem_obj_consumer, prepared_sources, ret_mask
+                            mem_obj_consumer, prepared_sources, ret_mask, perf_enabled
                         )
                     )
                 except Exception:
@@ -4175,6 +4285,7 @@ class LMCacheEngine(CPUCacheOperations):
                 # last-layer entry resumes this generator to synchronize the
                 # consumer and release shared-source ownership.
                 yield None
+            finish_started = serving_perf_now() if perf_enabled else 0.0
             try:
                 next(mem_obj_consumer)
             except BaseException:
@@ -4183,6 +4294,8 @@ class LMCacheEngine(CPUCacheOperations):
             sources_safe_to_release = True
             self._close_shared_retrieve_consumer(mem_obj_consumer)
             mem_obj_consumer = None
+            if finish_started:
+                consumer_finish_s += serving_perf_now() - finish_started
             adoption_keys = keys_layer_major
             preplanned_keys = kwargs.get("_prefill_layer_keys")
             if preplanned_keys is not None:
@@ -4233,12 +4346,42 @@ class LMCacheEngine(CPUCacheOperations):
                 monitor_req_id,
                 retrieved_tokens,
             )
-            logger.info(
-                "[req_id=%s kv_group=%s] Shared CPU rank0 retrieved %d tokens",
-                req_id,
-                kv_group,
-                retrieved_tokens,
-            )
+            if serving_perf_detailed_enabled():
+                logger.info(
+                    "[req_id=%s kv_group=%s] Shared CPU rank0 retrieved %d tokens",
+                    req_id,
+                    kv_group,
+                    retrieved_tokens,
+                )
+            if consume_started:
+                elapsed_s = serving_perf_now() - consume_started
+                serving_perf_log(
+                    logger,
+                    "dense_shared_consume",
+                    started=consume_started,
+                    req_id=req_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    rank=self.metadata.worker_id,
+                    role="rank0",
+                    layers=len(resolved_layers),
+                    objects=sum(map(len, resolved_layers)),
+                    unique_objects=len(
+                        {id(obj) for layer in resolved_layers for obj in layer}
+                    ),
+                    compact=compact_batch is not None,
+                    view_build_ms=0.0,
+                    consumer_send_ms=round(consumer_send_s * 1000, 3),
+                    consumer_final_wait_ms=round(consumer_finish_s * 1000, 3),
+                    suspended_or_other_ms=round(
+                        max(
+                            elapsed_s - consumer_send_s - consumer_finish_s,
+                            0.0,
+                        )
+                        * 1000,
+                        3,
+                    ),
+                )
             if not deferred_layerwise_get:
                 yield None
             # Keep request-owned shared objects through the final layer wait,
@@ -4315,6 +4458,8 @@ class LMCacheEngine(CPUCacheOperations):
         sources_safe_to_release = True
         prepared_sources: list[Any] = []
         consumer_failed = False
+        perf_enabled = serving_perf_detailed_enabled()
+        consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
         retained_lease = (
             self.get_shared_cpu_request_lease(req_id)
             if kwargs.get("_reuse_shared_dense_prefix") else None
@@ -4335,6 +4480,8 @@ class LMCacheEngine(CPUCacheOperations):
                         layer_id=layer_id,
                         kv_group=kv_group,
                     )
+                    if perf_enabled and not consume_started:
+                        consume_started = serving_perf_now()
                     try:
                         self._validate_shared_layerwise_envelope(
                             envelope,
@@ -4387,6 +4534,9 @@ class LMCacheEngine(CPUCacheOperations):
                         )
                         next(mem_obj_consumer)
                     if compact_batch is not None:
+                        page_view_started = (
+                            serving_perf_now() if perf_enabled else 0.0
+                        )
                         if kwargs.get("_reuse_shared_dense_prefix"):
                             kwargs["_shared_prefill_reuse_count"] = 0
                         if source_state is not None:
@@ -4443,6 +4593,8 @@ class LMCacheEngine(CPUCacheOperations):
                         for page in passive_pages[reused_pages:]:
                             if retained_lease is None or not retained_lease.owns(page):
                                 to_release.append(page)
+                        if page_view_started:
+                            view_build_s += serving_perf_now() - page_view_started
                 elif (
                     compact_batch is None
                     and envelope is not None
@@ -4465,6 +4617,7 @@ class LMCacheEngine(CPUCacheOperations):
                     if compact_batch is not None
                     else envelope.handles  # type: ignore[union-attr]
                 )
+                view_started = serving_perf_now() if perf_enabled else 0.0
                 page_chunks = len(passive_pages)
                 if source_prefix > page_chunks:
                     mem_objs_layer.extend(
@@ -4551,6 +4704,8 @@ class LMCacheEngine(CPUCacheOperations):
                     mem_objs_layer.append(mem_obj)
                     if retained_lease is None or not retained_lease.owns(mem_obj):
                         to_release.append(mem_obj)
+                if view_started:
+                    view_build_s += serving_perf_now() - view_started
                 resolved_layers.append(mem_objs_layer)
                 handles_by_layer.append(layer_handles)
 
@@ -4572,6 +4727,7 @@ class LMCacheEngine(CPUCacheOperations):
                     layer_request = yield None
 
                 assert mem_obj_consumer is not None
+                send_started = serving_perf_now() if perf_enabled else 0.0
                 try:
                     memory_objs_layer = (
                         LayerPageSource(
@@ -4593,6 +4749,8 @@ class LMCacheEngine(CPUCacheOperations):
                 except BaseException:
                     consumer_failed = deferred_layerwise_get
                     raise
+                if send_started:
+                    consumer_send_s += serving_perf_now() - send_started
 
             if deferred_layerwise_get:
                 if prepare_c8_packets and resolved_layers and (
@@ -4618,9 +4776,9 @@ class LMCacheEngine(CPUCacheOperations):
                         )
                     sources_safe_to_release = False
                 try:
-                    yield from (
+                    consumer_send_s = yield from (
                         self._submit_prepared_shared_prefill_layers(
-                            mem_obj_consumer, prepared_sources, ret_mask
+                            mem_obj_consumer, prepared_sources, ret_mask, perf_enabled
                         )
                     )
                 except Exception:
@@ -4632,6 +4790,7 @@ class LMCacheEngine(CPUCacheOperations):
             if deferred_cleanup_gate_used:
                 yield None
             if mem_obj_consumer is not None:
+                finish_started = serving_perf_now() if perf_enabled else 0.0
                 try:
                     next(mem_obj_consumer)
                 except BaseException:
@@ -4640,6 +4799,8 @@ class LMCacheEngine(CPUCacheOperations):
                 sources_safe_to_release = True
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
                 mem_obj_consumer = None
+                if finish_started:
+                    consumer_finish_s += serving_perf_now() - finish_started
             if resolved_layers:
                 adopted = self._adopt_dense_shared_retrieve_cache(
                     req_id=req_id,
@@ -4662,12 +4823,39 @@ class LMCacheEngine(CPUCacheOperations):
 
             retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
-            logger.info(
-                "[req_id=%s kv_group=%s] Shared CPU passive retrieved %d tokens",
-                req_id,
-                kv_group,
-                retrieved_tokens,
-            )
+            if serving_perf_detailed_enabled():
+                logger.info(
+                    "[req_id=%s kv_group=%s] Shared CPU passive retrieved %d tokens",
+                    req_id,
+                    kv_group,
+                    retrieved_tokens,
+                )
+            if consume_started and resolved_layers:
+                elapsed_s = serving_perf_now() - consume_started
+                active_s = view_build_s + consumer_send_s + consumer_finish_s
+                serving_perf_log(
+                    logger,
+                    "dense_shared_consume",
+                    started=consume_started,
+                    req_id=req_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    rank=self.metadata.worker_id,
+                    role="passive",
+                    layers=len(resolved_layers),
+                    objects=sum(map(len, resolved_layers)),
+                    unique_objects=len(
+                        {id(obj) for layer in resolved_layers for obj in layer}
+                    ),
+                    compact=compact_batch is not None,
+                    view_build_ms=round(view_build_s * 1000, 3),
+                    consumer_send_ms=round(consumer_send_s * 1000, 3),
+                    consumer_final_wait_ms=round(consumer_finish_s * 1000, 3),
+                    suspended_or_other_ms=round(
+                        max(elapsed_s - active_s, 0.0) * 1000,
+                        3,
+                    ),
+                )
             if not deferred_cleanup_gate_used:
                 yield None
             # Keep request-owned shared objects through the final layer wait,

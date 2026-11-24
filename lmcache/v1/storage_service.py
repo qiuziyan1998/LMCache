@@ -14,6 +14,11 @@ import sys
 import threading
 import time
 
+try:
+    from resource import RUSAGE_THREAD, getrusage
+except ImportError:  # Unavailable on some platforms.
+    getrusage = None
+
 # Third Party
 import msgspec
 import zmq
@@ -30,14 +35,69 @@ from lmcache.v1.rpc.storage_protocol import (
     encode_message,
 )
 from lmcache.v1.rpc_utils import PollerWakeup
-from lmcache.v1.rpc.storage_timing import (
+from lmcache.v1.serving_perf import (
+    SLOW_OPERATION_MS,
+    serving_perf_detailed_enabled,
     serving_perf_enabled,
     serving_perf_log,
     serving_perf_scope,
     serving_perf_measure,
+    serving_perf_report_due,
 )
 
 logger = init_logger(__name__)
+
+_PENDING_READ_SECONDS = 10.0
+_PENDING_REMINDER_SECONDS = 60.0
+
+
+def _caller_usage():
+    if getrusage is not None:
+        try:
+            return getrusage(RUSAGE_THREAD)
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def _pending_read_deadline(pending: dict, now: float) -> float:
+    """Report the oldest unfinished read on the socket owner and return the next notice time."""
+    unfinished = [
+        (start, req, future)
+        for future, (start, req) in pending.items()
+        if not future.done()
+    ]
+    if not unfinished:
+        return now + _PENDING_READ_SECONDS
+    start, req, future = min(unfinished, key=lambda item: item[0])
+    if now < start + _PENDING_READ_SECONDS:
+        return start + _PENDING_READ_SECONDS
+    context = req.payload.get("perf_context") if isinstance(req.payload, dict) else None
+    serving_perf_log(
+        logger,
+        "storage_operation_pending",
+        production=True,
+        req_id=req.identity.request_id,
+        operation_id=req.identity.operation_id,
+        service_epoch=req.identity.service_epoch,
+        client_session=req.identity.client_session,
+        generation=req.identity.load_generation,
+        method=req.method,
+        state="executing" if future.running() else "queued",
+        pending_count=len(unfinished),
+        age_ms=round((now - start) * 1000, 3),
+        **(
+            {
+                k: v
+                for k, v in context.items()
+                if k in ("source_req_id", "prepare_operation_id", "transfer_id")
+                and type(v) in (str, int)
+            }
+            if isinstance(context, dict)
+            else {}
+        ),
+    )
+    return now + _PENDING_REMINDER_SECONDS
 
 
 class StorageRuntime(Protocol):
@@ -153,6 +213,9 @@ class StorageService:
             "persist": ThreadPoolExecutor(1, thread_name_prefix="storage-persist"),
         }
         jobs: dict[tuple[bytes, tuple, int], tuple[Future, StorageRequest, str]] = {}
+        # Track only operations that can hold up lookup, restore or checkpointing.
+        pending_reads: dict[Future, tuple[float, StorageRequest]] = {}
+        next_notice = 0.0
         outboxes: tuple[OrderedDict, OrderedDict] = (OrderedDict(), OrderedDict())
         routes: dict[tuple[str, int], bytes] = {}
         fatal_notified: set[str] = set()
@@ -181,6 +244,10 @@ class StorageService:
             while True:
                 now = time.monotonic()
                 deadlines = []
+                if pending_reads:
+                    if now >= next_notice:
+                        next_notice = _pending_read_deadline(pending_reads, now)
+                    deadlines.append(next_notice)
                 if not notifier_complete:
                     # Custom runtimes may change health without a notification.
                     deadlines.append(now + retry_interval)
@@ -304,14 +371,22 @@ class StorageService:
                                             self._reply(request, "BUSY")
                                         )
                                     else:
+                                        observe = serving_perf_enabled()
+                                        timed = observe and method in ("prepare", "native_get")
+                                        queued = time.perf_counter() if timed else None
                                         future = executors[lane].submit(
-                                            self._handle_timed,
-                                            request,
-                                            time.perf_counter()
-                                            if serving_perf_enabled()
-                                            and method in ("prepare", "native_get")
-                                            else None,
+                                            self._handle_timed, request, queued
                                         )
+                                        if observe and method in (
+                                            "lookup", "native_exists", "prepare", "native_get",
+                                            "prepare_store", "reserve_write", "commit_checkpoint",
+                                        ):
+                                            submitted = time.monotonic()
+                                            if not pending_reads:
+                                                next_notice = (
+                                                    submitted + _PENDING_READ_SECONDS
+                                                )
+                                            pending_reads[future] = submitted, request
                                         jobs[key] = (future, request, lane)
                                         # A Future may already be done here. Its
                                         # callback cannot inspect/mutate jobs or
@@ -329,6 +404,8 @@ class StorageService:
                             if future.done():
                                 outboxes[0][key] = encode_message(future.result())
                                 del jobs[key]
+                                if pending_reads:
+                                    pending_reads.pop(future, None)
                                 available -= 1
                     for key in tuple(outboxes[channel])[:16]:
                         route_key = (channel, key[0])
@@ -439,6 +516,7 @@ class StorageService:
             return self._handle(request)
         started = time.perf_counter()
         cpu = time.thread_time()
+        usage = _caller_usage()
         correlation = {}
         if request.method == "prepare":
             correlation = dict(
@@ -459,14 +537,43 @@ class StorageService:
         finished = time.perf_counter()
         # One preparation summary; only slow native GET batches. No lookup,
         # per-layer, polling, PUT, or retirement logs on the steady decode path.
+        elapsed_ms = (finished - queued) * 1000
         if (
-            request.method == "prepare"
+            (request.method == "prepare" and serving_perf_detailed_enabled())
             or result.status != "COMPLETED"
-            or finished - queued >= 0.1
+            or (
+                elapsed_ms >= SLOW_OPERATION_MS
+                and (
+                    request.method != "native_get"
+                    or serving_perf_detailed_enabled()
+                    or serving_perf_report_due(
+                        f"native_get:{correlation.get('transfer_id')}:{elapsed_ms >= 1000}"
+                    )
+                )
+            )
         ):
+            counters = {}
+            if usage is not None and (end_usage := _caller_usage()) is not None:
+                counters = {
+                    "caller_major_faults": end_usage.ru_majflt - usage.ru_majflt,
+                    "caller_involuntary_switches": end_usage.ru_nivcsw - usage.ru_nivcsw,
+                }
+            queue_ms = (started - queued) * 1000
+            execute_ms = (finished - started) * 1000
+            native_ms = phases.get("native_call_ms", 0.0)
+            durations = {
+                "queue": queue_ms,
+                "native_call": native_ms,
+                "handler": max(0.0, execute_ms - native_ms),
+            }
             serving_perf_log(
                 logger,
                 "storage_service_timing",
+                elapsed_ms=round(elapsed_ms, 3),
+                dominant_phase=max(durations, key=durations.__getitem__),
+                **counters,
+                production=True,
+                error=str(result.error)[:256] if result.error else None,
                 req_id=request.identity.request_id,
                 operation_id=request.identity.operation_id,
                 service_epoch=request.identity.service_epoch,
@@ -476,8 +583,8 @@ class StorageService:
                 status=result.status,
                 **correlation,
                 **phases,
-                queue_ms=round((started - queued) * 1000, 3),
-                execute_ms=round((finished - started) * 1000, 3),
+                queue_ms=round(queue_ms, 3),
+                execute_ms=round(execute_ms, 3),
                 execute_thread_cpu_ms=round((time.thread_time() - cpu) * 1000, 3),
             )
         return result

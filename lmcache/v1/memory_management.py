@@ -22,6 +22,7 @@ from lmcache.v1.page_slot_pool import PageSlotPool, PageSlotSpec
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.serving_perf import serving_perf_detailed_enabled
 from lmcache.v1.system_detection import NUMAMapping
 
 if torch.cuda.is_available():
@@ -1958,15 +1959,16 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                     group, unit_raw_size, batch_size, allocation_purpose
                 )
             except MemoryError:
-                logger.warning(
-                    "[CPU_FIXED_SLOTS] allocation refused group=%d purpose=%s "
-                    "count=%d valid_tokens=%d pools=%s",
-                    group,
-                    allocation_purpose,
-                    batch_size,
-                    page_valid_tokens,
-                    self.page_slot_pool.snapshot(),
-                )
+                if serving_perf_detailed_enabled():
+                    logger.warning(
+                        "[CPU_FIXED_SLOTS] allocation refused group=%d purpose=%s "
+                        "count=%d valid_tokens=%d pools=%s",
+                        group,
+                        allocation_purpose,
+                        batch_size,
+                        page_valid_tokens,
+                        self.page_slot_pool.snapshot(),
+                    )
                 return None
         else:
             unit_aligned_size = self.address_manager.compute_aligned_size(unit_raw_size)

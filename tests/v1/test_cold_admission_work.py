@@ -283,7 +283,7 @@ def test_passive_tp_uses_shared_hashes_and_preserves_partial_tail():
     tree = ast.parse("from __future__ import annotations")
     tree.body.append(passive)
     scope = dict(
-        torch=torch, CacheEngineKey=CacheEngineKey, serving_perf_enabled=lambda: False
+        torch=torch, CacheEngineKey=CacheEngineKey, serving_perf_detailed_enabled=lambda: False
     )
     exec(compile(tree, "actual_passive_metadata", "exec"), scope)
     db = token_database()

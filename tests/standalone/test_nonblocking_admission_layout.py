@@ -170,6 +170,7 @@ def admission(
         step_skipped_waiting=skipped,
         skipped_waiting_requests=skipped,
         SERVING_PERF_ENABLED=False,
+        SERVING_PERF_DETAILED=False,
         bootstrap_only_step=False,
         bootstrap_sample_req_ids=[],
         num_scheduled_tokens={} if bootstrap else {"ongoing": 2},
@@ -398,6 +399,8 @@ def test_actual_recompute_schedule_continues_decode_while_lookup_is_pending():
         "incoming", computed=0, end=1024, compact=False, status="WAITING"
     )
     obj, allocations = fixture.scheduler(running=[ongoing], waiting=[incoming])
+    guard = methods_class(*SCHEDULERS[0], {"_reject_kv_admission_error"})
+    obj._reject_kv_admission_error = guard._reject_kv_admission_error.__get__(obj)
     obj.connector_prefix_cache_stats = None
     obj.kv_cache_manager.get_computed_blocks = lambda _: (
         obj.kv_cache_manager.empty_kv_cache_blocks,

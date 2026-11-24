@@ -22,6 +22,7 @@ from lmcache.v1.rpc.storage_protocol import (
     content_digest,
     wire_hash,
 )
+from lmcache.v1.serving_perf import serving_perf_enabled
 from lmcache.v1.token_database import ChunkedTokenDatabase
 
 _TRANSPORTS: dict[tuple[str, str], StorageClient] = {}
@@ -357,7 +358,7 @@ class StorageLookupClient(LookupClientInterface):
         error: str | None = None,
         diagnostics: dict | None = None,
     ) -> int:
-        if lookup_id not in self.reqs_status:
+        if lookup_id not in self.reqs_status and serving_perf_enabled():
             now = time.monotonic()
             started = entry.started if entry else started
             log_lookup_zero(

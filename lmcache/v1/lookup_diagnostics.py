@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded zero-lookup evidence, independent of PD_SERVING_PERF."""
+"""Bounded zero-lookup evidence for decoder diagnosis."""
 
 # Standard
 from collections.abc import Iterator
@@ -66,7 +66,7 @@ def log_lookup_zero(
     error: str | None = None,
     **fields: Any,
 ) -> None:
-    """Log one terminal zero result using host metadata, even with perf logs off."""
+    """Log one terminal zero result using existing host metadata."""
     if identity is not None:
         fields.update(
             operation_id=identity.operation_id,

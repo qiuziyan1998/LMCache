@@ -17,13 +17,14 @@ from lmcache.v1 import storage_service as service
 def test_service_timing_is_bounded_and_preserves_result(
     monkeypatch, method, duration, emitted
 ):
+    monkeypatch.setattr(service, "serving_perf_detailed_enabled", lambda: True)
     times = iter((1.0, 1.0 + duration))
     monkeypatch.setattr(service.time, "perf_counter", lambda: next(times))
     logs = []
     monkeypatch.setattr(
         service, "serving_perf_log", lambda *args, **kw: logs.append(kw)
     )
-    result = NS(status="COMPLETED")
+    result = NS(status="COMPLETED", error=None)
     owner = NS(_handle=lambda request: result)
     request = NS(
         method=method,
@@ -50,7 +51,7 @@ def test_disabled_service_timing_does_not_read_clock(monkeypatch):
 
 
 def test_phase_collection_rolls_up_and_resets_after_error(monkeypatch):
-    from lmcache.v1.rpc import storage_timing as perf
+    from lmcache.v1 import serving_perf as perf
 
     times = iter((1.0, 1.025))
     monkeypatch.setattr(perf.time, "perf_counter", lambda: next(times))
@@ -76,7 +77,7 @@ from lmcache.v1.storage_service import StorageService
 import time
 request = NS(method="prepare", payload={}, identity=NS(
     request_id="r", operation_id=1, service_epoch="e", client_session="w"))
-StorageService._handle_timed(NS(_handle=lambda _: NS(status="COMPLETED")),
+StorageService._handle_timed(NS(_handle=lambda _: NS(status="COMPLETED", error=None)),
                             request, time.perf_counter())
 """
     result = subprocess.run(
@@ -92,3 +93,24 @@ StorageService._handle_timed(NS(_handle=lambda _: NS(status="COMPLETED")),
     )
     assert result.returncode == 0, result.stderr
     assert '"event":"storage_service_timing"' in result.stderr
+
+
+def test_pending_checkpoint_summary_names_queued_work(monkeypatch):
+    from concurrent.futures import Future
+    from lmcache.v1 import serving_perf
+
+    monkeypatch.setattr(serving_perf, "_MODE", "1")
+    records = []
+    monkeypatch.setattr(service, "serving_perf_log", lambda _, event, **kw: records.append((event, kw)))
+    request = NS(method="commit_checkpoint", payload={}, identity=NS(
+        request_id="r", operation_id=7, service_epoch="e", client_session="w", load_generation=2,
+    ))
+    future = Future()
+    pending = {future: (1.0, request)}
+    assert service._pending_read_deadline(pending, 5) == 11
+    assert not records
+    assert service._pending_read_deadline(pending, 11) == 11 + service._PENDING_REMINDER_SECONDS
+    [(event, fields)] = records
+    assert (event, fields["method"], fields["state"]) == ("storage_operation_pending", "commit_checkpoint", "queued")
+    assert fields["operation_id"] == 7 and fields["generation"] == 2
+    assert not future.done()

@@ -940,3 +940,49 @@ def test_boundary_worker_metadata_requires_full_restore_capacity(blocks, valid):
     assert len(slots) == length and slots[-1].item() == 639 * 128
     assert set((slots // 128).tolist()).issubset(ids)
     assert meta.dsa_nonresident_frontier == length - 1
+
+
+@pytest.mark.parametrize("mode", ["0", "1", "detail"])
+@pytest.mark.parametrize("ack", ["failed", "captured", "ready"])
+def test_failed_checkpoint_is_visible_at_error_level_and_stale_ack_is_ignored(
+    monkeypatch, caplog, mode, ack
+):
+    import logging
+    from lmcache.v1 import serving_perf
+
+    monkeypatch.setattr(serving_perf, "_MODE", mode)
+    log = logging.getLogger("test.checkpoint.result")
+    caplog.set_level(logging.ERROR, logger=log.name)
+    req = request()
+    pending = control.PendingCheckpoint(
+        control.CaptureSpec("r", 1, 0, 10, 0, ((1,), (2,)))
+    )
+    if ack == "ready":
+        pending.status, pending.end = "persisting", 7
+    reason = "capture allocation refused" if ack == "failed" else ""
+    received_end = 11 if ack == "captured" else 10
+    adapter = NS(
+        _arm_preemption_controls=lambda: None,
+        _unfinished_requests={"r": req},
+        _preemption_checkpoints={"r": pending},
+        _resume_lookup_queries={"r": "old"},
+        lookup_client=None,
+    )
+    accept = method(
+        "accept_preemption_result",
+        logger=log,
+        serving_perf_enabled=serving_perf.serving_perf_enabled,
+        serving_perf_detailed_enabled=serving_perf.serving_perf_detailed_enabled,
+        serving_perf_log=serving_perf.serving_perf_log,
+    )
+    for gen in (0, 1, 1):
+        accept(
+            adapter,
+            control.CheckpointResult(
+                "r", gen, ack, end=received_end, reason=reason
+            ),
+        )
+    assert pending.status == "failed" and not adapter._resume_lookup_queries
+    assert len(caplog.records) == 1 and (reason or "invalid_ack_frontier") in caplog.text
+    if ack == "ready":
+        assert "seal_target=7" in caplog.text

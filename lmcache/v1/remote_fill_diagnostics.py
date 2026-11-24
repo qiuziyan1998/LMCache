@@ -6,6 +6,12 @@ import json
 import re
 from typing import Any, Literal, Optional
 
+from lmcache.v1.serving_perf import (
+    serving_perf_detailed_enabled,
+    serving_perf_enabled,
+    serving_perf_report_due,
+)
+
 REMOTE_FILL_DIAGNOSTIC_MARKER = "[LMCACHE_REMOTE_FILL_DIAGNOSTIC]"
 # Backward-compatible import alias. New records use the diagnostic marker.
 REMOTE_FILL_VALIDATION_MARKER = REMOTE_FILL_DIAGNOSTIC_MARKER
@@ -68,6 +74,17 @@ def log_remote_fill_diagnostic(
     path, so the disabled and successful paths have no additional work.
     """
 
+    if (
+        code == "RF-P-004"
+        and reason == "cached-prefix hole"
+        and severity == "warning"
+        and not memory_safety_uncertain
+        and not serving_perf_detailed_enabled()
+    ):
+        if not serving_perf_enabled() or not serving_perf_report_due(
+            f"remote_fill_fallback:{stage}"
+        ):
+            return
     fields: dict[str, object] = {
         "schema": 1,
         "event": _bounded_text(event),
