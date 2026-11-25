@@ -26,6 +26,8 @@ logger = init_logger(__name__)
 
 
 class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
+    dcp_indexer_wire_version = 1
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -54,6 +56,25 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
                 else {}
             ),
         )
+
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        pending = getattr(connector_metadata, "dcp_bind_indices", ())
+        if pending:
+            from vllm.distributed.parallel_state import get_dcp_group
+            from lmcache.integration.vllm.vllm_v1_adapter import _build_slot_mapping
+
+            rank = get_dcp_group().rank_in_group
+            block = self._lmcache_engine._block_size
+            for index in pending:
+                req = connector_metadata.requests[index]
+                if req.dcp_indexer_pages:
+                    slots = (_build_slot_mapping(req.dcp_indexer_pages, block, len(req.token_ids))
+                             if rank == req.dcp_indexer_owner else torch.empty(0, dtype=torch.long))
+                    req.indexer_slot_mapping = [slots]
+                if req.dcp_scratch_tables:
+                    req.slot_mapping = [_build_slot_mapping(req.dcp_scratch_tables[rank], block, req.slot_mapping[0].numel())]
+            connector_metadata.dcp_bind_indices = ()
+        super().bind_connector_metadata(connector_metadata)
 
     @property
     def supports_dsa_compact_external_load(self) -> bool:
@@ -280,6 +301,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
             call to this method (this call or a prior one).
         """
         return self._lmcache_engine.get_finished(finished_req_ids)
+
+    def take_dcp_received(self):
+        coordinator = getattr(self._lmcache_engine, "_cold_load_coordinator", None)
+        return coordinator.__dict__.pop("dcp_received", None) if coordinator is not None else None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Return block IDs that failed to load during the last interval."""

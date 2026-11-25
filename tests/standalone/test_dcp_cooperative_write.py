@@ -241,9 +241,17 @@ def peers(setup, monkeypatch):
                 state.views.clear()
 
 
-def test_cooperative_checkpoint_canonical_bytes_and_accepted_seal(peers):
+@pytest.mark.parametrize("index_owner", [0, 1])
+def test_cooperative_checkpoint_canonical_bytes_and_accepted_seal(peers, index_owner, monkeypatch):
+    from dataclasses import replace
+
     p = peers
-    p.run(lambda rank: p.workers[rank].capture(p.spec, p.caches[rank], 4))
+    layout = replace(p.spec.dcp_write_layout, indexer_owner=index_owner, allocation_epoch=31)
+    spec = replace(p.spec, dcp_write_layout=layout)
+    # A nonowner deliberately has no readable indexer. Rank zero still seals.
+    monkeypatch.setattr(p.engines[1-index_owner].gpu_connector, "prepare_group_capture",
+                        lambda *a, **kw: pytest.fail("nonowner attempted index capture"))
+    p.run(lambda rank: p.workers[rank].capture(spec, p.caches[rank], 4))
     leader, peer = p.workers
     assert [(r.status, r.end) for r in leader.poll()] == [("captured", 9)]
     assert not peer.poll() and peer.sources_drained()
@@ -257,6 +265,9 @@ def test_cooperative_checkpoint_canonical_bytes_and_accepted_seal(peers):
                 assert torch.equal(
                     actual, expected[:, None].expand_as(actual).bfloat16()
                 )
+    for _, _, page in leader.jobs["request", 1].fragments[1]:
+        for layer in range(3):
+            assert torch.all(page.layer_tensor(layer) == layer + 40)
     leader.seal(SealSpec("request", 1, tuple(range(7))))
     assert [(r.status, r.end) for r in finish(leader)] == [("ready", 7)]
     wait_drained(leader)
@@ -369,18 +380,21 @@ def test_uncertain_peer_fence_retains_all_owners_and_fails_both(peers):
     assert p.runtime.registry.snapshot()["leases"] == 2
 
 
-@pytest.mark.parametrize("group", [0, 1])
+@pytest.mark.parametrize(("group", "index_owner"), [(0, 0), (1, 0), (1, 1)])
 def test_cooperative_ordinary_store_commits_once_and_releases_all_participants(
-    peers, group
+    peers, group, index_owner, monkeypatch
 ):
+    from dataclasses import replace
     p = peers
     module = importlib.import_module("lmcache_ascend.v1.dcp_store")
     request = NS(
         req_id="request",
         token_ids=list(range(9)),
-        dcp_write_layout=p.spec.dcp_write_layout,
+        dcp_write_layout=replace(p.spec.dcp_write_layout, indexer_owner=index_owner, allocation_epoch=4),
     )
     options = {"slot_mapping": torch.arange(9), "slot_mapping_base": 0}
+    monkeypatch.setattr(p.engines[1-index_owner].gpu_connector, "prepare_group_capture",
+                        lambda *a, **kw: pytest.fail("nonowner attempted index save"))
     results = p.run(
         lambda rank: module.store_group(
             p.engines[rank],

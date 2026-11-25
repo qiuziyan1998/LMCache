@@ -123,7 +123,9 @@ def completed_cold_resume_state(request: Any, state: Any) -> bool:
         and getattr(state, "completed_cold_load_generation", None)
         == getattr(spec, "dsa_cold_load_generation", -1)
         and state.token_count == spec.lmcache_cached_tokens
-        and state.indexer_npu_resident
+        and (state.indexer_npu_resident or getattr(state, "dcp_indexer_ready_epoch", 0))
+        and (not getattr(request, "dcp_allocation_epoch", 0)
+             or state.dcp_indexer_ready_epoch == request.dcp_allocation_epoch)
         and (not (getattr(spec, "dsa_cold_resident_load", False)
                   or getattr(spec, "process_ordinary_resume", False))
              or state.dense_prefix_resident_tokens == spec.lmcache_cached_tokens)
@@ -443,6 +445,8 @@ class DsaDcpDenseLoad:
     world_size: int
     block_ids: tuple[int, ...]
 
+    rank_block_ids: tuple[tuple[int, ...], ...] = ()
+
     def select(self, rank: int, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the owned global token IDs and physical slots in a CPU mask."""
         if (
@@ -460,7 +464,8 @@ class DsaDcpDenseLoad:
         columns, offsets = local // block, local % block
         tokens = columns * span + rank * block + offsets
         selected = mask[tokens]
-        ids = torch.tensor(self.block_ids, dtype=torch.long, device="cpu")
+        ids = torch.tensor(self.rank_block_ids[rank] if self.rank_block_ids else self.block_ids,
+                           dtype=torch.long, device="cpu")
         return (
             tokens[selected].int(),
             ids[columns[selected]] * block + offsets[selected],
@@ -1256,6 +1261,7 @@ class WorkerRetrieveState:
     shared_latent_status: str = "missing"
     shared_index_status: str = "missing"
     indexer_npu_resident: bool = False
+    dcp_indexer_ready_epoch = 0  # The owner has fenced G1; physical residency remains rank local.
     indexer_npu_materialization_pending: bool = field(default=False, repr=False)
     shared_generation: int = 0
     pointer_cache_generation: int = 0
@@ -1422,6 +1428,12 @@ class ReqMeta:
     live_split_latent_cpu: bool = False
     dsa_dcp_load: Optional[DsaDcpDenseLoad] = None
     dcp_write_layout: Any = None
+    # Instance attributes exist on the wire only for request-sharded metadata.
+    dcp_indexer_owner = None
+    dcp_allocation_epoch = 0
+    dcp_validation_ids = ()
+    dcp_indexer_pages = ()
+    dcp_scratch_tables = ()
 
     def retrieve_token_count(self) -> int:
         """Return the logical retrieve prefix represented by this metadata."""
@@ -2109,6 +2121,8 @@ class LMCacheConnectorMetadata(KVConnectorMetadata):
             req_meta (ReqMeta): the request metadata.
         """
         self.requests.append(req_meta)
+        if getattr(req_meta, "dcp_indexer_pages", ()) or getattr(req_meta, "dcp_scratch_tables", ()):
+            self.__dict__.setdefault("dcp_bind_indices", []).append(len(self.requests) - 1)
 
 
 @dataclass
@@ -2159,6 +2173,10 @@ class LMCacheConnectorV1Impl:
         self.device = vllm_config.device_config.device
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self._layerwise_prefill_p_node = _layerwise_prefill_p_node_enabled()
+        self._dcp_request_sharding = any(
+            getattr(getattr(group, "kv_cache_spec", None), "dcp_request_sharding", False)
+            for group in getattr(kv_cache_config, "kv_cache_groups", ())
+        )
         self._layerwise_prefill_bank_count = 2
         if self._layerwise_prefill_p_node:
             # Read the same startup configuration as the physical allocator.
@@ -3388,11 +3406,18 @@ class LMCacheConnectorV1Impl:
         prefix hit may skip prefill. A live request then keeps that NPU state
         while frontier growth refreshes only its shared CPU metadata.
         """
+        epoch = getattr(request, "dcp_allocation_epoch", 0)
+        if epoch:
+            if bound_state is None or getattr(bound_state, "dcp_indexer_ready_epoch", 0) != epoch:
+                raise RuntimeError(f"Missing fenced DCP indexer for {request.req_id} allocation {epoch}")
+            # The owner appends current keys in forward. Only Group 0 uses
+            # remote sparse sources after the initial owner read is fenced.
+            return INDEXER_RETRIEVE_RESIDENT_SKIP
         if (
             bound_state is None
             or not bound_state.shared_request_active
             or bound_state.shared_index_status != "present"
-            or not bound_state.indexer_npu_resident
+            or not (bound_state.indexer_npu_resident or getattr(bound_state, "dcp_indexer_ready_epoch", 0))
             or request.load_spec is None
             or (bool(getattr(request, "resumed_from_preemption", False))
                 and not completed_cold_resume_state(request, bound_state))
@@ -4338,7 +4363,8 @@ class LMCacheConnectorV1Impl:
             return bool(
                 state is not None and end > 0
                 and end >= int(required_end)
-                and state.token_count >= end and state.indexer_npu_resident
+                and state.token_count >= end
+                and (state.indexer_npu_resident or getattr(state, "dcp_indexer_ready_epoch", 0))
                 and self.lmcache_engine.compact_source_importer.is_certified_source(
                     state.prepared_sparse_sources.get(0), request.req_id,
                     state.process_load_generation,
@@ -4635,6 +4661,17 @@ class LMCacheConnectorV1Impl:
         finished_recving = set(
             getattr(connector_output, "finished_recving", None) or ()
         )
+        received = getattr(connector_output, "dcp_received", None) or ()
+        expected = getattr(self, "_dcp_receive_attempts", None)
+        if finished_recving and (expected or received):
+            for req_id in tuple(finished_recving):
+                attempt = expected.get(req_id) if expected else None
+                if attempt is not None and (req_id, *attempt) in received:
+                    expected.pop(req_id)
+                elif attempt is not None or any(item[0] == req_id for item in received):
+                    finished_recving.discard(req_id)
+            # The scheduler consumes this same output after the connector.
+            connector_output.finished_recving = finished_recving or None
         for req_id in finished_recving:
             if getattr(self.config, "decoder_storage_mode", "local") == "process":
                 # The worker's prepared leases outlive the independent lookup
@@ -5143,6 +5180,7 @@ class LMCacheConnectorV1Impl:
         state.shared_latent_status = "missing"
         state.shared_index_status = "missing"
         state.indexer_npu_resident = False
+        state.dcp_indexer_ready_epoch = 0
         state.dense_prefix_resident_tokens = 0
         state.indexer_npu_materialization_pending = False
         state.shared_generation = 0
@@ -5902,6 +5940,8 @@ class LMCacheConnectorV1Impl:
             state is None
             or state.token_count < token_count
             or state.slot_mapping is None
+            or (getattr(request, "dcp_allocation_epoch", 0)
+                and getattr(state, "dcp_indexer_ready_epoch", 0) != request.dcp_allocation_epoch)
             or self._prepared_sparse_source(state, 0, state.token_count) is None
         ):
             raise RuntimeError(
@@ -7143,7 +7183,8 @@ class LMCacheConnectorV1Impl:
                 f"active_generation={existing[0]}, generation={generation}"
             )
         indexer_slots = request.indexer_slot_mapping[0]
-        indexer_block_ids = _cold_indexer_block_ids(indexer_slots, self._block_size)
+        indexer_block_ids = (set(request.dcp_validation_ids) if getattr(request, "dcp_validation_ids", ())
+                             else _cold_indexer_block_ids(indexer_slots, self._block_size))
         npu_device_id = (
             int(torch.npu.current_device()) if hasattr(torch, "npu") else None
         )
@@ -7159,15 +7200,18 @@ class LMCacheConnectorV1Impl:
             "latent_shared_ready": Future(),
         }
         dcp_load = getattr(request, "dsa_dcp_load", None)
-        if dcp_load is not None:
+        if dcp_load is not None or getattr(request, "dcp_indexer_owner", None) is not None:
             # Resolve the rank from the same group that owns the worker KV.
             from vllm.distributed.parallel_state import get_dcp_group
 
             group = get_dcp_group()
-            if group.world_size != dcp_load.world_size:
+            if dcp_load is not None and group.world_size != dcp_load.world_size:
                 raise ValueError("DCP restore layout disagrees with the worker group")
             plan["dsa_dcp_rank"] = group.rank_in_group
-            indexer_block_ids.update(dcp_load.block_ids)
+            if dcp_load is not None:
+                indexer_block_ids.update(dcp_load.block_ids)
+            if getattr(request, "dcp_indexer_owner", None) is not None:
+                plan["owns_indexer"] = group.rank_in_group == request.dcp_indexer_owner
         executor = self._get_dsa_cold_load_executor()
         process_storage = getattr(self.lmcache_engine, "storage_process", None)
         if process_storage is not None:
@@ -7188,7 +7232,8 @@ class LMCacheConnectorV1Impl:
             submit_prepare(self, plan)
             if getattr(request.load_spec, "process_ordinary_load", False):
                 first = prefix // self._block_size * self._block_size
-                block_ids = _cold_indexer_block_ids(indexer_slots[first:], self._block_size)
+                block_ids = (set(request.dcp_validation_ids[first // self._block_size:])
+                             if getattr(request, "dcp_validation_ids", ()) else _cold_indexer_block_ids(indexer_slots[first:], self._block_size))
                 if dcp_load is not None:
                     span = dcp_load.block_size * dcp_load.world_size
                     block_ids.update(dcp_load.block_ids[prefix // span:])
@@ -8420,6 +8465,7 @@ class LMCacheConnectorV1Impl:
                     if dsa_two_groups:
                         indexer_kvcaches = self._kvcaches_for_group(1)
                         materialize_index = (
+                            bool(getattr(request, "dcp_allocation_epoch", 0)) or
                             self._sparse_decode_requires_index_materialization(
                                 request,
                                 shared_cpu_enabled,
@@ -8944,6 +8990,9 @@ class LMCacheConnectorV1Impl:
                 "validation mapping: "
                 f"req_id={request.req_id}, failed_kv_group={kv_group}"
             )
+        validation_ids = getattr(request, "dcp_validation_ids", ())
+        if validation_ids:
+            slot_mapping = _build_slot_mapping(validation_ids, self._block_size, token_count)
         retrieve_slot_mapping = slot_mapping[:token_count]
         missing_blocks = self.record_failed_blocks(
             request.req_id,
@@ -9359,6 +9408,9 @@ class LMCacheConnectorV1Impl:
             )
         }
 
+        owner_epochs = {r.req_id: r.dcp_allocation_epoch for r in requests
+                        if getattr(r, "dcp_allocation_epoch", 0)} if getattr(
+                            self, "_dcp_request_sharding", False) else None
         resolved_sources: dict[str, Optional[PreparedSparseSource]] = {}
 
         def source_ready(req_id: str, frontier: int) -> bool:
@@ -9370,7 +9422,8 @@ class LMCacheConnectorV1Impl:
                 source is not None
                 and source.total_tokens >= frontier
                 and (not shared or state.shared_request_active)
-                and (state.indexer_npu_resident or req_id in native_index_requests)
+                and (state.indexer_npu_resident or getattr(state, "dcp_indexer_ready_epoch", 0) or req_id in native_index_requests)
+                and (not owner_epochs or req_id not in owner_epochs or state.dcp_indexer_ready_epoch == owner_epochs[req_id])
                 and not state.indexer_npu_materialization_pending
                 and len(source.layers) == self.num_layers
             )
@@ -11961,52 +12014,43 @@ class LMCacheConnectorV1Impl:
                 latent_slots = [_build_slot_mapping(
                     latent_block_ids, self._block_size, len(token_ids)
                 )]
-        indexer_slot_mapping = [
-            _build_slot_mapping(
-                indexer_block_ids,
-                self._block_size,
-                len(token_ids),
-            )
-        ]
-        validation_blocks = getattr(
-            self, "_dsa_cold_indexer_block_ids", None
-        )
+        placement = getattr(request, "dcp_indexer_placement", None)
+        if placement is not None and dcp_load is not None:
+            dcp_load = DsaDcpDenseLoad(self._block_size, dcp_size, dcp_load.block_ids,
+                                       placement.latent_tables(dcp_load.block_ids))
+        validation_blocks = getattr(self, "_dsa_cold_indexer_block_ids", None)
         if validation_blocks is None:
-            validation_blocks = {}
-            self._dsa_cold_indexer_block_ids = validation_blocks
-        validation_blocks[request.request_id] = set(indexer_block_ids)
+            validation_blocks = self._dsa_cold_indexer_block_ids = {}
+        validation = validation_blocks[request.request_id] = set(indexer_block_ids)
         if dcp_load is not None:
-            validation_blocks[request.request_id].update(dcp_load.block_ids)
+            validation.update(dcp_load.block_ids)
         if ordinary:
-            validation_blocks[request.request_id].update(latent_block_ids)
-            return ReqMeta(
-                req_id=request.request_id,
-                token_ids=token_ids,
-                slot_mapping=latent_slots,
-                indexer_slot_mapping=indexer_slot_mapping,
-                is_last_prefill=False,
-                is_sparse_decode=False,
-                load_spec=load_spec,
-                dsa_dcp_load=dcp_load,
-                request_configs=extract_request_configs(request.sampling_params),
-            )
-        remap_frontier = (
-            load_spec.dsa_remap_frontier
-            if load_spec.dsa_remap_frontier is not None
-            else load_spec.dsa_committed_end
-        )
+            validation.update(latent_block_ids)
+        frontier = getattr(load_spec, "dsa_remap_frontier", None)
         req_meta = ReqMeta(
             req_id=request.request_id,
             token_ids=token_ids,
             slot_mapping=latent_slots,
-            indexer_slot_mapping=indexer_slot_mapping,
-            is_last_prefill=True,
-            is_sparse_decode=True,
-            dsa_nonresident_frontier=int(remap_frontier or 0),
+            indexer_slot_mapping=(
+                [] if placement is not None else [_build_slot_mapping(indexer_block_ids, self._block_size, len(token_ids))]
+            ),
+            is_last_prefill=not ordinary,
+            is_sparse_decode=not ordinary,
+            dsa_nonresident_frontier=0 if ordinary else int(
+                (load_spec.dsa_committed_end if frontier is None else frontier) or 0
+            ),
             load_spec=load_spec,
             dsa_dcp_load=dcp_load,
             request_configs=extract_request_configs(request.sampling_params),
         )
+        if placement is not None:
+            ids = tuple(indexer_block_ids[:required_indexer_blocks])
+            req_meta.dcp_indexer_owner = placement.owner
+            req_meta.dcp_allocation_epoch = placement.epoch
+            req_meta.dcp_validation_ids = ids
+            req_meta.dcp_indexer_pages = tuple(placement.indexer_table(ids))
+        if ordinary:
+            return req_meta
         params = getattr(request, "kv_transfer_params", None)
         raw_capabilities = (
             params.get("live_split_capabilities", ())
@@ -12298,6 +12342,15 @@ class LMCacheConnectorV1Impl:
             layerwise_prefill_dma=getattr(self, "_layerwise_prefill_dma", False),
             dsa_dcp_size=getattr(self, "_dsa_dcp_size", None),
         )
+        placement = getattr(request, "dcp_indexer_placement", None)
+        if metadata is not None and placement is not None:
+            metadata.dcp_indexer_owner, metadata.dcp_allocation_epoch = placement.owner, placement.epoch
+            if (metadata.indexer_slot_mapping and load_spec is not None and load_spec.can_load
+                    and not getattr(load_spec, "process_ordinary_resume", False)):
+                metadata.dcp_validation_ids = tuple(placement.indexer)
+            if metadata.slot_mapping and metadata.slot_mapping[0].numel():
+                count = cdiv(metadata.slot_mapping[0].numel(), self._block_size)
+                metadata.dcp_scratch_tables = placement.latent_tables(tracker.allocated_block_ids[:count])
         if (metadata is not None and metadata.save_spec is not None
                 and metadata.save_spec.can_save and getattr(self, "_dsa_dcp_size", None)):
             metadata.dcp_write_layout = self._dcp_write_layout(tracker)
@@ -12314,9 +12367,12 @@ class LMCacheConnectorV1Impl:
         if request is None:
             raise ValueError("DCP write lost its scheduler request")
         origin = self._dsa_dcp_live_origin if request.dsa_compact_allocated else 0
-        return DcpWriteLayout(world, self._block_size, tuple(
-            tracker.allocated_block_ids if blocks is None else blocks
-        ), origin)
+        ids = tuple(tracker.allocated_block_ids if blocks is None else blocks)
+        placement = getattr(request, "dcp_indexer_placement", None)
+        if placement is None:
+            return DcpWriteLayout(world, self._block_size, ids, origin)
+        return DcpWriteLayout(world, self._block_size, ids, origin,
+                              placement.latent_tables(ids), placement.owner, placement.epoch)
 
     def _add_decode_window_save_metas(
         self,
@@ -12368,6 +12424,9 @@ class LMCacheConnectorV1Impl:
                     window_end,
                 )
                 return
+            layout = req_meta.dcp_write_layout
+            if getattr(layout, "allocation_epoch", 0):
+                req_meta.dcp_indexer_owner, req_meta.dcp_allocation_epoch = layout.indexer_owner, layout.allocation_epoch
             meta.add_request(req_meta)
             tracker.decode_window_save_next_start = window_end
             tracker.decode_window_save_inflight_end = window_end
@@ -12436,6 +12495,10 @@ class LMCacheConnectorV1Impl:
                 if direct and active_direct not in (None, req_id):
                     continue
                 meta.add_request(req_meta)
+                if getattr(req_meta, "dcp_indexer_owner", None) is not None:
+                    self.__dict__.setdefault("_dcp_receive_attempts", {})[req_id] = (
+                        req_meta.dcp_allocation_epoch, req_meta.load_spec.dsa_cold_load_generation
+                    )
                 pending_cold.pop(req_id)
                 if direct:
                     if active_direct is None:
@@ -13124,7 +13187,12 @@ class LMCacheConnectorV1Impl:
             if tracker is not None:
                 # Capture before _preempt_request clears the compact allocation
                 # flag; metadata construction happens after that mutation.
-                snapshot = (*snapshot, self._dcp_write_layout(tracker, snapshot[2][0]))
+                layout = self._dcp_write_layout(tracker, snapshot[2][0])
+                if getattr(layout, "allocation_epoch", 0):
+                    placement = self._unfinished_requests[tracker.req_id].dcp_indexer_placement
+                    latent, indexer = snapshot[2]
+                    snapshot = (*snapshot[:2], (latent, tuple(placement.indexer_table(indexer))), *snapshot[3:])
+                snapshot = (*snapshot, layout)
         self._checkpoint_snapshots.append(snapshot)
         self._arm_preemption_controls()
 

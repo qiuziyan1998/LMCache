@@ -51,6 +51,9 @@ class DcpWriteLayout:
     block_size: int
     block_ids: tuple[int, ...]
     live_origin: int = 0
+    rank_block_ids: tuple[tuple[int, ...], ...] = ()
+    indexer_owner: int = 0
+    allocation_epoch: int = 0
 
     def __post_init__(self) -> None:
         for value in (self.world_size, self.block_size, self.live_origin):
@@ -60,6 +63,9 @@ class DcpWriteLayout:
             self.world_size not in (2, 4, 8)
             or self.block_size <= 0
             or self.live_origin < 0
+            or not 0 <= self.indexer_owner < self.world_size
+            or (self.rank_block_ids and (len(self.rank_block_ids) != self.world_size
+                or any(len(row) != len(self.block_ids) for row in self.rank_block_ids)))
         ):
             raise ValueError("Invalid DCP write layout")
 
@@ -73,15 +79,16 @@ class DcpWriteLayout:
             0 <= start <= end and 0 <= rank < self.world_size
         ):
             raise ValueError("Invalid DCP capture interval or rank")
+        blocks = self.rank_block_ids[rank] if self.rank_block_ids else self.block_ids
         block = self.block_size
         first = start // block
         stripe = first + (rank - first % self.world_size) % self.world_size
         while stripe * block < end:
             left, right = max(start, stripe * block), min(end, (stripe + 1) * block)
             column = self.live_origin + stripe // self.world_size
-            if column >= len(self.block_ids):
+            if column >= len(blocks):
                 raise ValueError("DCP capture exceeds its allocated block table")
-            physical = self.block_ids[column]
+            physical = blocks[column]
             if type(physical) is not int or physical <= 0:
                 raise ValueError("DCP capture includes a null or invalid block")
             slot = physical * block + left % block

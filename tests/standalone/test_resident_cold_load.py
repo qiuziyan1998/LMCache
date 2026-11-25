@@ -646,7 +646,8 @@ def test_completed_resident_restore_requires_both_groups(resident_tokens):
 
 @pytest.mark.parametrize("length", [129, 280, 4096, 16464, 18433, 20000])
 @pytest.mark.parametrize("dcp_size", [None, 4, 8])
-def test_resident_metadata_covers_full_hit_in_both_groups(length, dcp_size):
+@pytest.mark.parametrize("sharded", [False, True])
+def test_resident_metadata_covers_full_hit_in_both_groups(length, dcp_size, sharded):
     from dataclasses import dataclass
     from tests.standalone.test_storage_process_worker import loaded
     from test_checkpoint_adapter import SOURCE
@@ -682,8 +683,20 @@ def test_resident_metadata_covers_full_hit_in_both_groups(length, dcp_size):
     )
     latent = list(range(3, 3 + cdiv(length, 128 * (dcp_size or 1))))
     indexer = list(range(50, 50 + cdiv(length, 128)))
+    if sharded and dcp_size:
+        request.dcp_indexer_placement = NS(
+            owner=1, epoch=23,
+            latent_tables=lambda ids: tuple(tuple(b + rank * 17 for b in ids) for rank in range(dcp_size)),
+            indexer_table=lambda ids: [b + 31 for b in ids],
+        )
     meta = build(adapter, request, (latent, indexer), spec)
-    assert len(meta.indexer_slot_mapping[0]) == length
+    if sharded and dcp_size:
+        assert meta.indexer_slot_mapping == []
+        assert meta.dcp_validation_ids == tuple(indexer)
+        assert meta.dcp_indexer_pages == tuple(b + 31 for b in indexer)
+        assert (meta.dcp_indexer_owner, meta.dcp_allocation_epoch) == (1, 23)
+    else:
+        assert len(meta.indexer_slot_mapping[0]) == length
     assert meta.dsa_nonresident_frontier == 0
     if dcp_size is None:
         assert len(meta.slot_mapping[0]) == length
@@ -698,7 +711,8 @@ def test_resident_metadata_covers_full_hit_in_both_groups(length, dcp_size):
             )
             assert torch.all((tokens // 128) % dcp_size == rank)
             local = (tokens // (128 * dcp_size)) * 128 + tokens % 128
-            expected = torch.tensor(latent)[local // 128] * 128 + local % 128
+            physical = torch.tensor(latent) + (17 * rank if sharded else 0)
+            expected = physical[local // 128] * 128 + local % 128
             assert torch.equal(slots, expected)
             owned.extend(tokens.tolist())
         assert sorted(owned) == list(range(length))

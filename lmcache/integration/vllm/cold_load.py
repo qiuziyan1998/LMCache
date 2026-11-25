@@ -153,6 +153,10 @@ class ColdLoadCoordinator:
                     ) from exc
                 if not fail(req_id, entry, state, exc):
                     continue
+            if getattr(request, "dcp_indexer_owner", None) is not None:
+                self.__dict__.setdefault("dcp_received", set()).add(
+                    (req_id, request.dcp_allocation_epoch, generation)
+                )
             futures.pop(req_id, None)
             if was_aborted:
                 assert aborted_ids is not None

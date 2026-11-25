@@ -10,6 +10,7 @@ from types import SimpleNamespace as NS
 from pathlib import Path
 import ast
 import gc
+import sys
 
 import pytest
 import torch
@@ -202,11 +203,13 @@ def request(ticket, count):
     )
 
 
-def prepare_pair(adapters, ticket, count, mask):
+def prepare_pair(adapters, ticket, count, mask, **request_attrs):
     def prepare(adapter):
+        req = request(ticket, count)
+        vars(req).update(request_attrs)
         return ordinary_layerwise_load(
             adapter,
-            request(ticket, count),
+            req,
             list(range(count)),
             mask,
             torch.arange(7, 7 + count),
@@ -216,6 +219,50 @@ def prepare_pair(adapters, ticket, count, mask):
 
     with ThreadPoolExecutor(2) as pool:
         return list(pool.map(prepare, adapters))
+
+
+@pytest.mark.parametrize("owner", [0, 1])
+def test_sparse_nonowner_finishes_statistics_at_last_layer(harness, monkeypatch, owner):
+    adapters, ticket, runtime, ready, transfers = harness
+    group = NS(rank_in_group=0)
+    monkeypatch.setitem(
+        sys.modules, "vllm.distributed.parallel_state", NS(get_dcp_group=lambda: group)
+    )
+    pairs = prepare_pair(
+        adapters,
+        ticket,
+        5,
+        torch.ones(5, dtype=torch.bool),
+        is_sparse_decode=True,
+        dcp_indexer_owner=owner,
+        dcp_allocation_epoch=7,
+    )
+    try:
+        for rank, (adapter, pair) in enumerate(zip(adapters, pairs, strict=True)):
+            group.rank_in_group = rank
+            for gid, retriever in enumerate(pair):
+                next(retriever)
+                for _ in range(runtime.num_layers_for_group(gid)):
+                    retriever.send((None, 0))
+                # Sparse worker cleanup closes at the last yield.
+                retriever.close()
+            state = adapter._worker_retrieve_state["request"]
+            assert state.dcp_indexer_ready_epoch == 7
+            assert state.indexer_npu_resident == (rank == owner)
+            assert adapter.lmcache_engine.stats_monitor.finished == [
+                (1, 5),
+                (2, 5 if rank == owner else 0),
+            ]
+        assert {r for r, g, *_ in transfers if g == 1} == {owner}
+    finally:
+        ready[0] = True
+        for adapter, pair in zip(adapters, pairs, strict=True):
+            for retriever in pair:
+                retriever.close()
+            release_sources(
+                adapter._worker_retrieve_state["request"], adapter.lmcache_engine
+            )
+            adapter.lmcache_engine.native_source_lifetime.drain()
 
 
 @pytest.mark.parametrize("count", [1, 3, 5])

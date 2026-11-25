@@ -398,6 +398,27 @@ def ordinary_layerwise_load(
         completed = set()
 
         def retrieve(group: int, mapping: torch.Tensor) -> Generator[Any, Any, None]:
+            if group == 1 and getattr(request, "dcp_indexer_owner", None) is not None:
+                from vllm.distributed.parallel_state import get_dcp_group
+
+                if get_dcp_group().rank_in_group != request.dcp_indexer_owner:
+                    # Keep the ordinary layer generator cadence without a write to nonowner HBM.
+                    try:
+                        for _ in range(adapter._num_layers_for_group(group)):
+                            yield None
+                        completed.add(group)
+                        _set_indexer_ready(state, request)
+                        if completed == {0, 1}:
+                            if not request.is_sparse_decode:
+                                state.dense_prefix_resident_tokens = count
+                            record_state(adapter, state, request)
+                    finally:
+                        if stats is not None:
+                            stats.on_retrieve_finished(monitor_requests[group], 0)
+                    yield None
+                    if not request.is_sparse_decode:
+                        yield mask.clone()
+                    return
             # Preserve the mask without changing physical source coverage or
             # scheduler computed tokens. This is admission-time metadata only.
             if request.is_sparse_decode and group == 0:
@@ -448,7 +469,7 @@ def ordinary_layerwise_load(
                     if layer == len(sources[group].layers) - 1:
                         completed.add(group)
                         if group == 1:
-                            state.indexer_npu_resident = True
+                            _set_indexer_ready(state, request)
                         if completed == {0, 1}:
                             if not request.is_sparse_decode:
                                 state.dense_prefix_resident_tokens = count
@@ -581,6 +602,29 @@ def load_prepared_dense_source(
             retriever.close()
 
 
+def _set_indexer_ready(state, request):
+    owner = getattr(request, "dcp_indexer_owner", None)
+    if owner is None:
+        state.indexer_npu_resident = True
+    else:
+        from vllm.distributed.parallel_state import get_dcp_group
+
+        state.indexer_npu_resident = owner == get_dcp_group().rank_in_group
+        state.dcp_indexer_ready_epoch = request.dcp_allocation_epoch
+
+
+def _owner_load_agreement(engine, request, error):
+    if getattr(request, "dcp_indexer_owner", None) is not None:
+        ready = engine._ordered_checkpoint_agreement(
+            f"{request.req_id}/{request.dcp_allocation_epoch}/{request.dcp_indexer_owner}", "dcp_owner_resident",
+            request.load_spec.dsa_cold_load_generation, 1, error is None,
+        )
+        if not ready and error is None:
+            raise RuntimeError("DCP owner or latent shard failed this load generation")
+    if error is not None:
+        raise error
+
+
 def run_ordinary(
     adapter: Any,
     plan: dict[str, Any],
@@ -612,16 +656,21 @@ def run_ordinary(
             previous.exception()
         if not import_ordinary_sources(adapter, plan, state):
             raise RuntimeError("Ordinary CPU prefix preparation missed safely")
-        for group in (0, 1):
-            load_prepared_dense_source(
-                adapter, state.prepared_sparse_sources[group], plan, group
-            )
-            if stats is not None:
-                stats.on_retrieve_finished(monitors[group], retrieved_tokens)
-                finished_groups.add(group)
+        error = None
+        try:
+            for group in (0, 1):
+                local = group == 0 or plan.get("owns_indexer", True)
+                if local:
+                    load_prepared_dense_source(adapter, state.prepared_sparse_sources[group], plan, group)
+                if stats is not None:
+                    stats.on_retrieve_finished(monitors[group], retrieved_tokens if local else 0)
+                    finished_groups.add(group)
+        except BaseException as exc:
+            error = exc
+        _owner_load_agreement(engine, request, error)
         state.slot_mapping = request.slot_mapping[0]
         state.indexer_slot_mapping = plan["indexer_slots_cpu"]
-        state.indexer_npu_resident = True
+        _set_indexer_ready(state, request)
         state.dense_prefix_resident_tokens = plan["token_count"]
         adapter._record_dsa_cold_dense_load_readiness(state)
         return state
@@ -647,15 +696,17 @@ def run_indexer(adapter: Any, plan: dict[str, Any], device: int | None) -> Any:
     spec = request.load_spec
     engine = adapter.lmcache_engine
     checkpoint = hasattr(spec, "checkpoint_generation")
+    owns_indexer = plan.get("owns_indexer", True)
     if not checkpoint and spec.dsa_group1_direct_hbm:
-        engine.load_group1_pages_direct(
-            plan["tokens"],
-            plan["indexer_slots_cpu"],
-            plan["indexer_kvcaches"],
-            request.request_configs,
-            request.req_id,
-            chunk_plan=plan["chunk_plan"],
-        )
+        if owns_indexer:
+            engine.load_group1_pages_direct(
+                plan["tokens"],
+                plan["indexer_slots_cpu"],
+                plan["indexer_kvcaches"],
+                request.request_configs,
+                request.req_id,
+                chunk_plan=plan["chunk_plan"],
+            )
         return plan["token_mask"], None
     plan["latent_shared_ready"].result()
     sources = plan["storage_sources"]
@@ -668,7 +719,7 @@ def run_indexer(adapter: Any, plan: dict[str, Any], device: int | None) -> Any:
         )
         error = None
         try:
-            if base:
+            if base and owns_indexer:
                 chunks = tuple(
                     chunk for chunk in plan["chunk_plan"]() if chunk[1] <= base
                 )
@@ -690,7 +741,8 @@ def run_indexer(adapter: Any, plan: dict[str, Any], device: int | None) -> Any:
     source = sources.get(1)
     readiness = None
     if source is not None:
-        readiness = load_prepared_dense_source(adapter, source, plan, 1, base)
+        if owns_indexer:
+            readiness = load_prepared_dense_source(adapter, source, plan, 1, base)
         engine.native_source_lifetime.retire_source(source)
         source.owner_lease.release("fenced")
         sources.pop(1)
@@ -791,13 +843,23 @@ def run_cold(
             raise RuntimeError("CPU source import failed on another TP rank")
         plan["storage_sources"] = sources
         plan["latent_shared_ready"].set_result(None)
-        if getattr(request.load_spec, "dsa_cold_resident_load", False):
-            load_prepared_dense_source(adapter, sources[0], plan, 0)
-            state.dense_prefix_resident_tokens = plan["token_count"]
-        mark("resident_load_ms", "indexer_wait")
-        indexer.result()
+        error = None
+        try:
+            if getattr(request.load_spec, "dsa_cold_resident_load", False):
+                load_prepared_dense_source(adapter, sources[0], plan, 0)
+                state.dense_prefix_resident_tokens = plan["token_count"]
+            mark("resident_load_ms", "indexer_wait")
+        except BaseException as exc:
+            error = exc
+        # Join even after a latent failure. The indexer owns the preceding
+        # checkpoint-prefix collective and any outstanding Group-1 DMA.
+        try:
+            indexer.result()
+        except BaseException as exc:
+            error = exc if error is None else error
+        _owner_load_agreement(engine, request, error)
         mark("indexer_remaining_wait_ms", "state_publication")
-        state.indexer_npu_resident = True
+        _set_indexer_ready(state, request)
         state.location = "LocalCPU"
         state.metadata_warm = True
         state.token_count = plan["token_count"]
@@ -884,7 +946,7 @@ def record_state(adapter: Any, state: Any, request: Any) -> None:
     sources = state.prepared_sparse_sources
     if (
         0 not in sources
-        or not state.indexer_npu_resident
+        or not (state.indexer_npu_resident or getattr(state, "dcp_indexer_ready_epoch", 0))
         or any(
             not engine.compact_source_importer.is_certified_source(
                 source, request.req_id, generation
@@ -1110,7 +1172,7 @@ def promote_store(adapter: Any, request: Any, result: Any) -> None:
         state.metadata_token_ids = request.token_ids[: reply.source_end]
         state.process_load_generation = generation
         state.process_source_plan = job["storage_source_plan"]
-        state.indexer_npu_resident = True
+        _set_indexer_ready(state, request)
         if old is not None:
             state.slot_mapping = old.slot_mapping
             state.indexer_slot_mapping = old.indexer_slot_mapping
