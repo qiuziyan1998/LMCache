@@ -1630,6 +1630,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if (
                 pages is None
                 and eviction
+                and serving_perf_enabled()
                 and not serving_perf_detailed_enabled()
                 and serving_perf_report_due(
                     f"slots_unavailable:{group}:{allocation_purpose}"
@@ -1717,7 +1718,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     (time.monotonic() - started) * 1000,
                 )
                 return None
-            if not waiting:
+            if not waiting and serving_perf_enabled():
                 logger.warning(
                     "[LMCACHE_PAGE_ALLOC] status=waiting pages=%d layers=%d "
                     "timeout_s=%.1f yielding_event_loop=1",

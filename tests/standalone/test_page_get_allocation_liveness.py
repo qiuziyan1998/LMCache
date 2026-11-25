@@ -101,7 +101,7 @@ def setup(*, pressure=False, failure=None, timeout=0.3):
 
     backend = NS(
         metadata=NS(chunk_size=1024), config=NS(blocking_timeout_secs=timeout),
-        use_hot=True, cpu_lock=threading.Lock(),
+        use_hot=True, fixed_slots_enabled=False, cpu_lock=threading.Lock(),
         memory_allocator=NS(batched_allocate_layer_pages=allocate),
         _pop_layer_page_evict_candidate_locked=evict,
         stats_monitor=NS(update_local_cpu_evict_failed_count=lambda n: None,

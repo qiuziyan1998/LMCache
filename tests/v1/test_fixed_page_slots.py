@@ -3,8 +3,10 @@
 
 # Standard
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from random import Random
 from types import SimpleNamespace
+import asyncio
 import logging
 
 # Third Party
@@ -301,6 +303,55 @@ def test_reclaim_targets_missing_group_and_preserves_borrowed_and_pinned_owners(
     pages[2].ref_count_down()
     backend.clear()
     assert owner.total_allocated_size == 0 and owner.memcheck()
+
+
+@pytest.mark.parametrize("mode", ["0", "1", "detail"])
+def test_fixed_slot_retry_and_timeout_logging(
+    mode: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("lmcache.v1.serving_perf._MODE", mode)
+    owner = make_allocator(slots=1)
+    backend = LocalCPUBackend(
+        LMCacheEngineConfig.from_defaults(local_cpu=True), memory_allocator=owner
+    )
+    logger = logging.getLogger("lmcache.v1.storage_backend.local_cpu_backend")
+    monkeypatch.setattr(logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(
+        "lmcache.v1.storage_backend.local_cpu_backend.serving_perf_report_due",
+        lambda key: True,
+    )
+    caplog.set_level(logging.WARNING, logger=logger.name)
+    take_slot = partial(
+        backend.async_batched_allocate_layer_pages,
+        [torch.Size([3072])] * 2,
+        [torch.bfloat16] * 2,
+        1,
+        2,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+        valid_tokens=[1],
+        full_tokens=1024,
+    )
+
+    async def exercise() -> None:
+        held = allocate(owner, 0, [1])[0]
+        asyncio.get_running_loop().call_soon(held.ref_count_down)
+        pages = await take_slot()
+        assert pages and pages[0].is_valid()
+        try:
+            assert ("status=waiting" in caplog.text) == (mode != "0")
+            allocation_warning = "allocation unavailable after reclaim" in caplog.text
+            assert allocation_warning == (mode == "1")
+            caplog.clear()
+            backend.config.blocking_timeout_secs = 0
+            assert await take_slot() is None
+            assert any(
+                rec.levelno == logging.ERROR and "status=failed" in rec.getMessage()
+                for rec in caplog.records
+            )
+        finally:
+            pages[0].ref_count_down()
+
+    asyncio.run(exercise())
 
 
 def test_checkpoint_reclaim_reports_entries_checked_and_stops_at_first_match(
