@@ -2223,6 +2223,7 @@ class LMCacheConnectorV1Impl:
 
         indexer_c8_layout = None
         self._dsa_dcp_size = None
+        self._prefill_dcp_size = None
         self._dsa_dcp_live_origin = 0
         self._dsa_dcp_cold_geometry = None
         if runtime_group_layer_counts is not None:
@@ -2239,27 +2240,32 @@ class LMCacheConnectorV1Impl:
                     or getattr(indexer_spec, "dsa_dcp_size", None) != 1
                     or latent_spec.block_size != indexer_spec.block_size
                     or parallel.cp_kv_cache_interleave_size != latent_spec.block_size
-                    or config.pd_role != "receiver"
+                    or config.pd_role != ("sender" if self._layerwise_prefill_p_node else "receiver")
                 ):
-                    raise ValueError("Invalid decoder DCP cache geometry")
-                self._dsa_dcp_size = dcp_size
-                from vllm.v1.core.dsa_shared_pool import (
-                    dsa_scratch_blocks_for_topk, dsa_shared_block_layout,
-                )
+                    raise ValueError("Invalid DSA DCP cache geometry")
+                if self._layerwise_prefill_p_node:
+                    if not config.use_layerwise or config.enable_blending:
+                        raise ValueError("Banked prefill DCP requires layerwise DMA without blending")
+                    self._prefill_dcp_size = dcp_size
+                else:
+                    self._dsa_dcp_size = dcp_size
+                    from vllm.v1.core.dsa_shared_pool import (
+                        dsa_scratch_blocks_for_topk, dsa_shared_block_layout,
+                    )
 
-                bundle = dsa_shared_block_layout(latent_spec, indexer_spec).latent_blocks_per_bundle
-                scratch = dsa_scratch_blocks_for_topk(
-                    kv_cache_config.dsa_index_topk, latent_spec.block_size,
-                    kv_cache_config.dsa_num_speculative_tokens + 1,
-                )
-                self._dsa_dcp_live_origin = cdiv(scratch, bundle) * bundle
-                from lmcache.integration.vllm.dcp import DcpColdLoadGeometry
+                    bundle = dsa_shared_block_layout(latent_spec, indexer_spec).latent_blocks_per_bundle
+                    scratch = dsa_scratch_blocks_for_topk(
+                        kv_cache_config.dsa_index_topk, latent_spec.block_size,
+                        kv_cache_config.dsa_num_speculative_tokens + 1,
+                    )
+                    self._dsa_dcp_live_origin = cdiv(scratch, bundle) * bundle
+                    from lmcache.integration.vllm.dcp import DcpColdLoadGeometry
 
-                self._dsa_dcp_cold_geometry = DcpColdLoadGeometry(
-                    self._dsa_dcp_live_origin * latent_spec.block_size * dcp_size,
-                    vllm_config.model_config.max_model_len,
-                    kv_cache_config.dsa_num_speculative_tokens,
-                )
+                    self._dsa_dcp_cold_geometry = DcpColdLoadGeometry(
+                        self._dsa_dcp_live_origin * latent_spec.block_size * dcp_size,
+                        vllm_config.model_config.max_model_len,
+                        kv_cache_config.dsa_num_speculative_tokens,
+                    )
             if getattr(indexer_spec, "cache_sparse_c8", False):
                 selected = getattr(indexer_spec, "indexer_c8_layer_names", None)
                 mask = (
@@ -3245,6 +3251,8 @@ class LMCacheConnectorV1Impl:
         if not self._layerwise_prefill_p_node:
             return
         kv_group = self._layerwise_wait_group(layer_name)
+        if kv_group == 0 and (batch := getattr(self, "_prefill_dcp_batch", None)) is not None:
+            batch.workspace.last_read = event
         self.lmcache_engine.gpu_connector.record_layerwise_prefill_bank_use(
             self._layerwise_prefill_transfer_layer_id(layer_name, kv_group),
             kv_group,
@@ -4021,8 +4029,8 @@ class LMCacheConnectorV1Impl:
     def _trim_prefill_for_recalc_last(
         request: "ReqMeta",
         retrieve_tokens: list[int],
-        slot_mapping: torch.Tensor,
-    ) -> tuple[list[int], torch.Tensor]:
+        slot_mapping: Optional[torch.Tensor],
+    ) -> tuple[list[int], Optional[torch.Tensor]]:
         """Handle vLLM recalc_last=1 on a full-cache-hit prefill retrieve.
 
         We intentionally do NOT trim retrieve_tokens or slot_mapping. Rationale:
@@ -8052,6 +8060,38 @@ class LMCacheConnectorV1Impl:
             )
             raise
 
+    def _bind_prefill_dcp_batch(self, attn_metadata, requests) -> None:
+        batch = next((m.prefill_dcp for m in attn_metadata.values()
+                      if getattr(m, "prefill_dcp", None) is not None), None)
+        if batch is None and requests:
+            raise RuntimeError("Sharded prefill requires the worker's Group-0 batch layout")
+        if batch is not None:
+            if batch.workspace.unfenced:
+                raise RuntimeError("Cannot prime prefill DMA after an unfenced transfer")
+            by_id = {r.req_id: r for r in requests}
+            for req_id, (prefix, end) in batch.coverage.items():
+                req = by_id.get(req_id)
+                spec = req.load_spec if req is not None else None
+                if prefix and (spec is None or not spec.can_load or spec.vllm_cached_tokens >= self._lmcache_chunk_size):
+                    raise RuntimeError(f"Sharded prefill has incomplete history for {req_id}: need {prefix}")
+                if spec and spec.can_load and not prefix <= spec.lmcache_cached_tokens <= min(end, len(req.token_ids)):
+                    raise RuntimeError(f"Invalid sharded prefill load for {req_id}: history={prefix}, "
+                                       f"hit={spec.lmcache_cached_tokens}, ids={len(req.token_ids)}, end={end}")
+                if req and req.save_spec and req.save_spec.can_save and len(req.token_ids) > end:
+                    raise RuntimeError(f"Sharded prefill save exceeds computed KV for {req_id}: end {end}")
+        self._prefill_dcp_batch = batch
+
+    def _request_recalc_last_token(self, request: ReqMeta) -> bool:
+        if request.is_sparse_decode:
+            return False
+        batch = getattr(self, "_prefill_dcp_batch", None)
+        if batch is not None:
+            # Only a token in this forward's fresh suffix may be missing from the source.
+            return request.load_spec.lmcache_cached_tokens > batch.coverage[request.req_id][0]
+        return self._full_hit_recalc_last_token(
+            request.load_spec, request.retrieve_token_count(), is_sparse_decode=False
+        )
+
     def _start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
         paged KV buffer.
@@ -8123,6 +8163,8 @@ class LMCacheConnectorV1Impl:
         if attn_metadata is None:
             logger.debug("In connector.start_load_kv, but the attn_metadata is None")
             return
+        if getattr(self, "_prefill_dcp_size", None):
+            self._bind_prefill_dcp_batch(attn_metadata, metadata.requests)
 
         if len(self.kv_caches) == 0:
             logger.warning(
@@ -8214,6 +8256,8 @@ class LMCacheConnectorV1Impl:
                 request for _, request in loadable_requests
             )
         )
+        if getattr(self, "_prefill_dcp_size", None) and loadable_requests and not self._deferred_layerwise_prefill_load_active:
+            raise RuntimeError("Sharded Group-0 reload requires the banked prefill DMA path")
         gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
         if staged_load_count and gpu_connector is not None and hasattr(
             gpu_connector, "set_layerwise_staging_concurrency"
@@ -8251,13 +8295,16 @@ class LMCacheConnectorV1Impl:
                         device=self.device, dtype=torch.long
                     )
                 slot_mapping = request.slot_mapping[0]
+            elif getattr(self, "_prefill_dcp_size", None):
+                # The striped DMA planner receives physical block lists directly.
+                slot_mapping = None
             else:
                 assert request.slot_mapping
                 slot_mapping = self._dense_retrieve_slot_mapping(
                     request.slot_mapping[0]
                 )
 
-            if not request.is_sparse_decode:
+            if not request.is_sparse_decode and slot_mapping is not None:
                 assert len(tokens) == len(slot_mapping)
 
             retrieve_tokens = (
@@ -8269,11 +8316,7 @@ class LMCacheConnectorV1Impl:
                     is_sparse_decode=request.is_sparse_decode,
                 )
             )
-            recalc_last_applied = self._full_hit_recalc_last_token(
-                request.load_spec,
-                request.retrieve_token_count(),
-                is_sparse_decode=request.is_sparse_decode,
-            )
+            recalc_last_applied = self._request_recalc_last_token(request)
             if recalc_last_applied:
                 retrieve_tokens, slot_mapping = self._trim_prefill_for_recalc_last(
                     request, retrieve_tokens, slot_mapping
@@ -8292,7 +8335,7 @@ class LMCacheConnectorV1Impl:
             )
             indexer_token_mask = token_mask
             if (
-                not request.is_sparse_decode
+                not request.is_sparse_decode and slot_mapping is not None
                 and token_count > len(slot_mapping)
             ):
                 logger.warning(
@@ -8630,7 +8673,7 @@ class LMCacheConnectorV1Impl:
                         )
                 else:
                     retrieve_slot_mapping = slot_mapping
-                    if lmcache_cached_tokens < len(slot_mapping):
+                    if slot_mapping is not None and lmcache_cached_tokens < len(slot_mapping):
                         retrieve_slot_mapping = slot_mapping[:lmcache_cached_tokens]
                     retrieve_state = self._worker_retrieve_state.get(
                         request.req_id
@@ -8730,7 +8773,9 @@ class LMCacheConnectorV1Impl:
                         **(
                             {"prefill_dma_block_ids_by_bank":
                              self._layerwise_prefill_dma_block_ids(request, 0),
-                             "prefill_dma_block_size": self._block_size}
+                             "prefill_dma_block_size": self._block_size,
+                             "prefill_dma_shard": (self._prefill_dcp_size, self._prefill_dcp_batch.rank)
+                             if getattr(self, "_prefill_dcp_size", None) else None}
                             if self._deferred_layerwise_prefill_load_active
                             and self._layerwise_prefill_dma else {}
                         ),
@@ -8913,11 +8958,7 @@ class LMCacheConnectorV1Impl:
         assert request.load_spec is not None
         load_spec = request.load_spec
         if recalc_last_applied is None:
-            recalc_last_applied = self._full_hit_recalc_last_token(
-                load_spec,
-                request.retrieve_token_count(),
-                is_sparse_decode=request.is_sparse_decode,
-            )
+            recalc_last_applied = self._request_recalc_last_token(request)
         token_count = min(
             int(load_spec.lmcache_cached_tokens),
             request.retrieve_token_count(),
@@ -10359,6 +10400,9 @@ class LMCacheConnectorV1Impl:
         sync = kv_group == 0 or (
             self._is_dsa_two_groups() and world_size > 1
         )
+        if kv_group == 0 and getattr(self, "_prefill_dcp_size", None):
+            batch = self._prefill_dcp_batch
+            store_kwargs["prefill_dcp_save"] = (batch.workspace, batch.save_blocks[request.req_id])
         storer = self.lmcache_engine.store_layer(
             token_ids,
             mask=store_mask,
@@ -12340,7 +12384,7 @@ class LMCacheConnectorV1Impl:
             save_entire_prefix=self.kv_role == "kv_producer",
             live_source_requested=live_source_requested,
             layerwise_prefill_dma=getattr(self, "_layerwise_prefill_dma", False),
-            dsa_dcp_size=getattr(self, "_dsa_dcp_size", None),
+            dsa_dcp_size=getattr(self, "_prefill_dcp_size", None) or getattr(self, "_dsa_dcp_size", None),
         )
         placement = getattr(request, "dcp_indexer_placement", None)
         if metadata is not None and placement is not None:

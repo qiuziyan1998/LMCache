@@ -248,3 +248,21 @@ def test_four_bank_sender_keeps_persistent_handoff_without_dense_source(
     assert metadata.live_source_indexer_slot_mapping == []
     assert not adapter.supports_dsa_live_split()
     assert not adapter.supports_dsa_live_latent_source()
+
+
+def test_banked_sender_keeps_canonical_handoff_and_reloads_short_local_table(definitions):
+    adapter = make_adapter(definitions, None)
+    adapter._layerwise_prefill_dma = True
+    adapter._prefill_dcp_size = 8
+    adapter._unfinished_requests["r"].num_computed_tokens = 257
+    banks = tuple(([b+1], [10+b, 20+b, 30+b]) for b in range(4))
+    tracker = definitions["RequestTracker"](
+        req_id="r", prompt_len=1000, token_ids=list(range(260)),
+        allocated_block_ids=banks[0][0], allocated_block_ids_indexer=banks[0][1],
+        allocated_block_ids_by_bank=banks, block_allocation_mode="prefill_child",
+    )
+    meta = adapter._build_request_meta(tracker, None)
+    assert meta.load_spec.can_load and meta.load_spec.lmcache_cached_tokens == 257
+    assert meta.block_ids_by_bank == banks and not meta.live_source_requested
+    assert meta.slot_mapping == [] and meta.dcp_write_layout is None
+    assert len(meta.indexer_slot_mapping[0]) >= 257

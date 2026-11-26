@@ -2,6 +2,7 @@
 """Reject missing required history in the production retrieval path."""
 
 import ast
+import logging
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -214,6 +215,100 @@ def test_coverage_validation_reads_only_range_endpoints():
         kv_group=1,
         recalculate_last_token=False,
     )
+
+
+@pytest.mark.parametrize("group", [0, 1])
+@pytest.mark.parametrize("first_fresh,recompute_tail", [(1024, True), (1025, False)])
+def test_sharded_prefill_actual_history_controls_both_source_checks(
+    group, first_fresh, recompute_tail
+):
+    # Both scheduler payloads have 1,025 IDs. Only the full hit recomputes ID 1,024.
+    cls = extracted_class(
+        ADAPTER,
+        "LMCacheConnectorV1Impl",
+        {
+            "_bind_prefill_dcp_batch",
+            "_request_recalc_last_token",
+            "_validate_dense_retrieve_result",
+            "_load_token_mask_for_retrieve",
+            "record_failed_blocks",
+        },
+        {"torch": torch, "logger": logging.getLogger(__name__)},
+    )
+    obj = cls()
+    obj._lmcache_chunk_size, obj._block_size = 1024, 128
+    obj._invalid_block_ids = set()
+    obj._is_dsa_two_groups = lambda: True
+    req = NS(
+        req_id="r",
+        is_sparse_decode=False,
+        token_ids=list(range(1025)),
+        save_spec=None,
+        load_spec=NS(can_load=True, vllm_cached_tokens=0, lmcache_cached_tokens=1025),
+        indexer_slot_mapping=[torch.arange(1025)],
+        retrieve_token_count=lambda: 1025,
+    )
+    obj._bind_prefill_dcp_batch(
+        {
+            "L": NS(
+                prefill_dcp=NS(
+                    workspace=NS(unfenced=False), coverage={"r": (first_fresh, 1028)}
+                )
+            )
+        },
+        [req],
+    )
+    recalc = obj._request_recalc_last_token(req)
+    assert recalc is recompute_tail
+    source = reader(False, 1024)[0]
+
+    def check_source():
+        source._require_complete_prefill_source(
+            [0], [1024], 1025, req_id="r", kv_group=group, recalculate_last_token=recalc
+        )
+
+    if recompute_tail:
+        check_source()
+    else:
+        with pytest.raises(RuntimeError, match="required_tokens=1025"):
+            check_source()
+    obj._validate_dense_retrieve_result(req, torch.arange(1025) < 1024, kv_group=group)
+    assert obj._invalid_block_ids == (set() if recompute_tail else {8})
+
+
+@pytest.mark.parametrize("hit,ids", [(1024, 1025), (1025, 1024), (1029, 1029)])
+def test_sharded_load_extent_is_checked_before_priming(hit, ids):
+    cls = extracted_class(
+        ADAPTER, "LMCacheConnectorV1Impl", {"_bind_prefill_dcp_batch"}, {}
+    )
+    obj = cls()
+    obj._lmcache_chunk_size = 1024
+    req = NS(
+        req_id="r",
+        token_ids=range(ids),
+        save_spec=None,
+        load_spec=NS(can_load=True, vllm_cached_tokens=0, lmcache_cached_tokens=hit),
+    )
+    with pytest.raises(RuntimeError, match="Invalid sharded prefill load"):
+        obj._bind_prefill_dcp_batch(
+            {
+                "L": NS(
+                    prefill_dcp=NS(
+                        workspace=NS(unfenced=False), coverage={"r": (1025, 1028)}
+                    )
+                )
+            },
+            [req],
+        )
+
+
+def test_poisoned_workspace_rejects_new_step_before_dma():
+    cls = extracted_class(
+        ADAPTER, "LMCacheConnectorV1Impl", {"_bind_prefill_dcp_batch"}, {}
+    )
+    meta = {"L": NS(prefill_dcp=NS(workspace=NS(unfenced=True)))}
+    with pytest.raises(RuntimeError, match="Cannot prime prefill DMA"):
+        cls()._bind_prefill_dcp_batch(meta, [])
 
 
 def test_adapter_priming_consumes_existing_yields_without_tensor_operations():
