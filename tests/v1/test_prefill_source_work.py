@@ -17,6 +17,7 @@ import torch
 from lmcache.v1 import cache_engine as engine_module
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.memory_management import LayerPageSource, MemoryFormat
+from lmcache.v1.page_errors import LayerPageUnavailable
 from lmcache.v1.prefill_metadata import PrefillMetadataCache
 from lmcache.v1.prefill_sources import SharedPrefillSources
 from lmcache.v1.pin_monitor import PinMonitor
@@ -87,8 +88,10 @@ class PageBackend:
 
 
 class SharedEngine(LMCacheEngine):
-    def __init__(self, *, passive: bool, layers: int = 3) -> None:
-        self.config = SimpleNamespace(chunk_size=4, save_unfull_chunk=True)
+    def __init__(self, *, passive: bool, layers: int = 3, chunk_size: int = 4) -> None:
+        self.config = SimpleNamespace(chunk_size=chunk_size, save_unfull_chunk=True)
+        self.page_stride = max(128, chunk_size * 2 * layers)
+        self.group_bytes = self.page_stride * 64
         self.num_layers = layers
         self.metadata = SimpleNamespace(
             first_rank=0, worker_id=int(passive), is_first_rank=lambda: not passive
@@ -98,7 +101,7 @@ class SharedEngine(LMCacheEngine):
         self.shared_cpu_cache_name = "/source-work"
         self.allocator = PassiveSharedViewAllocator(
             reuse_prefill=True,
-            slab_tensor=torch.zeros(16384, dtype=torch.uint8),
+            slab_tensor=torch.zeros(self.group_bytes * 2, dtype=torch.uint8),
             shm_name=self.shared_cpu_cache_name,
             generation=7,
         )
@@ -122,7 +125,7 @@ class SharedEngine(LMCacheEngine):
         self.location_counts: list[int] = []
         self.token_database = object.__new__(ChunkedTokenDatabase)
         self.token_database.config = self.config
-        self.token_database.chunk_size = 4
+        self.token_database.chunk_size = chunk_size
         self.token_database.hash_func = hash
         self.token_database.mooncake_payload_layout = "test-layout"
         self.token_database.save_only_first_rank = False
@@ -238,7 +241,7 @@ class SharedEngine(LMCacheEngine):
                 physical_sizes=[(end - start) * 2],
                 chunk_hashes=[key.chunk_hash],
                 offsets=[],
-                page_offsets=[group * 8192 + len(self.backend.hot_cache) * 128],
+                page_offsets=[group * self.group_bytes + len(self.backend.hot_cache) * self.page_stride],
                 page_physical_sizes=[(end - start) * 2 * self.num_layers],
             )
             self.backend.hot_cache[key] = self.allocator.create_page_view(
@@ -410,6 +413,97 @@ def test_retained_remote_page_with_local_remote_suffix_keeps_page_route(
         rank0.release_shared_cpu_sparse_request("r")
         passive.release_shared_cpu_sparse_request("r")
         for page in all_pages.values():
+            assert page.get_ref_count() == 1 and page.metadata.pin_count == 0
+            page.ref_count_down()
+
+
+@pytest.mark.parametrize("group", [0, 1])
+@pytest.mark.parametrize("race", ["none", "cold", "hole", "evict", "relocate", "short_read", "pinned"])
+def test_fixed_slot_prefill_reads_only_pages_and_agrees_across_tp(
+    shared_engines, group, race
+):
+    # Match DP2's 19 full chunks + 636 tokens. Only page 13 is remote.
+    total = 20_092
+    owner, reader = (
+        SharedEngine(passive=passive, layers=22, chunk_size=1024)
+        for passive in (False, True)
+    )
+    for engine in (owner, reader):
+        engine.call_kwargs["shared_cpu_request_preflight_state"] = {}
+    owner.retrieve_locations = None
+    owner.populate(total, group)
+    local = owner.backend.hot_cache
+    keys = list(local)
+    originals = list(local.values())
+    remote = {keys[13]: local.pop(keys[13])}
+    if race == "hole":
+        del local[keys[14]]
+    calls = []
+
+    def prefix(wanted, source):
+        return next((i for i, k in enumerate(wanted) if k not in source), len(wanted))
+
+    def local_get(wanted):
+        pages = [local[k] for k in wanted[:prefix(wanted, local)]]
+        for page in pages:
+            page.ref_count_up()
+        return pages, len(pages)
+
+    def remote_get(wanted):
+        calls.append(list(wanted))
+        if race == "short_read":
+            raise LayerPageUnavailable("short native read")
+        if keys[14] in local and race in {"evict", "relocate"}:
+            displaced = local.pop(keys[14])
+            if race == "relocate":
+                remote[keys[14]] = displaced
+        pages = [remote[k] for k in wanted]
+        for page in pages:
+            page.ref_count_up()
+        return pages
+
+    owner.backend.fixed_slots_enabled = True
+    owner.backend.layer_page_presence = lambda wanted: [k in local for k in wanted]
+    owner.backend.batched_get_layer_page_prefix = local_get
+    backends = owner.storage_manager.storage_backends
+    backends["RemoteBackend"] = SimpleNamespace(
+        batched_contains_layer_pages=lambda wanted: prefix(wanted, remote),
+        batched_get_layer_pages=remote_get,
+    )
+    owner.storage_manager.get_active_storage_backends = lambda **_: backends.items()
+    owner.storage_manager.batched_get = lambda *a, **kw: pytest.fail("legacy get")
+    if race == "pinned":
+        owner._remote_fill_retrieve_plan = lambda _, candidates, group: [
+            ("RemoteBackend" if key in remote else "LocalCPUBackend", True)
+            for _, _, key in candidates
+        ]
+    try:
+        # First pass establishes the request-owned prefix; second pass resolves
+        # only its suffix and publishes the result to the passive TP reader.
+        for length in ((total,) if race == "cold" else (3 * 1024, total)):
+            outputs = owner.retrieve(length, group)
+            reader.incoming.extend(owner.outgoing)
+            owner.outgoing.clear()
+            peer = reader.retrieve(length, group)
+            assert len(outputs) == len(peer) == 22 + 2
+            assert torch.equal(outputs[-1], peer[-1])
+            assert not reader.incoming
+        failed = race in {"evict", "hole", "short_read"}
+        valid = 14 * 1024 if race == "hole" else 0 if failed else total
+        assert outputs[-1].tolist() == [True] * valid + [False] * (total - valid)
+        for engine in (owner, reader):
+            assert bool(engine.call_kwargs["shared_cpu_request_preflight_state"].get(
+                "incomplete_prefill")) == failed
+        if not failed:
+            for row in owner.caches["cached_memory_objs"]:
+                assert list(row) == originals
+            assert originals[-1].get_shape() == torch.Size([636])
+        if race == "none":
+            assert calls == [[keys[13]]]
+    finally:
+        for engine in (owner, reader):
+            engine.release_shared_cpu_sparse_request("r")
+        for page in originals:
             assert page.get_ref_count() == 1 and page.metadata.pin_count == 0
             page.ref_count_down()
 

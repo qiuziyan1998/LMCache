@@ -25,6 +25,7 @@ from lmcache.v1.memory_management import (
     TensorMemoryObj,
 )
 from lmcache.v1.mooncake_layout import mooncake_valid_tokens
+from lmcache.v1.page_errors import LayerPageUnavailable
 from lmcache.v1.remote_fill.security import content_digest
 from lmcache.v1.serving_perf import (
     serving_perf_enabled,
@@ -1154,6 +1155,57 @@ class CPUCacheOperations:
             self._release_shared_retrieve_objs(owned, unpin=True)
             raise
 
+    def _fixed_slot_prefill_page_plan(self, keys: list[CacheEngineKey]) -> list[str]:
+        """Plan the continuous physical prefix, probing remote only for local gaps."""
+        assert self.storage_manager is not None
+        active = dict(self.storage_manager.get_active_storage_backends(
+            search_range=self.retrieve_locations
+        ))
+        local = active.get("LocalCPUBackend")
+        remote = active.get("RemoteBackend")
+        present = local.layer_page_presence(keys) if local is not None else [False] * len(keys)
+        locations: list[str] = []
+        while len(locations) < len(keys):
+            start = len(locations)
+            if present[start]:
+                locations.append("LocalCPUBackend")
+                continue
+            if remote is None:
+                break
+            end = start + 1
+            while end < len(keys) and not present[end]:
+                end += 1
+            count = remote.batched_contains_layer_pages(keys[start:end])
+            if not 0 <= count <= end - start:
+                raise ValueError("Invalid physical remote page prefix count")
+            locations.extend(["RemoteBackend"] * count)
+            if count < end - start:
+                break
+        return locations
+
+    def _load_fixed_slot_prefill_pages(
+        self, *, req_id: str, phase: str, kv_group: int,
+        keys_layer_major: list[list[CacheEngineKey]], locations: list[str],
+        retained_plan: bool = False,
+    ) -> tuple[list[list[MemoryObj]], int]:
+        """Acquire whole pages, rechecking placement once if the snapshot went stale."""
+        keys = [key.without_layer() if isinstance(key, LayerCacheEngineKey) else key
+                for key in keys_layer_major[0]]
+        for attempt in range(2):
+            try:
+                return self._resolve_shared_rank0_exact_layer_pages(
+                    req_id=req_id, phase=phase, kv_group=kv_group,
+                    keys_layer_major=keys_layer_major, page_chunks=len(keys),
+                    base_page_keys=keys, chunk_locations=locations, fixed_slot_prefill=True,
+                )
+            except LayerPageUnavailable:
+                if attempt or retained_plan:
+                    raise
+                locations = self._fixed_slot_prefill_page_plan(keys)
+                if len(locations) != len(keys):
+                    raise
+        raise AssertionError("unreachable")
+
     def _resolve_shared_rank0_exact_layer_pages(
         self,
         *,
@@ -1164,6 +1216,7 @@ class CPUCacheOperations:
         page_chunks: int,
         base_page_keys: list[CacheEngineKey],
         chunk_locations: list[str],
+        fixed_slot_prefill: bool = False,
     ) -> tuple[list[list[MemoryObj]], int]:
         """Resolve a retained RemoteFill plan without reselecting its tier."""
         chunks = len(keys_layer_major[0])
@@ -1195,6 +1248,8 @@ class CPUCacheOperations:
                     )
                     if count != len(run_keys):
                         owned.extend(fetched)
+                        if fixed_slot_prefill:
+                            raise LayerPageUnavailable("Local prefill page disappeared")
                         raise ValueError(
                             "Pinned RemoteFill LocalCPU page plan became unavailable"
                         )
@@ -1209,6 +1264,8 @@ class CPUCacheOperations:
                     fetched = retrieve(run_keys)
                 if len(fetched) != len(run_keys):
                     owned.extend(fetched)
+                    if fixed_slot_prefill and not fetched:
+                        raise LayerPageUnavailable("Remote prefill pages unavailable")
                     raise ValueError(
                         "RemoteFill exact layer-page result count is inconsistent"
                     )
@@ -1219,6 +1276,9 @@ class CPUCacheOperations:
             tail: list[list[MemoryObj]] = []
             tail_locations = chunk_locations[page_chunks:]
             for layer_id, layer_keys in enumerate(keys_layer_major):
+                if not tail_locations:
+                    tail.append([])
+                    continue
                 layer = self._resolve_shared_rank0_layer_mem_objs(
                     req_id=req_id,
                     phase=phase,

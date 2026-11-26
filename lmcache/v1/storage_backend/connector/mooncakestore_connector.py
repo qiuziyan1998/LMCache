@@ -47,6 +47,7 @@ from lmcache.v1.mooncake_layout import (
     mooncake_valid_tokens,
     resolve_mooncake_dsa_raw_token_dims,
 )
+from lmcache.v1.page_errors import LayerPageUnavailable
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.remote_fill.mooncake_transport import (
     MooncakeDirectPushTransport as MooncakeDirectPushTransport,
@@ -1630,7 +1631,7 @@ class MooncakestoreConnector(RemoteConnector):
                 else 0.0
             )
             if list(statuses) != expected:
-                raise RuntimeError(
+                raise LayerPageUnavailable(
                     f"Mooncake layer-page get returned {list(statuses)}, "
                     f"expected {expected}"
                 )

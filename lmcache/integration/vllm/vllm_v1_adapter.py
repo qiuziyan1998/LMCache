@@ -1561,6 +1561,10 @@ class ReqMeta:
     dsa_dcp_load: Optional[DsaDcpDenseLoad] = None
     dcp_write_layout: Any = None
 
+    # Worker-local, for this scheduler step only. Never publish KV derived
+    # from a prefix which the scheduler must invalidate and recompute.
+    incomplete_prefill_load: bool = False
+
     def retrieve_token_count(self) -> int:
         """Return the logical retrieve prefix represented by this metadata."""
         if self.sparse_warm_ref and self.load_spec is not None:
@@ -9758,6 +9762,18 @@ class LMCacheConnectorV1Impl:
                         ),
                         prefix_tokens=len(retrieve_tokens),
                     )
+                    if dense_preflight_state.get("incomplete_prefill"):
+                        request.incomplete_prefill_load = True
+                        request.live_source_requested = False
+                        if request.save_spec is not None:
+                            request.save_spec.can_save = False
+                            request.save_spec.can_save_latent = False
+                            request.save_spec.can_save_indexer = False
+                        # Keep ownership until both group retrievers drain, but
+                        # do not advertise or reuse this generation on retry.
+                        retrieve_state.dense_prefix_generation = None
+                        self._set_worker_retrieve_state(request.req_id, retrieve_state)
+                        continue
                     if retain_dense_seed:
                         retrieve_state.location = "LocalCPUBackend"
                         retrieve_state.token_count = len(retrieve_tokens)
@@ -11456,6 +11472,8 @@ class LMCacheConnectorV1Impl:
         dsa_two_groups = self._is_dsa_two_groups()
         try:
             for request in connector_metadata.requests:
+                if getattr(request, "incomplete_prefill_load", False) is True:
+                    continue
                 save_spec = request.save_spec
                 if (
                     save_spec is None or not save_spec.can_save
@@ -11575,6 +11593,8 @@ class LMCacheConnectorV1Impl:
             return
 
         for request in connector_metadata.requests:
+            if getattr(request, "incomplete_prefill_load", False) is True:
+                continue
             save_spec = request.save_spec
             if (
                 save_spec is None or not save_spec.can_save

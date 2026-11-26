@@ -883,6 +883,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
         except (AttributeError, TypeError, ValueError):
             return False
 
+    def layer_page_presence(self, keys: Sequence[CacheEngineKey]) -> list[bool]:
+        """Snapshot physical-page presence for canonical keys without taking pins."""
+        with self.cpu_lock:
+            return [isinstance(self.hot_cache.get(key), LayerPageMemoryObj) for key in keys]
+
     def batched_get_layer_page_prefix(
         self, keys: Sequence[CacheEngineKey]
     ) -> tuple[list[LayerPageMemoryObj], int]:

@@ -95,6 +95,7 @@ from lmcache.v1.mooncake_layout import (
     mooncake_valid_tokens,
 )
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.page_errors import LayerPageUnavailable
 from lmcache.v1.prefill_locations import PrefillLocationPlan
 from lmcache.v1.prefill_metadata import PrefillSequenceView
 from lmcache.v1.prefill_sources import SharedPrefillSources, same_chunk_key
@@ -146,6 +147,7 @@ LayerwiseRetrieveSegment = Tuple[
 ]
 _SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
 _PREFILL_REUSE_DEBUG_KEY = "_prefill_reuse_debug_stats"
+_INCOMPLETE_FIXED_PREFILL = "incomplete fixed-slot prefill prefix"
 
 
 def _log_prefill_reuse_preparation(
@@ -3933,7 +3935,15 @@ class LMCacheEngine(CPUCacheOperations):
         if prefix < len(starts):
             keys = [list(row[prefix:]) for row in keys_layer_major]
             try:
-                if (page_first and mooncake_layer_pages_enabled(self.config)
+                if kwargs.get("_fixed_slot_prefill"):
+                    suffix, _ = self._load_fixed_slot_prefill_pages(
+                        req_id=req_id, phase=phase, kv_group=kv_group,
+                        keys_layer_major=keys,
+                        locations=list(chunk_locations_layer_major[0][prefix:]),
+                        retained_plan=kwargs.get("_fixed_slot_retained_plan", False),
+                    )
+                    owned.extend(suffix[0])  # one reference per physical page
+                elif (page_first and mooncake_layer_pages_enabled(self.config)
                         and planned_page_chunks > prefix):
                     suffix, _ = self._resolve_shared_rank0_layer_pages(
                         req_id=req_id, phase=phase, kv_group=kv_group,
@@ -3978,6 +3988,28 @@ class LMCacheEngine(CPUCacheOperations):
             pages += 1
         return rows, pages, owned, validated
 
+    def _skip_shared_dense_load(
+        self, req_id: str, phase: str, request_ordinal: int, kv_group: int,
+        deferred: bool, ret_mask: torch.Tensor, monitor_req_id: int, message: str,
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        """Notify all TP readers before yielding an empty, invalidatable load mask."""
+        ret_mask.zero_()
+        layers = self.num_layers_for_group(kv_group)
+        for layer_id in range(layers):
+            self._broadcast_shared_envelope(SharedHandleEnvelope(
+                request_id=req_id, phase=phase, request_ordinal=request_ordinal,
+                layer_id=layer_id, kv_group=kv_group, status="skipped",
+                generation=self.shared_cpu_cache_generation, handles=[], message=message,
+            ))
+            if not deferred:
+                yield None
+        if deferred:
+            for _ in range(layers):
+                yield None
+        yield None
+        self.stats_monitor.on_retrieve_finished(monitor_req_id, 0)
+        yield ret_mask
+
     def _retrieve_layer_shared_rank0(
         self,
         *,
@@ -4015,28 +4047,12 @@ class LMCacheEngine(CPUCacheOperations):
             is not None
         )
         if not keys_layer_major:
-            for layer_id in range(self.num_layers_for_group(kv_group)):
-                self._broadcast_shared_envelope(
-                    SharedHandleEnvelope(
-                        request_id=req_id,
-                        phase=phase,
-                        request_ordinal=request_ordinal,
-                        layer_id=layer_id,
-                        kv_group=kv_group,
-                        status="skipped",
-                        generation=self.shared_cpu_cache_generation,
-                        handles=[],
-                        message="no dense prefix shared CPU cache chunks selected",
-                    )
-                )
-                if not deferred_layerwise_get:
-                    yield None
-            if deferred_layerwise_get:
-                for _ in range(self.num_layers_for_group(kv_group)):
-                    yield None
-            yield None
-            self.stats_monitor.on_retrieve_finished(monitor_req_id, 0)
-            yield ret_mask
+            yield from self._skip_shared_dense_load(
+                req_id, phase, request_ordinal, kv_group, deferred_layerwise_get,
+                ret_mask, monitor_req_id, _INCOMPLETE_FIXED_PREFILL
+                if kwargs.get("_incomplete_fixed_prefill")
+                else "no dense prefix shared CPU cache chunks selected",
+            )
             return
 
         exact_locations: Optional[list[str]] = None
@@ -4188,6 +4204,16 @@ class LMCacheEngine(CPUCacheOperations):
                                 layer_pages = tuple(
                                     pre_resolved_layers[0][:layer_page_chunks]
                                 )
+                            elif kwargs.get("_fixed_slot_prefill"):
+                                pre_resolved_layers, layer_page_chunks = (
+                                    self._load_fixed_slot_prefill_pages(
+                                        req_id=req_id, phase=phase, kv_group=kv_group,
+                                        keys_layer_major=keys_layer_major,
+                                        locations=list(chunk_locations_layer_major[0]),
+                                        retained_plan=remote_fill_plan is not None,
+                                    )
+                                )
+                                layer_pages = tuple(pre_resolved_layers[0])
                             elif not page_first_resolve:
                                 # P-node preparation already resolves every
                                 # layer before forward. Publish their offsets
@@ -4310,6 +4336,18 @@ class LMCacheEngine(CPUCacheOperations):
                 except Exception as exc:
                     if not envelope_required:
                         raise
+                    if (layer_id == 0 and kwargs.get("_fixed_slot_prefill")
+                            and isinstance(exc, LayerPageUnavailable)):
+                        logger.warning("Fixed-slot prefill page unavailable before "
+                                       "publication: req=%s group=%d: %s", req_id, kv_group, exc)
+                        state = kwargs.get("shared_cpu_request_preflight_state")
+                        if state is not None:
+                            state["incomplete_prefill"] = True
+                        yield from self._skip_shared_dense_load(
+                            req_id, phase, request_ordinal, kv_group, deferred_layerwise_get,
+                            ret_mask, monitor_req_id, _INCOMPLETE_FIXED_PREFILL,
+                        )
+                        return
                     message = (
                         "Shared CPU cache rank0 materialization failed before "
                         "handle publication."
@@ -4400,7 +4438,9 @@ class LMCacheEngine(CPUCacheOperations):
                             handles=(
                                 [] if compact_batch is not None else handles
                             ),
-                            batch=compact_batch,
+                                batch=compact_batch,
+                                message=(_INCOMPLETE_FIXED_PREFILL
+                                         if kwargs.get("_incomplete_fixed_prefill") else None),
                         )
                     )
                     if (
@@ -4719,6 +4759,10 @@ class LMCacheEngine(CPUCacheOperations):
                         raise _RemoteFillMaterializationError(
                             "RemoteFill shared-handle envelope validation failed"
                         ) from exc
+                    if envelope.message == _INCOMPLETE_FIXED_PREFILL:
+                        state = kwargs.get("shared_cpu_request_preflight_state")
+                        if state is not None:
+                            state["incomplete_prefill"] = True
                     if envelope.status in ("miss", "skipped"):
                         if deferred_layerwise_get:
                             prepared_sources.append(None)
@@ -4741,6 +4785,12 @@ class LMCacheEngine(CPUCacheOperations):
                     )
                     starts = starts_all[:expected_handle_count]
                     ends = ends_all[:expected_handle_count]
+                    if expected_handle_count < len(starts_all):
+                        # Rank0 selected a shorter physical prefix than our
+                        # candidate list. Retain keys only for published views.
+                        keys_layer_major = [
+                            row[:expected_handle_count] for row in keys_layer_major
+                        ]
                     for start, end in zip(starts, ends, strict=False):
                         ret_mask[start:end] = True
                     if not prepare_c8_packets:
@@ -6535,12 +6585,24 @@ class LMCacheEngine(CPUCacheOperations):
             tail_plan: Optional[list[str]] = None
             layer_pages = False
             page_candidates: list[tuple[int, int, CacheEngineKey]] = []
+            fixed_prefill = (
+                deferred_layerwise_get
+                and phase == "dense_prefix"
+                and mooncake_layer_pages_enabled(self.config)
+                and getattr(self._shared_local_cpu_backend(), "fixed_slots_enabled", False) is True
+                and self._remote_fill_local_full_hint(request_configs) is None
+            )
+            if fixed_prefill:
+                kwargs["_fixed_slot_prefill"] = True
+                kwargs["_fixed_slot_retained_plan"] = remote_fill_plan is not None
             if remote_fill_plan is None and mooncake_page_layout_enabled(self.config):
                 layer_pages = mooncake_layer_pages_enabled(self.config)
                 # Exact-size merged pages include the valid partial tail.
                 page_candidates = candidates
                 if len(page_candidates) > retained_chunks:
-                    suffix_plan = self._shared_page_first_location_plan(
+                    suffix_plan = self._fixed_slot_prefill_page_plan(
+                        [item[2] for item in page_candidates[retained_chunks:]]
+                    ) if fixed_prefill else self._shared_page_first_location_plan(
                         [
                             item[2]
                             if layer_pages
@@ -6592,6 +6654,14 @@ class LMCacheEngine(CPUCacheOperations):
             for candidate_index, (start, end, key) in enumerate(
                 candidates[retained_chunks:], retained_chunks
             ):
+                if fixed_prefill and remote_fill_plan is None and candidate_index >= len(batch_plan or []):
+                    # A physical miss ends this prefix. A per-layer alias hit
+                    # does not authorize a legacy allocation from a fixed pool.
+                    kwargs["_incomplete_fixed_prefill"] = True
+                    state = kwargs.get("shared_cpu_request_preflight_state")
+                    if state is not None:
+                        state["incomplete_prefill"] = True
+                    break
                 missing_layer = False
                 remote_fill_chunk = (
                     remote_fill_plan[candidate_index]
