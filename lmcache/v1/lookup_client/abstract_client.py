@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections.abc import Sequence
-from typing import Any, Optional, Union
 import abc
+from collections.abc import Sequence
 import threading
+from typing import Any, Optional, Union
 import zlib
 
 # Third Party
@@ -245,6 +245,18 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
                 if digest_store is not None
                 else None
             )
+
+    def peek_ticket(self, lookup_id: str) -> Optional[Any]:
+        """Return a cached source ticket without consuming it or changing holds.
+
+        Args:
+            lookup_id: Request lookup identity.
+
+        Returns:
+            The service client's immutable source ticket, or None for clients
+            without ticket support or without a result for this lookup.
+        """
+        return None
 
     def cleanup_lookup(self, lookup_id: str) -> None:
         """Release worker-side lookup state, if any, and local status."""

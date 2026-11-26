@@ -159,6 +159,7 @@ def _mk_eng(
     rel: Any = None,
 ) -> Any:
     e: Any = LMCacheEngine.__new__(LMCacheEngine)
+    e.storage_process = None
     nop = lambda *_a, **_k: None  # noqa: E731
     if cfg is not None and meta is not None:
         e.config, e.metadata = cfg, meta
@@ -659,6 +660,7 @@ class TestSharedPrefillOptimizations(unittest.TestCase):
         cfg, meta, eq = _cfg(dsa=True), _meta(dsa=True), self.assertEqual
         db = ChunkedTokenDatabase(cfg, meta)
         eng = LMCacheEngine.__new__(LMCacheEngine)
+        eng.storage_process = None
         eng.token_database, eng.config, eng.metadata = db, cfg, meta
         toks = list(range(300))
         pre = list(db.process_tokens(tokens=toks, make_key=False))
@@ -1553,6 +1555,7 @@ class TestSharedPrefillOptimizations(unittest.TestCase):
 
         sm_closed = [0]
         eng_store: Any = object.__new__(ce_mod.LMCacheEngine)
+        eng_store.storage_process = None
         eng_store.gpu_connector = conn_h
         eng_store.storage_manager = _N(
             close=lambda: sm_closed.__setitem__(0, sm_closed[0] + 1)
@@ -1581,6 +1584,7 @@ class TestSharedPrefillOptimizations(unittest.TestCase):
         ) -> tuple[Any, Any]:
             m_obj = _make_fake_mem(objs_ev, role)
             eng: Any = object.__new__(ce_mod.LMCacheEngine)
+            eng.storage_process = None
             eng.config = _N(
                 remote_url=None,
                 enable_controller=False,
@@ -1934,6 +1938,7 @@ class TestSharedPrefillOptimizations(unittest.TestCase):
         from lmcache.v1.token_database import ChunkedTokenDatabase
 
         eng: Any = LMCacheEngine.__new__(LMCacheEngine)
+        eng.storage_process = None
         eng._shared_cpu_request_leases = {}
 
         def _mk_lease() -> Any:
@@ -1969,6 +1974,7 @@ class TestSharedPrefillOptimizations(unittest.TestCase):
         meta = _meta()
         db = ChunkedTokenDatabase(cfg, meta)
         eng_tok: Any = LMCacheEngine.__new__(LMCacheEngine)
+        eng_tok.storage_process = None
         eng_tok.token_database, eng_tok.config, eng_tok.metadata = db, cfg, meta
         toks = list(range(300))
         pre = list(db.process_tokens(tokens=toks, make_key=False))

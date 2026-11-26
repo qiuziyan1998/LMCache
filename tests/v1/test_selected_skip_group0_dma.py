@@ -69,6 +69,7 @@ def _eng(
     *, nl: int = 3, r0: bool = True, abort: bool = False, rf: bool = False, **ex: Any
 ) -> Any:
     eng: Any = LMCacheEngine.__new__(LMCacheEngine)
+    eng.storage_process = None
     eng.config = LMCacheEngineConfig(
         chunk_size=128,
         local_cpu=True,
@@ -558,6 +559,7 @@ class TestSelectedSkipGroup0DMA(unittest.TestCase):
 
         closed: list[str] = []
         eng_c: Any = LMCacheEngine.__new__(LMCacheEngine)
+        eng_c.storage_process = None
         eng_c.lmcache_worker = _NS(close=lambda: closed.append("worker"))
         eng_c.storage_manager = _NS(close=lambda: closed.append("sm"))
         eng_c.shared_cpu_cache_mapping = _NS(close=lambda: closed.append("map"))
@@ -585,6 +587,7 @@ class TestSelectedSkipGroup0DMA(unittest.TestCase):
 
         self.addCleanup(_cleanup_builder)
         eng_b: Any = LMCacheEngine.__new__(LMCacheEngine)
+        eng_b.storage_process = None
         eng_b.lmcache_worker = None
         eng_b.storage_manager = None
         eng_b.shared_cpu_cache_mapping = None
@@ -619,6 +622,7 @@ class TestSelectedSkipGroup0DMA(unittest.TestCase):
 
         meta_live = LMCacheConnectorMetadata(requests=reqs_live)
         eng_live: Any = LMCacheEngine.__new__(LMCacheEngine)
+        eng_live.storage_process = None
         eng_live._record_recompute_fallback_req("req-bad")
         stale_fb_closed: list[bool] = []
 
@@ -1040,6 +1044,7 @@ class TestSelectedSkipGroup0DMA(unittest.TestCase):
             ),
         )
         eng: Any = LMCacheEngine.__new__(LMCacheEngine)
+        eng.storage_process = None
         eng.config = cfg
         eng.metadata = meta
         eng.token_database = db

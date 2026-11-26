@@ -17,21 +17,21 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from .test_prefill_source_work import SharedEngine, gc_disabled, shared_engines  # noqa: F401
 
 
-@pytest.fixture(params=["base", "ascend", "ascend_perf"])
+@pytest.fixture(params=["base", "ascend"])
 def resolver(request):
     if request.param == "base":
         return LMCacheEngine._resolve_shared_rank0_layer_pages
     path = (
         Path(__file__).resolve().parents[3]
         / "LMCache-Ascend"
-        / "lmcache_ascend/v1/cache_engine.py"
+        / "lmcache_ascend/v1/cpu_cache_operations.py"
     )
     if not path.exists():
         pytest.skip("Ascend-derived resolver requires sibling LMCache-Ascend checkout")
     cls = next(
         n
         for n in ast.parse(path.read_text(encoding="utf-8")).body
-        if isinstance(n, ast.ClassDef) and n.name == "AscendLMCacheEngine"
+        if isinstance(n, ast.ClassDef) and n.name == "AscendCPUCacheOperations"
     )
     method = next(
         n
@@ -42,7 +42,6 @@ def resolver(request):
     tree = ast.parse("from __future__ import annotations")
     tree.body.append(method)
     namespace = dict(LMCacheEngine._resolve_shared_rank0_layer_pages.__globals__)
-    namespace["serving_perf_enabled"] = lambda: request.param == "ascend_perf"
     exec(compile(tree, str(path), "exec"), namespace)
     return namespace[method.name]
 

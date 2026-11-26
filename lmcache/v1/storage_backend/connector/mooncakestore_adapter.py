@@ -39,4 +39,6 @@ class MooncakestoreConnectorAdapter(ConnectorAdapter):
             lmcache_config=context.config,
             lmcache_metadata=context.metadata,
             external_page_only=context.external_page_only,
+            defer_layout=getattr(context, "defer_layout", False),
+            native_io=getattr(context, "native_io", None),
         )

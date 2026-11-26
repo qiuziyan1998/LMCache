@@ -87,6 +87,20 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": True,
         "env_converter": _to_bool,
     },
+    "decoder_storage_mode": {
+        "type": str,
+        "default": "local",
+        "env_converter": str,
+        "description": "Decoder CPU storage ownership: local or process.",
+        "mutable": False,
+    },
+    "decoder_require_kv_prefix": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": "Require a verified KV prefix for admission on vLLM receivers.",
+        "mutable": False,
+    },
     "max_local_cpu_size": {"type": float, "default": 5.0, "env_converter": float},
     "reserve_local_cpu_size": {"type": float, "default": 0.0, "env_converter": float},
     "local_disk": {
@@ -832,6 +846,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
 def _validate_config(self):
     """Validate configuration"""
 
+    if self.decoder_storage_mode not in ("local", "process"):
+        raise ValueError(
+            "decoder_storage_mode must be 'local' or 'process', got "
+            f"{self.decoder_storage_mode!r}"
+        )
     if self.decode_preemption_checkpoint and self.decode_checkpoint_writeback and not (
         self.pd_role in (None, "receiver")
         and self.decode_checkpoint_retention_max_bytes > 0

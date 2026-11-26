@@ -10,6 +10,90 @@ import pytest
 import torch
 from test_checkpoint_adapter import method
 
+from lmcache.integration.vllm.dcp import DcpColdLoadGeometry
+
+
+@pytest.mark.parametrize(
+    "length,world,model_limit,max_output,output,resumable,threshold,hit_delta,expected",
+    [
+        (16464, 8, 20000, None, 0, False, 0, 0, True),
+        (20000, 8, 20000, None, 0, False, 0, 0, True),
+        (18433, 8, 20000, None, 0, False, 0, 0, True),
+        (16464, 4, 20000, None, 0, False, 0, 0, False),
+        (16464, 1, 20000, None, 0, False, 0, 0, False),
+        (32768, 8, 32768, None, 0, False, 0, 0, True),
+        (32769, 8, 40000, None, 0, False, 0, 0, False),
+        (16464, 8, 1000000, None, 0, False, 0, 0, False),
+        (16464, 8, 1000000, 16303, 0, False, 0, 0, True),
+        (16464, 8, 1000000, 16304, 0, False, 0, 0, False),
+        (16464, 8, 1000000, 16304, 1, False, 0, 0, True),
+        (16464, 8, 1000000, 1, 0, True, 0, 0, False),
+        (16464, 8, 20000, None, 0, True, 0, 0, True),
+        (16464, 8, 16000, None, 0, False, 0, 0, False),
+        (16464, 8, 20000, None, 0, False, 16464, 0, False),
+        (16464, 8, 20000, None, 0, False, 0, 128, False),
+    ],
+)
+@pytest.mark.parametrize("capable", [False, True])
+def test_dcp_resident_admission_bounds_growth_and_preserves_policy(
+    length, world, model_limit, max_output, output, resumable, threshold,
+    hit_delta, expected, capable,
+):
+    request = NS(
+        request_id="r", num_tokens=length, prompt_token_ids=[1] * length,
+        all_token_ids=[1] * length, num_preemptions=0, status="waiting",
+        max_tokens=max_output, num_output_tokens=output, resumable=resumable,
+    )
+    adapter = NS(
+        _resident_cold_load_enabled=capable, kv_role="kv_both",
+        _dsa_dcp_size=world if world > 1 else None,
+        _dsa_dcp_cold_geometry=(
+            DcpColdLoadGeometry(32 * 128 * world, model_limit, 1)
+            if world > 1 else None
+        ),
+        lookup_client=NS(lookup_cache=lambda **kw: length - hit_delta),
+        _cold_perf_lookup_started={}, _lmcache_chunk_size=1024, _block_size=128,
+        _dsa_scratch_capacity=4096, _dsa_kv_policy_threshold=threshold,
+        config=NS(pd_role="receiver", min_retrieve_tokens=0,
+                  dsa_group1_load_mode="p2p_preferred"),
+        enable_sparse_attention=True, supports_dsa_cold_compact_load=lambda: True,
+        load_specs={}, _requests_priority={},
+    )
+    matched = method(
+        "get_num_new_matched_tokens", cdiv=lambda a, b: (a + b - 1) // b, LoadSpec=NS
+    )(adapter, request, 0)
+    spec = adapter.load_specs["r"]
+    assert matched == length - (hit_delta or 1)
+    resident = expected and capable
+    assert getattr(spec, "dsa_cold_resident_load", False) == resident
+    if resident:
+        assert spec.dsa_cold_compact_load
+        assert spec.dsa_committed_end == length
+        assert spec.dsa_remap_frontier == spec.dsa_release_frontier == 0
+        assert spec.dsa_cold_resume_computed_end == length - 1
+        assert not method("is_dsa_cold_compact_load")(adapter, "r")
+        adapter.should_load_kv_async = lambda req_id: method("should_load_kv_async")(
+            adapter, req_id
+        )
+        assert method("get_dsa_cold_load_num_tokens")(adapter, "r") == length
+        # A scoped checkpoint restore credits its whole source, while retaining
+        # the un-restored accepted suffix for the existing recompute path.
+        request.status = "preempted"
+        request.num_preemptions = 1
+        request.prompt_token_ids = request.prompt_token_ids[:-128]
+        adapter._resume_lookup_queries = {"r": (length - 1, "preemption_checkpoint", 0)}
+        adapter.lookup_client.lookup_cache = lambda **kw: length - 1
+        matched = method(
+            "get_num_new_matched_tokens", cdiv=lambda a, b: (a + b - 1) // b,
+            LoadSpec=NS,
+        )(adapter, request, 0)
+        spec = adapter.load_specs["r"]
+        assert matched == length - 1 and spec.dsa_cold_resident_load
+        assert spec.dsa_cold_resume_computed_end == spec.dsa_committed_end == length - 1
+        assert spec.dsa_remap_frontier == spec.dsa_release_frontier == 0
+        assert spec.checkpoint_generation == 1
+        assert request.kv_resume_checkpoint == (1, length, length - 1)
+
 
 @pytest.mark.parametrize("length", [2, 127, 128, 129, 280, 1025, 4095, 4096, 4097])
 @pytest.mark.parametrize("role", [None, "sender", "receiver"])
@@ -217,6 +301,90 @@ def test_resident_worker_loads_before_publication_and_unblocks_failures(
         assert state.metadata_token_ids is plan["tokens"]
 
 
+@pytest.mark.parametrize("copy_failure", [None, "fenced", "unknown"])
+def test_local_dcp_resident_copy_can_overlap_direct_indexer(
+    monkeypatch, no_cyclic_gc, copy_failure
+):
+    from lmcache.integration.vllm import storage_process
+
+    source = NS(graph_owners=None)
+    state = NS(
+        prepared_sparse_sources={}, has_cache=lambda: True,
+        dense_load_source_owners=(), dense_load_readiness=None,
+    )
+    request = NS(
+        req_id="r",
+        load_spec=NS(
+            dsa_cold_load_generation=1,
+            dsa_cold_resident_load=True,
+            dsa_group1_direct_hbm=True,
+        ),
+    )
+    plan = dict(
+        request=request, tokens=list(range(129)), token_count=129,
+        token_mask=torch.ones(129, dtype=torch.bool), latent_kvcaches=[],
+        latent_shared_ready=Future(), dsa_dcp_rank=1,
+    )
+    trace = []
+
+    def materialize(tokens, mask, **kwargs):
+        assert kwargs["materialize_only"]
+        yield None
+        yield mask
+
+    def copy_latent(adapter, prepared, load_plan, group):
+        assert prepared is source and load_plan is plan and group == 0
+        assert plan["latent_shared_ready"].result() is None
+        trace.append("latent_copy")
+        if copy_failure:
+            raise RuntimeError("injected latent transfer failure")
+
+    def wait_indexer():
+        trace.append("indexer_wait")
+        return None, None
+
+    def synchronize():
+        trace.append("fence")
+        if copy_failure == "unknown":
+            raise RuntimeError("completion unknown")
+
+    def seal(state, count):
+        assert count == 129
+        state.prepared_sparse_sources[0] = source
+
+    monkeypatch.setattr(storage_process, "load_prepared_dense_source", copy_latent)
+    adapter = NS(
+        lmcache_engine=NS(retrieve_layer_head_token_wise=materialize),
+        _num_layers_for_group=lambda _: 1,
+        _sparse_retrieve_kwargs=lambda *a, **kw: ({}, None, None),
+        _refresh_prepared_sparse_sources=seal,
+        _record_dsa_cold_dense_load_readiness=lambda *a, **kw: trace.append("ready"),
+        _synchronize_dsa_cold_dense_load=synchronize,
+        _release_dense_load_source_owners=lambda *a, **kw: None,
+        _release_unadopted_shared_request_objects=lambda *a: None,
+        _release_shared_worker_retrieve_state=lambda *a: trace.append("release"),
+    )
+    run = method(
+        "_run_dsa_cold_compact_load",
+        torch=torch,
+        WorkerRetrieveState=lambda **_: state,
+        logger=NS(exception=lambda *a: None),
+    )
+    indexer = NS(result=wait_indexer)
+    if copy_failure:
+        with pytest.raises(RuntimeError, match="injected latent") as exc:
+            run(adapter, plan, None, indexer)
+        assert trace[:3] == ["latent_copy", "indexer_wait", "fence"]
+        assert ("release" in trace) == (copy_failure == "fenced")
+        assert getattr(exc.value, "_lmcache_dsa_cold_state", None) is (
+            state if copy_failure == "unknown" else None
+        )
+    else:
+        assert run(adapter, plan, None, indexer) is state
+        assert state.dense_prefix_resident_tokens == 129
+        assert trace == ["latent_copy", "indexer_wait", "ready"]
+
+
 @pytest.mark.parametrize("reuse", [False, True])
 @pytest.mark.parametrize("length", [1, 129, 84454])
 def test_cold_publication_adopts_snapshot_without_copy(
@@ -382,6 +550,7 @@ def test_cold_pool_reuses_threads_across_bursts_and_shutdown_drains(
             assert executor.submit(threading.current_thread).result(timeout=5) is worker
         adapter = NS(
             _dsa_kv_policy_states={}, _cold_load_coordinator=coordinator,
+            lmcache_engine=None,
             _synchronize_dsa_cold_dense_load=lambda: actions.append("sync"),
             _drain_dense_load_retirements=lambda **kw: actions.append("retire"),
             _manager=NS(stop_services=lambda: actions.append("stop")),
@@ -415,7 +584,7 @@ def test_retained_pool_drops_completed_request_data_without_gc(
 
     def indexer(plan: dict, device: object) -> tuple:
         plan["latent_shared_ready"].result(timeout=5)
-        return None, None, 0., 0.
+        return None, None
 
     def latent(
         plan: dict, device: object, sibling: Future, previous: Future | None
@@ -475,8 +644,13 @@ def test_completed_resident_restore_requires_both_groups(resident_tokens):
     assert not check(NS(load_spec=spec), state)
 
 
-@pytest.mark.parametrize("length", [129, 280, 4096])
-def test_resident_metadata_covers_full_hit_in_both_groups(length):
+@pytest.mark.parametrize("length", [129, 280, 4096, 16464, 18433, 20000])
+@pytest.mark.parametrize("dcp_size", [None, 4, 8])
+def test_resident_metadata_covers_full_hit_in_both_groups(length, dcp_size):
+    from dataclasses import dataclass
+    from tests.standalone.test_storage_process_worker import loaded
+    from test_checkpoint_adapter import SOURCE
+
     cdiv = lambda a, b: (a + b - 1) // b
     mapping = method("_build_slot_mapping", torch=torch, utils=NS(cdiv=cdiv))
     build = method(
@@ -486,9 +660,14 @@ def test_resident_metadata_covers_full_hit_in_both_groups(length):
         _split_kv_group_block_ids=lambda blocks: blocks,
         _build_slot_mapping=mapping,
         _live_split_source_dp_rank=lambda *a: None,
+        DsaDcpDenseLoad=loaded(
+            SOURCE, "DsaDcpDenseLoad", {"dataclass": dataclass, "torch": torch}
+        ),
+        torch=torch,
     )
     adapter = NS(
         _block_size=128,
+        _dsa_dcp_size=dcp_size,
         _vllm_config=NS(parallel_config=NS(tensor_parallel_size=4)),
         _group1_p2p_preferred=lambda: False,
     )
@@ -501,12 +680,30 @@ def test_resident_metadata_covers_full_hit_in_both_groups(length):
         dsa_committed_end=length,
         dsa_remap_frontier=0,
     )
-    latent = list(range(3, 3 + cdiv(length, 128)))
+    latent = list(range(3, 3 + cdiv(length, 128 * (dcp_size or 1))))
     indexer = list(range(50, 50 + cdiv(length, 128)))
     meta = build(adapter, request, (latent, indexer), spec)
-    assert len(meta.slot_mapping[0]) == len(meta.indexer_slot_mapping[0]) == length
+    assert len(meta.indexer_slot_mapping[0]) == length
     assert meta.dsa_nonresident_frontier == 0
-    assert (meta.slot_mapping[0] // 128).unique().tolist() == latent
+    if dcp_size is None:
+        assert len(meta.slot_mapping[0]) == length
+        assert (meta.slot_mapping[0] // 128).unique().tolist() == latent
+    else:
+        assert meta.slot_mapping[0].numel() == 0
+        assert meta.dsa_dcp_load.block_ids == tuple(latent)
+        owned = []
+        for rank in range(dcp_size):
+            tokens, slots = meta.dsa_dcp_load.select(
+                rank, torch.ones(length, dtype=torch.bool)
+            )
+            assert torch.all((tokens // 128) % dcp_size == rank)
+            local = (tokens // (128 * dcp_size)) * 128 + tokens % 128
+            expected = torch.tensor(latent)[local // 128] * 128 + local % 128
+            assert torch.equal(slots, expected)
+            owned.extend(tokens.tolist())
+        assert sorted(owned) == list(range(length))
+        with pytest.raises(ValueError, match="allocated indexer"):
+            build(adapter, request, (latent, [0, *indexer[1:]]), spec)
     with pytest.raises(ValueError, match="complete latent"):
         build(adapter, request, (latent[:-1], indexer), spec)
 

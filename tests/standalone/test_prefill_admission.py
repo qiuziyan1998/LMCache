@@ -129,6 +129,7 @@ def test_capacity_counts_only_free_and_evictable_unique_owners(use_hot):
     pinned = NS(can_evict=False, get_physical_size=lambda: 200)
     inflight = NS(can_evict=False, get_physical_size=lambda: 300)
     backend = NS(
+        fixed_slots_enabled=False,
         cpu_lock=Lock(),
         use_hot=use_hot,
         get_allocator_capacity_bytes=lambda: (50, 1000),

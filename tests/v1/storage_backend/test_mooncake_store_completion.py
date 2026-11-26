@@ -7,7 +7,6 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 import asyncio
-import io
 import json
 import sys
 import threading
@@ -18,9 +17,9 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
-from lmcache.v1 import startup_trace
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.lookup_diagnostics import page_key_fingerprint
 from lmcache.v1.memory_management import MemoryFormat, TensorMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
@@ -45,9 +44,8 @@ def test_page_lookup_skips_disabled_diagnostic_payload(
 ) -> None:
     monkeypatch.setattr(mooncake_connector, "serving_perf_enabled", lambda: False)
     forbidden = Mock(side_effect=AssertionError("disabled diagnostic work"))
-    monkeypatch.setattr(mooncake_connector, "serving_perf_now", forbidden)
+    monkeypatch.setattr(mooncake_connector, "page_key_fingerprint", forbidden)
     monkeypatch.setattr(mooncake_connector, "serving_perf_log", forbidden)
-    monkeypatch.setattr(mooncake_connector, "trace_mooncake_keys", lambda *a, **k: None)
 
     class Key:
         @property
@@ -75,9 +73,12 @@ def _make_mooncake_connector(
     calls: list,
     *,
     remote_fill_enabled: bool = False,
+    config_overrides: dict | None = None,
     external_page_only: bool = False,
     store_cls: type | None = None,
     cpu_buffer: torch.Tensor | None = None,
+    native_io=None,
+    native_owner_mapping=None,
 ) -> tuple[MooncakestoreConnector, asyncio.AbstractEventLoop]:
     class _Store:
         def setup(self, *args):
@@ -127,8 +128,11 @@ def _make_mooncake_connector(
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=8,
         enable_remote_lmcache_store=remote_fill_enabled,
-        use_layerwise=external_page_only,
-        dsa_two_groups=external_page_only,
+        **{
+            "use_layerwise": external_page_only,
+            "dsa_two_groups": external_page_only,
+            **(config_overrides or {}),
+        },
         remote_url=(
             "mooncakestore://127.0.0.1:50051"
             if external_page_only
@@ -171,6 +175,8 @@ def _make_mooncake_connector(
             config,
             metadata,
             external_page_only=external_page_only,
+            native_io=native_io,
+            native_owner_mapping=native_owner_mapping,
         )
     except BaseException:
         loop.close()
@@ -188,23 +194,15 @@ def _make_mooncake_connector(
         "mooncake_register_cpu",
     ],
 )
-def test_mooncake_startup_marks_native_calls_and_preserves_failure(
+def test_mooncake_startup_orders_native_calls_and_preserves_failure(
     monkeypatch: pytest.MonkeyPatch, failure_stage: str | None
 ) -> None:
-    output = io.StringIO()
-    monkeypatch.setattr(startup_trace, "sys", SimpleNamespace(stderr=output))
     monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
     original = RuntimeError("native failure at secret-endpoint")
     stages = []
     calls = []
 
     def entering(stage: str) -> None:
-        lines = [
-            line for line in output.getvalue().splitlines()
-            if line.startswith("[LMCACHE_INIT]")
-        ]
-        assert f"stage={stage} state=begin" in lines[-1]
-        assert "rank=0" in lines[-1]
         stages.append(stage)
         if failure_stage == stage:
             raise original
@@ -257,16 +255,9 @@ def test_mooncake_startup_marks_native_calls_and_preserves_failure(
         with pytest.raises(RuntimeError) as caught:
             construct()
         assert caught.value is original
-    lines = [
-        line for line in output.getvalue().splitlines()
-        if line.startswith("[LMCACHE_INIT]")
-    ]
-    for stage in stages:
-        matching = [line for line in lines if f"stage={stage} " in line]
-        assert len(matching) == 2
-        final_state = "error" if stage == failure_stage else "end"
-        assert f"state={final_state}" in matching[-1]
-    assert all("secret-endpoint" not in line for line in lines)
+    expected = ["mooncake_create", "mooncake_shared_engine", "mooncake_setup", "mooncake_register_cpu"]
+    assert stages == (expected if failure_stage is None else expected[:expected.index(failure_stage) + 1])
+
 
 
 def test_external_page_only_mooncake_has_no_local_cpu_slab(monkeypatch) -> None:
@@ -1309,8 +1300,10 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
     assert exists[1] == [mooncake_page_key(_key(7), 2)]
 
 
+@pytest.mark.parametrize("last_group", [0, 1])
 def test_mooncake_direct_page_put_uses_latent_segment_hint(
     monkeypatch: pytest.MonkeyPatch,
+    last_group: int,
 ) -> None:
     class _ReplicateConfig:
         pass
@@ -1367,7 +1360,7 @@ def test_mooncake_direct_page_put_uses_latent_segment_hint(
 
     asyncio.run(
         connector.batched_put_external_pages(
-            [hinted, _key(11)],
+            [hinted, _key(11, last_group)],
             [[owner.data_ptr()], [owner.data_ptr() + 16]],
             [[16], [16]],
             (owner,),
@@ -1381,6 +1374,12 @@ def test_mooncake_direct_page_put_uses_latent_segment_hint(
     assert calls[1][1] is connector.replica_config
     event, fields = events[-1]
     assert event == "direct_npu_page_put"
+    assert fields["req_id"] == "request"
+    assert fields["status"] == "ok"
+    expected_fps = {0: page_key_fingerprint(calls[0][0][0])}
+    if last_group == 1:
+        expected_fps[1] = page_key_fingerprint(calls[-1][0][0])
+    assert fields["first_page_key_fps"] == expected_fps
     assert fields["preferred_segments"] == ["decoder-segment"]
     assert fields["preferred_pages"] == 1
     assert fields["default_pages"] == 1
@@ -1823,19 +1822,8 @@ def test_mooncake_cancelled_get_drains_native_read(layout: str) -> None:
     assert memory_obj.ref_count == 0
 
 
-def test_mooncake_direct_external_get_registers_storage_and_validates_bytes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_mooncake_direct_external_get_registers_storage_and_validates_bytes() -> None:
     calls = []
-    events = []
-    monkeypatch.setattr(
-        mooncake_connector, "serving_perf_enabled", lambda: True
-    )
-    monkeypatch.setattr(
-        mooncake_connector,
-        "serving_perf_log",
-        lambda _logger, event, **fields: events.append((event, fields)),
-    )
 
     class _Store:
         def register_buffer(self, ptr, size):
@@ -1878,15 +1866,6 @@ def test_mooncake_direct_external_get_registers_storage_and_validates_bytes(
 
     assert [call[0] for call in calls].count("register") == 1
     assert [call[0] for call in calls].count("get") == 2
-    assert [event for event, _ in events] == [
-        "direct_npu_page_get",
-        "direct_npu_page_get",
-    ]
-    for _, fields in events:
-        assert fields["setup_ms"] >= 0
-        assert fields["lock_wait_ms"] >= 0
-        assert fields["transfer_ms"] >= 0
-        assert fields["native_thread_cpu_ms"] >= 0
 
 
 def test_mooncake_cancelled_direct_external_get_drains_native_read() -> None:
@@ -2427,7 +2406,6 @@ def test_remote_direct_get_preserves_unknown_native_completion() -> None:
 
 @pytest.mark.parametrize("canonical_keys", [False, True])
 def test_mooncake_layer_page_get_allocates_exact_full_and_tail_pages(
-    monkeypatch: pytest.MonkeyPatch,
     canonical_keys: bool,
 ) -> None:
     class _PageStore:
@@ -2486,15 +2464,6 @@ def test_mooncake_layer_page_get_allocates_exact_full_and_tail_pages(
         if canonical_keys
         else [key.get_first_layer() for key in base_keys]
     )
-    events = []
-    monkeypatch.setattr(
-        mooncake_connector, "serving_perf_enabled", lambda: True
-    )
-    monkeypatch.setattr(
-        mooncake_connector,
-        "serving_perf_log",
-        lambda _logger, event, **fields: events.append((event, fields)),
-    )
 
     pages = asyncio.run(connector.batched_get_layer_pages(keys))
 
@@ -2510,28 +2479,6 @@ def test_mooncake_layer_page_get_allocates_exact_full_and_tail_pages(
     submitted_keys, submitted_pages = connector.local_cpu_backend.submitted
     assert submitted_pages == pages
     assert submitted_keys == base_keys
-    event, fields = events.pop()
-    assert event == "mooncake_page_get"
-    assert fields["layout"] == "layer_merged"
-    assert fields["kv_group"] == 0
-    assert fields["kv_groups"] == [0]
-    assert fields["pages"] == 2
-    assert fields["submitted_pages"] == 2
-    assert fields["completed_pages"] == 2
-    assert fields["layers"] == 2
-    assert fields["buffers"] == 4
-    assert fields["bytes"] == 44
-    assert fields["status"] == "ok"
-    assert all(
-        fields[name] >= 0
-        for name in (
-            "metadata_ms",
-            "allocation_ms",
-            "buffer_setup_ms",
-            "transfer_ms",
-            "publish_ms",
-        )
-    )
     for page in pages:
         page.ref_count_down()
 
@@ -2923,6 +2870,68 @@ def test_mooncake_timeout_keeps_source_buffer_until_native_put_exits() -> None:
     assert memory_obj.ref_count == 1
 
 
+@pytest.mark.parametrize("cancel_close", [True, False], ids=["cancel-close", "unknown-during-close"])
+def test_close_during_native_put_preserves_ownership(monkeypatch, cancel_close):
+    calls = []
+    slab = torch.zeros(64, dtype=torch.uint8)
+    connector, loop = _make_mooncake_connector(
+        monkeypatch, {"save_chunk_meta": False}, calls, cpu_buffer=slab
+    )
+    allocator = TensorMemoryAllocator(slab, align_bytes=64)
+    source = allocator.allocate(connector.meta_shapes, connector.meta_dtypes, connector.meta_fmt)
+    entered, release = threading.Event(), threading.Event()
+    uncertainty = NativeExternalPageTransferUnknownError("put", loop.create_future())
+
+    def native_put(*args):
+        entered.set()
+        assert release.wait(5)
+        if not cancel_close:
+            raise uncertainty
+        return 0
+
+    monkeypatch.setattr(connector.store, "put_from", native_put, raising=False)
+
+    async def exercise():
+        put = asyncio.create_task(connector.put(_key(1), source))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            source.ref_count_down()  # Only the in-flight PUT owns the allocation.
+            closing = asyncio.create_task(connector.close())
+            await asyncio.sleep(0)  # Close is now waiting on the original PUT.
+            assert not closing.done()
+            if cancel_close:
+                closing.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await closing
+                assert allocator.get_capacity_bytes() == (0, 64)
+                assert connector._inflight_put_tasks
+                release.set()
+                await put
+                assert allocator.get_capacity_bytes() == (64, 64)
+                await connector.close()
+                assert [entry[0] for entry in calls].count("unregister") == 1
+            else:
+                release.set()
+                with pytest.raises(NativeExternalPageTransferUnknownError):
+                    await put
+                with pytest.raises(RuntimeError, match="unknown"):
+                    await closing
+                assert allocator.get_capacity_bytes() == (0, 64)
+                assert connector._external_native_unknown_error is uncertainty
+                assert not uncertainty.terminal_future.done()
+                with pytest.raises(RuntimeError, match="unknown"):
+                    await connector.close()
+                assert not any(entry[0] in ("unregister", "close") for entry in calls)
+        finally:
+            release.set()
+            await asyncio.gather(put, return_exceptions=True)
+
+    try:
+        loop.run_until_complete(exercise())
+    finally:
+        loop.close()
+
+
 def _group_manager(*num_layers: int) -> KVLayerGroupsManager:
     return KVLayerGroupsManager(
         kv_layer_groups=[
@@ -2960,9 +2969,7 @@ def _configure_page_cardinality(
     connector._page_num_layers = model_num_layers
 
 
-def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_mooncake_layer_page_get_allocates_one_object_per_chunk() -> None:
     class _PageStore:
         def __init__(self) -> None:
             self.args = None
@@ -3009,15 +3016,6 @@ def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
 
     connector._metadata_for_raw_key = metadata_for_raw_key
     keys = [_layer_key(chunk_hash, 0, kv_group=1) for chunk_hash in (1, 2)]
-    events = []
-    monkeypatch.setattr(
-        mooncake_connector, "serving_perf_enabled", lambda: True
-    )
-    monkeypatch.setattr(
-        mooncake_connector,
-        "serving_perf_log",
-        lambda _logger, event, **fields: events.append((event, fields)),
-    )
 
     pages = asyncio.run(connector.batched_get_layer_pages(keys))
 
@@ -3034,28 +3032,6 @@ def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
     submitted_keys, submitted_pages = connector.local_cpu_backend.submitted
     assert submitted_pages == pages
     assert submitted_keys == [keys[0].without_layer(), keys[1].without_layer()]
-    event, fields = events.pop()
-    assert event == "mooncake_page_get"
-    assert fields["layout"] == "layer_merged"
-    assert fields["kv_group"] == 1
-    assert fields["kv_groups"] == [1]
-    assert fields["pages"] == 2
-    assert fields["submitted_pages"] == 2
-    assert fields["completed_pages"] == 2
-    assert fields["layers"] == 2
-    assert fields["buffers"] == 4
-    assert fields["bytes"] == 64
-    assert fields["status"] == "ok"
-    assert all(
-        fields[name] >= 0
-        for name in (
-            "metadata_ms",
-            "allocation_ms",
-            "buffer_setup_ms",
-            "transfer_ms",
-            "publish_ms",
-        )
-    )
     for page in pages:
         page.ref_count_down()
 
@@ -3212,3 +3188,116 @@ def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout(
     assert fields["first_page_key"] == connector.store.page_args[0][0]
     assert fields["last_page_key"] == connector.store.page_args[0][0]
     assert fields["legacy_objects"] == 2
+
+
+def test_storage_facade_does_not_construct_native_store(monkeypatch):
+    calls = []
+
+    class NoNative:
+        def __init__(self):
+            raise AssertionError("M must not construct Mooncake/ADXL")
+
+    remote = SimpleNamespace(
+        replica_factory=SimpleNamespace,
+        get_hostname=lambda: "worker",
+        close=lambda: None,
+    )
+    connector, loop = _make_mooncake_connector(
+        monkeypatch,
+        {"use_ascend_direct": True},
+        calls,
+        store_cls=NoNative,
+        native_io=remote,
+    )
+    try:
+        assert connector.store is remote
+        assert calls == []
+        assert connector.registered_buffer_ptr is None
+    finally:
+        loop.run_until_complete(connector.close())
+        loop.close()
+
+
+def test_worker_full_store_registers_host_mapping_not_device_alias(monkeypatch):
+    calls = []
+    tensor = torch.empty(64, dtype=torch.uint8)
+    mapping = SimpleNamespace(
+        tensor=tensor,
+        ptr=tensor.data_ptr(),
+        size=64,
+        device_base=tensor.data_ptr() + 100000,
+    )
+    connector, loop = _make_mooncake_connector(
+        monkeypatch,
+        {
+            "global_segment_size": 123456,
+            "local_buffer_size": 0,
+            "use_ascend_direct": True,
+        },
+        calls,
+        native_owner_mapping=mapping,
+    )
+    try:
+        assert ("register", mapping.ptr, 64) in calls
+        assert calls[0][0] == "setup" and calls[0][1][2:4] == (123456, 0)
+    finally:
+        loop.run_until_complete(connector.close())
+        loop.close()
+
+
+def test_worker_gateway_and_group1_reader_share_engine_not_store_capacity(monkeypatch):
+    from lmcache.v1.rpc.mooncake_transport import start_worker_transport
+    from tests.v1.test_worker_mooncake_transport import endpoint
+
+    calls = []
+    shared = SimpleNamespace(
+        adopt_registered_buffer=lambda ptr, size, register: register() == 0,
+        release_adopted_buffer=lambda ptr, size, unregister: unregister(),
+    )
+    native_engine = object()
+    monkeypatch.setattr(
+        mooncake_connector,
+        "_shared_vllm_mooncake_transport",
+        lambda: (shared, "host:123", native_engine, object()),
+    )
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(current_device=lambda: 0, set_device=lambda device: None),
+        raising=False,
+    )
+    reader, loop = _make_mooncake_connector(
+        monkeypatch,
+        {
+            "mooncake_reuse_vllm_transfer_engine": True,
+            "global_segment_size": 123456,
+            "local_buffer_size": 0,
+            "save_chunk_meta": False,
+        },
+        calls,
+        external_page_only=True,
+    )
+    tensor = torch.empty(64, dtype=torch.uint8)
+    mapping = SimpleNamespace(
+        tensor=tensor, ptr=tensor.data_ptr(), size=64, generation=1, shm_name="slab"
+    )
+    descriptor = dict(
+        cache_instance_id="cache",
+        service_epoch="epoch",
+        transport=dict(work=endpoint(), lifecycle=endpoint(), nonce=b"native".hex()),
+    )
+    gateway = start_worker_transport(
+        reader._engine_config, reader._lmcache_metadata, mapping, descriptor
+    )
+    try:
+        setups = [item[1] for item in calls if item[0] == "setup"]
+        assert [args[2] for args in setups] == [0, 123456]
+        assert all(args[-1] is native_engine for args in setups)
+        assert [item for item in calls if item[0] == "register"] == [
+            ("register", mapping.ptr, 64)
+        ]
+        assert gateway.runtime.descriptor()["session"] == "host:123"
+    finally:
+        gateway.close()
+        asyncio.run(reader.close())
+        loop.close()

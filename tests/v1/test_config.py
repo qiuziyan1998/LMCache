@@ -14,6 +14,35 @@ from lmcache.v1.mooncake_layout import mooncake_layer_pages_enabled
 BASE_DIR = Path(__file__).parent
 
 
+@pytest.mark.parametrize(
+    "yaml_value,env_value,expected",
+    [
+        (None, None, False),
+        ("true", None, True),
+        ("false", "1", True),
+        ("true", "0", False),
+    ],
+)
+def test_decoder_kv_prefix_startup_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    yaml_value: str | None,
+    env_value: str | None,
+    expected: bool,
+) -> None:
+    from lmcache.integration.vllm import utils
+
+    path = tmp_path / "decoder.yaml"
+    setting = "" if yaml_value is None else f"decoder_require_kv_prefix: {yaml_value}\n"
+    path.write_text(f"pd_role: receiver\n{setting}", encoding="utf-8")
+    monkeypatch.setenv("LMCACHE_CONFIG_FILE", str(path))
+    monkeypatch.delenv("LMCACHE_DECODER_REQUIRE_KV_PREFIX", raising=False)
+    if env_value is not None:
+        monkeypatch.setenv("LMCACHE_DECODER_REQUIRE_KV_PREFIX", env_value)
+    monkeypatch.setattr(utils, "_config_instance", None)
+    assert utils.lmcache_get_or_create_config().decoder_require_kv_prefix is expected
+
+
 def test_get_extra_config_from_file():
     config = LMCacheEngineConfig.from_file(BASE_DIR / "data/test_config.yaml")
     check_extra_config(config)

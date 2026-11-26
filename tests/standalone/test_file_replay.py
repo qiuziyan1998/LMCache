@@ -309,3 +309,37 @@ def test_external_connector_file_read_skips_native_registration(fixture, monkeyp
     )
     assert owner.tolist() == list(range(32))
     assert len(f.state.ack) == 1
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_process_replay_keeps_file_and_native_reads_in_key_order(fixture, tmp_path, flat):
+    from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
+        MooncakestoreConnector,
+    )
+    from tests.v1.test_worker_mooncake_transport import transport
+
+    with transport(tmp_path) as (remote, worker, slab):
+        connector = object.__new__(MooncakestoreConnector)
+        replay = fixture.store
+        connector.store = connector._file_replay_store = replay
+        connector._remote_store = replay.native = remote
+        owner = torch.frombuffer(slab.buf, dtype=torch.uint8)
+        connector.local_cpu_backend = NS(memory_allocator=NS(pin_allocator=NS(buffer=owner)))
+        connector._register_cpu_buffer()
+        worker.store.values["ordinary"] = b"abcd"
+        keys = ["ordinary", fixture.keys()[0][-1]]
+        start = owner.data_ptr()
+        try:
+            if flat:
+                result = connector._call_store(replay.batch_get_into, keys, [start, start + 4], [4, 32])
+            else:
+                result = connector._call_store(
+                    replay.batch_get_into_multi_buffers, keys,
+                    [[start], [start + 4, start + 20]], [[4], [16, 16]],
+                )
+            assert result == [4, 32]
+            assert bytes(slab.buf[:36]) == b"abcd" + bytes(range(32))
+            assert len(fixture.state.ack) == 1
+        finally:
+            replay.memory.cpu = ()
+            del owner
+            del connector.local_cpu_backend

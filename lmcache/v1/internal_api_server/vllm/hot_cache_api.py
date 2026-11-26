@@ -157,7 +157,12 @@ async def get_hot_cache_status(request: Request):
         if err:
             return err
 
-        enabled = engine.is_hot_cache_enabled()
+        if getattr(engine, "storage_process", None) is not None:
+            from lmcache.v1.rpc.storage_admin import get_engine_storage_admin
+
+            enabled = get_engine_storage_admin(engine).is_hot_cache_enabled()
+        else:
+            enabled = engine.is_hot_cache_enabled()
         mode_str = "enabled" if enabled else "disabled"
         return PlainTextResponse(
             content=json.dumps(

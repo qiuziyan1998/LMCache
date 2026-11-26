@@ -35,10 +35,10 @@ class Page:
 
 def resolver(local_positions: set[int]) -> tuple:
     """Load actual resolver methods, with only backend I/O substituted."""
-    path = Path(__file__).resolve().parents[2] / "lmcache/v1/cache_engine.py"
+    path = Path(__file__).resolve().parents[2] / "lmcache/v1/cpu_cache_operations.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     cls = next(
-        node for node in tree.body if getattr(node, "name", "") == "LMCacheEngine"
+        node for node in tree.body if getattr(node, "name", "") == "CPUCacheOperations"
     )
     names = {
         "_resolve_shared_rank0_layer_pages",

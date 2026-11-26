@@ -59,6 +59,14 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
     def supports_dsa_compact_external_load(self) -> bool:
         return self._lmcache_engine.supports_dsa_cold_compact_load()
 
+    def is_dsa_cold_compact_load(self, request_id: str) -> bool:
+        """Return whether this request uses compact external-load allocation."""
+        return self._lmcache_engine.is_dsa_cold_compact_load(request_id)
+
+    def get_dsa_cold_load_num_tokens(self, request_id: str) -> int:
+        """Return the physical restore extent, independently of token reuse."""
+        return self._lmcache_engine.get_dsa_cold_load_num_tokens(request_id)
+
     @property
     def supports_preemption_checkpoint(self) -> bool:
         """Whether this connector requests pre-overwrite decoder snapshots."""
