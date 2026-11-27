@@ -4,13 +4,16 @@
 # Standard
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 import ast
+import runpy
 import time
 
 # Third Party
 import pytest
 
 # First Party
+from lmcache.v1.lookup_client.abstract_client import LookupBusyTimeout
 from lmcache.v1.lookup_client.storage_lookup_client import StorageLookupClient
 from lmcache.v1.rpc.storage_client import StorageClient
 from lmcache.v1.storage_service import StorageService
@@ -265,3 +268,78 @@ def test_process_admission_preserves_exact_ticket_and_existing_cold_policy(hit, 
     assert spec.cpu_source_ticket is ticket
     assert getattr(spec, "dsa_cold_compact_load", False) == (hit == total)
     assert getattr(spec, "dsa_cold_resident_load", False) == (hit == total <= 4096)
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_busy_receiver_only_parks_or_rejects_the_sixteenth_row(expired: bool) -> None:
+    """Exercise the connector, deployed waiting-loop guard and per-step output."""
+    workspace = Path(__file__).resolve().parents[3]
+    guard = runpy.run_path(
+        str(workspace / "vllm/tests/v1/core/test_cold_compact_admission_guard.py")
+    )
+    scheduler, req, released, schema = guard["_scheduler"](length=31842)
+    req.prompt_token_ids = range(req.num_tokens)
+    peers = [
+        NS(
+            request_id=str(i),
+            num_tokens=42,
+            num_computed_tokens=42,
+            use_structured_output=False,
+            num_output_placeholders=0,
+            has_encoder_inputs=False,
+        )
+        for i in range(15)
+    ]
+    scheduler.running.extend(peers)
+    scheduler.requests.update((p.request_id, p) for p in peers)
+    lookup = Mock()
+    lookup.lookup_cache.side_effect = [
+        None,
+        None,
+        LookupBusyTimeout(req.request_id) if expired else req.num_tokens,
+    ]
+    adapter = NS(
+        kv_role="kv_both",
+        lookup_client=lookup,
+        config=config(),
+        _cold_perf_lookup_started={},
+        load_specs={},
+        enable_sparse_attention=False,
+        supports_dsa_cold_compact_load=lambda: False,
+    )
+    matched = method(
+        "get_num_new_matched_tokens",
+        LookupBusyTimeout=LookupBusyTimeout,
+        RequestStatus=schema["RequestStatus"],
+        logger=Mock(),
+        LoadSpec=NS,
+    )
+    scheduler.connector = NS(
+        get_num_new_matched_tokens=lambda r, local: (matched(adapter, r, local), False)
+    )
+    scheduler.kv_cache_manager = NS(get_computed_blocks=lambda r: (None, 0))
+    for tick in range(3):
+        step = guard["_run_waiting_lookup"](
+            scheduler,
+            guard["ASCEND"] / "recompute_scheduler.py",
+            "RecomputeScheduler",
+            "_finish_kv_admission_error",
+        )
+        if tick < 2:
+            assert step["admitted"] == [] and step["step_skipped_waiting"] == [req]
+            scheduler.waiting.extend(step["step_skipped_waiting"])
+        output = NS(
+            num_scheduled_tokens={p.request_id: 1 for p in peers},
+            bootstrap_sample_req_ids=None,
+            has_structured_output_requests=False,
+        )
+        scheduler._update_after_schedule(output)
+        assert all(p.num_computed_tokens == 43 + tick for p in peers)
+    if expired:
+        assert not step["admitted"] and released == [req.request_id]
+        [(_, error)] = output._dsa_admission_errors
+        assert error.finish_reason == schema["FinishReason"].ERROR
+        assert error.stop_reason == "storage_lookup_busy_timeout"
+    else:
+        assert step["admitted"] == [req.request_id] and not released
+        assert req.num_external_computed_tokens == 31841

@@ -7,6 +7,10 @@ import abc
 import torch
 
 
+class LookupBusyTimeout(TimeoutError):
+    """Storage admission stayed busy; no prefix count was established."""
+
+
 class LookupClientInterface(metaclass=abc.ABCMeta):
     """Abstract interface for lookup clients."""
 

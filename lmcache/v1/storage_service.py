@@ -212,7 +212,9 @@ class StorageService:
             "lookup": ThreadPoolExecutor(1, thread_name_prefix="storage-lookup"),
             "persist": ThreadPoolExecutor(1, thread_name_prefix="storage-persist"),
         }
-        jobs: dict[tuple[bytes, tuple, int], tuple[Future, StorageRequest, str]] = {}
+        jobs: dict[
+            tuple[bytes, tuple, int], tuple[Future, StorageRequest, str, float]
+        ] = {}
         # Only timed reads/prepares get a deadline. Idle services still sleep indefinitely.
         pending_reads: dict[Future, tuple[float, StorageRequest]] = {}
         next_notice = 0.0
@@ -355,18 +357,41 @@ class StorageService:
                                     lane = getattr(self.runtime, "work_lanes", {}).get(
                                         method, lane
                                     )
-                                    if (
-                                        self._quiescing.is_set()
-                                        or sum(
-                                            job[2] == lane
-                                            or (
-                                                lane in ("bulk", "reserve")
-                                                and job[2] in ("bulk", "reserve")
-                                            )
-                                            for job in jobs.values()
+                                    budget = (
+                                        ("bulk", "reserve")
+                                        if lane in ("bulk", "reserve")
+                                        else (lane,)
+                                    )
+                                    outstanding = sum(
+                                        job[2] in budget for job in jobs.values()
+                                    )
+                                    quiescing = self._quiescing.is_set()
+                                    if quiescing or outstanding >= self.max_work:
+                                        observed = time.monotonic()
+                                        oldest = min(
+                                            (
+                                                job[3]
+                                                for job in jobs.values()
+                                                if job[2] in budget
+                                            ),
+                                            default=observed,
                                         )
-                                        >= self.max_work
-                                    ):
+                                        logger.warning(
+                                            "[STORAGE_ADMISSION_BUSY] req_id=%s "
+                                            "service_epoch=%s client_session=%s "
+                                            "operation_id=%d lane=%s "
+                                            "outstanding=%d max_work=%d "
+                                            "quiescing=%s oldest_job_ms=%.3f",
+                                            request.identity.request_id,
+                                            self.service_epoch,
+                                            request.identity.client_session,
+                                            request.identity.operation_id,
+                                            lane,
+                                            outstanding,
+                                            self.max_work,
+                                            quiescing,
+                                            (observed - oldest) * 1000,
+                                        )
                                         outboxes[channel][key] = encode_message(
                                             self._reply(request, "BUSY")
                                         )
@@ -386,7 +411,12 @@ class StorageService:
                                                     submitted + _PENDING_READ_SECONDS
                                                 )
                                             pending_reads[future] = submitted, request
-                                        jobs[key] = (future, request, lane)
+                                        jobs[key] = (
+                                            future,
+                                            request,
+                                            lane,
+                                            time.monotonic(),
+                                        )
                                         # A Future may already be done here. Its
                                         # callback cannot inspect/mutate jobs or
                                         # serialize results on an executor thread.
@@ -397,7 +427,7 @@ class StorageService:
                                 )
                     if not channel:
                         available = min(16, limit - len(outboxes[0]))
-                        for key, (future, request, _) in tuple(jobs.items()):
+                        for key, (future, request, _, _) in tuple(jobs.items()):
                             if available <= 0:
                                 break
                             if future.done():
@@ -472,7 +502,7 @@ class StorageService:
                     )
                     or (
                         len(outboxes[0]) < self.max_work * 2
-                        and any(future.done() for future, _, _ in jobs.values())
+                        and any(job[0].done() for job in jobs.values())
                     )
                     or (
                         len(outboxes[1]) < lifecycle_limit

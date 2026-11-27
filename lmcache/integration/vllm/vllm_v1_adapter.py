@@ -88,6 +88,7 @@ from lmcache.v1.gpu_connector.sparse import (
 )
 from lmcache.v1.indexer_c8 import IndexerC8Layout
 from lmcache.v1.kv_layer_groups import validate_two_group_layer_counts
+from lmcache.v1.lookup_client.abstract_client import LookupBusyTimeout
 from lmcache.v1.manager import LMCacheManager
 from lmcache.v1.prefill_metadata import PrefillMetadataCache
 
@@ -12771,9 +12772,17 @@ class LMCacheConnectorV1Impl:
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
 
-        if (
-            num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
-        ) != -1:
+        try:
+            num_external_hit_tokens = self.lookup_client.lookup_cache(lookup_id=req_id)
+        except LookupBusyTimeout:
+            # The scheduler sums local and external tokens and enforces this
+            # per-request admission floor before allocating any blocks.
+            request.min_kv_prefix_tokens = num_computed_tokens + 1
+            request.stop_reason = "storage_lookup_busy_timeout"
+            self.load_specs.pop(req_id, None)
+            logger.warning("Rejecting request %s: %s", req_id, request.stop_reason)
+            return 0
+        if num_external_hit_tokens != -1:
             # -1 means no result cached
             # None or int means ongoing (async) or cached result
             logger.debug(

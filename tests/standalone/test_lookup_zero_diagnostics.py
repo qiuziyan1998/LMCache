@@ -16,6 +16,7 @@ import pytest
 # First Party
 from lmcache.v1 import serving_perf
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.lookup_client.abstract_client import LookupBusyTimeout
 from lmcache.v1.lookup_client.storage_lookup_client import StorageLookupClient
 from lmcache.v1.lookup_diagnostics import (
     collect_lookup_failure,
@@ -56,17 +57,32 @@ def make_client(monkeypatch: pytest.MonkeyPatch) -> Any:
     clients = []
 
     def make(
-        status: str = "COMPLETED", *, hit: bool = False, async_loading: bool = True
+        status: str | tuple[str, ...] = "COMPLETED",
+        *,
+        hit: bool = False,
+        async_loading: bool = True,
+        timeout_ms: int = 1,
     ) -> tuple[StorageLookupClient, Mock]:
         transport = Mock()
 
         def request(method: str, payload: dict, **fields: Any) -> StorageFuture:
-            identity = OperationIdentity("cache", "epoch", "scheduler", 17, **fields)
+            identity = OperationIdentity(
+                "cache",
+                "epoch",
+                "scheduler",
+                16 + transport.request.call_count,
+                **fields,
+            )
             work = StorageRequest(
                 identity, method, payload, content_digest(payload), b"s"
             )
             future = StorageFuture(work)
-            if status != "PENDING":
+            outcome = (
+                status[min(transport.request.call_count, len(status)) - 1]
+                if isinstance(status, tuple)
+                else status
+            )
+            if outcome != "PENDING":
                 reply = LookupReply(
                     4 if hit else 0,
                     "ticket" if hit else "",
@@ -75,15 +91,15 @@ def make_client(monkeypatch: pytest.MonkeyPatch) -> Any:
                     (0,) if hit else (),
                     (4,) if hit else (),
                     (7,) if hit else (),
-                    {},
+                    payload["request_configs"],
                     {"backend_reason": "page_unavailable"} if not hit else {},
                 )
                 future.set_result(
                     StorageResult(
                         identity,
-                        status,
+                        outcome,
                         msgspec.to_builtins(reply),
-                        error="not ready" if status == "FAILED_SAFE" else None,
+                        error="not ready" if outcome == "FAILED_SAFE" else None,
                     )
                 )
             return future
@@ -103,7 +119,7 @@ def make_client(monkeypatch: pytest.MonkeyPatch) -> Any:
             LMCacheEngineConfig.from_defaults(
                 pd_role="receiver",
                 enable_async_loading=async_loading,
-                lookup_timeout_ms=1,
+                lookup_timeout_ms=timeout_ms,
                 blocking_timeout_secs=0,
             ),
             SimpleNamespace(use_mla=True, mla_cache_tp_replicated=True),
@@ -122,7 +138,6 @@ def make_client(monkeypatch: pytest.MonkeyPatch) -> Any:
     "status,reason",
     [
         ("COMPLETED", "no_complete_prefix"),
-        ("BUSY", "storage_busy"),
         ("CANCELLED_NOT_STARTED", "storage_cancelled_not_started"),
         ("FAILED_SAFE", "storage_failed_safe"),
     ],
@@ -181,24 +196,137 @@ def test_timeout_logs_once_and_preserves_cached_miss_and_cancellation(
     transport.cancel.assert_called_once()
 
 
-@pytest.mark.parametrize("empty", [False, True])
-def test_unsubmitted_zero_reports_local_cause(
-    make_client: Any,
-    caplog: pytest.LogCaptureFixture,
-    empty: bool,
+def test_empty_query_reports_local_cause(
+    make_client: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
     client, transport = make_client()
-    transport.request.side_effect = BufferError("queue full")
-    assert client.lookup([] if empty else [1, 2, 3, 4], "request") == 0
+    assert client.lookup([], "request") == 0
     for _ in range(20):
         assert client.lookup_cache("request") == 0
     [record] = records(caplog)
     assert record["status"] == "NOT_SUBMITTED"
-    assert record["reason"] == (
-        "no_query_chunks" if empty else "submission_backpressure"
-    )
+    assert record["reason"] == "no_query_chunks"
     assert "operation_id" not in record
-    assert transport.request.call_count == (0 if empty else 1)
+    transport.request.assert_not_called()
+
+
+@pytest.mark.parametrize("async_loading", [False, True])
+def test_busy_retries_only_after_cancel_ack_and_backoff(
+    make_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    async_loading: bool,
+) -> None:
+    from lmcache.v1.lookup_client import storage_lookup_client as module
+
+    clock = Mock(return_value=10.0)
+    monkeypatch.setattr(
+        module, "time", SimpleNamespace(monotonic=clock, sleep=module.time.sleep)
+    )
+    client, transport = make_client(
+        ("BUSY", "COMPLETED"), hit=True, async_loading=async_loading, timeout_ms=1000
+    )
+    cancelled, ack = Future(), Future()
+    transport.cancel.side_effect = lambda _: cancelled
+    transport.acknowledge_terminal.return_value = ack
+    configs = {"tags": [1]}
+    assert client.lookup([1, 2, 3, 4], "r", configs) is None
+    assert client.lookup_cache("r") is None
+    configs["tags"].append(2)
+    clock.return_value += 0.2
+    for _ in range(100):
+        assert client.lookup_cache("r") is None
+    transport.cancel.assert_called_once()
+    old = transport.cancel.call_args.args[0]
+    proof = {"terminal_result_digest": b"proof"}
+    cancelled.set_result(StorageResult(old, "CANCELLED_NOT_STARTED", proof))
+    for _ in range(100):
+        assert client.lookup([7], "r") is None
+    transport.acknowledge_terminal.assert_called_once_with(old, proof)
+    transport.request.assert_called_once()
+    ack.set_result(StorageResult(old, "ACKNOWLEDGED"))
+    # The replacement must use the first plan, not the caller's changed data.
+    assert client.lookup_cache("r") is None
+    assert client.lookup_cache("r") == 4
+    ticket = client.peek_ticket("r")
+    assert ticket.identity.operation_id > old.operation_id
+    assert ticket.identity.request_attempt != old.request_attempt
+    assert ticket.reply.request_configs == {"tags": [1]}
+    assert transport.request.call_count == 2
+    assert not records(caplog)
+
+
+@pytest.mark.parametrize(
+    "phase", ["busy", "ack_pending", "retry_inflight", "not_submitted"]
+)
+def test_busy_deadline_is_from_first_submission(
+    make_client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    phase: str,
+) -> None:
+    from lmcache.v1.lookup_client import storage_lookup_client as module
+
+    clock = Mock(return_value=10.0)
+    monkeypatch.setattr(
+        module, "time", SimpleNamespace(monotonic=clock, sleep=module.time.sleep)
+    )
+    client, transport = make_client(
+        ("BUSY", "PENDING") if phase == "retry_inflight" else "BUSY", timeout_ms=1000
+    )
+    if phase == "not_submitted":
+        transport.request.side_effect = BufferError("transport full")
+    cancel = Future()
+    if phase == "ack_pending":
+        transport.cancel.side_effect = lambda _: cancel
+    assert client.lookup(range(4), "r") is None
+    for _ in range(100):
+        assert client.lookup_cache("r") is None
+    transport.request.assert_called_once()
+    clock.return_value += 0.7
+    for _ in range(10):
+        assert client.lookup_cache("r") is None
+    attempts = transport.request.call_count
+    assert attempts == (1 if phase == "ack_pending" else 2)
+    clock.return_value += 0.31
+    for _ in range(5):
+        with pytest.raises(LookupBusyTimeout):
+            client.lookup_cache("r")
+    assert client.peek_ticket("r") is None and not records(caplog)
+    assert transport.request.call_count == attempts
+    if phase == "ack_pending":
+        cancel.set_result(
+            StorageResult(transport.cancel.call_args.args[0], "ACKNOWLEDGED")
+        )
+    client.cleanup_lookup("r")
+    for _ in range(10):
+        if client.lookup_cache("r") == -1:
+            break
+    assert client.lookup_cache("r") == -1
+
+
+@pytest.mark.parametrize("action", ["clear_lookup_status", "cleanup_lookup", "close"])
+def test_discarded_busy_request_cannot_retry_after_ack(
+    make_client: Any, action: str
+) -> None:
+    client, transport = make_client(("COMPLETED", "BUSY"), hit=True, timeout_ms=1000)
+    assert client.lookup(range(4), "r") is None
+    assert client.lookup_cache("r") == 4
+    prior = client.peek_ticket("r")
+    client.clear_lookup_status("r")  # This ticket now belongs to the worker.
+    assert client.lookup(range(4), "r") is None
+    assert client.lookup_cache("r") is None
+    # Poll until cleanup has started, but do not advance past the retry delay.
+    assert client.lookup_cache("r") is None
+    transport.cancel.assert_called_once()
+    assert transport.cancel.call_args.args[0] != prior.identity
+    getattr(client, action)(*(() if action == "close" else ("r",)))
+    if action == "close":
+        assert not client.is_healthy()
+    else:
+        assert client.lookup_cache("r") == -1
+        client.cleanup_lookup("r")
+    assert transport.request.call_count == 2
 
 
 def test_hits_remain_silent(make_client: Any, caplog: pytest.LogCaptureFixture) -> None:

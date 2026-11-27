@@ -334,7 +334,7 @@ def test_actual_scheduler_update_transfers_ticket_before_clear() -> None:
     assert spec.can_load is False
 
 
-def test_busy_lookup_acknowledges_cancelled_tombstone_result() -> None:
+def test_busy_lookup_acknowledges_tombstone_then_loads_verified_prefix(caplog) -> None:
     runtime = LookupRuntime()
     work, lifecycle = endpoint(), endpoint()
     service = StorageService(
@@ -371,15 +371,25 @@ def test_busy_lookup_acknowledges_cancelled_tombstone_result() -> None:
         while client.lookup_cache("busy") is None:
             assert time.monotonic() < deadline
             time.sleep(0.005)
-        assert client.lookup_cache("busy") == 0
+        assert client.lookup_cache("busy") == 4
+        ticket = client.peek_ticket("busy")
+        assert ticket is not None and ticket.identity.request_id == "busy"
+        assert any(
+            "[STORAGE_ADMISSION_BUSY] req_id=busy " in record.getMessage()
+            and "lane=lookup outstanding=1 max_work=1 quiescing=False"
+            in record.getMessage()
+            for record in caplog.records
+        )
         while client.lookup_cache("slow") is None:
             assert time.monotonic() < deadline
             time.sleep(0.005)
         client.cleanup_lookup("slow")
+        client.cleanup_lookup("busy")
         while runtime.registry.snapshot()["operations"]:
             assert time.monotonic() < deadline
             time.sleep(0.005)
-        assert runtime.lookups == 1
+        assert runtime.lookups == 2
+        assert not runtime.tickets
     finally:
         client.close()
         service.close()
